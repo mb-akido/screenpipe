@@ -248,7 +248,7 @@ impl UpdatesManager {
                 warn!("updater check() error: {}", e);
             }
         }
-        if let Some(update) = check_result? {
+        if let Ok(Some(update)) = check_result {
             *self.update_available.lock().await = true;
 
             // Emit "update-downloading" immediately so user sees feedback
