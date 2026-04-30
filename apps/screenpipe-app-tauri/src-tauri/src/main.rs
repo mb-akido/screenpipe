@@ -39,6 +39,7 @@ mod analytics;
 #[allow(deprecated)]
 mod icons;
 use crate::analytics::start_analytics;
+mod cpu_check;
 mod calendar;
 mod capture_session;
 mod chatgpt_oauth;
@@ -318,6 +319,9 @@ async fn is_server_running(app: AppHandle) -> Result<bool, String> {
 #[tokio::main]
 async fn main() {
     let _ = fix_path_env::fix();
+
+    // Check CPU features before initializing any AVX-using dependencies.
+    cpu_check::check_cpu_features();
 
     // Refuse to launch while a `screenpipe db recover|cleanup` operation is in
     // progress. The CLI writes ~/.screenpipe/.db_recovery.lock before doing
