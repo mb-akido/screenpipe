@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
-#[command(about = "Score screenpipe diarization (v2: AudioManager end-to-end) against an RTTM reference")]
+#[command(
+    about = "Score screenpipe diarization (v2: AudioManager end-to-end) against an RTTM reference"
+)]
 struct Args {
     /// Path to the audio file (wav, mp3, etc — anything symphonia can decode).
     #[arg(long)]
@@ -72,7 +74,11 @@ async fn main() -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("screenpipe-eval-{}-{}", std::process::id(), now_nanos))
+        std::env::temp_dir().join(format!(
+            "screenpipe-eval-{}-{}",
+            std::process::id(),
+            now_nanos
+        ))
     };
     std::fs::create_dir_all(&work_dir).context("mkdir work_dir")?;
     let db_path = work_dir.join("eval.db");
@@ -136,7 +142,10 @@ async fn main() -> Result<()> {
         }));
     }
 
-    eprintln!("starting wav playback into AudioManager: {}", args.audio.display());
+    eprintln!(
+        "starting wav playback into AudioManager: {}",
+        args.audio.display()
+    );
     let handle = manager
         .start_with_wav(&args.audio)
         .await
@@ -212,11 +221,7 @@ fn stage_pyannote_models() -> Result<()> {
             continue;
         }
         std::fs::copy(&src, &dst).with_context(|| {
-            format!(
-                "copy pyannote model {} -> {}",
-                src.display(),
-                dst.display()
-            )
+            format!("copy pyannote model {} -> {}", src.display(), dst.display())
         })?;
         eprintln!("staged {} -> {}", src.display(), dst.display());
     }
