@@ -344,6 +344,25 @@ pub async fn get_cpal_device_and_config(
     // Get the highest quality configuration based on device type
     let config = if is_output_device && !is_display {
         let configs: Vec<_> = cpal_audio_device.supported_output_configs()?.collect();
+        
+        // Log all supported output configurations for diagnostic purposes
+        tracing::debug!(
+            device = %device_name,
+            config_count = configs.len(),
+            "Supported output configurations:"
+        );
+        for (i, cfg) in configs.iter().enumerate() {
+            tracing::debug!(
+                device = %device_name,
+                config_idx = i,
+                sample_rate_range = ?format!("{}-{}", cfg.min_sample_rate().0, cfg.max_sample_rate().0),
+                channels = cfg.channels(),
+                buffer_size = ?cfg.buffer_size(),
+                sample_format = ?cfg.sample_format(),
+                "Output config detail"
+            );
+        }
+        
         let best_config = configs
             .iter()
             .max_by(|a, b| {
@@ -354,9 +373,35 @@ pub async fn get_cpal_device_and_config(
             })
             .ok_or_else(|| anyhow!("No supported output configurations found"))?;
 
+        tracing::debug!(
+            device = %device_name,
+            selected_sample_rate = best_config.max_sample_rate().0,
+            selected_channels = best_config.channels(),
+            "Selected output configuration (highest sample rate)"
+        );
+
         (*best_config).with_sample_rate(best_config.max_sample_rate())
     } else {
         let configs: Vec<_> = cpal_audio_device.supported_input_configs()?.collect();
+        
+        // Log all supported input configurations for diagnostic purposes
+        tracing::debug!(
+            device = %device_name,
+            config_count = configs.len(),
+            "Supported input configurations:"
+        );
+        for (i, cfg) in configs.iter().enumerate() {
+            tracing::debug!(
+                device = %device_name,
+                config_idx = i,
+                sample_rate_range = ?format!("{}-{}", cfg.min_sample_rate().0, cfg.max_sample_rate().0),
+                channels = cfg.channels(),
+                buffer_size = ?cfg.buffer_size(),
+                sample_format = ?cfg.sample_format(),
+                "Input config detail"
+            );
+        }
+        
         let best_config = configs
             .iter()
             .max_by(|a, b| {
@@ -366,6 +411,13 @@ pub async fn get_cpal_device_and_config(
                     .then(a.channels().cmp(&b.channels()))
             })
             .ok_or_else(|| anyhow!("No supported input configurations found"))?;
+
+        tracing::debug!(
+            device = %device_name,
+            selected_sample_rate = best_config.max_sample_rate().0,
+            selected_channels = best_config.channels(),
+            "Selected input configuration (highest sample rate)"
+        );
 
         (*best_config).with_sample_rate(best_config.max_sample_rate())
     };

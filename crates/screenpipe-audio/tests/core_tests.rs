@@ -390,4 +390,51 @@ mod tests {
 
         debug!("Transcription completed in {:?}", elapsed_time);
     }
+
+    #[tokio::test]
+    async fn test_get_cpal_device_and_config_logs_supported_configs() {
+        use screenpipe_audio::core::device::{
+            get_cpal_device_and_config, list_audio_devices,
+        };
+
+        setup();
+
+        // Get available devices
+        let devices = list_audio_devices().await.expect("Failed to list devices");
+        if devices.is_empty() {
+            eprintln!("No audio devices available for test, skipping");
+            return;
+        }
+
+        // Test with the first available device
+        let device = &devices[0];
+        tracing::info!("Testing device: {}", device);
+
+        // This should succeed and trigger debug logging for all supported configs
+        let result = get_cpal_device_and_config(device).await;
+        assert!(
+            result.is_ok(),
+            "get_cpal_device_and_config should succeed for device: {}",
+            device
+        );
+
+        let (_cpal_device, config) = result.unwrap();
+        
+        // Verify we got a valid configuration
+        assert!(
+            config.channels() > 0,
+            "Selected configuration should have at least one channel"
+        );
+        assert!(
+            config.sample_rate().0 > 0,
+            "Selected configuration should have a valid sample rate"
+        );
+
+        println!(
+            "✓ Successfully tested device '{}': {} channels @ {} Hz",
+            device,
+            config.channels(),
+            config.sample_rate().0
+        );
+    }
 }
