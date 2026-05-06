@@ -5,30 +5,20 @@
 //! Tinfoil-enclave image-PII redactor.
 //!
 //! Sibling of [`crate::adapters::tinfoil::TinfoilRedactor`] — same auth /
-//! URL / Bearer-token shape, but for the image modality. Sends a
+//! enclave / Bearer-token shape, but for the image modality. Sends a
 //! base64-encoded JPG/PNG to `POST {url}/image/detect` and parses
 //! `[{bbox, label, score}, …]` back out.
 //!
-//! ## Security gap to close before GA: attested transport
+//! ## Attested transport
 //!
-//! Tinfoil's confidential-compute claim (the operator can't see your
-//! data) only holds when the client *cryptographically verifies the
-//! enclave* before sending — i.e. fetches the AMD-SEV-SNP / Intel-TDX
-//! attestation report, checks the chip-vendor signature, compares
-//! the report's `MEASUREMENT` against the expected enclave image
-//! hash, and pins TLS to the attestation-bound public key.
+//! Requests go through [`tinfoil`] (github.com/tinfoilsh/tinfoil-rs).
+//! On first call the SDK does AMD SEV-SNP hardware attestation,
+//! Sigstore code-provenance verification against the latest GitHub
+//! release of the configured repo, and pins TLS to the SPKI in the
+//! attestation document — so a compromised CA can't MITM the bytes
+//! of a screenshot in transit.
 //!
-//! Tinfoil ships official clients for Go / Python / JavaScript /
-//! Swift that do this. **There is no official Rust client yet.** This
-//! adapter (and the sibling text adapter) currently uses a plain
-//! `reqwest::Client` — that's safe for "private compute on a server
-//! we trust" but does NOT defend against a malicious / compromised
-//! Tinfoil operator. The attested-transport upgrade is tracked
-//! separately and hot-swappable here: replace the inner
-//! `reqwest::Client` with a wrapper that performs attestation
-//! verification, no surface API change. Until then, treat this
-//! adapter the same as you'd treat a regular HTTPS API call to a
-//! cooperating service.
+//! See the sibling text adapter for the full verification rationale.
 //!
 //! Shipping rationale: a single Tinfoil container running BOTH the OPF
 //! text model and the rfdetr_v8 image model on H200 is far faster than
@@ -57,13 +47,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 
+use crate::adapters::tinfoil::strip_scheme_and_path;
 use crate::image::{ImageRedactor, ImageRegion};
 use crate::{RedactError, SpanLabel};
 
-const DEFAULT_URL: &str = "https://pii.screenpipe.containers.tinfoil.dev";
+const DEFAULT_ENCLAVE: &str = "pii.screenpipe.containers.tinfoil.dev";
+const DEFAULT_REPO: &str = "screenpipe/privacy-filter";
 // Image inference is faster than text on the enclave (single forward
 // pass per frame, no per-row tokenization) — but allow generous
 // headroom for first-call cold-start + larger payloads.
@@ -75,9 +68,13 @@ const TINFOIL_IMAGE_VERSION: u32 = 1;
 /// adapter so users only configure auth once.
 #[derive(Debug, Clone, Default)]
 pub struct TinfoilImageConfig {
-    /// Override the enclave URL. Falls back to
-    /// `SCREENPIPE_PRIVACY_FILTER_URL`, then [`DEFAULT_URL`].
-    pub url: Option<String>,
+    /// Override the enclave host. Falls back to
+    /// `SCREENPIPE_PRIVACY_FILTER_ENCLAVE`, then `SCREENPIPE_PRIVACY_FILTER_URL`,
+    /// then [`DEFAULT_ENCLAVE`]. Scheme + path are stripped.
+    pub enclave: Option<String>,
+    /// GitHub repo (`org/repo`) cross-checked via Sigstore. Falls back
+    /// to `SCREENPIPE_PRIVACY_FILTER_REPO`, then [`DEFAULT_REPO`].
+    pub repo: Option<String>,
     /// Bearer token. Falls back to
     /// `SCREENPIPE_PRIVACY_FILTER_API_KEY`, then `SCREENPIPE_API_AUTH_KEY`.
     pub api_key: Option<String>,
@@ -88,20 +85,40 @@ pub struct TinfoilImageConfig {
     pub threshold: f32,
 }
 
-#[derive(Debug)]
 pub struct TinfoilImageRedactor {
-    http: reqwest::Client,
-    url: String,
+    enclave: String,
+    repo: String,
+    bearer: Option<HeaderValue>,
+    timeout: Duration,
     threshold: f32,
+    client: OnceCell<tinfoil::Client>,
     has_auth: bool,
+}
+
+impl std::fmt::Debug for TinfoilImageRedactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TinfoilImageRedactor")
+            .field("enclave", &self.enclave)
+            .field("repo", &self.repo)
+            .field("threshold", &self.threshold)
+            .field("has_auth", &self.has_auth)
+            .finish()
+    }
 }
 
 impl TinfoilImageRedactor {
     pub fn new(cfg: TinfoilImageConfig) -> Self {
-        let url = cfg
-            .url
+        let enclave_raw = cfg
+            .enclave
+            .or_else(|| std::env::var("SCREENPIPE_PRIVACY_FILTER_ENCLAVE").ok())
             .or_else(|| std::env::var("SCREENPIPE_PRIVACY_FILTER_URL").ok())
-            .unwrap_or_else(|| DEFAULT_URL.to_string());
+            .unwrap_or_else(|| DEFAULT_ENCLAVE.to_string());
+        let enclave = strip_scheme_and_path(&enclave_raw).to_string();
+
+        let repo = cfg
+            .repo
+            .or_else(|| std::env::var("SCREENPIPE_PRIVACY_FILTER_REPO").ok())
+            .unwrap_or_else(|| DEFAULT_REPO.to_string());
 
         let api_key = cfg.api_key.or_else(|| {
             std::env::var("SCREENPIPE_PRIVACY_FILTER_API_KEY")
@@ -109,40 +126,35 @@ impl TinfoilImageRedactor {
                 .or_else(|| std::env::var("SCREENPIPE_API_AUTH_KEY").ok())
         });
 
-        let mut headers = HeaderMap::new();
-        let has_auth = if let Some(ref key) = api_key {
-            match HeaderValue::from_str(&format!("Bearer {key}")) {
+        let (bearer, has_auth) = match api_key.as_deref() {
+            Some(key) => match HeaderValue::from_str(&format!("Bearer {key}")) {
                 Ok(mut v) => {
                     v.set_sensitive(true);
-                    headers.insert(AUTHORIZATION, v);
-                    true
+                    (Some(v), true)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "tinfoil_image api key invalid for HTTP header; sending un-authed");
-                    false
+                    (None, false)
                 }
+            },
+            None => {
+                tracing::info!(
+                    "tinfoil_image redactor has no api key — requests will be un-authenticated. \
+                     Set SCREENPIPE_PRIVACY_FILTER_API_KEY or pass via TinfoilImageConfig.api_key."
+                );
+                (None, false)
             }
-        } else {
-            tracing::info!(
-                "tinfoil_image redactor has no api key — requests will be un-authenticated. \
-                 Set SCREENPIPE_PRIVACY_FILTER_API_KEY or pass via TinfoilImageConfig.api_key."
-            );
-            false
         };
-
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(cfg.timeout.unwrap_or(DEFAULT_TIMEOUT))
-            .pool_max_idle_per_host(8)
-            .build()
-            .expect("reqwest client should build with default settings");
 
         let threshold = if cfg.threshold > 0.0 { cfg.threshold } else { 0.30 };
 
         Self {
-            http,
-            url,
+            enclave,
+            repo,
+            bearer,
+            timeout: cfg.timeout.unwrap_or(DEFAULT_TIMEOUT),
             threshold,
+            client: OnceCell::new(),
             has_auth,
         }
     }
@@ -154,6 +166,27 @@ impl TinfoilImageRedactor {
 
     pub fn has_auth(&self) -> bool {
         self.has_auth
+    }
+
+    /// Verify the enclave once and reuse its attested HTTP client.
+    /// See the text adapter for the full verification description.
+    async fn http(&self) -> Result<&reqwest::Client, RedactError> {
+        let client = self
+            .client
+            .get_or_try_init(|| async {
+                tinfoil::Client::new(&self.enclave, &self.repo, "")
+                    .await
+                    .map_err(|e| {
+                        RedactError::Runtime(format!(
+                            "tinfoil_image attestation failed for {}: {}",
+                            self.enclave, e
+                        ))
+                    })
+            })
+            .await?;
+        client
+            .http_client()
+            .map_err(|e| RedactError::Runtime(format!("tinfoil_image http_client: {}", e)))
     }
 }
 
@@ -195,15 +228,18 @@ impl ImageRedactor for TinfoilImageRedactor {
         })?;
         let image_b64 = B64.encode(&bytes);
 
-        let resp = self
-            .http
-            .post(format!("{}/image/detect", self.url))
+        let http = self.http().await?;
+        let mut req = http
+            .post(format!("https://{}/image/detect", self.enclave))
+            .timeout(self.timeout)
             .json(&DetectRequest {
                 image_b64: &image_b64,
                 threshold: self.threshold,
-            })
-            .send()
-            .await?;
+            });
+        if let Some(b) = &self.bearer {
+            req = req.header(AUTHORIZATION, b.clone());
+        }
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -261,13 +297,21 @@ mod tests {
         assert_eq!(r.version(), TINFOIL_IMAGE_VERSION);
     }
 
+    fn cfg() -> TinfoilImageConfig {
+        TinfoilImageConfig {
+            enclave: Some("example.invalid".into()),
+            repo: Some("test/never".into()),
+            api_key: None,
+            timeout: None,
+            threshold: 0.0,
+        }
+    }
+
     #[test]
     fn explicit_api_key_sets_auth() {
         let r = TinfoilImageRedactor::new(TinfoilImageConfig {
-            url: Some("http://example.invalid".into()),
             api_key: Some("test-token".into()),
-            timeout: None,
-            threshold: 0.0,
+            ..cfg()
         });
         assert!(r.has_auth());
     }
@@ -277,12 +321,7 @@ mod tests {
         // Make sure no env var is leaking in.
         std::env::remove_var("SCREENPIPE_PRIVACY_FILTER_API_KEY");
         std::env::remove_var("SCREENPIPE_API_AUTH_KEY");
-        let r = TinfoilImageRedactor::new(TinfoilImageConfig {
-            url: Some("http://example.invalid".into()),
-            api_key: None,
-            timeout: None,
-            threshold: 0.0,
-        });
+        let r = TinfoilImageRedactor::new(cfg());
         assert!(!r.has_auth());
     }
 
@@ -294,14 +333,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_url_bubbles_up_as_error() {
-        let r = TinfoilImageRedactor::new(TinfoilImageConfig {
-            url: Some("http://127.0.0.1:1".into()), // refused
-            api_key: None,
-            timeout: Some(Duration::from_millis(200)),
-            threshold: 0.3,
-        });
-        // Use a path that can't open — covers both error branches.
+    async fn unreachable_enclave_bubbles_up_as_error() {
+        // Bad path covers the read-error branch first. The
+        // attestation/network branch is reachable only via a valid
+        // image file + reachable host, which we don't exercise in
+        // unit tests.
+        let r = TinfoilImageRedactor::new(cfg());
         let res = r.detect(std::path::Path::new("/nonexistent.jpg")).await;
         assert!(res.is_err());
     }

@@ -29,6 +29,12 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
 thiserror = "1"
+# Tinfoil enclave attestation: AMD SEV-SNP attestation + Sigstore code-
+# provenance verification + TLS cert pinning for the privacy-filter PII
+# redaction service. See adapters/tinfoil.rs for the threat model
+# (without this a compromised CA can still observe unredacted text in
+# transit even though the enclave itself is honest).
+tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
