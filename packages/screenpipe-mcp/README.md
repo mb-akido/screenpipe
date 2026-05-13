@@ -34,10 +34,10 @@ The MCP server can run over HTTP using the [Streamable HTTP transport](https://m
 
 ```bash
 # loopback only (default)
-npx screenpipe-mcp-http --port 3031
+npx -y --package screenpipe-mcp@latest screenpipe-mcp-http --port 3031
 
 # expose to your LAN with bearer auth
-npx screenpipe-mcp-http --listen-on-lan --api-key $(openssl rand -hex 16)
+npx -y --package screenpipe-mcp@latest screenpipe-mcp-http --listen-on-lan --api-key $(openssl rand -hex 16)
 
 # or from source
 npm run start:http -- --port 3031
@@ -75,6 +75,8 @@ Point any MCP client that supports HTTP transport at the `/mcp` endpoint:
 If your machines are on different networks, expose port 3031 via Tailscale, SSH tunnel, or similar — see the [OpenClaw integration guide](https://docs.screenpi.pe/openclaw) for detailed examples.
 
 > **Note:** The HTTP server currently exposes `search_content` only. The stdio server has the full tool set (export-video, list-meetings, activity-summary, search-elements, frame-context). We're working on bringing HTTP to full parity.
+
+**n8n:** If n8n runs in Docker Desktop, use `http://host.docker.internal:3031/mcp` in the MCP Client Tool. If n8n runs directly on the same machine, use `http://localhost:3031/mcp`.
 
 ### Option 3: From Source
 
@@ -115,7 +117,7 @@ npx @modelcontextprotocol/inspector npx screenpipe-mcp
 | Mode | Command | Use Case |
 |------|---------|----------|
 | **stdio** (default) | `npx screenpipe-mcp` | Claude Desktop, local MCP clients |
-| **HTTP** | `npx screenpipe-mcp-http` | Remote clients, network access, OpenClaw on VPS |
+| **HTTP** | `npx --package screenpipe-mcp screenpipe-mcp-http` | Remote clients, network access, OpenClaw on VPS |
 
 ## Available Tools
 

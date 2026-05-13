@@ -14,7 +14,9 @@ static DEF: IntegrationDef = IntegrationDef {
     icon: "n8n",
     category: Category::Productivity,
     description:
-        "Send data to n8n workflows via webhook. POST JSON to the webhook URL with any payload.",
+        "Send data to n8n workflows via webhook, or let n8n call ScreenPipe through the MCP HTTP server. \
+        Webhook mode: POST JSON to the webhook URL with any payload. \
+        MCP mode: run screenpipe-mcp-http and point n8n's MCP Client Tool at /mcp.",
     fields: &[FieldDef {
         key: "webhook_url",
         label: "Webhook URL",

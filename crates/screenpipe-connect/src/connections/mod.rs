@@ -46,6 +46,7 @@ pub mod obsidian;
 pub mod otter;
 pub mod perplexity;
 pub mod pipedrive;
+pub mod plaid;
 pub mod pocket;
 pub mod posthog;
 pub mod pushover;
@@ -138,6 +139,11 @@ pub enum ProxyAuth {
         username_key: &'static str,
         password_key: &'static str,
     },
+    /// Inject credential fields into a JSON request body. Useful for APIs like
+    /// Plaid where authentication is part of the POST body rather than headers.
+    JsonBody {
+        credential_keys: &'static [&'static str],
+    },
     /// No auth needed (e.g. webhook-based integrations where the URL is the secret).
     None,
 }
@@ -218,6 +224,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(notion::Notion),
         Box::new(linear::Linear),
         Box::new(perplexity::Perplexity),
+        Box::new(plaid::Plaid),
         Box::new(obsidian::Obsidian),
         Box::new(n8n::N8n),
         Box::new(make::Make),

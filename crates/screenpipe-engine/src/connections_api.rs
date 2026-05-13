@@ -996,6 +996,7 @@ async fn oauth_callback(Query(params): Query<OAuthCallbackQuery>) -> (StatusCode
 enum ResolvedAuth {
     Header(String, String),
     Basic(String, String),
+    JsonBody(Vec<(String, String)>),
     None,
 }
 
@@ -1138,6 +1139,22 @@ fn resolve_auth(
             } else {
                 ResolvedAuth::None
             }
+        }
+        ProxyAuth::JsonBody { credential_keys } => {
+            let Some(c) = creds else {
+                return ResolvedAuth::None;
+            };
+            let mut fields = Vec::with_capacity(credential_keys.len());
+            for key in *credential_keys {
+                let Some(value) = c.get(*key).and_then(|v| v.as_str()) else {
+                    return ResolvedAuth::None;
+                };
+                if value.is_empty() {
+                    return ResolvedAuth::None;
+                }
+                fields.push(((*key).to_string(), value.to_string()));
+            }
+            ResolvedAuth::JsonBody(fields)
         }
         ProxyAuth::None => ResolvedAuth::None,
     }
@@ -1312,12 +1329,56 @@ async fn connection_proxy(
     }
 
     // Inject auth
+    let mut auth_wrote_body = false;
     match auth {
         ResolvedAuth::Header(name, value) => {
             req = req.header(&name, &value);
         }
         ResolvedAuth::Basic(user, pass) => {
             req = req.basic_auth(&user, Some(&pass));
+        }
+        ResolvedAuth::JsonBody(fields) => {
+            let mut json_body: Value = if body.is_empty() {
+                json!({})
+            } else {
+                match serde_json::from_slice(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": format!("proxy request body must be JSON for this connection: {}", e) })),
+                        )
+                            .into_response();
+                    }
+                }
+            };
+
+            let Some(obj) = json_body.as_object_mut() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "proxy request body must be a JSON object for this connection" })),
+                )
+                    .into_response();
+            };
+
+            for (key, value) in fields {
+                obj.insert(key, Value::String(value));
+            }
+
+            req = req.header("content-type", "application/json");
+            match serde_json::to_vec(&json_body) {
+                Ok(bytes) => {
+                    req = req.body(bytes);
+                    auth_wrote_body = true;
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("failed to build proxy JSON body: {}", e) })),
+                    )
+                        .into_response();
+                }
+            }
         }
         ResolvedAuth::None => {}
     }
@@ -1327,8 +1388,8 @@ async fn connection_proxy(
         req = req.header(*name, *value);
     }
 
-    // Forward body
-    if !body.is_empty() {
+    // Forward body for connections whose auth did not already rewrite it.
+    if !body.is_empty() && !auth_wrote_body {
         req = req.body(body.to_vec());
     }
 

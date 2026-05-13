@@ -2638,9 +2638,6 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "etcetera"
@@ -7765,7 +7762,6 @@ dependencies = [
  "dashmap",
  "dirs 5.0.1",
  "env_logger",
- "esaxx-rs",
  "futures",
  "hf-hub 0.3.2",
  "hound",

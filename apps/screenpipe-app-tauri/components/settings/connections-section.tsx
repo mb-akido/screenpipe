@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogClose, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Download, ExternalLink, Check, Loader2, Copy, Terminal, Lock, LogIn, LogOut, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff, FolderOpen } from "lucide-react";
+import { Download, ExternalLink, Check, Loader2, Copy, Terminal, Lock, LogIn, LogOut, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff, FolderOpen, Landmark } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { commands } from "@/lib/utils/tauri";
 import { useSettings, getStore } from "@/lib/hooks/use-settings";
@@ -318,6 +318,7 @@ export function IntegrationIcon({ icon }: { icon: string }) {
     perplexity: <img src="/images/perplexity.svg" alt="Perplexity" className="w-5 h-5" />,
     posthog: <img src="/images/posthog.svg" alt="PostHog" className="w-5 h-5" />,
     n8n: <img src="/images/n8n.png" alt="n8n" className="w-5 h-5 rounded" />,
+    plaid: <Landmark className="h-5 w-5 text-muted-foreground" />,
     make: <img src="/images/make.png" alt="Make" className="w-5 h-5 rounded" />,
     glean: <img src="/images/glean.svg" alt="Glean" className="w-5 h-5 rounded" />,
     zapier: <img src="/images/zapier.png" alt="Zapier" className="w-5 h-5 rounded" />,
@@ -741,6 +742,72 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
         <summary className="cursor-pointer">manual config</summary>
         <pre className="mt-2 bg-muted border border-border rounded-lg p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{manualConfig}</pre>
       </details>
+    </div>
+  );
+}
+
+function CopySnippet({ value, wrap = false }: { value: string; wrap?: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {}
+  }, [value]);
+
+  return (
+    <div className="relative group">
+      <pre className={`bg-muted border border-border rounded-lg p-3 pr-10 text-xs font-mono text-foreground overflow-x-auto ${wrap ? "whitespace-pre-wrap break-all" : ""}`}>{value}</pre>
+      <Button variant="ghost" size="sm" onClick={handleCopy} className="absolute top-2 right-2 h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity">
+        {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3 text-muted-foreground" />}
+      </Button>
+    </div>
+  );
+}
+
+function N8nPanel({
+  integration,
+  onRefresh,
+  onDisconnected,
+}: {
+  integration: IntegrationInfo;
+  onRefresh: () => void;
+  onDisconnected?: () => void;
+}) {
+  const httpCommand = "npx -y --package screenpipe-mcp@latest screenpipe-mcp-http --port 3031";
+  const dockerEndpoint = "http://host.docker.internal:3031/mcp";
+  const localEndpoint = "http://localhost:3031/mcp";
+
+  return (
+    <div className="space-y-5">
+      <div className="space-y-2">
+        <p className="text-xs text-muted-foreground">Send ScreenPipe events into n8n workflows.</p>
+        <ApiIntegrationPanel
+          integration={integration}
+          onRefresh={onRefresh}
+          onDisconnected={onDisconnected}
+        />
+      </div>
+
+      <div className="border-t border-border pt-4 space-y-3">
+        <p className="text-xs text-muted-foreground">Let n8n read ScreenPipe context through MCP.</p>
+        <div className="space-y-1.5">
+          <p className="text-xs text-muted-foreground">1. Run the MCP HTTP server:</p>
+          <CopySnippet value={httpCommand} wrap />
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-xs text-muted-foreground">2. In n8n&apos;s MCP Client Tool, use this URL if n8n runs in Docker:</p>
+          <CopySnippet value={dockerEndpoint} />
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-xs text-muted-foreground">If n8n runs directly on this computer, use:</p>
+          <CopySnippet value={localEndpoint} />
+        </div>
+        <Button variant="outline" onClick={() => openUrl("https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-langchain.mcpClient/")} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+          <ExternalLink className="h-3 w-3" />open n8n docs
+        </Button>
+      </div>
     </div>
   );
 }
@@ -2014,6 +2081,13 @@ export function ConnectionsSection() {
       />;
       default:
         if (selectedIntegration) {
+          if (selectedIntegration.id === "n8n") {
+            return <N8nPanel
+              integration={selectedIntegration}
+              onRefresh={fetchIntegrations}
+              onDisconnected={() => setIntegrations(prev => prev.map(i => i.id === selectedIntegration.id ? { ...i, connected: false } : i))}
+            />;
+          }
           if (selectedIntegration.is_oauth) {
             return <OAuthPanel integrationId={selectedIntegration.id} integrationName={selectedIntegration.name} />;
           }
