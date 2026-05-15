@@ -10,9 +10,10 @@
  * window hosts the browser sidebar. A successful `owned_browser_navigate`
  * emits the sidebar event that attaches that child, which WebKitGTK cannot
  * safely observe because it drops the parent window context after
- * `Window::add_child`. Linux CI therefore stays on the command paths that do
- * not show the child; other platforms still smoke the cold-start navigate
- * path that historically regressed:
+ * `Window::add_child`. WebKitGTK also rejects malformed URL strings before
+ * they reach the Tauri invoke handler. Linux CI therefore stays on the
+ * no-child hide path; other platforms still smoke the cold-start navigate path
+ * and malformed-url error path that historically regressed:
  *
  *   - install-race vs. per-conversation restore (commit `f31d437e0`)
  *   - cookie injection on the wrong navigate path (`7d68c54de`)
@@ -26,6 +27,7 @@ import { openHomeWindow, waitForAppReady } from "../helpers/test-utils.js";
 import { invoke } from "../helpers/tauri.js";
 
 const canAttachOwnedBrowserWithoutLosingWebDriver = process.platform !== "linux";
+const canRoundTripMalformedOwnedBrowserUrl = process.platform !== "linux";
 
 describe("Owned browser", function () {
   this.timeout(120_000);
@@ -50,11 +52,14 @@ describe("Owned browser", function () {
     },
   );
 
-  it("owned_browser_navigate rejects invalid URLs with a clear error", async () => {
-    const res = await invoke("owned_browser_navigate", { url: "not a url" });
-    expect(res.ok).toBe(false);
-    expect(res.error ?? "").toContain("invalid url");
-  });
+  (canRoundTripMalformedOwnedBrowserUrl ? it : it.skip)(
+    "owned_browser_navigate rejects invalid URLs with a clear error",
+    async () => {
+      const res = await invoke("owned_browser_navigate", { url: "not a url" });
+      expect(res.ok).toBe(false);
+      expect(res.error ?? "").toContain("invalid url");
+    },
+  );
 
   it("owned_browser_hide returns Ok without an attached child", async () => {
     const res = await invoke("owned_browser_hide");
