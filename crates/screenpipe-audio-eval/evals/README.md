@@ -62,6 +62,48 @@ Templates live in `crates/screenpipe-audio-eval/evals/templates/`. Composed
 fixtures should NOT be checked into git — they're regenerated every CI run
 into a temp dir.
 
+## screenpipe-shaped LibriSpeech fixtures
+
+For fast iteration without private user audio, generate deterministic fixtures
+from LibriSpeech `test-clean`:
+
+```bash
+cargo run -p screenpipe-audio-eval --bin screenpipe-eval-screenpipe-fixtures -- \
+  --librispeech-dir crates/screenpipe-audio-eval/evals/fixtures/librispeech/LibriSpeech/test-clean \
+  --out-dir /tmp/screenpipe-speaker-suite
+```
+
+This creates five fixtures that model actual screenpipe usage patterns:
+
+- `screenpipe_meeting_rapid_handoffs`: meeting mode, three recurring speakers,
+  short pauses, quick turns.
+- `screenpipe_background_24_7_day`: background mode, long silence gaps, recurring
+  speakers across separated meetings.
+- `screenpipe_short_backchannels`: short acknowledgements that tend to get
+  swallowed into one turn.
+- `screenpipe_mic_system_echo_leakage`: system audio captured again through the
+  microphone as a delayed low-volume duplicate.
+- `screenpipe_overlap_crosstalk`: two people talking at once, represented as
+  overlapping RTTM segments.
+
+Then score them:
+
+```bash
+for wav in /tmp/screenpipe-speaker-suite/*.wav; do
+  name="$(basename "$wav" .wav)"
+  cargo run -p screenpipe-audio-eval --bin screenpipe-eval-diarization -- \
+    --audio "$wav" \
+    --rttm "/tmp/screenpipe-speaker-suite/${name}.rttm" \
+    --fixture "$name" \
+    --hyp-rttm "/tmp/screenpipe-speaker-suite/${name}.hyp.rttm"
+done
+```
+
+These fixtures are synthetic, but the failure modes are screenpipe-specific:
+live meeting handoffs, background 24/7 silence, duplicated mic/system capture,
+and crosstalk. Use them as a regression suite before claiming speaker-ID
+quality improvements.
+
 ## Metrics
 
 Single JSON line on stdout, progress on stderr. Fields:

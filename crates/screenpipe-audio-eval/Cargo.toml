@@ -43,5 +43,9 @@ name = "screenpipe-eval-compose"
 path = "src/bin/compose_fixture.rs"
 
 [[bin]]
+name = "screenpipe-eval-screenpipe-fixtures"
+path = "src/bin/screenpipe_fixtures.rs"
+
+[[bin]]
 name = "screenpipe-eval-transcription"
 path = "src/bin/eval_transcription.rs"

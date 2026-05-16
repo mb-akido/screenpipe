@@ -167,6 +167,16 @@ jobs:
           done
           ls -lh /tmp/composed/
 
+      - name: Generate screenpipe-shaped fixtures
+        run: |
+          mkdir -p /tmp/screenpipe-shaped
+          ./target/release/screenpipe-eval-screenpipe-fixtures \
+            --librispeech-dir crates/screenpipe-audio-eval/evals/fixtures/librispeech/LibriSpeech/test-clean \
+            --out-dir /tmp/screenpipe-shaped \
+            > /tmp/screenpipe-shaped/manifest.json
+          cat /tmp/screenpipe-shaped/manifest.json
+          ls -lh /tmp/screenpipe-shaped/
+
       - name: Run eval on fixtures
         env:
           FIXTURES: ${{ inputs.fixtures || 'abjxc,bxpwa,dhorc' }}
@@ -215,6 +225,28 @@ jobs:
               }
             cat "/tmp/eval-results/${tpl}.json"
           done
+          # screenpipe-shaped LibriSpeech fixtures: live meetings,
+          # background 24/7 gaps, backchannels, mic/system echo, crosstalk.
+          for audio in /tmp/screenpipe-shaped/*.wav; do
+            stem=$(basename "$audio" .wav)
+            rttm="/tmp/screenpipe-shaped/${stem}.rttm"
+            if [ ! -f "$rttm" ]; then
+              echo "::warning::skipping screenpipe-shaped ${stem} — RTTM missing"
+              continue
+            fi
+            echo "==> running eval on screenpipe-shaped ${stem}"
+            /usr/bin/time -v ./target/release/screenpipe-eval-diarization \
+              --audio "$audio" \
+              --rttm  "$rttm" \
+              --fixture "$stem" \
+              > "/tmp/eval-results/${stem}.json" \
+              2>"/tmp/eval-results/${stem}.stderr" || {
+                echo "::error::eval failed for screenpipe-shaped ${stem}"
+                cat "/tmp/eval-results/${stem}.stderr"
+                exit 1
+              }
+            cat "/tmp/eval-results/${stem}.json"
+          done
 
       # Score whisper-tiny against LibriSpeech test-clean. 50 utterances
       # is enough for a stable mean on most CI runs (~6 min wall) without
@@ -247,20 +279,29 @@ jobs:
             echo "<!-- diarization-eval-report -->"
             echo "## Diarization eval results"
             echo
-            echo "Source: \`crates/screenpipe-audio-eval/evals/\` · VoxConverse dev (CC-BY-4.0) + composed workday templates"
+            echo "Source: \`crates/screenpipe-audio-eval/evals/\` · VoxConverse dev (CC-BY-4.0) + composed workday templates + screenpipe-shaped LibriSpeech fixtures"
             echo
             echo "| fixture | DER | VAD FA | VAD FN | boundary err (s) | continuity | predicted / true spk |"
             echo "|---|---:|---:|---:|---:|---:|---:|"
-            # Render in a stable order: composed templates first (the headline),
-            # then raw VoxConverse stems alphabetically.
+            # Render in a stable order: composed templates first, then the
+            # screenpipe-shaped rows, then raw VoxConverse stems alphabetically.
             order=()
             for tpl in interrupted_meeting long_silence_day; do
               [ -f "/tmp/eval-results/${tpl}.json" ] && order+=("$tpl")
             done
+            for stem in \
+              screenpipe_meeting_rapid_handoffs \
+              screenpipe_background_24_7_day \
+              screenpipe_short_backchannels \
+              screenpipe_mic_system_echo_leakage \
+              screenpipe_overlap_crosstalk
+            do
+              [ -f "/tmp/eval-results/${stem}.json" ] && order+=("$stem")
+            done
             for f in $(ls /tmp/eval-results/*.json | sort); do
               stem=$(basename "$f" .json)
               case "$stem" in
-                interrupted_meeting|long_silence_day|transcription) ;;
+                interrupted_meeting|long_silence_day|screenpipe_*|transcription) ;;
                 *) order+=("$stem") ;;
               esac
             done
@@ -283,7 +324,7 @@ jobs:
               ' "$f"
             done
             echo
-            echo "<sub>DER, VAD FA, VAD FN, boundary err: lower is better. Continuity: higher is better, 1.0 = same hyp cluster across all silence gaps. Composed workday rows (\`interrupted_meeting\`, \`long_silence_day\`) are the headline — they exercise screenpipe-shaped data. Raw VoxConverse rows score broadcast-quality stems for comparison. See \`crates/screenpipe-audio-eval/evals/README.md\` for methodology.</sub>"
+            echo "<sub>DER, VAD FA, VAD FN, boundary err: lower is better. Continuity: higher is better, 1.0 = same hyp cluster across all silence gaps. Composed workday rows and \`screenpipe_*\` rows exercise screenpipe-shaped usage: meetings, background gaps, backchannels, echo leakage, and crosstalk. Raw VoxConverse rows score broadcast-quality stems for comparison. See \`crates/screenpipe-audio-eval/evals/README.md\` for methodology.</sub>"
             echo
             if [ -f /tmp/eval-results/transcription.json ]; then
               echo "## Transcription quality"
