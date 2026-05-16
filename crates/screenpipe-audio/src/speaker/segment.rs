@@ -10,7 +10,7 @@ use tracing::error;
 use super::{embedding::EmbeddingExtractor, embedding_manager::EmbeddingManager};
 
 const MIN_EMBEDDING_SAMPLES: usize = 1600;
-const MAX_EMBEDDING_SEGMENT_SECONDS: f64 = 4.0;
+const MAX_EMBEDDING_SEGMENT_SECONDS: f64 = 2.0;
 const MAX_SAME_SPEAKER_MERGE_GAP_SECONDS: f64 = 0.75;
 
 // pyannote segmentation 3.0 uses powerset classes: 0 is silence, 1..=3 are
@@ -373,7 +373,7 @@ pub fn get_speaker_from_embedding(
     embedding_manager: &mut EmbeddingManager,
     embedding: Vec<f32>,
 ) -> String {
-    let search_threshold = 0.55; // cosine similarity threshold (1 - distance); balances false merge vs over-split on screenpipe-shaped evals
+    let search_threshold = 0.35; // cosine similarity threshold (1 - distance); balances false merge vs over-split on screenpipe-shaped evals
 
     embedding_manager
         .search_speaker(embedding.clone(), search_threshold)
