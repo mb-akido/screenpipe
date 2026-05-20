@@ -414,25 +414,42 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         && global_audio_active
         && audio_snap.uptime_secs > 120.0
     {
-        // Only flag a stall when the transcription consumer is actively processing
-        // (heartbeat recent) but DB writes have stopped. This prevents false positives
-        // during silence when VAD filters everything and nothing is written to DB.
-        let transcription_fresh = audio_snap.last_transcription_attempt_ts > 0
-            && now_ts.saturating_sub(audio_snap.last_transcription_attempt_ts) < threshold_secs;
-        let db_stale = audio_snap.last_db_write_ts == 0
-            || now_ts.saturating_sub(audio_snap.last_db_write_ts) > threshold_secs;
-        let stalled = transcription_fresh && db_stale;
+        // Direct measurement: count chunks stuck in 'pending' status. This
+        // replaces the previous pool-idle + stale-metric heuristic, which
+        // fired false positives whenever the live path's dedup short-circuit
+        // ate batches of common short words and went silent on the write
+        // pool. The pool idleness was a side effect of *expected* dedup
+        // behavior, not a real stall.
+        //
+        // A real stall now means: the reconciliation worker has pending
+        // chunks older than the freshness window — i.e. they should have
+        // been processed by now and haven't.
+        let backlog = audio_reconciliation_backlog.unwrap_or((0, None));
+        let pending_count = backlog.0;
+        let oldest_pending_age_secs = backlog
+            .1
+            .map(|ts| (now.timestamp() - ts.timestamp()).max(0) as u64)
+            .unwrap_or(0);
+        // A few pending chunks at any moment is normal (the 10-min freshness
+        // delay means there's always 10 min of in-flight audio). We flag a
+        // stall only when there's a real backlog (>20 chunks) AND the oldest
+        // pending chunk has been waiting noticeably longer than the
+        // freshness delay (>2x the delay = should have been picked up by
+        // the last sweep).
+        let stalled = pending_count > 20
+            && oldest_pending_age_secs
+                > (AUDIO_RECONCILIATION_FRESHNESS_DELAY_SECS as u64).saturating_mul(2);
         if stalled {
-            // throttle to once per 60s to avoid log spam (health runs every ~1s)
+            // Throttle to once per 60s to avoid log spam (health runs every ~1s).
             static LAST_AUDIO_STALL_LOG: AtomicU64 = AtomicU64::new(0);
             let prev = LAST_AUDIO_STALL_LOG.load(Ordering::Relaxed);
             if now_ts.saturating_sub(prev) >= 60 {
                 LAST_AUDIO_STALL_LOG.store(now_ts, Ordering::Relaxed);
                 let (rs, ri, ws, wi) = state.db.pool_stats();
                 warn!(
-                    "health_check: audio transcription writes stalled — transcription active but last DB write {}s ago ({}) | pool: read={}/{} idle, write={}/{} idle",
-                    if audio_snap.last_db_write_ts > 0 { now_ts.saturating_sub(audio_snap.last_db_write_ts) } else { 0 },
-                    suspected_stall_cause(ri, wi),
+                    "health_check: audio transcription backlog stalled — {} chunk(s) pending, oldest {}s old | pool: read={}/{} idle, write={}/{} idle",
+                    pending_count,
+                    oldest_pending_age_secs,
                     ri, rs, wi, ws,
                 );
             }
