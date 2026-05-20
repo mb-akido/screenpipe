@@ -17,6 +17,14 @@ const EXECUTABLE_NAME: &str = "ffmpeg.exe";
 
 static FFMPEG_PATH: Lazy<Option<PathBuf>> = Lazy::new(find_ffmpeg_path_internal);
 
+/// Probe for an ffmpeg binary without attempting an auto-install.
+///
+/// This is intended for startup paths where we want to avoid network/download
+/// spikes and still allow the app to run with degraded functionality.
+pub fn probe_ffmpeg_path() -> Option<PathBuf> {
+    probe_ffmpeg_path_internal()
+}
+
 pub fn find_ffmpeg_path() -> Option<PathBuf> {
     FFMPEG_PATH.as_ref().map(|p| p.clone())
 }
@@ -66,7 +74,7 @@ fn has_matching_ffprobe(ffmpeg_path: &std::path::Path) -> bool {
     which(probe_name).is_ok()
 }
 
-fn find_ffmpeg_path_internal() -> Option<PathBuf> {
+fn probe_ffmpeg_path_internal() -> Option<PathBuf> {
     debug!("Starting search for ffmpeg executable");
 
     // macOS: prefer the app-bundled ffmpeg (Tauri sidecar lands in
@@ -212,6 +220,14 @@ fn find_ffmpeg_path_internal() -> Option<PathBuf> {
                 }
             }
         }
+    }
+
+    None
+}
+
+fn find_ffmpeg_path_internal() -> Option<PathBuf> {
+    if let Some(path) = probe_ffmpeg_path_internal() {
+        return Some(path);
     }
 
     debug!("ffmpeg not found. installing...");

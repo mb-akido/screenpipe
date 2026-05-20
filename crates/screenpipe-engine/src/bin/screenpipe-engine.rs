@@ -21,7 +21,7 @@ use screenpipe_audio::{
     meeting_detector::MeetingDetector,
 };
 use screenpipe_core::agents::AgentExecutor;
-use screenpipe_core::find_ffmpeg_path;
+use screenpipe_core::{find_ffmpeg_path, probe_ffmpeg_path};
 use screenpipe_core::paths;
 use screenpipe_db::DatabaseManager;
 use screenpipe_engine::{
@@ -587,15 +587,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Replace the current conditional check with:
-    let ffmpeg_path = find_ffmpeg_path();
-    if ffmpeg_path.is_none() {
-        // Try one more time, which might trigger the installation
-        let ffmpeg_path = find_ffmpeg_path();
-        if ffmpeg_path.is_none() {
-            eprintln!("ffmpeg not found and installation failed. please install ffmpeg manually.");
-            std::process::exit(1);
-        }
+    let ffmpeg_available = probe_ffmpeg_path().is_some();
+    if !ffmpeg_available {
+        eprintln!("warning: ffmpeg not found; recording will continue, but snapshot compaction and video export endpoints will be unavailable until ffmpeg is installed.");
     }
 
     // Pre-flight permission check (macOS: trigger native prompts + poll until granted)
@@ -919,13 +913,17 @@ async fn main() -> anyhow::Result<()> {
     // Skipping the worker avoids the ffmpeg H.265 encoding load for users who don't
     // need the MP4 timeline UI (task-mining tools, headless analysis pipelines, etc.).
     if !config.disable_snapshot_compaction {
-        screenpipe_engine::start_snapshot_compaction(
-            db.clone(),
-            config.video_quality.clone(),
-            shutdown_tx.subscribe(),
-            power_manager.clone(),
-            Some(hot_frame_cache.clone()),
-        );
+        if ffmpeg_available {
+            screenpipe_engine::start_snapshot_compaction(
+                db.clone(),
+                config.video_quality.clone(),
+                shutdown_tx.subscribe(),
+                power_manager.clone(),
+                Some(hot_frame_cache.clone()),
+            );
+        } else {
+            warn!("snapshot compaction disabled â€” ffmpeg not found");
+        }
     } else {
         info!("snapshot compaction disabled via --disable-snapshot-compaction");
     }

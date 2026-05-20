@@ -381,8 +381,8 @@ async fn start_ffmpeg_lowpri(
     fps: f64,
     video_quality: &str,
 ) -> Result<tokio::process::Child> {
-    let ffmpeg_path =
-        screenpipe_core::find_ffmpeg_path().ok_or_else(|| anyhow::anyhow!("ffmpeg not found"))?;
+    let ffmpeg_path = screenpipe_core::probe_ffmpeg_path()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg not found"))?;
 
     let fps_str = fps.to_string();
     let crf = video_quality_to_crf(video_quality);

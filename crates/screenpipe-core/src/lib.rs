@@ -13,7 +13,7 @@ pub mod strings;
 // screenpipe/sdk) can reuse the x265 pipeline without pulling the full
 // engine dep tree (db, connect, a11y, etc.).
 pub mod video;
-pub use ffmpeg::{ffmpeg_cmd, ffmpeg_cmd_async, find_ffmpeg_path};
+pub use ffmpeg::{ffmpeg_cmd, ffmpeg_cmd_async, find_ffmpeg_path, probe_ffmpeg_path};
 
 mod language;
 #[cfg(feature = "security")]
