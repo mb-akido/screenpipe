@@ -72,7 +72,7 @@ pub struct Destination {
 
 impl Destination {
     pub const CLAUDE_CODE: Destination = Destination {
-        id: "claude_code",
+        id: "claude-code",
         display_name: "Claude Code",
         filename: "CLAUDE.md",
     };

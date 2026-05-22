@@ -362,9 +362,10 @@ pub(crate) async fn delete_memory_handler(
 /// 5 minutes; this handler exists so the app's "sync now" button and
 /// `curl`-based debugging don't have to wait for the next tick.
 ///
-/// Skipped to JSON intentionally — `oasgen` chokes on `anyhow::Result`
-/// inside the per-destination outcome, and the response is internal
-/// to the app + CLI tooling so OpenAPI generation isn't load-bearing.
+/// Returns `JsonResponse<Value>` so the per-destination outcome (which
+/// includes `anyhow::Result` via a custom `serialize_with`) doesn't have
+/// to be OaSchema. The OpenAPI spec just reports a generic JSON shape.
+#[oasgen]
 pub(crate) async fn sync_external_memories_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {

@@ -791,6 +791,11 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
         <summary className="cursor-pointer">manual config</summary>
         <pre className="mt-2 bg-muted border border-border rounded-lg p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{manualConfig}</pre>
       </details>
+      <MemorySyncSubsection
+        integrationId="codex"
+        defaultPath="~/.codex"
+        targetFilename="AGENTS.md"
+      />
     </div>
   );
 }
@@ -815,6 +820,191 @@ function ClaudeCodePanel() {
           {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3 text-muted-foreground" />}
         </Button>
       </div>
+      <MemorySyncSubsection
+        integrationId="claude-code"
+        defaultPath="~/.claude"
+        targetFilename="CLAUDE.md"
+      />
+    </div>
+  );
+}
+
+// Shared subsection used by ClaudeCodePanel + CodexPanel. Surfaces the
+// memory-sync feature backed by the screenpipe-connect Integrations of
+// the same id ("claude-code", "codex"). Lives next to the MCP install
+// flow so the user finds both surfaces in one card per tool.
+//
+// State machine: idle → connecting → connected ⇆ syncing ⇆ idle. The
+// "connected" signal is whether GET /connections/:id returns a non-empty
+// credentials map — connect() always writes the resolved home_path so
+// the backend `Integration::list()`'s `enabled && !credentials.is_empty()`
+// rule sees us as on.
+function MemorySyncSubsection({
+  integrationId,
+  defaultPath,
+  targetFilename,
+}: {
+  integrationId: "claude-code" | "codex";
+  defaultPath: string;
+  targetFilename: string;
+}) {
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [homePath, setHomePath] = useState(defaultPath);
+  const [status, setStatus] = useState<"idle" | "connecting" | "syncing">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<string | null>(null);
+
+  useEffect(() => {
+    localFetch(`/connections/${integrationId}`)
+      .then(r => r.json())
+      .then(data => {
+        const saved = data?.credentials?.home_path;
+        if (typeof saved === "string" && saved.length > 0) {
+          setHomePath(saved);
+          setConnected(true);
+        } else {
+          setConnected(false);
+        }
+      })
+      .catch(() => setConnected(false));
+  }, [integrationId]);
+
+  const persistedPath = homePath.trim() || defaultPath;
+
+  const handleConnect = useCallback(async () => {
+    setStatus("connecting");
+    setError(null);
+    try {
+      // `test` round-trips through the backend Integration::test() which
+      // creates the directory if missing and probes write access. This
+      // surfaces "read-only filesystem" / "no permission" up front rather
+      // than silently failing in the background scheduler later.
+      const testRes = await localFetch(`/connections/${integrationId}/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credentials: { home_path: persistedPath } }),
+      });
+      const testData = await testRes.json();
+      if (!testRes.ok || testData.error) throw new Error(testData.error || "test failed");
+
+      const saveRes = await localFetch(`/connections/${integrationId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credentials: { home_path: persistedPath } }),
+      });
+      const saveData = await saveRes.json();
+      if (!saveRes.ok || saveData.error) throw new Error(saveData.error || "save failed");
+
+      setConnected(true);
+      notifyConnectionsUpdated();
+      posthog.capture("connection_saved", { integration: integrationId });
+
+      // Kick off an immediate sync so the user sees the file populate
+      // before the next 5-minute scheduler tick.
+      await triggerSyncNow();
+    } catch (e: any) {
+      setError(e?.message || "connection failed");
+    } finally {
+      setStatus("idle");
+    }
+  }, [integrationId, persistedPath]);
+
+  const handleDisconnect = useCallback(async () => {
+    setError(null);
+    try {
+      const res = await localFetch(`/connections/${integrationId}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) throw new Error("disconnect failed");
+      setConnected(false);
+      setLastResult(null);
+      notifyConnectionsUpdated();
+    } catch (e: any) {
+      setError(e?.message || "disconnect failed");
+    }
+  }, [integrationId]);
+
+  const triggerSyncNow = useCallback(async () => {
+    setStatus("syncing");
+    setError(null);
+    try {
+      const res = await localFetch("/memories/sync-external", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "sync failed");
+
+      // The endpoint returns a list of per-destination outcomes — pick
+      // the one for this integration and render it. The other tile's
+      // panel will refresh independently when the user opens it.
+      const me = (data?.results || []).find((r: any) => r.destination_id === integrationId);
+      if (me?.outcome?.ok) {
+        const result = me.outcome.result;
+        if (result?.Wrote) {
+          setLastResult(`wrote ${result.Wrote.entries} entr${result.Wrote.entries === 1 ? "y" : "ies"} to ${result.Wrote.path}`);
+        } else if (result?.Unchanged) {
+          setLastResult(`up to date (${result.Unchanged.entries} entries)`);
+        } else if (result?.Skipped) {
+          setLastResult(`skipped: ${result.Skipped.reason}`);
+        } else {
+          setLastResult("synced");
+        }
+      } else if (me) {
+        throw new Error(me?.outcome?.error || "sync failed");
+      }
+    } catch (e: any) {
+      setError(e?.message || "sync failed");
+    } finally {
+      setStatus("idle");
+    }
+  }, [integrationId]);
+
+  if (connected === null) {
+    return null; // initial fetch in flight — avoid flicker
+  }
+
+  return (
+    <div className="border-t border-border pt-3 mt-3 space-y-2">
+      <div className="space-y-0.5">
+        <p className="text-xs font-medium text-foreground">memory sync (beta)</p>
+        <p className="text-xs text-muted-foreground">
+          Continuously mirror screenpipe memories into {targetFilename} so the assistant
+          carries durable context across every new session. Writes a screenpipe-owned
+          marker block — content outside the block is left alone.
+        </p>
+      </div>
+
+      {connected ? (
+        <>
+          <div className="p-2 bg-muted border border-border rounded-lg space-y-0.5">
+            <p className="text-xs text-muted-foreground">syncing to</p>
+            <p className="text-xs text-foreground font-mono break-all">{persistedPath}/{targetFilename}</p>
+          </div>
+          {lastResult && <p className="text-xs text-muted-foreground">{lastResult}</p>}
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={triggerSyncNow} disabled={status === "syncing"} size="sm" variant="outline" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+              {status === "syncing" ? (<><Loader2 className="h-3 w-3 animate-spin" />syncing...</>) : (<><Send className="h-3 w-3" />sync now</>)}
+            </Button>
+            <Button onClick={handleDisconnect} size="sm" variant="ghost" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+              <LogOut className="h-3 w-3" />stop syncing
+            </Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground">home directory (optional)</Label>
+            <Input
+              value={homePath}
+              onChange={(e) => setHomePath(e.target.value)}
+              placeholder={defaultPath}
+              className="h-7 text-xs font-mono"
+              spellCheck={false}
+            />
+          </div>
+          <Button onClick={handleConnect} disabled={status === "connecting"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            {status === "connecting" ? (<><Loader2 className="h-3 w-3 animate-spin" />enabling...</>) : (<><Download className="h-3 w-3" />enable memory sync</>)}
+          </Button>
+        </>
+      )}
+
+      {error && <p className="text-xs text-destructive">{error}</p>}
     </div>
   );
 }

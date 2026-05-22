@@ -9,7 +9,7 @@ use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
 static DEF: IntegrationDef = IntegrationDef {
-    id: "claude_code",
+    id: "claude-code",
     name: "Claude Code",
     icon: "claude",
     category: Category::Productivity,

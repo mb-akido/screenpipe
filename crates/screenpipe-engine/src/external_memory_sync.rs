@@ -535,7 +535,7 @@ mod tests {
         // off — the scheduler should respect that and not write.
         let store_path = dir.path().join("connections.json");
         let saved = json!({
-            "claude_code": {
+            "claude-code": {
                 "enabled": false,
                 "credentials": {}
             }
@@ -575,7 +575,7 @@ mod tests {
 
         let store_path = dir.path().join("connections.json");
         let saved = json!({
-            "claude_code": {
+            "claude-code": {
                 "enabled": true,
                 "credentials": {}
             }
