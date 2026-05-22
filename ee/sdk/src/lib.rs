@@ -24,8 +24,33 @@ mod platform;
 pub struct RecorderOptions {
     /// Absolute path where the MP4 will be written.
     pub output: String,
-    /// Optional monitor id. If omitted, records the primary display.
+    /// Single-monitor MP4 fallback. When `mp4Monitors` is also provided,
+    /// it takes precedence and this field is ignored.
+    ///
+    /// - `Some(id)` — record only this monitor to MP4 at `output`
+    ///   (legacy behavior, kept for backward compat).
+    /// - `None` + no `mp4Monitors` → record **every attached monitor**
+    ///   (the new default — see `mp4Monitors` for the per-monitor file
+    ///   path expansion).
     pub monitor_id: Option<u32>,
+    /// Which monitors to record to MP4. Mirrors `pairedMonitors` for the
+    /// video pipeline:
+    ///
+    /// - `undefined` (default) — record every attached monitor, one MP4
+    ///   per display. Same intelligent-focus stance as paired capture:
+    ///   the user's full multi-screen session is in the recording.
+    /// - `[id, id, ...]` — pin MP4 to exactly these IDs.
+    /// - `[]` — disable MP4 entirely while still letting paired capture
+    ///   run (no ffmpeg process is started).
+    ///
+    /// When more than one monitor is recorded, `output` is treated as a
+    /// path template. If it contains the literal substring
+    /// `{monitor_id}`, that's substituted per monitor. Otherwise the
+    /// recorder auto-suffixes `-monitor-{id}` before the file extension,
+    /// e.g. `/tmp/session.mp4` → `/tmp/session-monitor-1.mp4` +
+    /// `/tmp/session-monitor-2.mp4`. Single-monitor recordings use
+    /// `output` verbatim.
+    pub mp4_monitors: Option<Vec<u32>>,
     /// Reserved for future MP4 audio muxing. Accepted today but not recorded.
     pub microphone: Option<bool>,
     /// Reserved for future system-audio muxing. Accepted today but not recorded.
@@ -43,6 +68,92 @@ pub struct RecorderOptions {
     /// When the focused window is a browser navigated to a matching URL,
     /// the recorder skips writing frames. Mirrors `--ignored-urls`.
     pub ignored_urls: Option<Vec<String>>,
+    /// When set, the recorder runs the engine's event-driven paired-capture
+    /// pipeline in parallel with the MP4 writer: typed UI events (click,
+    /// typing pause, app switch, etc.) + visual-change detection + idle
+    /// baseline fire `paired_capture()` against a SQLite at
+    /// `{dataDir}/db.sqlite`. JPEG snapshots are written under
+    /// `{dataDir}/data/`. Same DB schema and trigger taxonomy the
+    /// screenpipe CLI writes, so an SDK-recorded session is queryable by
+    /// the existing `screenpipe-js` REST client or any tool that reads the
+    /// CLI's DB.
+    ///
+    /// When omitted, the recorder is video-only — no DB is opened, no
+    /// snapshots are written, and the focus-watcher result is consumed only
+    /// to gate MP4 frames (the historical SDK behavior).
+    pub data_dir: Option<String>,
+    /// Which monitors to record paired captures from. Only meaningful when
+    /// `dataDir` is set.
+    ///
+    /// - `undefined` (default) — record paired captures from **every
+    ///   attached monitor**, matching the screenpipe CLI which spins up
+    ///   one capture loop per monitor and tags each row with its
+    ///   `monitor_id`. UI events fan out to all monitor loops so a click
+    ///   on monitor 1 produces a row on every monitor (with the same
+    ///   `capture_trigger`) — i.e. "what was on every screen the moment
+    ///   the user did X". Same behavior the CLI ships.
+    /// - `[id, id, ...]` — pin paired-capture to this exact set of
+    ///   monitor IDs. Use when you only care about one display or need
+    ///   to cap DB volume on a 4-monitor workstation.
+    ///
+    /// `monitorId` (above) still controls only the MP4 writer — that's
+    /// independent of paired capture and remains single-monitor.
+    pub paired_monitors: Option<Vec<u32>>,
+    /// Per-event-type toggles for the platform UI hooks that feed
+    /// paired-capture triggers. When `undefined`, uses the same defaults
+    /// `screenpipe-a11y`'s `UiCaptureConfig::default()` ships with
+    /// (clicks, typing pauses, app switches, clipboard ON; keystrokes,
+    /// scroll, mouse-move, window-focus OFF — the privacy/volume-friendly
+    /// set). Only meaningful when `dataDir` is set.
+    ///
+    /// Enabling `captureScroll` is required for `scroll_stop` triggers
+    /// to fire. Enabling `captureKeystrokes` is required for `key_press`
+    /// triggers — note the privacy implication: individual keystrokes
+    /// hit the platform hook stream and may surface in event logs.
+    pub ui_capture: Option<UiCaptureOptions>,
+}
+
+/// Per-event-type toggles passed through to the platform UI hooks. Maps
+/// 1-to-1 onto `screenpipe_a11y::config::UiCaptureConfig`. Each field
+/// defaults to the corresponding `UiCaptureConfig::default()` value when
+/// left undefined, so callers can override one knob without restating the
+/// others. See the field doc on each toggle for trigger implications.
+#[napi(object)]
+pub struct UiCaptureOptions {
+    /// Capture mouse clicks. Default: true.
+    /// Drives the `click` capture trigger.
+    pub capture_clicks: Option<bool>,
+    /// Capture aggregated text input (typing-pause bursts). Default: true.
+    /// Drives the `typing_pause` capture trigger.
+    pub capture_text: Option<bool>,
+    /// Capture individual keystrokes. Default: false.
+    /// HIGH PRIVACY RISK — individual key events stream through the hook.
+    /// Required to enable the `key_press` capture trigger.
+    pub capture_keystrokes: Option<bool>,
+    /// Capture app-switch events. Default: true.
+    /// Drives the `app_switch` capture trigger.
+    pub capture_app_switch: Option<bool>,
+    /// Capture window-focus changes within the same app. Default: false.
+    /// High volume on workflows with lots of tab/window switching.
+    /// Required to enable the `window_focus` capture trigger.
+    pub capture_window_focus: Option<bool>,
+    /// Capture scroll events. Default: false.
+    /// Very high volume — every wheel tick produces an event.
+    /// Required to enable the `scroll_stop` capture trigger.
+    pub capture_scroll: Option<bool>,
+    /// Capture clipboard operations. Default: true.
+    /// Drives the `clipboard` capture trigger.
+    pub capture_clipboard: Option<bool>,
+    /// Include clipboard content in the event payload. Default: true.
+    /// PRIVACY RISK — clipboard text may include passwords/tokens.
+    pub capture_clipboard_content: Option<bool>,
+    /// Resolve accessibility-element context on each click. Default: true.
+    /// Slightly slower but produces richer DB rows.
+    pub capture_context: Option<bool>,
+    /// Capture mouse-move events. Default: false.
+    /// Extreme volume — every pixel of motion. Almost never useful as a
+    /// capture trigger; supported for analytics use cases.
+    pub capture_mouse_move: Option<bool>,
 }
 
 /// Permission status returned by `requestPermissions`.

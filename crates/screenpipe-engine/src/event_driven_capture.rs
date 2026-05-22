@@ -9,8 +9,8 @@
 //! click, typing pause, scroll stop, clipboard, and periodic idle fallback.
 
 use crate::hot_frame_cache::{HotFrame, HotFrameCache};
-use crate::paired_capture::{paired_capture, CaptureContext, PairedCaptureResult};
 use crate::power::PowerProfile;
+use screenpipe_capture::paired_capture::{paired_capture, CaptureContext, PairedCaptureResult};
 use anyhow::Result;
 use chrono::Utc;
 use screenpipe_a11y::tree::TreeWalkerConfig;
@@ -1295,7 +1295,7 @@ async fn do_capture(
     }
 
     let tree_walk_result = tokio::task::spawn_blocking(move || {
-        crate::paired_capture::walk_accessibility_tree(&config)
+        screenpipe_capture::paired_capture::walk_accessibility_tree(&config)
     })
     .await?;
 

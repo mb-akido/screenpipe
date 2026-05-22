@@ -6,6 +6,14 @@ description = "Screenpipe SDK — Rust core for screen recording exposed via nap
 license = "LicenseRef-Screenpipe-Enterprise"
 publish = false
 
+# The SDK is intentionally not part of the parent screenpipe workspace
+# (see the root Cargo.toml `workspace.exclude`). Declaring an empty
+# `[workspace]` table here keeps cargo from walking up the directory tree
+# searching for a parent — important when the repo is checked out under a
+# git worktree, where the worktree path is nested inside another tree that
+# does NOT exclude `ee/sdk` and would otherwise mis-attach this crate.
+[workspace]
+
 [lib]
 crate-type = ["cdylib"]
 
@@ -29,6 +37,16 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 screenpipe-screen = { path = "../../crates/screenpipe-screen" }
 screenpipe-core   = { path = "../../crates/screenpipe-core", default-features = false }
 screenpipe-a11y   = { path = "../../crates/screenpipe-a11y", default-features = false }
+# Paired-capture + DB persistence (opt-in via RecorderOptions.data_dir). When
+# the caller does not provide a dataDir, these crates are still linked but no
+# DB connection is opened, so the runtime cost stays at the static size cost.
+screenpipe-capture = { path = "../../crates/screenpipe-capture" }
+screenpipe-db     = { path = "../../crates/screenpipe-db" }
+screenpipe-config = { path = "../../crates/screenpipe-config" }
+chrono = { version = "0.4", features = ["serde"] }
+# Used to bridge the (sync) UiEvent stream from screenpipe-a11y's RecordingHandle
+# into a tokio mpsc so the paired-capture loop can `select!` on it.
+crossbeam-channel = "0.5"
 cpal = { git = "https://github.com/screenpipe/cpal.git", branch = "main" }
 
 [build-dependencies]

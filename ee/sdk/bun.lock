@@ -8,10 +8,24 @@
         "@napi-rs/cli": "^2.18.4",
         "@types/node": "^22.10.1",
       },
+      "optionalDependencies": {
+        "@screenpipe/sdk-darwin-arm64": "0.2.0",
+        "@screenpipe/sdk-darwin-x64": "0.2.0",
+        "@screenpipe/sdk-win32-arm64-msvc": "0.2.0",
+        "@screenpipe/sdk-win32-x64-msvc": "0.2.0",
+      },
     },
   },
   "packages": {
     "@napi-rs/cli": ["@napi-rs/cli@2.18.4", "", { "bin": { "napi": "scripts/index.js" } }, "sha512-SgJeA4df9DE2iAEpr3M2H0OKl/yjtg1BnRI5/JyowS71tUWhrfSu2LT0V3vlHET+g1hBVlrO60PmEXwUEKp8Mg=="],
+
+    "@screenpipe/sdk-darwin-arm64": ["@screenpipe/sdk-darwin-arm64@0.2.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-2g1wea9UDVgncBEU6qu2s3xT++w8CIHoo7VNlfdp89UF7m67AgaUip1TmxyM+2VNssyjEM6qpNVw2N7aO73Q2A=="],
+
+    "@screenpipe/sdk-darwin-x64": ["@screenpipe/sdk-darwin-x64@0.2.0", "", { "os": "darwin", "cpu": "x64" }, "sha512-KoZ2dQ/unbiGE6NygCM1d9cq0JuHp/zkrNfifIr5je5M3Y7NgKJbpZUmdX4UXMkOFvw9M2HjByjo1QhcrfD17g=="],
+
+    "@screenpipe/sdk-win32-arm64-msvc": ["@screenpipe/sdk-win32-arm64-msvc@0.2.0", "", { "os": "win32", "cpu": "arm64" }, "sha512-gpApw2kWvcTn2lzFpWgY1yXmllsXUqx2FRD259H1Fi9Xmgnf5KSyS0EEZZEnrW0JXSYp/Y/0hgFW3ejwE738ng=="],
+
+    "@screenpipe/sdk-win32-x64-msvc": ["@screenpipe/sdk-win32-x64-msvc@0.2.0", "", { "os": "win32", "cpu": "x64" }, "sha512-a7nDbmVlsC6D1ieLUTyfk01czHILBHMZqltlYwsONQJj+DDbi98FDXNKCfE1qzWFS3mXVnKdXyI3g4paBCumbA=="],
 
     "@types/node": ["@types/node@22.19.17", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-wGdMcf+vPYM6jikpS/qhg6WiqSV/OhG+jeeHT/KlVqxYfD40iYJf9/AE1uQxVWFvU7MipKRkRv8NSHiCGgPr8Q=="],
 

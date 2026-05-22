@@ -8144,6 +8144,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "screenpipe-capture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "image",
+ "once_cell",
+ "regex",
+ "screenpipe-a11y",
+ "screenpipe-core",
+ "screenpipe-db",
+ "screenpipe-screen",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "screenpipe-config"
 version = "0.3.341"
 dependencies = [
@@ -8308,6 +8327,7 @@ dependencies = [
  "screenpipe-a11y",
  "screenpipe-apple-intelligence",
  "screenpipe-audio",
+ "screenpipe-capture",
  "screenpipe-config",
  "screenpipe-connect",
  "screenpipe-core",
