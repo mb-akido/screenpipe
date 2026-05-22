@@ -357,7 +357,10 @@ mod tests {
         let meeting_start = Utc::now() - Duration::minutes(10);
         let before_live_at = meeting_start + Duration::seconds(20);
         let live_at = meeting_start + Duration::minutes(2);
-        let overlap_at = live_at + Duration::seconds(15);
+        // Well inside the ±15s live-coverage window — placing this on the exact
+        // boundary (live_at + 15s) flips behavior across platforms because
+        // julianday() float math rounds differently on macOS vs Linux.
+        let overlap_at = live_at + Duration::seconds(5);
         let after_live_at = live_at + Duration::minutes(3);
 
         let meeting_id = sqlx::query(
@@ -450,9 +453,9 @@ mod tests {
             .collect::<Vec<_>>();
         // Background rows within ±15s of a live segment are now dropped so the
         // UI/AI consumer sees one copy of each utterance instead of two. The
-        // "duplicate near live" row sits exactly 15s after the live segment
-        // (on the boundary) and is correctly suppressed; background rows
-        // outside the window (before/after) survive and cover the gaps.
+        // "duplicate near live" row sits 5s after the live segment (inside
+        // the window) and is correctly suppressed; background rows outside
+        // the window (before/after) survive and cover the gaps.
         assert_eq!(
             transcripts,
             vec![
