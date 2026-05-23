@@ -10,9 +10,9 @@
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod recorder;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub use recorder::{request_permissions, RecorderImpl};
+pub use recorder::{request_permissions, Recorder};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod stub;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub use stub::{request_permissions, RecorderImpl};
+pub use stub::{request_permissions, Recorder};

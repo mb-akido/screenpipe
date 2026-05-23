@@ -80,7 +80,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 const SNAPSHOT_JPEG_QUALITY: u8 = 70;
 const SNAPSHOT_MAX_WIDTH: u32 = 1280;
 
-pub struct RecorderImpl {
+pub struct Recorder {
     options: RecorderOptions,
     filter: Arc<FilterState>,
     stop_flag: Arc<AtomicBool>,
@@ -128,7 +128,7 @@ impl FilterConfig {
     }
 }
 
-impl RecorderImpl {
+impl Recorder {
     pub fn new(options: RecorderOptions) -> Result<Self> {
         let filter = build_filter_state(&options);
         Ok(Self {

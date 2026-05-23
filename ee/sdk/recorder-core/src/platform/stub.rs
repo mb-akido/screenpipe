@@ -8,9 +8,9 @@
 use crate::{PermissionStatus, RecorderOptions};
 use anyhow::{anyhow, Result};
 
-pub struct RecorderImpl;
+pub struct Recorder;
 
-impl RecorderImpl {
+impl Recorder {
     pub fn new(_options: RecorderOptions) -> Result<Self> {
         Err(anyhow!(
             "screenpipe-sdk is only supported on macOS and Windows. Linux support is not implemented."
@@ -18,15 +18,15 @@ impl RecorderImpl {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        unreachable!("stub::RecorderImpl::new already errored")
+        unreachable!("stub::Recorder::new already errored")
     }
 
     pub async fn stop(&mut self) -> Result<()> {
-        unreachable!("stub::RecorderImpl::new already errored")
+        unreachable!("stub::Recorder::new already errored")
     }
 
     pub async fn snapshot(&self) -> Result<Vec<u8>> {
-        unreachable!("stub::RecorderImpl::new already errored")
+        unreachable!("stub::Recorder::new already errored")
     }
 
     pub fn frames_written(&self) -> u64 {

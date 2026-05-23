@@ -1,20 +1,19 @@
 [package]
 name = "screenpipe-tauri"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Tauri v2 plugin wrapper for @screenpipe/sdk"
+description = "Native Tauri v2 plugin for the screenpipe SDK — in-process recorder, no Node bridge"
 license = "LicenseRef-Screenpipe-Enterprise"
 publish = false
 
-# Independent of the SDK workspace at `ee/sdk/Cargo.toml`. The Tauri
-# plugin is a thin wrapper around the JS bridge (no native build, just
-# stdio JSON-RPC), so it shouldn't share lockfiles with the napi addon
-# that pulls in the full screenpipe monorepo tree.
-[workspace]
-
 [dependencies]
+# The pure-Rust recorder orchestration. Calling it in-process is what
+# lets this plugin avoid spawning a Node helper at runtime.
+screenpipe-recorder = { path = "../../recorder-core" }
+
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
+tokio = { version = "1", features = ["sync", "time"] }
