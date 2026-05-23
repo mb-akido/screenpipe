@@ -199,6 +199,10 @@ export type Settings = SettingsStore & {
 	/** Seconds after a meeting ends during which audio is still recorded.
 	 * Absorbs detector hysteresis and trailing audio. Default 30. */
 	audioMeetingsOnlyGraceTailSecs?: number;
+	/** Skip the v2 meeting detector watcher entirely. Mirrors the engine flag of
+	 * the same name. When true, `audioMeetingsOnly` cannot function — the UI
+	 * disables that toggle. */
+	disableMeetingDetector?: boolean;
 	/** User's name for speaker identification — input device audio will be labeled with this name */
 	userName?: string;
 	/** Filters pushed from team — merged with local filters for recording */
@@ -477,6 +481,7 @@ let DEFAULT_SETTINGS: Settings = {
 			audioMeetingsOnly: false,
 			audioMeetingsOnlyPrerollSecs: 60,
 			audioMeetingsOnlyGraceTailSecs: 30,
+			disableMeetingDetector: false,
 			ocrEngine: "default",
 			monitorIds: ["default"],
 			audioDevices: ["default"],
@@ -673,6 +678,10 @@ function createSettingsStore() {
 		}
 		if (settings.audioMeetingsOnlyGraceTailSecs === undefined) {
 			settings.audioMeetingsOnlyGraceTailSecs = 30;
+			needsUpdate = true;
+		}
+		if (settings.disableMeetingDetector === undefined) {
+			settings.disableMeetingDetector = false;
 			needsUpdate = true;
 		}
 

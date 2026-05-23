@@ -31,6 +31,12 @@ interface AudioPipelineHealth {
   transcription_paused?: boolean;
   meeting_detected?: boolean;
   meeting_app?: string;
+  /** When true, audio capture is gated on the meeting detector. */
+  meetings_only_active?: boolean;
+  /** Cumulative chunks dropped because no meeting was detected. */
+  meetings_only_chunks_dropped?: number;
+  /** Cumulative chunks replayed from the pre-roll buffer when a meeting started. */
+  meetings_only_chunks_promoted_from_preroll?: number;
 }
 
 interface HealthCheckResponse {

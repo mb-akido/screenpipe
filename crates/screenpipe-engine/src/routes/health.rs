@@ -211,6 +211,15 @@ pub struct AudioPipelineHealthInfo {
     pub meeting_detected: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meeting_app: Option<String>,
+    // Meetings-only mode (audio is gated on the meeting detector).
+    // `active` mirrors the user setting; `dropped`/`promoted` are
+    // cumulative counters since this audio manager started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meetings_only_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meetings_only_chunks_dropped: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meetings_only_chunks_promoted_from_preroll: Option<u64>,
 }
 
 /// Hard ceiling on /health response time. The endpoint is on the path of
@@ -938,6 +947,24 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 oldest_pending_transcription_at,
                 meeting_detected,
                 meeting_app,
+                meetings_only_active: if audio_snap.meetings_only_active {
+                    Some(true)
+                } else {
+                    None
+                },
+                meetings_only_chunks_dropped: if audio_snap.meetings_only_chunks_dropped > 0 {
+                    Some(audio_snap.meetings_only_chunks_dropped)
+                } else {
+                    None
+                },
+                meetings_only_chunks_promoted_from_preroll: if audio_snap
+                    .meetings_only_chunks_promoted
+                    > 0
+                {
+                    Some(audio_snap.meetings_only_chunks_promoted)
+                } else {
+                    None
+                },
             })
         } else {
             None

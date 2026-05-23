@@ -2559,38 +2559,74 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               <Switch
                 id="audioMeetingsOnly"
                 checked={settings.audioMeetingsOnly ?? false}
-                disabled={settings.disableMeetingDetector}
+                disabled={settings.disableMeetingDetector ?? false}
                 onCheckedChange={(checked) =>
                   handleSettingsChange({ audioMeetingsOnly: checked }, true)
                 }
               />
             </div>
-            {(settings.audioMeetingsOnly ?? false) && !settings.disableMeetingDetector && (
+            {(settings.audioMeetingsOnly ?? false) && !(settings.disableMeetingDetector ?? false) && (
               <div className="mt-2.5 ml-[26px] flex flex-col gap-2">
+                {/* Live status — driven by /health. Standby when meetings-only is
+                    active but no meeting is detected; Recording when a meeting
+                    is active. Hidden if telemetry hasn't reported yet. */}
+                {health?.audio_pipeline?.meetings_only_active && (
+                  <div className="flex items-center gap-2 text-xs">
+                    {health?.audio_pipeline?.meeting_detected ? (
+                      <>
+                        <Circle className="h-2 w-2 fill-emerald-500 text-emerald-500" />
+                        <span className="text-emerald-700 dark:text-emerald-400">
+                          Recording — meeting active
+                          {health?.audio_pipeline?.meeting_app
+                            ? ` (${health.audio_pipeline.meeting_app})`
+                            : ""}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <Circle className="h-2 w-2 fill-amber-500 text-amber-500" />
+                        <span className="text-amber-700 dark:text-amber-400">
+                          Standby — waiting for a meeting
+                        </span>
+                      </>
+                    )}
+                    {typeof health?.audio_pipeline?.meetings_only_chunks_dropped === "number" &&
+                      health.audio_pipeline.meetings_only_chunks_dropped > 0 && (
+                      <span className="text-muted-foreground">
+                        ({health.audio_pipeline.meetings_only_chunks_dropped} chunks dropped
+                        {typeof health.audio_pipeline.meetings_only_chunks_promoted_from_preroll ===
+                          "number" &&
+                        health.audio_pipeline.meetings_only_chunks_promoted_from_preroll > 0
+                          ? `, ${health.audio_pipeline.meetings_only_chunks_promoted_from_preroll} replayed from pre-roll`
+                          : ""})
+                      </span>
+                    )}
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-3">
                   <Label className="text-xs text-muted-foreground flex items-center gap-1.5">
                     Pre-roll
-                    <HelpTooltip text="How much audio is kept in memory just before a meeting starts. When the detector fires, this buffer is replayed so the first seconds of the call aren't lost." />
+                    <HelpTooltip text="How much audio is kept in memory just before a meeting starts. When the detector fires, this buffer is replayed so the first seconds of the call aren't lost. Setting too low risks missing 'can you hear me?' — 30-60s is recommended." />
                   </Label>
                   <div className="flex items-center gap-2">
                     <Input
                       type="number"
-                      min={0}
+                      min={5}
                       max={300}
                       className="h-8 w-[80px] text-xs"
                       value={settings.audioMeetingsOnlyPrerollSecs ?? 60}
                       onChange={(e) => {
-                        const n = Math.max(0, Math.min(300, Number(e.target.value) || 0));
+                        const n = Math.max(5, Math.min(300, Number(e.target.value) || 5));
                         handleSettingsChange({ audioMeetingsOnlyPrerollSecs: n }, true);
                       }}
                     />
-                    <span className="text-xs text-muted-foreground">seconds</span>
+                    <span className="text-xs text-muted-foreground">seconds (recommended ≥ 30)</span>
                   </div>
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <Label className="text-xs text-muted-foreground flex items-center gap-1.5">
                     Grace tail
-                    <HelpTooltip text="How long to keep recording after a meeting ends. Absorbs detector hysteresis and trailing audio (e.g. 'thanks, bye')." />
+                    <HelpTooltip text="How long to keep recording after a meeting ends. Absorbs detector hysteresis and trailing audio (e.g. 'thanks, bye'). Set to 0 to stop the instant the detector flips off, at the cost of clipping the end of the call." />
                   </Label>
                   <div className="flex items-center gap-2">
                     <Input
@@ -2604,7 +2640,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                         handleSettingsChange({ audioMeetingsOnlyGraceTailSecs: n }, true);
                       }}
                     />
-                    <span className="text-xs text-muted-foreground">seconds</span>
+                    <span className="text-xs text-muted-foreground">seconds (recommended ≥ 15)</span>
                   </div>
                 </div>
                 <p className="text-xs text-muted-foreground">

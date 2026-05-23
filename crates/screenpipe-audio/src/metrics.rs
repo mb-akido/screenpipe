@@ -285,6 +285,10 @@ impl AudioPipelineMetrics {
         let transcriptions_completed = self.transcriptions_completed.load(Ordering::Relaxed);
         let db_inserted = self.db_inserted.load(Ordering::Relaxed);
         let uptime_secs = self.started_at.elapsed().as_secs_f64();
+        let meetings_only_active = self.meetings_only_active.load(Ordering::Relaxed);
+        let meetings_only_chunks_dropped = self.chunks_dropped_no_meeting.load(Ordering::Relaxed);
+        let meetings_only_chunks_promoted =
+            self.chunks_promoted_from_preroll.load(Ordering::Relaxed);
 
         AudioMetricsSnapshot {
             uptime_secs,
@@ -334,6 +338,9 @@ impl AudioPipelineMetrics {
             last_transcription_attempt_ts: self
                 .last_transcription_attempt_ts
                 .load(Ordering::Relaxed),
+            meetings_only_active,
+            meetings_only_chunks_dropped,
+            meetings_only_chunks_promoted,
         }
     }
 }
@@ -391,4 +398,9 @@ pub struct AudioMetricsSnapshot {
     pub last_db_write_ts: u64,
     /// Unix timestamp (secs) of most recent transcription attempt (heartbeat)
     pub last_transcription_attempt_ts: u64,
+
+    // Meetings-only mode
+    pub meetings_only_active: bool,
+    pub meetings_only_chunks_dropped: u64,
+    pub meetings_only_chunks_promoted: u64,
 }

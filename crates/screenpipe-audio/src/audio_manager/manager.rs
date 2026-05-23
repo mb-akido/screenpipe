@@ -79,6 +79,31 @@ fn log_audio_process_error(e: &anyhow::Error) {
     }
 }
 
+/// Rate-limiter for the meetings-only "no detector" misconfiguration error.
+/// Same pattern as `log_audio_process_error` — once per 300s is enough to
+/// surface the problem without spamming Sentry on every audio manager start.
+static LAST_MEETINGS_ONLY_NO_DETECTOR_EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
+const MEETINGS_ONLY_NO_DETECTOR_INTERVAL_SECS: u64 = 300;
+
+fn log_meetings_only_no_detector_once() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_MEETINGS_ONLY_NO_DETECTOR_EPOCH_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= MEETINGS_ONLY_NO_DETECTOR_INTERVAL_SECS {
+        LAST_MEETINGS_ONLY_NO_DETECTOR_EPOCH_SECS.store(now, Ordering::Relaxed);
+        error!(
+            "audio_meetings_only is enabled but no meeting detector is configured; \
+             no audio will be recorded until the detector is enabled"
+        );
+    } else {
+        debug!(
+            "audio_meetings_only without detector (rate-limited; see prior error for details)"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AudioManagerStatus {
     Running,
@@ -719,11 +744,9 @@ impl AudioManager {
             // "only during meetings"; silently recording 24/7 would violate
             // intent. The receiver loop will refuse to persist anything,
             // and the UI surface (chunks_dropped_no_meeting) makes the
-            // misconfiguration visible.
-            error!(
-                "audio_meetings_only is enabled but no meeting detector is configured; \
-                 no audio will be recorded until the detector is enabled"
-            );
+            // misconfiguration visible. Rate-limited so an apply_options
+            // loop can't flood Sentry.
+            log_meetings_only_no_detector_once();
         }
 
         // Build unified transcription engine — only loads the needed model
@@ -771,9 +794,17 @@ impl AudioManager {
                 audio_meetings_only_preroll_secs,
                 audio_meetings_only_max_preroll_chunks,
             );
-            let mut was_in_meeting = false;
-            let mut last_in_meeting_at: Option<std::time::Instant> = None;
+            let mut gate_state = super::meetings_only_gate::GateState::new();
             let grace_tail = std::time::Duration::from_secs(audio_meetings_only_grace_tail_secs);
+
+            // Heartbeat: every 5 minutes log the number of chunks dropped
+            // since the last heartbeat. Long-running sessions in a quiet
+            // office shouldn't be silent — operators need a periodic signal
+            // that the gate is doing what it says.
+            let mut last_drop_heartbeat: std::time::Instant = std::time::Instant::now();
+            let mut drops_since_heartbeat: u64 = 0;
+            const DROP_HEARTBEAT_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(300);
 
             while let Ok(audio) = whisper_receiver.recv() {
                 metrics.record_chunk_received();
@@ -796,25 +827,21 @@ impl AudioManager {
                     meeting.on_audio_activity(&audio.device.device_type, has_activity);
                 }
 
-                // Meetings-only gate: drop chunks outside the meeting window.
-                // - In-meeting → fall through to normal persist + STT path
-                // - Leading edge (false→true) → replay pre-roll through the
-                //   channel first so the first words of the call are kept
-                // - Grace tail → keep recording briefly after detector flips
-                //   off (absorbs detector hysteresis and trailing audio)
-                // - Otherwise → buffer in pre-roll and skip persist
+                // Meetings-only gate: defers to GateState (unit-tested
+                // state machine). Pre-roll replay and metrics happen here.
                 //
-                // Fails closed when no detector is configured: nothing is
-                // persisted so privacy intent is preserved.
+                // Fails closed when no detector is configured: in_meeting is
+                // forced false → state machine always returns Drop → nothing
+                // is persisted, privacy intent preserved.
                 if audio_meetings_only {
                     let in_meeting = meeting_detector
                         .as_ref()
                         .map(|d| d.is_in_meeting())
                         .unwrap_or(false);
-                    let now = std::time::Instant::now();
-
-                    if in_meeting {
-                        if !was_in_meeting {
+                    let action =
+                        gate_state.evaluate(in_meeting, std::time::Instant::now(), grace_tail);
+                    match action {
+                        super::meetings_only_gate::GateAction::ProcessAfterReplay => {
                             let drained = preroll.drain();
                             if !drained.is_empty() {
                                 let count = drained.len() as u64;
@@ -843,26 +870,26 @@ impl AudioManager {
                                     sent, count
                                 );
                             }
-                        }
-                        was_in_meeting = true;
-                        last_in_meeting_at = Some(now);
-                        // Fall through to normal processing below.
-                    } else {
-                        let within_grace = last_in_meeting_at
-                            .map(|t| now.duration_since(t) < grace_tail)
-                            .unwrap_or(false);
-                        if within_grace {
-                            // Trailing tail — keep recording as if in-meeting.
                             // Fall through to normal processing below.
-                        } else {
-                            if was_in_meeting {
-                                info!(
-                                    "meetings_only: meeting window closed — buffering audio in pre-roll only"
-                                );
-                            }
-                            was_in_meeting = false;
+                        }
+                        super::meetings_only_gate::GateAction::Process => {
+                            // Fall through to normal processing below.
+                        }
+                        super::meetings_only_gate::GateAction::Drop => {
                             preroll.push(audio.clone());
                             metrics.record_chunk_dropped_no_meeting();
+                            drops_since_heartbeat += 1;
+                            if last_drop_heartbeat.elapsed() >= DROP_HEARTBEAT_INTERVAL {
+                                info!(
+                                    "meetings_only: heartbeat — dropped {} chunks in the last {}s \
+                                     (pre-roll len={})",
+                                    drops_since_heartbeat,
+                                    DROP_HEARTBEAT_INTERVAL.as_secs(),
+                                    preroll.len()
+                                );
+                                drops_since_heartbeat = 0;
+                                last_drop_heartbeat = std::time::Instant::now();
+                            }
                             debug!(
                                 "meetings_only: no meeting detected — chunk buffered (pre-roll len={})",
                                 preroll.len()

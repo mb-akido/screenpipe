@@ -302,6 +302,18 @@ async fn reconfigure_audio_manager(
     server: &ServerCore,
     config: &RecordingConfig,
 ) -> Result<(), String> {
+    // Symmetric with the CLI parse-time validation: refuse to start audio when
+    // meetings-only is requested but the meeting detector is disabled. Without
+    // this, the receiver fails closed (records nothing), but the UI shows the
+    // toggle as on — confusing for the user. Surface the misconfig loudly.
+    if config.audio_meetings_only && config.disable_meeting_detector {
+        return Err(
+            "audio_meetings_only requires the meeting detector; disable one of \
+             the two in Settings → Recording"
+                .to_string(),
+        );
+    }
+
     let openai_compatible_config =
         if config.audio_transcription_engine == AudioTranscriptionEngine::OpenAICompatible {
             Some(OpenAICompatibleConfig {
