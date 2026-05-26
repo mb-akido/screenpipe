@@ -2,6 +2,21 @@ import { createErrorResponse } from './cors';
 import { Env, UserTier, AuthResult } from '../types';
 import { getTierConfig } from '../services/usage-tracker';
 
+/**
+ * Read-only metadata endpoints that bypass per-minute rate limiting.
+ *
+ * `/v1/models` is the model catalog — clients call it on every cold
+ * boot (and Pi's `ensure_pi_config` re-fetches it per-pipe). Putting
+ * it in the same per-minute bucket as `/v1/chat/completions` means a
+ * freshly-installed user can burn their entire RPM budget on metadata
+ * before issuing a single inference request. The response is cheap
+ * to serve, idempotent, and the same payload for everyone in a given
+ * tier — no abuse vector that justifies a per-minute cap.
+ */
+const RATE_LIMIT_BYPASS = new Set<string>([
+  '/v1/models',
+]);
+
 export class RateLimiter {
   private state: DurableObjectState;
   private requests: Map<string, { count: number; lastReset: number }>;
@@ -76,6 +91,13 @@ export async function checkRateLimit(
   env: Env,
   authResult?: AuthResult
 ): Promise<{ allowed: boolean; response?: Response }> {
+  const url = new URL(request.url);
+
+  // Read-only metadata: skip the Durable Object round-trip entirely.
+  if (RATE_LIMIT_BYPASS.has(url.pathname)) {
+    return { allowed: true };
+  }
+
   // Use device ID if available, fall back to IP
   const identifier = authResult?.deviceId ||
     request.headers.get('X-Device-Id') ||
@@ -88,7 +110,6 @@ export async function checkRateLimit(
   const rateLimiter = env.RATE_LIMITER.get(rateLimiterId);
 
   // Pass tier info and resolved RPM to the rate limiter
-  const url = new URL(request.url);
   url.searchParams.set('id', identifier);
   url.searchParams.set('tier', tier);
   url.searchParams.set('rpm', String(getTierConfig(env)[tier]?.rpm || 5));
