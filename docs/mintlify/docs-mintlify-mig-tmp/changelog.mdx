@@ -15,6 +15,11 @@ icon: "newspaper"
 
 - **`screenpipe search` CLI** — query your local history straight from the terminal without the daemon running. Same flags and JSON shape as `GET /search`, so existing `jq` filters work unchanged and AI scripts can read your data even when the desktop app is closed. see the [CLI reference](/cli-reference).
 - **`screenpipe team` CLI for enterprise admins** — three new subcommands (`screenpipe team devices`, `screenpipe team search`, `screenpipe team records`) let team admins query teammates' history from any machine they've signed into, with no local daemon required. uses your `team_api_token` from `~/.screenpipe/enterprise.json`. see the [CLI reference](/cli-reference) and [teams](/teams).
+- **Workflowy connection** — connect your Workflowy account from **settings → connections** so agents and pipes can read and write your outlines alongside your other tools. see [connections](/connections).
+- **VS Code terminal capture** — screenpipe now reads VS Code's integrated terminal output through accessibility (including xterm.js panes) and labels each window with the active terminal session name, so terminal commands and output are searchable like the rest of your editor.
+- **Cmd+N / Ctrl+N opens a new chat** — start a fresh chat from the home page with a keyboard shortcut; focus lands in the input automatically.
+- **Ctrl+Tab recent-chat switcher** — hold Ctrl and tap Tab to cycle through your most recent chats, the same way you switch between browser tabs or editor files.
+- **Gemini 3.5 Flash in the auto model waterfall** — added to the screenpipe AI gateway model catalog and promoted to the top of the auto-routing waterfall for faster, cheaper responses on routine chat turns.
 - **Discord community link in the Help menu** — jump straight into the screenpipe Discord from the in-app Help section.
 
 ### updates
@@ -24,6 +29,10 @@ icon: "newspaper"
 - **smaller, faster on-device PII redactor** — the text redaction worker now runs the v45 phase 3 ONNX INT8 model (~278 MB, 90.2% HIPAA, sub-10 ms p50) with CoreML / DirectML / CPU execution providers, replacing the previous 2.8 GB Candle model. First-run auto-downloads with SHA verification. see [privacy filter](/privacy-filter).
 - **clearer memory sync status in connections** — the "sync now" button in connections now pops a toast on click, shows the real outcome (wrote, unchanged, skipped) instead of a generic "synced", and folds the file path + relative "Xs ago" timestamp into a single status card. see [connections](/connections).
 - **canonical domain switch to screenpipe.com** — desktop app and CLI website links now point to `screenpipe.com`. Existing `screenpi.pe/join/...` team invites still work, and API endpoints are unchanged. see [teams](/teams).
+- **shorter onboarding** — the encrypt-data step is gone (encryption is on by default) and the pipe step now picks two recommended pipes (digital clone and personal CRM) by default instead of asking you to choose between three paths. you can still uncheck either pipe before continuing.
+- **`/search` accepts looser boolean values** — boolean query parameters now accept `1`, `0`, `yes`, `no`, and empty strings in addition to `true`/`false`, so quick `curl` calls and ad-hoc shell scripts don't bounce on a 400. see the [API docs](/for-developers).
+- **quieter audio logs when screen-recording permission is denied** — the audio capture loop no longer spams retry errors when ScreenCaptureKit is blocked by TCC, and a missing `ffmpeg` binary surfaces a single clear error instead of a repeated panic.
+- **in-app Intercom chat removed** — the live-chat widget has been removed from desktop Settings; the support email and Discord link remain.
 
 ### bug fixes
 
@@ -31,6 +40,26 @@ icon: "newspaper"
 - **`npx screenpipe-mcp --http` now works as documented** — the README one-liner used to 404 because no `screenpipe-mcp-http` package existed on npm. The `--http` flag on the main package now routes to the HTTP server directly. see [MCP server](/mcp-server).
 - **auto-restart toggle shortcut fixed** — the keyboard shortcut for toggling auto-restart now fires reliably.
 - **`screenpipe://view` links open in the in-app viewer everywhere** — deep links inside notifications, notification history, chat, and the viewer itself now all route through the same handler, so a link copied from a notification into chat opens the in-app viewer instead of falling through to the browser.
+- **system audio follows the system default output** — when you've set audio capture to follow the system default, switching outputs (built-in speakers → AirPods → external DAC) now reliably keeps capturing instead of going silent until you toggle the device.
+- **no more first-launch white screen on a fresh install** — fixed a React boot crash that could leave the desktop app stuck on a blank window the first time you opened it.
+- **Intel Mac Pi assistant install** — the bundled Pi assistant no longer fails with "Bad CPU type in executable" on Intel Macs; the correct x86_64 binary now ships in the macOS installer.
+- **macOS screen-capture permission detection** — onboarding and the permissions screen now actually attempt a one-frame capture to verify the permission was granted, instead of trusting the system API that sometimes reports `true` when capture is still blocked. see [permissions](/permissions).
+- **low-battery pause is no longer triggered by macOS Low Power Mode alone** — being plugged in with macOS Low Power Mode enabled (e.g. on AC with the system-wide setting on) no longer falsely pauses screenpipe capture.
+- **low-battery crash on Apple Silicon** — fixed a crash on the low-battery code path triggered by a missing profile field on some hardware; battery-tier downgrades now apply cleanly.
+- **multi-account Google Docs and Sheets** — connecting a second Google Docs or Sheets account now shows the Google account picker and stores both accounts separately, matching how Gmail and Calendar already behave. see [connections](/connections).
+- **clearer "not connected" vs. "needs an account" in connections** — connections that support multiple accounts now distinguish "no accounts connected" from "we don't know which account to use," with a specific call-to-action for each. see [connections](/connections).
+- **chat preset stays put when you send** — the chat preset selector no longer snaps back to the default preset the moment you hit send or open a previous conversation.
+- **local media attachments render reliably in chat** — images and other media dragged into the chat composer now display correctly in the message bubble instead of showing a broken icon.
+- **cron-scheduled pipes don't fire on install** — newly installed or just-edited cron pipes wait for the next scheduled tick instead of immediately running once at install time. see [pipes](/pipes).
+- **MCP HTTP sessions register after `initialize`** — fixed a race where MCP HTTP clients could see a "session not found" error on the first tool call right after connecting. see [MCP server](/mcp-server).
+- **misleading "join and take notes" button removed from the in-progress meeting toast** — the toast that fires once a meeting is already running no longer offers a button that did nothing.
+- **Windows excluded apps are actually excluded** — apps added to capture exclusions on Windows are now filtered from screen capture, matching macOS behavior.
+- **overlay shortcut pill clicks restored** — buttons inside the expanded keyboard-shortcut overlay pill are clickable again.
+- **desktop sign-in URL fixed** — the "sign in" button in the desktop app now opens the correct screenpipe.com login URL.
+- **`whisper` removed from the low-battery notification** — the on-screen message when capture pauses on low battery no longer mentions the old Whisper engine.
+- **power-mode selector stays visible when the engine is offline** — Settings → Recording no longer hides the power-mode selector when the engine's `/power` endpoint is briefly unreachable.
+- **collapsed chat sidebar no longer traps Tab focus** — when every sidebar section is empty, the collapsed sidebar button no longer cycles focus through hidden tabs.
+- **AI gateway streaming fixes** — fixed a class of provider edge cases that could break tool-calling chats: assistant messages with string content now keep their `tool_calls`, orphan tool messages without a matching `tool_call_id` are dropped, and Pi streaming responses now emit `finish_reason` before `[DONE]` so OpenAI-style clients close the stream cleanly.
 
 ## week of may 24, 2026
 
