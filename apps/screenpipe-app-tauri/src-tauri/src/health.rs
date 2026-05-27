@@ -111,6 +111,31 @@ pub fn get_boot_phase_snapshot() -> BootPhaseSnapshot {
     BOOT_PHASE.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// True once `ServerCore::start` has finished and the app reached the "ready" phase.
+///
+/// Lifecycle gate for actions that race process teardown against still-initializing
+/// native sessions — see #3622 (onnxruntime SIGSEGV during auto-updater restart while
+/// `AudioManager::new` is mid-`create_session`).
+pub fn is_boot_ready() -> bool {
+    BOOT_PHASE
+        .read()
+        .map(|g| g.phase == "ready")
+        .unwrap_or(false)
+}
+
+/// Block until the boot phase reaches "ready" or `timeout` elapses.
+/// Returns `true` if ready, `false` on timeout.
+pub async fn wait_for_boot_ready(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if is_boot_ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    is_boot_ready()
+}
+
 // Shared recording status that can be read by the tray menu
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RecordingStatus {

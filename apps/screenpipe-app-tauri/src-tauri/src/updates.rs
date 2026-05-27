@@ -640,6 +640,28 @@ impl UpdatesManager {
                     "auto-update enabled, restarting to apply update v{}",
                     update.version
                 );
+
+                // #3622: don't call process::exit while AudioManager::new is mid-init.
+                // ORT's C++ static destructors race the still-running create_session
+                // and segfault (EXC_BAD_ACCESS inside PlannerImpl::GetElementSize, see
+                // duplicate #3557 for the full stack). Wait for boot phase == "ready"
+                // BEFORE the user-facing 30s countdown so the UI doesn't lie about
+                // when the restart will happen. In the common case boot is already
+                // ready and this returns immediately. If startup is genuinely stuck
+                // past 5 min, defer to the next check cycle — pending update remains
+                // downloaded, banner stays visible.
+                let restart_wait_cap = Duration::from_secs(5 * 60);
+                if !crate::health::wait_for_boot_ready(restart_wait_cap).await {
+                    warn!(
+                        "auto-update v{}: boot phase not ready after {}s — deferring restart \
+                         to avoid onnxruntime teardown race (#3622). current phase: {}",
+                        update.version,
+                        restart_wait_cap.as_secs(),
+                        crate::health::get_boot_phase_snapshot().phase
+                    );
+                    return Result::Ok(true);
+                }
+
                 let _ = self.app.emit(
                     "update-restarting",
                     serde_json::json!({
