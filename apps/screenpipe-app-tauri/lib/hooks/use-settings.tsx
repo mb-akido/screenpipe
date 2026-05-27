@@ -310,6 +310,16 @@ export type Settings = SettingsStore & {
 	}>;
 	apiAuth?: boolean;
 	apiKey?: string;
+	/** When true and a meeting is detected, drop the screen-capture
+	 * debounce to `meetingCaptureIntervalMs` so the on-disk MP4 chunks
+	 * have enough frames to rewatch the shared screen smoothly. Restored
+	 * when the meeting ends. Off by default — the higher rate adds disk
+	 * + CPU only for the meeting window. */
+	meetingHighFpsEnabled?: boolean;
+	/** `min_capture_interval_ms` to use while in a meeting and
+	 * `meetingHighFpsEnabled` is true. Default 100 ≈ 10 fps. Clamped to
+	 * >= 33 ms (30 fps ceiling) by the backend. */
+	meetingCaptureIntervalMs?: number;
 	/**
 	 * When true the backend binds the HTTP API to 0.0.0.0 instead of 127.0.0.1
 	 * so other devices on the LAN can reach it. api_auth is force-enabled
@@ -551,6 +561,8 @@ let DEFAULT_SETTINGS: Settings = {
 			localRetentionDays: 14,
 			localRetentionMode: "media",
 			encryptStore: true,
+			meetingHighFpsEnabled: false,
+			meetingCaptureIntervalMs: 100,
 		};
 
 export function createDefaultSettingsObject(): Settings {

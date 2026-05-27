@@ -3051,6 +3051,54 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
+        {/* Meeting high-FPS recording — bumps screen capture rate while a meeting is active for shareable replay */}
+        {!settings.disableVision && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center space-x-2.5 min-w-0">
+                  <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-medium text-foreground">High-FPS meeting recording</h3>
+                    <p className="text-xs text-muted-foreground">
+                      While a meeting is detected, capture screen at ~{Math.round(1000 / (settings.meetingCaptureIntervalMs ?? 100))} fps so you can rewatch slides, demos, and shared docs after the call. Restores normal rate when the meeting ends.
+                    </p>
+                  </div>
+                </div>
+                <Switch
+                  id="meetingHighFpsEnabled"
+                  checked={!!settings.meetingHighFpsEnabled}
+                  onCheckedChange={(checked) => handleSettingsChange({ meetingHighFpsEnabled: checked }, true)}
+                />
+              </div>
+              {settings.meetingHighFpsEnabled && (
+                <div className="mt-3 pt-3 border-t border-border flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <h4 className="text-xs font-medium text-foreground">Capture interval</h4>
+                    <p className="text-[11px] text-muted-foreground">
+                      Lower = smoother replay + more disk. Clamped to ≥ 33 ms (30 fps).
+                    </p>
+                  </div>
+                  <Select
+                    value={String(settings.meetingCaptureIntervalMs ?? 100)}
+                    onValueChange={(value) => handleSettingsChange({ meetingCaptureIntervalMs: Number(value) }, true)}
+                  >
+                    <SelectTrigger className="w-[200px] h-8 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="200">200 ms — 5 fps (light)</SelectItem>
+                      <SelectItem value="100">100 ms — 10 fps (default)</SelectItem>
+                      <SelectItem value="67">67 ms — 15 fps</SelectItem>
+                      <SelectItem value="33">33 ms — 30 fps (max)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
         {/* Monitor Selection */}
         {!settings.disableVision && !settings.useAllMonitors && (
           <Card className="border-border bg-card overflow-hidden">

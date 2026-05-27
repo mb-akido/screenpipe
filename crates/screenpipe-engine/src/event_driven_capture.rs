@@ -337,6 +337,72 @@ pub fn trigger_channel() -> (TriggerSender, TriggerReceiver) {
     (tx, rx)
 }
 
+/// Edge-triggered FPS override applied while a meeting is active.
+///
+/// On `false → true`, stashes the current `min_capture_interval_ms` and
+/// returns the meeting-FPS value to apply. On `true → false`, returns the
+/// stashed baseline so the loop can restore it. While in the same state,
+/// returns `None` so the loop does no work.
+///
+/// `baseline_ms` MUST be updated by callers whenever the underlying baseline
+/// changes (e.g. a power-profile update) so the eventual restore writes the
+/// correct value. Kept as a struct (not a free function) so the test
+/// coverage stays cheap and the bookkeeping invariant is local.
+#[derive(Debug)]
+pub(crate) struct MeetingFpsOverride {
+    active: bool,
+    baseline_ms: u64,
+    meeting_ms: u64,
+}
+
+impl MeetingFpsOverride {
+    pub(crate) fn new(initial_baseline_ms: u64, meeting_ms: u64) -> Self {
+        Self {
+            active: false,
+            baseline_ms: initial_baseline_ms,
+            meeting_ms,
+        }
+    }
+
+    /// Apply external baseline changes (e.g. power-profile updates) while the
+    /// override may or may not be active. Returns the value the caller should
+    /// install on the live config: the meeting value if active, the new
+    /// baseline otherwise.
+    pub(crate) fn on_baseline_change(&mut self, new_baseline_ms: u64) -> u64 {
+        self.baseline_ms = new_baseline_ms;
+        if self.active {
+            self.meeting_ms
+        } else {
+            new_baseline_ms
+        }
+    }
+
+    /// React to a fresh meeting-detector reading. Returns `Some(new_ms)` on a
+    /// state transition (caller installs it on the live config), `None`
+    /// while the state is unchanged.
+    pub(crate) fn on_meeting_state(&mut self, in_meeting: bool, current_live_ms: u64) -> Option<u64> {
+        if in_meeting == self.active {
+            return None;
+        }
+        if in_meeting {
+            // Capture whatever the live config currently is as the restore
+            // target — this is the correct value even when the baseline
+            // tracker missed an update (defense-in-depth).
+            self.baseline_ms = current_live_ms;
+            self.active = true;
+            Some(self.meeting_ms)
+        } else {
+            self.active = false;
+            Some(self.baseline_ms)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
 /// True iff this tick should release the OS-level capture stream.
 ///
 /// Edge-triggered: fires exactly once on the non-paused → paused transition.
@@ -377,6 +443,13 @@ pub async fn event_driven_capture_loop(
     power_profile_rx: Option<watch::Receiver<PowerProfile>>,
     focus_controller: Arc<crate::focus_aware_controller::FocusAwareController>,
     linker_tx: Option<crate::frame_linker_actor::LinkerSender>,
+    // When set, the loop watches `is_in_meeting()` and overrides
+    // `min_capture_interval_ms` to `meeting_capture_interval_ms` while a
+    // meeting is active. Restored to the prior baseline on meeting end.
+    meeting_detector: Option<Arc<screenpipe_audio::meeting_detector::MeetingDetector>>,
+    // Capture debounce (ms) used while in a meeting. Ignored when
+    // `meeting_detector` is `None`.
+    meeting_capture_interval_ms: u64,
 ) -> Result<()> {
     info!(
         "event-driven capture started for monitor {} (device: {})",
@@ -390,6 +463,15 @@ pub async fn event_driven_capture_loop(
 
     let mut state = EventDrivenCapture::new(config);
     let mut power_profile_rx = power_profile_rx;
+    // Meeting high-FPS override: takes ownership of `min_capture_interval_ms`
+    // while a meeting is active; the loop forwards power-profile baseline
+    // updates so the post-meeting restore writes the current baseline, not
+    // the value captured when the meeting started.
+    let meeting_capture_interval_ms = meeting_capture_interval_ms.max(33);
+    let mut meeting_fps = MeetingFpsOverride::new(
+        state.config.min_capture_interval_ms,
+        meeting_capture_interval_ms,
+    );
     // Polling the ActivityFeed too aggressively burns CPU when idle. External UI
     // triggers arrive via `broadcast::Receiver::recv()` (awaitable), so we only
     // need a modest tick to detect typing-pause / idle timers.
@@ -736,7 +818,11 @@ pub async fn event_driven_capture_loop(
                     "applying power profile {:?} to monitor {}",
                     profile.name, monitor_id
                 );
-                state.config.min_capture_interval_ms = profile.min_capture_interval_ms;
+                // While a meeting is active the high-FPS override owns
+                // `min_capture_interval_ms`; route the new baseline through
+                // the override so the post-meeting cadence is still correct.
+                state.config.min_capture_interval_ms =
+                    meeting_fps.on_baseline_change(profile.min_capture_interval_ms);
                 state.config.idle_capture_interval_ms = profile.idle_capture_interval_ms;
                 // Power profile can only LOWER quality from the user's baseline,
                 // never raise it — picking "max" in settings shouldn't be silently
@@ -755,6 +841,27 @@ pub async fn event_driven_capture_loop(
                         profile.name, monitor_id
                     );
                 }
+            }
+        }
+
+        // Meeting high-FPS override: when the v2 meeting detector flips into
+        // "in meeting", drop capture debounce so the snapshot-compaction
+        // worker has enough frames to encode a smooth MP4 chunk for replay.
+        // Restore the baseline interval on meeting end. Cheap atomic load per
+        // tick; the override is a pure-state transition reducer.
+        if let Some(detector) = meeting_detector.as_ref() {
+            let in_meeting_now = detector.is_in_meeting();
+            if let Some(new_ms) =
+                meeting_fps.on_meeting_state(in_meeting_now, state.config.min_capture_interval_ms)
+            {
+                info!(
+                    "meeting high-fps: monitor {} {} min_capture_interval_ms {} -> {} ms",
+                    monitor_id,
+                    if in_meeting_now { "dropping" } else { "restoring" },
+                    state.config.min_capture_interval_ms,
+                    new_ms,
+                );
+                state.config.min_capture_interval_ms = new_ms;
             }
         }
 
@@ -2133,5 +2240,61 @@ mod tests {
             !should_release_on_pause_entry(false, false),
             "active steady-state: must NOT release"
         );
+    }
+
+    #[test]
+    fn meeting_fps_no_change_returns_none() {
+        let mut o = MeetingFpsOverride::new(500, 100);
+        // No state transition — caller must do nothing.
+        assert_eq!(o.on_meeting_state(false, 500), None);
+        assert!(!o.is_active());
+    }
+
+    #[test]
+    fn meeting_fps_enter_then_exit_restores_baseline() {
+        let mut o = MeetingFpsOverride::new(500, 100);
+        // false -> true: drop to meeting interval.
+        assert_eq!(o.on_meeting_state(true, 500), Some(100));
+        assert!(o.is_active());
+        // true -> false: restore the baseline that was live when we entered.
+        assert_eq!(o.on_meeting_state(false, 100), Some(500));
+        assert!(!o.is_active());
+    }
+
+    #[test]
+    fn meeting_fps_baseline_change_during_meeting_persists_on_exit() {
+        // Regression guard: a power-profile update mid-meeting must not be
+        // dropped — exiting the meeting must restore the NEW baseline, not
+        // the value live at meeting-start.
+        let mut o = MeetingFpsOverride::new(500, 100);
+        assert_eq!(o.on_meeting_state(true, 500), Some(100));
+        // Power profile shifts baseline to 1000 (saver mode) mid-meeting.
+        // While active, the live config stays at meeting_ms.
+        assert_eq!(o.on_baseline_change(1000), 100);
+        // Exit meeting — must restore the updated baseline, not 500.
+        assert_eq!(o.on_meeting_state(false, 100), Some(1000));
+    }
+
+    #[test]
+    fn meeting_fps_baseline_change_when_idle_passes_through() {
+        let mut o = MeetingFpsOverride::new(500, 100);
+        // Idle: baseline changes flow straight to the live value.
+        assert_eq!(o.on_baseline_change(800), 800);
+        assert!(!o.is_active());
+        // Entering meeting still uses the latest live ms as the restore target.
+        assert_eq!(o.on_meeting_state(true, 800), Some(100));
+        assert_eq!(o.on_meeting_state(false, 100), Some(800));
+    }
+
+    #[test]
+    fn meeting_fps_redundant_calls_are_noops() {
+        let mut o = MeetingFpsOverride::new(500, 100);
+        assert_eq!(o.on_meeting_state(true, 500), Some(100));
+        // Same state again — no transition, no write.
+        assert_eq!(o.on_meeting_state(true, 100), None);
+        assert_eq!(o.on_meeting_state(true, 100), None);
+        assert_eq!(o.on_meeting_state(false, 100), Some(500));
+        // Same state again — no transition, no write.
+        assert_eq!(o.on_meeting_state(false, 500), None);
     }
 }

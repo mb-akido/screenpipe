@@ -198,6 +198,27 @@ pub struct RecordingSettings {
     #[serde(rename = "minCaptureIntervalMs", default)]
     pub min_capture_interval_ms: Option<u64>,
 
+    /// While a meeting is detected, drop `min_capture_interval_ms` to
+    /// `meeting_capture_interval_ms` so the on-disk MP4 chunks have enough
+    /// frames to rewatch the shared screen smoothly (slides flipped, doc
+    /// scrolled, demo shown). Restored when the meeting ends.
+    ///
+    /// Opt-in: default off. The high-FPS burst increases disk + CPU for the
+    /// duration of the meeting; we don't want to silently change the capture
+    /// budget for users who haven't asked for it.
+    #[serde(rename = "meetingHighFpsEnabled", default)]
+    pub meeting_high_fps_enabled: bool,
+
+    /// Capture debounce (`min_capture_interval_ms`) used while a meeting is
+    /// active and `meeting_high_fps_enabled` is true.
+    /// Default 100 ms ≈ 10 fps — smooth enough for human replay without
+    /// exploding disk usage. Clamped at runtime to >= 33 ms (30 fps ceiling).
+    #[serde(
+        rename = "meetingCaptureIntervalMs",
+        default = "default_meeting_capture_interval_ms"
+    )]
+    pub meeting_capture_interval_ms: u64,
+
     /// Override `EventDrivenCaptureConfig::capture_on_keystroke`.
     /// None = engine default (false). When true, non-printable key events
     /// (Arrow / Enter / Tab / Esc, modifier combos like Ctrl+S) fire a paired
@@ -497,6 +518,8 @@ impl Default for RecordingSettings {
             visual_check_interval_ms: None,
             visual_change_threshold: None,
             min_capture_interval_ms: None,
+            meeting_high_fps_enabled: false,
+            meeting_capture_interval_ms: default_meeting_capture_interval_ms(),
             capture_on_keystroke: None,
             capture_on_clipboard: None,
             capture_scroll: None,
@@ -567,6 +590,10 @@ fn default_pause_extraction_on_input_ms() -> u64 {
 
 fn default_pii_backend() -> String {
     "local".to_string()
+}
+
+fn default_meeting_capture_interval_ms() -> u64 {
+    100
 }
 
 #[cfg(test)]

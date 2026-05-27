@@ -934,11 +934,14 @@ async fn main() -> anyhow::Result<()> {
     let (handle, capture_trigger_tx, linker_tx) = if !config.disable_vision {
         let vision_config =
             config.to_vision_manager_config(output_path_clone.to_string(), vision_metrics.clone());
-        let vision_manager = Arc::new(
+        let mut vision_manager_builder =
             VisionManager::new(vision_config, db_clone.clone(), vision_handle.clone())
                 .with_hot_frame_cache(hot_frame_cache.clone())
-                .with_power_profile(power_manager.subscribe()),
-        );
+                .with_power_profile(power_manager.subscribe());
+        if let Some(ref detector) = meeting_detector {
+            vision_manager_builder = vision_manager_builder.with_meeting_detector(detector.clone());
+        }
+        let vision_manager = Arc::new(vision_manager_builder);
 
         // Get the broadcast trigger sender BEFORE moving the VisionManager into
         // the spawned task. This sender is passed to start_ui_recording so UI

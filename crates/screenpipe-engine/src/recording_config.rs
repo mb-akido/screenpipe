@@ -153,6 +153,11 @@ pub struct RecordingConfig {
     pub visual_check_interval_ms: Option<u64>,
     pub visual_change_threshold: Option<f64>,
     pub min_capture_interval_ms: Option<u64>,
+    /// While a meeting is detected, drop `min_capture_interval_ms` to
+    /// `meeting_capture_interval_ms`. See `RecordingSettings.meeting_high_fps_enabled`.
+    pub meeting_high_fps_enabled: bool,
+    /// `min_capture_interval_ms` used while in a meeting (clamped to >= 33 ms at runtime).
+    pub meeting_capture_interval_ms: u64,
     /// Override `EventDrivenCaptureConfig::capture_on_keystroke`.
     /// None = engine default (false). See `RecordingSettings.capture_on_keystroke`.
     pub capture_on_keystroke: Option<bool>,
@@ -315,6 +320,8 @@ impl RecordingConfig {
             visual_check_interval_ms: settings.visual_check_interval_ms,
             visual_change_threshold: settings.visual_change_threshold,
             min_capture_interval_ms: settings.min_capture_interval_ms,
+            meeting_high_fps_enabled: settings.meeting_high_fps_enabled,
+            meeting_capture_interval_ms: settings.meeting_capture_interval_ms,
             capture_on_keystroke: settings.capture_on_keystroke,
             capture_on_clipboard: settings.capture_on_clipboard,
             capture_scroll: settings.capture_scroll,
@@ -425,6 +432,8 @@ impl RecordingConfig {
             min_capture_interval_ms: self.min_capture_interval_ms,
             capture_on_keystroke: self.capture_on_keystroke,
             capture_on_clipboard: self.capture_on_clipboard,
+            meeting_high_fps_enabled: self.meeting_high_fps_enabled,
+            meeting_capture_interval_ms: self.meeting_capture_interval_ms,
         }
     }
 }
