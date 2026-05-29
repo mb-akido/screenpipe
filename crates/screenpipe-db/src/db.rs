@@ -1186,16 +1186,19 @@ impl DatabaseManager {
     /// browser-based meetings alive when the user switches tabs but audio is
     /// still flowing (i.e. the meeting is still going).
     pub async fn has_recent_output_audio(&self, within_secs: i64) -> Result<bool, sqlx::Error> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM audio_transcriptions
-             WHERE is_input_device = 0
-               AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
-             LIMIT 1",
+        // EXISTS short-circuits on the first matching row instead of scanning
+        // every transcription in the window like COUNT(*) would.
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM audio_transcriptions
+                 WHERE is_input_device = 0
+                   AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
+             )",
         )
         .bind(format!("-{} seconds", within_secs))
         .fetch_one(&self.pool)
         .await?;
-        Ok(count > 0)
+        Ok(exists != 0)
     }
 
     /// Returns recently transcribed chunks that still have no assigned speaker.
