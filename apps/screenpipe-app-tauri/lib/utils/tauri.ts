@@ -1019,9 +1019,10 @@ async ownedBrowserHide() : Promise<Result<null, string>> {
 }
 },
 /**
- * Navigate the embedded webview to `url`. Used by the agent (via
- * `POST /connections/browsers/owned-default/eval`) and by the sidebar
- * when restoring per-chat state.
+ * Navigate the embedded webview to `url`. Used by the sidebar when restoring
+ * per-chat state or on user reload — i.e. always an action of the chat that's
+ * on screen, so it carries no owner (`None`) and the frontend always honors
+ * it. The agent/pipe path is the connect-trait `navigate` (owner-tagged).
  */
 async ownedBrowserNavigate(url: string) : Promise<Result<null, string>> {
     try {
