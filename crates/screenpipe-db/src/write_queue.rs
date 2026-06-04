@@ -1518,28 +1518,17 @@ fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
 /// malformed" until the connection is dropped. Treat them as fatal so
 /// the batch loop drops the connection instead of reusing it for
 /// follow-on writes that will all fail in confusing ways.
+#[cfg(test)]
 fn is_fatal_sqlite_message(msg_lower: &str) -> bool {
-    msg_lower.contains("disk i/o error") || msg_lower.contains("malformed")
+    crate::sqlite_error::is_fatal_sqlite_message(msg_lower)
 }
 
 fn is_connection_error(e: &sqlx::Error) -> bool {
-    if matches!(
-        e,
-        sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut
-    ) {
-        return true;
-    }
-    if let sqlx::Error::Database(db) = e {
-        return is_fatal_sqlite_message(&db.message().to_lowercase());
-    }
-    if let sqlx::Error::Protocol(msg) = e {
-        return is_fatal_sqlite_message(&msg.to_lowercase());
-    }
-    false
+    crate::sqlite_error::is_sqlite_connection_error(e)
 }
 
 fn should_recycle_sqlite_connection(e: &sqlx::Error) -> bool {
-    is_connection_error(e) || is_cantopen_error(e)
+    crate::sqlite_error::should_recycle_sqlite_connection(e)
 }
 
 fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
@@ -1553,25 +1542,13 @@ fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
 }
 
 fn is_busy_error(e: &sqlx::Error) -> bool {
-    match e {
-        sqlx::Error::Database(db_err) => {
-            let msg = db_err.message().to_lowercase();
-            msg.contains("database is locked") || msg.contains("database table is locked")
-        }
-        _ => false,
-    }
+    crate::sqlite_error::is_sqlite_busy_error(e)
 }
 
 /// SQLITE_CANTOPEN — "unable to open database file". At runtime this means the
 /// data dir/file vanished out from under an open pool (deleted folder, etc.).
 fn is_cantopen_error(e: &sqlx::Error) -> bool {
-    match e {
-        sqlx::Error::Database(db_err) => db_err
-            .message()
-            .to_lowercase()
-            .contains("unable to open database file"),
-        _ => false,
-    }
+    crate::sqlite_error::is_sqlite_cantopen_error(e)
 }
 
 /// Ensure the database file's parent directory exists.
