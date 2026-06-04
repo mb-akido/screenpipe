@@ -214,12 +214,29 @@ function NoteEditor(
     }
   }, [value, editor]);
 
+  const handleShellClick = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest('[data-testid="note-editor"]')
+      ) {
+        return;
+      }
+
+      editor?.chain().focus("end").run();
+    },
+    [editor],
+  );
+
   return (
     <div
       className={cn("relative", className)}
-      // Click anywhere in the wrapper (including padding) → focus the editor,
-      // preventing dead clicks just outside the contentEditable area.
-      onClick={() => editor?.chain().focus().run()}
+      data-testid="note-editor-shell"
+      // Click shell-only whitespace into the note, while letting ProseMirror own
+      // clicks that start inside the editable surface so caret placement stays
+      // tied to the user's actual click target.
+      onClick={handleShellClick}
     >
       <EditorContent editor={editor} />
     </div>

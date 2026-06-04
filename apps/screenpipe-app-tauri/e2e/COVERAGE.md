@@ -7,8 +7,8 @@ and layer declared in the manifest, weighted by confidence and criticality.
 - Manifest: `e2e/coverage-map.json`
 - Specs directory: `e2e/specs`
 - Mapped specs: 40
-- Declared test blocks: 142
-- Weighted coverage points: 113.2
+- Declared test blocks: 143
+- Weighted coverage points: 114.2
 
 Confidence weights: strong=1.0, partial=0.7, conditional=0.4, smoke=0.3.
 Criticality weights: high=1.0, medium=0.7, low=0.4.
@@ -19,9 +19,9 @@ can execute more runtime cases than this number shows.
 
 | Platform | Specs | Declared tests | Weighted points | Layers | Features | Critical score |
 | --- | --- | --- | --- | --- | --- | --- |
-| windows | 33 | 131 | 109.8 | 14 | 39 | 92% |
-| macos | 37 | 112 | 87.4 | 14 | 40 | 89% |
-| linux | 28 | 100 | 83.9 | 12 | 36 | 86% |
+| windows | 33 | 132 | 110.8 | 14 | 39 | 92% |
+| macos | 37 | 113 | 88.4 | 14 | 40 | 89% |
+| linux | 28 | 101 | 84.9 | 12 | 36 | 86% |
 
 ## Runtime Results
 
@@ -36,13 +36,13 @@ pass/fail/skip counts.
 | audio-device | 2 specs / 22 tests / 17.8 pts | 1 specs / 1 tests / 0.3 pts | - |
 | capture-ocr | 2 specs / 9 tests / 3.6 pts | 2 specs / 3 tests / 1.2 pts | 1 specs / 2 tests / 0.8 pts |
 | chat-ai | 6 specs / 6 tests / 3.4 pts | 8 specs / 9 tests / 4.3 pts | 6 specs / 6 tests / 3.4 pts |
-| local-api | 10 specs / 72 tests / 62.5 pts | 9 specs / 51 tests / 45.1 pts | 8 specs / 50 tests / 44.7 pts |
+| local-api | 10 specs / 73 tests / 63.5 pts | 9 specs / 52 tests / 46.1 pts | 8 specs / 51 tests / 45.7 pts |
 | notifications | 2 specs / 11 tests / 10.1 pts | 2 specs / 4 tests / 2.4 pts | 1 specs / 3 tests / 2.1 pts |
 | onboarding | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts |
 | os-integration | 3 specs / 16 tests / 15.1 pts | 3 specs / 3 tests / 0.9 pts | - |
 | performance | 2 specs / 43 tests / 43.0 pts | 4 specs / 33 tests / 29.5 pts | 1 specs / 28 tests / 28.0 pts |
 | pipes | 1 specs / 7 tests / 7.0 pts | 1 specs / 7 tests / 7.0 pts | 1 specs / 7 tests / 7.0 pts |
-| real-ui-e2e | 16 specs / 63 tests / 53.5 pts | 17 specs / 54 tests / 44.6 pts | 14 specs / 48 tests / 42.7 pts |
+| real-ui-e2e | 16 specs / 64 tests / 54.5 pts | 17 specs / 55 tests / 45.6 pts | 14 specs / 49 tests / 43.7 pts |
 | settings | 4 specs / 19 tests / 18.4 pts | 4 specs / 12 tests / 10.7 pts | 3 specs / 11 tests / 10.4 pts |
 | storage-privacy | 4 specs / 19 tests / 18.4 pts | 3 specs / 11 tests / 10.4 pts | 3 specs / 11 tests / 10.4 pts |
 | tauri-command | 8 specs / 17 tests / 10.3 pts | 9 specs / 19 tests / 10.8 pts | 8 specs / 17 tests / 10.3 pts |
@@ -110,7 +110,7 @@ pass/fail/skip counts.
 | main-overlay-visibility.spec.ts | windows, macos, linux | window-lifecycle, tauri-command | window-lifecycle, main-overlay | medium | partial | command | 1 | Main overlay show/hide without duplicate handles. |
 | main-window-close-reopen.spec.ts | windows, macos, linux | window-lifecycle, tauri-command | window-lifecycle, main-window | medium | partial | command | 1 | Main close/reopen without handle leaks. |
 | main-window.spec.ts | windows, macos, linux | window-lifecycle, tauri-command | window-lifecycle, main-window | medium | partial | command | 2 | Main window show/hide dedupe. |
-| meeting-note-bottom-click.spec.ts | windows, macos, linux | real-ui-e2e, local-api | meeting-notes | high | strong | real-user-flow | 2 | Seeds and opens a long meeting note, then clicks the bottom editor line. |
+| meeting-note-bottom-click.spec.ts | windows, macos, linux | real-ui-e2e, local-api | meeting-notes | high | strong | real-user-flow | 3 | Seeds and opens a long meeting note, checks editor shell click focus behavior, then clicks the bottom editor line. |
 | notification-viewer-link.spec.ts | windows, macos, linux | notifications, local-api, window-lifecycle | notifications, viewer-deeplink | high | partial | mixed | 3 | Notification local file links rewrite into in-app viewer links. |
 | onboarding-redirect.spec.ts | windows, macos, linux | onboarding, real-ui-e2e, window-lifecycle | onboarding, app-launch | high | conditional | real-user-flow | 3 | Opt-in no-onboarding seed verifies onboarding redirect. |
 | owned-browser.spec.ts | windows, macos | os-integration, window-lifecycle | owned-browser, window-lifecycle | low | smoke | command | 1 | Embedded agent browser hides safely without an attached child. |
