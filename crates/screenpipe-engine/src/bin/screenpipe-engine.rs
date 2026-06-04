@@ -548,12 +548,24 @@ async fn main() -> anyhow::Result<()> {
 
         // Attach non-sensitive CLI settings to all future Sentry events
         sentry::configure_scope(|scope| {
-            // Set user.id to the same analytics ID used by PostHog
-            // This links Sentry errors to PostHog sessions and feedback reports
+            // Set user.id to the same analytics ID used by PostHog. Embedded
+            // customers can set SCREENPIPE_SUPPORT_ID to make standalone CLI
+            // events searchable by customer without using email.
             scope.set_user(Some(sentry::protocol::User {
                 id: Some(analytics::get_distinct_id().to_string()),
                 ..Default::default()
             }));
+            let telemetry_context =
+                screenpipe_engine::telemetry_context::TelemetryContext::from_env();
+            for (key, value) in telemetry_context.pairs() {
+                scope.set_tag(key, value);
+            }
+            if !telemetry_context.is_empty() {
+                scope.set_context(
+                    "screenpipe_support",
+                    sentry::protocol::Context::Other(telemetry_context.to_json_map()),
+                );
+            }
             scope.set_context(
                 "cli_settings",
                 sentry::protocol::Context::Other({
