@@ -492,21 +492,19 @@ async fn execute_batch(
         let mut conn = match acquired {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
-                // "unable to open database file" (SQLITE_CANTOPEN) on acquire
-                // means the data dir/file vanished mid-run (deleted folder,
-                // etc.) — the top runtime DB error (SCREENPIPE-CLI-HA).
-                // Recreate the dir AND the db file, then retry, instead of
-                // erroring every queued write. Recreating the dir alone is
-                // not enough: the pool opens with create_if_missing=false, so
-                // a fresh acquire against the now-missing file would
-                // CANTOPEN again. The recreated db is empty (schema is
-                // restored by migrations on the next startup); this just
-                // clears CANTOPEN so the pool can reconnect.
-                if is_cantopen_error(&e) && attempt < max_retries {
-                    let recovered = ensure_db_openable(db_path).await;
+                // Retry runtime connection-loss errors before failing queued
+                // writes. CANTOPEN needs explicit file recovery; IOERR/malformed
+                // usually clears by letting sqlx discard the failed acquire path
+                // and trying a fresh handle.
+                if should_recycle_sqlite_connection(&e) && attempt < max_retries {
+                    let recovered = if is_cantopen_error(&e) {
+                        ensure_db_openable(db_path).await
+                    } else {
+                        false
+                    };
                     warn!(
-                        "write_queue: acquire CANTOPEN (attempt {}/{}), db_recovered={}, retrying",
-                        attempt, max_retries, recovered
+                        "write_queue: acquire connection error (attempt {}/{}), db_recovered={}, retrying: {}",
+                        attempt, max_retries, recovered, e
                     );
                     last_error = Some(e);
                     tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
@@ -551,6 +549,25 @@ async fn execute_batch(
                 last_error = Some(e);
                 tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
                 continue;
+            }
+            Err(e) if should_recycle_sqlite_connection(&e) => {
+                let recovered = if is_cantopen_error(&e) {
+                    ensure_db_openable(db_path).await
+                } else {
+                    false
+                };
+                warn!(
+                    "write_queue: BEGIN IMMEDIATE connection error (attempt {}/{}), db_recovered={}, detaching connection: {}",
+                    attempt, max_retries, recovered, e
+                );
+                let _raw = conn.detach();
+                if attempt < max_retries {
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                    continue;
+                }
+                send_error_to_all(batch, e);
+                return;
             }
             Err(e) => {
                 warn!("write_queue: BEGIN IMMEDIATE failed: {}", e);
@@ -1515,7 +1532,14 @@ fn is_connection_error(e: &sqlx::Error) -> bool {
     if let sqlx::Error::Database(db) = e {
         return is_fatal_sqlite_message(&db.message().to_lowercase());
     }
+    if let sqlx::Error::Protocol(msg) = e {
+        return is_fatal_sqlite_message(&msg.to_lowercase());
+    }
     false
+}
+
+fn should_recycle_sqlite_connection(e: &sqlx::Error) -> bool {
+    is_connection_error(e) || is_cantopen_error(e)
 }
 
 fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
@@ -2249,6 +2273,22 @@ mod tests {
         assert!(is_connection_error(&sqlx::Error::PoolTimedOut));
         assert!(is_connection_error(&sqlx::Error::Io(
             std::io::Error::other("broken pipe")
+        )));
+    }
+
+    #[test]
+    fn sqlite_connection_recycle_classifies_begin_and_acquire_failures() {
+        assert!(should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "error returned from database: (code: 522) disk i/o error".into()
+        )));
+        assert!(should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "error returned from database: (code: 11) database disk image is malformed".into()
+        )));
+        assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "database is locked".into()
+        )));
+        assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "no such table: foo".into()
         )));
     }
 
