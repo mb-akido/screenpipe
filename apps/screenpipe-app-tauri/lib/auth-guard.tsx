@@ -9,6 +9,7 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { toast } from "@/components/ui/use-toast";
 import { ToastAction } from "@/components/ui/toast";
 import posthog from "posthog-js";
+import { commands } from "@/lib/utils/tauri";
 
 const CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const TOAST_COOLDOWN_MS = 5 * 60 * 1000;
@@ -31,8 +32,8 @@ function showSignedOutToast() {
   lastToastTime = now;
 
   toast({
-    title: "signed out — cloud features paused",
-    description: "local recording still running. sign in to restore pro.",
+    title: "signed out — app paused",
+    description: "sign in with an active plan to keep using screenpipe.",
     variant: "destructive",
     duration: 30000,
     action: (
@@ -57,6 +58,9 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     console.warn("auth-guard: session expired, clearing");
     posthog.capture("session_expired");
     await updateSettings({ user: null as any });
+    try {
+      await commands.setCloudToken(null);
+    } catch {}
     showSignedOutToast();
   }, [updateSettings]);
 

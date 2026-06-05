@@ -42,6 +42,8 @@ pub fn resolved_api_auth_key() -> Option<String> {
 
 /// Magic header for encrypted store.bin files.
 const STORE_MAGIC: &[u8; 8] = b"SPSTORE1";
+const APP_ENTITLEMENT_MAX_STALE_HOURS: i64 = 72;
+const APP_ENTITLEMENT_CLOCK_SKEW_MINUTES: i64 = 5;
 
 // ---------------------------------------------------------------------------
 // Settings-loss recovery
@@ -808,6 +810,9 @@ pub struct User {
     pub contact: Option<String>,
     pub cloud_subscribed: Option<bool>,
     pub credits_balance: Option<i32>,
+    pub app_entitled: Option<bool>,
+    pub subscription_plan: Option<String>,
+    pub entitlement: Option<serde_json::Value>,
 }
 
 impl Default for User {
@@ -829,8 +834,53 @@ impl Default for User {
             contact: None,
             cloud_subscribed: None,
             credits_balance: None,
+            app_entitled: None,
+            subscription_plan: None,
+            entitlement: None,
         }
     }
+}
+
+fn parse_entitlement_time(
+    value: Option<&serde_json::Value>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    value
+        .and_then(|value| value.as_str())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn entitlement_checked_recently(entitlement: &serde_json::Value) -> bool {
+    let Some(checked_at) = parse_entitlement_time(entitlement.get("checked_at")) else {
+        return false;
+    };
+
+    let now = chrono::Utc::now();
+    checked_at <= now + chrono::Duration::minutes(APP_ENTITLEMENT_CLOCK_SKEW_MINUTES)
+        && now.signed_duration_since(checked_at)
+            <= chrono::Duration::hours(APP_ENTITLEMENT_MAX_STALE_HOURS)
+}
+
+fn entitlement_active_or_in_grace(entitlement: &serde_json::Value) -> bool {
+    if entitlement
+        .get("active")
+        .and_then(|active| active.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    parse_entitlement_time(entitlement.get("grace_until"))
+        .map(|grace_until| grace_until > chrono::Utc::now())
+        .unwrap_or(false)
+}
+
+fn entitlement_feature(entitlement: &serde_json::Value, feature: &str) -> bool {
+    entitlement
+        .get("features")
+        .and_then(|features| features.get(feature))
+        .and_then(|feature| feature.as_bool())
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Type)]
@@ -1211,6 +1261,30 @@ impl SettingsStore {
             config.port = p;
         }
         config
+    }
+
+    pub fn app_entitled_or_dev(&self) -> bool {
+        if cfg!(debug_assertions)
+            || std::env::var("TAURI_ENV_DEBUG").ok().as_deref() == Some("true")
+        {
+            return true;
+        }
+
+        if self.user.cloud_subscribed == Some(true) {
+            return true;
+        }
+
+        let Some(entitlement) = self.user.entitlement.as_ref() else {
+            return false;
+        };
+
+        if !entitlement_checked_recently(entitlement)
+            || !entitlement_active_or_in_grace(entitlement)
+        {
+            return false;
+        }
+
+        self.user.app_entitled == Some(true) || entitlement_feature(entitlement, "app")
     }
 
     pub fn audio_engine_resolution(&self) -> AudioEngineResolution {

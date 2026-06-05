@@ -15,6 +15,7 @@ import { forwardRef } from "react";
 import { NuqsAdapter } from "nuqs/adapters/next/app";
 import { commands } from "@/lib/utils/tauri";
 import { useUpdateListener } from "@/components/update-banner";
+import { AppEntitlementGate } from "@/components/app-entitlement-gate";
 
 /// Global mount point for the updater event listener. Lives here (not in
 /// per-page hooks) so the listener is registered for the lifetime of the
@@ -133,7 +134,9 @@ export const Providers = forwardRef<
             <ChangelogDialogProvider>
               <PermissionMonitorProvider>
                 <UpdateListenerMount />
-                <PostHogProvider client={posthog}>{mounted ? children : null}</PostHogProvider>
+                <PostHogProvider client={posthog}>
+                  {mounted ? <AppEntitlementGate>{children}</AppEntitlementGate> : null}
+                </PostHogProvider>
               </PermissionMonitorProvider>
             </ChangelogDialogProvider>
           </ThemeProvider>
