@@ -5,11 +5,10 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { localFetch } from "@/lib/api";
-import { exists, readTextFile } from "@tauri-apps/plugin-fs";
-import { homeDir } from "@tauri-apps/api/path";
 import posthog from "posthog-js";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { getStore, saveAndEncrypt } from "@/lib/hooks/use-settings";
@@ -106,6 +105,45 @@ function useMeetingState() {
   return { active: meetingState.active, loading, toggle };
 }
 
+type ShortcutReminderSettings = {
+  showScreenpipeShortcut?: string;
+  showChatShortcut?: string;
+  searchShortcut?: string;
+  shortcutOverlaySize?: string;
+  overlay?: string;
+  chat?: string;
+  search?: string;
+};
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function shortcutPayloadToSettings(payload: unknown): ShortcutReminderSettings {
+  if (!payload) return {};
+
+  if (typeof payload === "string") {
+    try {
+      const parsed = JSON.parse(payload);
+      return parsed && typeof parsed === "object"
+        ? (parsed as ShortcutReminderSettings)
+        : { showScreenpipeShortcut: payload };
+    } catch {
+      return { showScreenpipeShortcut: payload };
+    }
+  }
+
+  return typeof payload === "object" ? (payload as ShortcutReminderSettings) : {};
+}
+
+function shortcutOverlayScale(size: unknown) {
+  return size === "large" ? 2 : size === "medium" ? 1.5 : 1;
+}
+
+function errorText(error: unknown) {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
 export default function ShortcutReminderPage() {
   const { isMac, isLoading } = usePlatform();
   const [overlayShortcut, setOverlayShortcut] = useState<string | null>(null);
@@ -117,47 +155,34 @@ export default function ShortcutReminderPage() {
   const isMacRef = useRef(isMac);
   isMacRef.current = isMac;
 
-  // Read shortcuts directly from the store.bin file on disk (bypasses TS store plugin)
-  const loadShortcutsFromFile = useCallback(async () => {
-    try {
-      const home = await homeDir();
-      const path = `${home}/.screenpipe/store.bin`;
-      // Missing file is a valid first-run state (defaults will be applied by caller).
-      // Silently skipping avoids a webview→Rust error roundtrip per call, which
-      // compounded into thousands of log lines when the store-change listener fires.
-      if (!(await exists(path))) return;
-      const raw = await readTextFile(path);
-      if (!raw) return;
-      const data = JSON.parse(raw);
-      const settings = data?.settings;
-      if (settings?.showScreenpipeShortcut) {
-        setOverlayShortcut(formatShortcut(settings.showScreenpipeShortcut, isMacRef.current));
-      }
-      if (settings?.showChatShortcut) {
-        setChatShortcut(formatShortcut(settings.showChatShortcut, isMacRef.current));
-      }
-      if (settings?.searchShortcut) {
-        setSearchShortcut(formatShortcut(settings.searchShortcut, isMacRef.current));
-      }
-      if (settings?.shortcutOverlaySize) {
-        const s = settings.shortcutOverlaySize;
-        setOverlayScale(s === "large" ? 2 : s === "medium" ? 1.5 : 1);
-      }
-    } catch (e) {
-      // Error objects don't survive JSON.stringify — extract the human-readable parts
-      // so the report isn't just "{}".
-      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-      console.error("Failed to read shortcuts from store file:", msg);
-    }
+  const applyShortcutSettings = useCallback((settings: ShortcutReminderSettings) => {
+    const overlay = readString(settings.showScreenpipeShortcut ?? settings.overlay);
+    const chat = readString(settings.showChatShortcut ?? settings.chat);
+    const search = readString(settings.searchShortcut ?? settings.search);
+    const overlaySize = readString(settings.shortcutOverlaySize);
+
+    if (overlay) setOverlayShortcut(formatShortcut(overlay, isMacRef.current));
+    if (chat) setChatShortcut(formatShortcut(chat, isMacRef.current));
+    if (search) setSearchShortcut(formatShortcut(search, isMacRef.current));
+    if (overlaySize) setOverlayScale(shortcutOverlayScale(overlaySize));
   }, []);
+
+  const loadShortcutSettings = useCallback(async () => {
+    try {
+      const settings = await invoke<ShortcutReminderSettings>("get_shortcut_reminder_settings");
+      applyShortcutSettings(settings);
+    } catch (e) {
+      console.warn("Failed to read shortcut reminder settings:", errorText(e));
+    }
+  }, [applyShortcutSettings]);
 
   // Load shortcuts on mount + listen for updates
   useEffect(() => {
     if (isLoading) return;
 
-    // Initial load from file
-    loadShortcutsFromFile().then(() => {
-      // Set platform-appropriate defaults if file had no values
+    // Initial load
+    loadShortcutSettings().then(() => {
+      // Set platform-appropriate defaults if settings had no values
       setOverlayShortcut(prev => prev ?? (isMac ? "⌘⌃S" : "Alt+S"));
       setChatShortcut(prev => prev ?? (isMac ? "⌘⌃L" : "Alt+L"));
       setSearchShortcut(prev => prev ?? (isMac ? "⌘⌃K" : "Alt+K"));
@@ -171,7 +196,7 @@ export default function ShortcutReminderPage() {
       if (reloadTimer) clearTimeout(reloadTimer);
       reloadTimer = setTimeout(() => {
         reloadTimer = null;
-        loadShortcutsFromFile();
+        loadShortcutSettings();
       }, 250);
     };
     getStore().then(store => {
@@ -184,12 +209,12 @@ export default function ShortcutReminderPage() {
       if (reloadTimer) clearTimeout(reloadTimer);
       unlistenStore?.();
     };
-  }, [isLoading, isMac, loadShortcutsFromFile]);
+  }, [isLoading, isMac, loadShortcutSettings]);
 
   useEffect(() => {
     // Listen for explicit shortcut-reminder-update event (from Rust side)
-    const unlistenShortcut = listen<string>("shortcut-reminder-update", () => {
-      loadShortcutsFromFile();
+    const unlistenShortcut = listen<string>("shortcut-reminder-update", (event) => {
+      applyShortcutSettings(shortcutPayloadToSettings(event.payload));
     });
 
     posthog.capture("shortcut_reminder_shown");
@@ -197,7 +222,7 @@ export default function ShortcutReminderPage() {
     return () => {
       unlistenShortcut.then((fn) => fn());
     };
-  }, [loadShortcutsFromFile]);
+  }, [applyShortcutSettings]);
 
   // Use Tauri's native startDragging for window movement
   const handleMouseDown = useCallback(async (e: React.MouseEvent) => {

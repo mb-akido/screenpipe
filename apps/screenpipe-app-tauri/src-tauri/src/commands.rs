@@ -2122,6 +2122,68 @@ pub async fn open_search_window(
     Ok(())
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutReminderSettings {
+    pub show_screenpipe_shortcut: String,
+    pub show_chat_shortcut: String,
+    pub search_shortcut: String,
+    pub shortcut_overlay_size: String,
+}
+
+fn shortcut_payload_string(payload: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
+    payload.and_then(|value| {
+        keys.iter()
+            .find_map(|key| value.get(key).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    })
+}
+
+fn build_shortcut_reminder_settings(
+    app_handle: &tauri::AppHandle,
+    shortcut_override: Option<&str>,
+) -> ShortcutReminderSettings {
+    let store = SettingsStore::get(app_handle)
+        .unwrap_or_default()
+        .unwrap_or_default();
+
+    let payload = shortcut_override.and_then(|shortcut| {
+        serde_json::from_str::<serde_json::Value>(shortcut)
+            .ok()
+            .filter(|value| value.is_object())
+    });
+
+    let plain_overlay = shortcut_override
+        .filter(|shortcut| !shortcut.trim().is_empty())
+        .filter(|_| payload.is_none())
+        .map(str::to_string);
+
+    ShortcutReminderSettings {
+        show_screenpipe_shortcut: shortcut_payload_string(
+            payload.as_ref(),
+            &["showScreenpipeShortcut", "overlay"],
+        )
+        .or(plain_overlay)
+        .unwrap_or(store.show_screenpipe_shortcut),
+        show_chat_shortcut: shortcut_payload_string(
+            payload.as_ref(),
+            &["showChatShortcut", "chat"],
+        )
+        .unwrap_or(store.show_chat_shortcut),
+        search_shortcut: shortcut_payload_string(payload.as_ref(), &["searchShortcut", "search"])
+            .unwrap_or(store.search_shortcut),
+        shortcut_overlay_size: shortcut_payload_string(payload.as_ref(), &["shortcutOverlaySize"])
+            .unwrap_or(store.shortcut_overlay_size),
+    }
+}
+
+#[tauri::command]
+pub async fn get_shortcut_reminder_settings(
+    app_handle: tauri::AppHandle,
+) -> Result<ShortcutReminderSettings, String> {
+    Ok(build_shortcut_reminder_settings(&app_handle, None))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn show_shortcut_reminder(
@@ -2147,10 +2209,9 @@ pub async fn show_shortcut_reminder(
         return Ok(());
     }
 
-    let shortcut_overlay_size = crate::store::SettingsStore::get(&app_handle)
-        .unwrap_or_default()
-        .unwrap_or_default()
-        .shortcut_overlay_size;
+    let shortcut_settings = build_shortcut_reminder_settings(&app_handle, Some(&shortcut));
+    let shortcut_payload = serde_json::to_string(&shortcut_settings).map_err(|e| e.to_string())?;
+    let shortcut_overlay_size = shortcut_settings.shortcut_overlay_size.clone();
 
     // On macOS, try the native SwiftUI shortcut reminder first
     #[cfg(target_os = "macos")]
@@ -2193,23 +2254,21 @@ pub async fn show_shortcut_reminder(
                 }
             }
 
-            let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-            match serde_json::from_str::<serde_json::Value>(&shortcut) {
-                Ok(serde_json::Value::Object(o)) => {
-                    for (k, v) in o {
-                        map.insert(k, v);
-                    }
-                }
-                _ => {
-                    map.insert(
-                        "overlay".to_string(),
-                        serde_json::Value::String(shortcut.clone()),
-                    );
-                }
-            }
+            let mut map = match serde_json::to_value(&shortcut_settings).unwrap_or_default() {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
             map.insert(
-                "shortcutOverlaySize".to_string(),
-                serde_json::Value::String(shortcut_overlay_size.clone()),
+                "overlay".to_string(),
+                serde_json::Value::String(shortcut_settings.show_screenpipe_shortcut.clone()),
+            );
+            map.insert(
+                "chat".to_string(),
+                serde_json::Value::String(shortcut_settings.show_chat_shortcut.clone()),
+            );
+            map.insert(
+                "search".to_string(),
+                serde_json::Value::String(shortcut_settings.search_shortcut.clone()),
             );
             if let Some(state) = app_handle.try_state::<RecordingState>() {
                 let guard = state.server.lock().await;
@@ -2300,7 +2359,7 @@ pub async fn show_shortcut_reminder(
             window_height,
         )));
         let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
-        let _ = app_handle.emit_to(label, "shortcut-reminder-update", &shortcut);
+        let _ = app_handle.emit_to(label, "shortcut-reminder-update", &shortcut_payload);
         let _ = window.show();
 
         #[cfg(target_os = "macos")]
@@ -2445,7 +2504,7 @@ pub async fn show_shortcut_reminder(
     });
 
     // Send the shortcut info to the window
-    let _ = app_handle.emit_to(label, "shortcut-reminder-update", &shortcut);
+    let _ = app_handle.emit_to(label, "shortcut-reminder-update", &shortcut_payload);
 
     Ok(())
 }
