@@ -308,6 +308,134 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             &["imei"],
             Some(national_id::luhn),
         ),
+        // ---- distinctive-shape checksummed national IDs (no/low context) ----
+        // China resident ID — 17 digits + 0-9/X check, ISO 7064 MOD 11-2.
+        (
+            r"\b\d{17}[\dXx]\b",
+            SpanLabel::Id,
+            Some("china_resident_id"),
+            &[],
+            Some(national_id::china_resident_id),
+        ),
+        // Italy Codice Fiscale — 6 letters + 9 alnum + letter, mod-26.
+        (
+            r"\b[A-Za-z]{6}[0-9A-Za-z]{9}[A-Za-z]\b",
+            SpanLabel::Id,
+            Some("italy_codice_fiscale"),
+            &[],
+            Some(national_id::italy_codice_fiscale),
+        ),
+        // Mexico CURP — distinctive 18-char shape. Format/context-only:
+        // its checksum couldn't be verified against a trustworthy vector.
+        (
+            r"\b[A-Za-z]{4}\d{6}[A-Za-z]{6}[0-9A-Za-z]\d\b",
+            SpanLabel::Id,
+            Some("mexico_curp"),
+            &["curp", "renapo"],
+            None,
+        ),
+        // Finland HETU — DDMMYY + century sign + NNN + mod-31 check char.
+        (
+            r"\b\d{6}[-+ABCDEFYXWVUabcdefyxwvu]\d{3}[0-9A-Ya-y]\b",
+            SpanLabel::Id,
+            Some("finland_hetu"),
+            &[],
+            Some(national_id::finland_hetu),
+        ),
+        // France NIR — 15 digits starting 1/2, mod-97 key.
+        (
+            r"\b[12]\d{14}\b",
+            SpanLabel::Id,
+            Some("france_nir"),
+            &[],
+            Some(national_id::france_nir),
+        ),
+        // ---- context-gated checksummed national IDs (digit runs) ----
+        // Germany Steuer-ID — 11 digits, ISO 7064 MOD 11,10.
+        (
+            r"\b\d{11}\b",
+            SpanLabel::Id,
+            Some("germany_tax_id"),
+            &["steuer", "idnr", "identifikationsnummer", "tax id"],
+            Some(national_id::germany_tax_id),
+        ),
+        // Poland PESEL — 11 digits, weighted mod-10.
+        (
+            r"\b\d{11}\b",
+            SpanLabel::Id,
+            Some("poland_pesel"),
+            &["pesel"],
+            Some(national_id::poland_pesel),
+        ),
+        // Turkey TC Kimlik — 11 digits, custom checks.
+        (
+            r"\b\d{11}\b",
+            SpanLabel::Id,
+            Some("turkey_tc_kimlik"),
+            &["kimlik", "tckn", "tc no"],
+            Some(national_id::turkey_tc_kimlik),
+        ),
+        // Belgium national number — 11 digits, mod-97.
+        (
+            r"\b\d{2}\.?\d{2}\.?\d{2}-?\d{3}\.?\d{2}\b",
+            SpanLabel::Id,
+            Some("belgium_national_number"),
+            &[
+                "rijksregister",
+                "registre national",
+                "national number",
+                "niss",
+            ],
+            Some(national_id::belgium_national_number),
+        ),
+        // Norway fødselsnummer — 11 digits, two mod-11.
+        (
+            r"\b\d{11}\b",
+            SpanLabel::Id,
+            Some("norway_fodselsnummer"),
+            &["fødselsnummer", "fodselsnummer", "fnr"],
+            Some(national_id::norway_fodselsnummer),
+        ),
+        // South Africa ID — 13 digits, Luhn.
+        (
+            r"\b\d{13}\b",
+            SpanLabel::Id,
+            Some("south_africa_id"),
+            &["south african", "south africa", "rsa id", "id number"],
+            Some(national_id::south_africa_id),
+        ),
+        // South Korea RRN — 13 digits, weighted mod-11.
+        (
+            r"\b\d{6}-?\d{7}\b",
+            SpanLabel::Id,
+            Some("south_korea_rrn"),
+            &["resident registration", "rrn", "주민"],
+            Some(national_id::south_korea_rrn),
+        ),
+        // Sweden personnummer — 10/12 digits, Luhn.
+        (
+            r"\b(?:\d{2})?\d{6}[-+]?\d{4}\b",
+            SpanLabel::Id,
+            Some("sweden_personnummer"),
+            &["personnummer", "personnr", "skatteverket"],
+            Some(national_id::sweden_personnummer),
+        ),
+        // UK UTR — 10 digits, weighted mod-11.
+        (
+            r"\b\d{10}\b",
+            SpanLabel::Id,
+            Some("uk_utr"),
+            &["utr", "unique taxpayer", "self assessment"],
+            Some(national_id::uk_utr),
+        ),
+        // Australia Medicare — 10-11 digits (first 2-6), weighted mod-10.
+        (
+            r"\b[2-6]\d{9,10}\b",
+            SpanLabel::Id,
+            Some("australia_medicare"),
+            &["medicare"],
+            Some(national_id::australia_medicare),
+        ),
         // ---- format/context-only (no public checksum) ----
         // UK NINO — 2 prefix letters + 6 digits + A-D suffix.
         (
@@ -836,7 +964,7 @@ mod tests {
             seed
         };
 
-        let validators: [fn(&str) -> bool; 14] = [
+        let validators: [fn(&str) -> bool; 28] = [
             nid::luhn,
             nid::iban,
             nid::spain_dni,
@@ -850,7 +978,21 @@ mod tests {
             nid::vin,
             nid::us_npi,
             nid::us_dea,
+            nid::us_aba_routing,
+            nid::australia_tfn,
             nid::netherlands_bsn,
+            nid::germany_tax_id,
+            nid::china_resident_id,
+            nid::poland_pesel,
+            nid::sweden_personnummer,
+            nid::south_africa_id,
+            nid::turkey_tc_kimlik,
+            nid::finland_hetu,
+            nid::france_nir,
+            nid::belgium_national_number,
+            nid::norway_fodselsnummer,
+            nid::italy_codice_fiscale,
+            nid::uk_utr,
         ];
 
         for i in 0..200_000u64 {

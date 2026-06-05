@@ -153,6 +153,40 @@ fn shape(subtype: &str, r: &mut Rng) -> String {
             (0..2).map(|_| pick(r, CUSIP_CHARS)).collect::<String>()
         ),
         "us_ein" => format!("{}-{}", r.digits(2), r.digits(7)),
+        "germany_tax_id" | "turkey_tc_kimlik" => {
+            format!("{}{}", (b'1' + r.below(9) as u8) as char, r.digits(10))
+        }
+        "poland_pesel" | "belgium_national_number" | "norway_fodselsnummer" => r.digits(11),
+        "south_africa_id" | "south_korea_rrn" => r.digits(13),
+        "sweden_personnummer" | "uk_utr" => r.digits(10),
+        "australia_medicare" => format!("{}{}", (b'2' + r.below(5) as u8) as char, r.digits(9)),
+        "france_nir" => format!(
+            "{}{}",
+            if r.below(2) == 0 { '1' } else { '2' },
+            r.digits(14)
+        ),
+        "china_resident_id" => {
+            format!(
+                "{}{}",
+                r.digits(17),
+                b"0123456789X"[r.below(11) as usize] as char
+            )
+        }
+        "finland_hetu" => {
+            let c = b"0123456789ABCDEFHJKLMNPRSTUVWXY"[r.below(31) as usize] as char;
+            format!("{}-{}{}", r.digits(6), r.digits(3), c)
+        }
+        "italy_codice_fiscale" => {
+            let l6: String = (0..6).map(|_| r.upper()).collect();
+            let mid: String = (0..9).map(|_| pick(r, CUSIP_CHARS)).collect();
+            format!("{l6}{mid}{}", r.upper())
+        }
+        "mexico_curp" => {
+            let l4: String = (0..4).map(|_| r.upper()).collect();
+            let d6 = r.digits(6);
+            let l6: String = (0..6).map(|_| r.upper()).collect();
+            format!("{l4}{d6}{l6}{}{}", pick(r, CUSIP_CHARS), r.digit())
+        }
         other => panic!("no shape generator for {other}"),
     }
 }
@@ -176,7 +210,21 @@ fn validator(subtype: &str) -> Option<fn(&str) -> bool> {
         "australia_tfn" => nid::australia_tfn,
         "canada_sin" => nid::luhn,
         "imei" => nid::luhn,
-        // format-only (no checksum)
+        "germany_tax_id" => nid::germany_tax_id,
+        "china_resident_id" => nid::china_resident_id,
+        "poland_pesel" => nid::poland_pesel,
+        "sweden_personnummer" => nid::sweden_personnummer,
+        "south_africa_id" => nid::south_africa_id,
+        "turkey_tc_kimlik" => nid::turkey_tc_kimlik,
+        "finland_hetu" => nid::finland_hetu,
+        "france_nir" => nid::france_nir,
+        "belgium_national_number" => nid::belgium_national_number,
+        "norway_fodselsnummer" => nid::norway_fodselsnummer,
+        "italy_codice_fiscale" => nid::italy_codice_fiscale,
+        "australia_medicare" => nid::australia_medicare,
+        "uk_utr" => nid::uk_utr,
+        "south_korea_rrn" => nid::south_korea_rrn,
+        // format-only (no checksum): mexico_curp, us_ssn, uk_nino, ...
         _ => return None,
     })
 }
@@ -223,6 +271,21 @@ const CASES: &[(&str, &str)] = &[
     ("india_pan", "PAN"),
     ("swift_bic", "SWIFT"),
     ("us_ein", "EIN"),
+    ("china_resident_id", ""),
+    ("italy_codice_fiscale", ""),
+    ("mexico_curp", "CURP"),
+    ("finland_hetu", ""),
+    ("france_nir", ""),
+    ("germany_tax_id", "Steuer-ID"),
+    ("poland_pesel", "PESEL"),
+    ("turkey_tc_kimlik", "Kimlik"),
+    ("belgium_national_number", "Rijksregister"),
+    ("norway_fodselsnummer", "fnr"),
+    ("south_africa_id", "South African ID"),
+    ("south_korea_rrn", "resident registration"),
+    ("sweden_personnummer", "personnummer"),
+    ("uk_utr", "UTR"),
+    ("australia_medicare", "Medicare"),
 ];
 
 const TEMPLATES: &[&str] = &[
