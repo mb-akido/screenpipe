@@ -85,6 +85,18 @@ export function isDevBillingBypassEnabled() {
   );
 }
 
+// Show the dev-only login helper (paste a token / screenpipe:// URL) when we are
+// not in a plain production build, i.e. dev, a forced gate, or pointed at a
+// non-prod website. Never shows in a normal prod release.
+export function isDevLoginEnabled() {
+  return (
+    process.env.NODE_ENV === "development" ||
+    process.env.TAURI_ENV_DEBUG === "true" ||
+    process.env.NEXT_PUBLIC_SCREENPIPE_FORCE_BILLING_GATE === "true" ||
+    !!process.env.NEXT_PUBLIC_SCREENPIPE_WEB_URL
+  );
+}
+
 function asEntitlement(entitlement: AppUser["entitlement"] | undefined): AppEntitlement | null {
   if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement)) {
     return null;

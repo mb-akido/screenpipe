@@ -13,6 +13,7 @@ import {
   AppUser,
   hasAppEntitlement,
   isDevBillingBypassEnabled,
+  isDevLoginEnabled,
   needsAppEntitlementRefresh,
   normalizePlanLabel,
   PRICING_URL,
@@ -49,6 +50,9 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const { settings, updateSettings, loadUser, isSettingsLoaded } = useSettings();
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [devToken, setDevToken] = useState("");
+  const [devSubmitting, setDevSubmitting] = useState(false);
+  const [devError, setDevError] = useState<string | null>(null);
   const stoppedForGateRef = useRef(false);
   const autoVerifiedRef = useRef(false);
   const prevEntitledRef = useRef<boolean | null>(null);
@@ -121,6 +125,26 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     commands.openLoginWindow();
   }, [updateSettings]);
 
+  // Dev/preview only: deep links do not reach the `bun tauri dev` binary on
+  // macOS, so paste the login token (or the whole screenpipe://...api_key=...
+  // URL the browser tried to open) here to sign in without the OAuth callback.
+  const devLogin = useCallback(async () => {
+    const raw = devToken.trim();
+    if (!raw) return;
+    const match = raw.match(/[?&]api_key=([^&\s]+)/);
+    const token = match ? decodeURIComponent(match[1]) : raw;
+    setDevSubmitting(true);
+    setDevError(null);
+    try {
+      await loadUser(token, true);
+      setDevToken("");
+    } catch (err) {
+      setDevError(err instanceof Error ? err.message : "login failed");
+    } finally {
+      setDevSubmitting(false);
+    }
+  }, [devToken, loadUser]);
+
   // A signed-in user who is not yet entitled may have just paid, with the Stripe
   // webhook still in flight. Verify once against the server (Stripe fallback) so
   // they unlock without waiting for the next periodic poll.
@@ -145,6 +169,35 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
       });
     }
   }, [devBypass, isEntitled, isSettingsLoaded]);
+
+  const devLoginBlock = isDevLoginEnabled() ? (
+    <div className="mt-5 border-t border-border pt-4">
+      <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground mb-2">
+        dev login
+      </p>
+      <input
+        value={devToken}
+        onChange={(e) => setDevToken(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") void devLogin();
+        }}
+        placeholder="paste token or screenpipe://…api_key=…"
+        spellCheck={false}
+        className="w-full border border-border bg-background px-3 py-2 font-mono text-[11px] outline-none focus:border-foreground"
+      />
+      <Button
+        onClick={() => void devLogin()}
+        variant="secondary"
+        className="mt-2 w-full"
+        disabled={devSubmitting || !devToken.trim()}
+      >
+        {devSubmitting ? "signing in…" : "dev sign in"}
+      </Button>
+      {devError && (
+        <p className="mt-1 font-mono text-[11px] leading-5 text-destructive">{devError}</p>
+      )}
+    </div>
+  ) : null;
 
   if (!isSettingsLoaded) {
     return (
@@ -177,6 +230,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
             choose plan
           </Button>
         </div>
+        {devLoginBlock}
       </EntitlementShell>
     );
   }
@@ -225,6 +279,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
           </p>
         )}
       </div>
+      {devLoginBlock}
     </EntitlementShell>
   );
 }
