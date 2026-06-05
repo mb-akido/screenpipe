@@ -101,14 +101,31 @@ impl SpanLabel {
 /// new detector's subtype here so [`TextRedactionPolicy::from_labels`]
 /// will accept it from the `piiRedactionLabels` setting.
 pub const KNOWN_SUBTYPES: &[&str] = &[
+    // checksum-validated
     "us_ssn",
     "credit_card",
     "iban",
+    "isin",
+    "cusip",
+    "sedol",
+    "vin",
     "spain_dni",
+    "spain_nie",
     "brazil_cpf",
     "india_aadhaar",
     "canada_sin",
+    "australia_tfn",
+    "netherlands_bsn",
+    "us_npi",
+    "us_dea",
+    "us_aba_routing",
     "imei",
+    "mac_address",
+    // format / context only (no public checksum)
+    "uk_nino",
+    "india_pan",
+    "swift_bic",
+    "us_ein",
 ];
 
 /// Parse user-configured label names (canonical snake_case [`SpanLabel`]

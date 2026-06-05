@@ -149,6 +149,15 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
     //
     // Tuple: (regex, coarse label, subtype, context keywords, validator).
     let detailed: &[DetectorSpec] = &[
+        // ---- distinctive shapes, no context needed ----
+        // MAC address — hex pairs with separators; nothing else looks like it.
+        (
+            r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b",
+            SpanLabel::Id,
+            Some("mac_address"),
+            &[],
+            None,
+        ),
         // US SSN (formatted) — shape is specific enough on its own.
         (
             r"\b\d{3}-\d{2}-\d{4}\b",
@@ -157,23 +166,60 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             &[],
             None,
         ),
-        // IBAN — 2-letter country + 2 check digits + mod-97 body. Strong
-        // enough to run without a context keyword.
+        // ---- checksummed financial / securities ----
+        // IBAN — contiguous form only (the spaced/grouped form needs a
+        // country-length table to avoid eating trailing prose; tracked as
+        // follow-up). 2-letter country + 2 check digits + mod-97 body.
         (
-            r"\b[A-Z]{2}\d{2}(?: ?[A-Za-z0-9]){11,30}",
+            r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b",
             SpanLabel::Id,
             Some("iban"),
             &[],
             Some(national_id::iban),
         ),
-        // Spain DNI / NIF — 8 digits + mod-23 control letter.
+        // ISIN — country + 9-char NSIN + Luhn-over-expanded check digit.
         (
-            r"\b\d{8}[A-Za-z]\b",
+            r"\b[A-Z]{2}[A-Z0-9]{9}\d\b",
             SpanLabel::Id,
-            Some("spain_dni"),
-            &["dni", "nif"],
-            Some(national_id::spain_dni),
+            Some("isin"),
+            &[],
+            Some(national_id::isin),
         ),
+        // VIN — 17 chars (no I/O/Q), transliteration mod-11.
+        (
+            r"\b[A-HJ-NPR-Za-hj-npr-z0-9]{17}\b",
+            SpanLabel::Id,
+            Some("vin"),
+            &[],
+            Some(national_id::vin),
+        ),
+        // CUSIP — 9 chars, custom mod-10. Context-gated (9-char tokens are
+        // common; the checksum is only mod-10).
+        (
+            r"\b[0-9A-Z*@#]{8}\d\b",
+            SpanLabel::Id,
+            Some("cusip"),
+            &["cusip", "security", "securities"],
+            Some(national_id::cusip),
+        ),
+        // SEDOL — 7 chars, weighted mod-10. Context-gated.
+        (
+            r"\b[0-9B-DF-HJ-NP-TV-Z][0-9B-DF-HJ-NP-TV-Z]{5}\d\b",
+            SpanLabel::Id,
+            Some("sedol"),
+            &["sedol", "security", "securities"],
+            Some(national_id::sedol),
+        ),
+        // Credit / debit card — brand IIN + length + Luhn (the brand gate
+        // is what stops Luhn-passing hashes / timestamps).
+        (
+            r"\b(?:\d[ -]?){13,19}\b",
+            SpanLabel::Id,
+            Some("credit_card"),
+            &[],
+            Some(national_id::credit_card),
+        ),
+        // ---- checksummed government / national IDs ----
         // Brazil CPF — 11 digits, two mod-11 check digits.
         (
             r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b",
@@ -189,6 +235,62 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             Some("india_aadhaar"),
             &["aadhaar", "aadhar", "uidai"],
             Some(national_id::aadhaar),
+        ),
+        // Spain DNI / NIF — 8 digits + mod-23 control letter.
+        (
+            r"\b\d{8}[A-Za-z]\b",
+            SpanLabel::Id,
+            Some("spain_dni"),
+            &["dni", "nif"],
+            Some(national_id::spain_dni),
+        ),
+        // Spain NIE — X/Y/Z + 7 digits + mod-23 letter. Distinctive prefix.
+        (
+            r"\b[XYZxyz]\d{7}[A-Za-z]\b",
+            SpanLabel::Id,
+            Some("spain_nie"),
+            &[],
+            Some(national_id::spain_nie),
+        ),
+        // US NPI — 10 digits (first 1/2), Luhn over 80840 prefix.
+        (
+            r"\b[12]\d{9}\b",
+            SpanLabel::Id,
+            Some("us_npi"),
+            &["npi", "provider"],
+            Some(national_id::us_npi),
+        ),
+        // US DEA — 2 letters + 7 digits, custom mod-10.
+        (
+            r"\b[A-Za-z]{2}\d{7}\b",
+            SpanLabel::Id,
+            Some("us_dea"),
+            &["dea"],
+            Some(national_id::us_dea),
+        ),
+        // Netherlands BSN — 8-9 digits, elfproef. Context-gated.
+        (
+            r"\b\d{8,9}\b",
+            SpanLabel::Id,
+            Some("netherlands_bsn"),
+            &["bsn", "burgerservice", "sofinummer"],
+            Some(national_id::netherlands_bsn),
+        ),
+        // US ABA routing — 9 digits, 3-7-1 mod-10. Context-gated.
+        (
+            r"\b\d{9}\b",
+            SpanLabel::Id,
+            Some("us_aba_routing"),
+            &["routing", "aba", "rtn"],
+            Some(national_id::us_aba_routing),
+        ),
+        // Australia TFN — 9 digits, weighted mod-11. Context-gated.
+        (
+            r"\b\d{3} ?\d{3} ?\d{3}\b",
+            SpanLabel::Id,
+            Some("australia_tfn"),
+            &["tfn", "tax file"],
+            Some(national_id::australia_tfn),
         ),
         // Canada SIN — 9 digits, Luhn. Weak checksum → context-gated.
         (
@@ -206,13 +308,38 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             &["imei"],
             Some(national_id::luhn),
         ),
-        // Credit / debit card — 13-19 digits, Luhn. Catch-all; keep last.
+        // ---- format/context-only (no public checksum) ----
+        // UK NINO — 2 prefix letters + 6 digits + A-D suffix.
         (
-            r"\b(?:\d[ -]?){13,19}\b",
+            r"\b[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\d{6}[A-Da-d]\b",
             SpanLabel::Id,
-            Some("credit_card"),
-            &[],
-            Some(national_id::luhn),
+            Some("uk_nino"),
+            &["national insurance", "nino", "ni number"],
+            None,
+        ),
+        // India PAN — 5 letters + 4 digits + letter.
+        (
+            r"\b[A-Z]{5}\d{4}[A-Z]\b",
+            SpanLabel::Id,
+            Some("india_pan"),
+            &["pan", "permanent account"],
+            None,
+        ),
+        // SWIFT/BIC — 8 or 11 chars. Heavily context-gated (8 caps is common).
+        (
+            r"\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b",
+            SpanLabel::Id,
+            Some("swift_bic"),
+            &["swift", "bic", "beneficiary"],
+            None,
+        ),
+        // US EIN — XX-XXXXXXX. Very generic; must be context-gated.
+        (
+            r"\b\d{2}-\d{7}\b",
+            SpanLabel::Id,
+            Some("us_ein"),
+            &["ein", "employer identification", "fein"],
+            None,
         ),
     ];
 
@@ -307,7 +434,7 @@ pub fn redact_one(text: &str) -> RedactionOutput {
             // the small preceding window is lowercased (and only on the
             // rare context-gated match), so the hot path stays
             // allocation-free for ordinary text.
-            if !pat.context.is_empty() && !has_context(text, m.start(), pat.context) {
+            if !pat.context.is_empty() && !has_context(text, m.start(), m.end(), pat.context) {
                 continue;
             }
 
@@ -338,18 +465,48 @@ pub fn redact_one(text: &str) -> RedactionOutput {
     }
 }
 
-/// Does one of `keys` (already lowercase) appear within the ~48 bytes
-/// before `match_start`? Only the small preceding window is lowercased,
-/// so a long input doesn't pay a full-copy allocation. Used to gate
-/// weak-checksum numeric IDs so a bare digit run only counts next to its
-/// label ("SIN: …", "IMEI …").
-fn has_context(text: &str, match_start: usize, keys: &[&str]) -> bool {
-    let mut start = match_start.saturating_sub(48);
-    while start > 0 && !text.is_char_boundary(start) {
-        start -= 1;
+/// Whole-word (boundary-anchored) substring test. `needle` must be
+/// lowercase; `hay` is lowercased by the caller. This is what stops the
+/// 3-letter keyword `sin` from matching inside `business` while still
+/// matching `SIN:` / ` sin `.
+fn whole_word_contains(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
     }
-    let window = text[start..match_start].to_ascii_lowercase();
-    keys.iter().any(|k| window.contains(k))
+    let bytes = hay.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(needle) {
+        let i = from + rel;
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let after = i + needle.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = i + 1;
+    }
+    false
+}
+
+/// Does one of `keys` (already lowercase) appear as a whole word within
+/// ~48 bytes before the match OR ~48 bytes after it? Real labels usually
+/// precede ("SIN: …") but sometimes follow ("… (SIN)"), so both windows
+/// are checked. Only the two small windows are lowercased, so the hot
+/// path stays allocation-free for ordinary text. Gates weak-checksum
+/// numeric IDs (issue #2340).
+fn has_context(text: &str, m_start: usize, m_end: usize, keys: &[&str]) -> bool {
+    let mut bstart = m_start.saturating_sub(48);
+    while bstart > 0 && !text.is_char_boundary(bstart) {
+        bstart -= 1;
+    }
+    let before = text[bstart..m_start].to_ascii_lowercase();
+    let mut aend = (m_end + 48).min(text.len());
+    while aend < text.len() && !text.is_char_boundary(aend) {
+        aend += 1;
+    }
+    let after = text[m_end..aend].to_ascii_lowercase();
+    keys.iter()
+        .any(|k| whole_word_contains(&before, k) || whole_word_contains(&after, k))
 }
 
 /// Replace each span's bytes with its label placeholder, leaving the
@@ -490,7 +647,8 @@ mod tests {
 
     #[test]
     fn iban_caught_with_subtype() {
-        let out = run("Invoice IBAN GB82 WEST 1234 5698 7654 32 — please pay");
+        // Contiguous form; trailing prose must not break detection.
+        let out = run("Invoice IBAN GB82WEST12345698765432 please pay by friday");
         assert!(has_subtype(&out, "iban"), "spans: {:?}", out.spans);
         assert!(out.redacted.contains("[ID]"));
     }
@@ -498,7 +656,7 @@ mod tests {
     #[test]
     fn iban_bad_checksum_rejected() {
         // Last digit flipped → fails mod-97 → must not be flagged.
-        let out = run("Invoice IBAN GB82 WEST 1234 5698 7654 33 — please pay");
+        let out = run("Invoice IBAN GB82WEST12345698765433 (typo)");
         assert!(!has_subtype(&out, "iban"), "spans: {:?}", out.spans);
     }
 
@@ -544,11 +702,14 @@ mod tests {
     }
 
     #[test]
-    fn imei_context_gated_else_card() {
+    fn imei_context_gated_and_not_a_card() {
         // With its label, a 15-digit Luhn number is an IMEI.
         assert!(has_subtype(&run("IMEI 490154203237518 reported"), "imei"));
-        // Bare, the same number falls through to the card catch-all.
-        assert!(has_subtype(&run("490154203237518"), "credit_card"));
+        // Bare, it is NOT flagged: no IMEI context, and 49... is not a
+        // valid card IIN, so the brand-aware card check rejects it too.
+        let bare = run("490154203237518");
+        assert!(!has_subtype(&bare, "imei"));
+        assert!(!has_subtype(&bare, "credit_card"));
     }
 
     #[test]
