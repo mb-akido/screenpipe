@@ -1145,6 +1145,13 @@ mod tests {
         )
         .unwrap();
 
+        // build_local_manifest has two signatures by feature: the `secrets`
+        // build takes an extra `Option<&SecretStore>`. Select the right call so
+        // this test compiles under both `cargo test -p screenpipe-core` (no
+        // secrets) and the workspace build where engine unifies `secrets` on.
+        #[cfg(feature = "secrets")]
+        let manifest = build_local_manifest(dir.path(), "machine-1", None).await;
+        #[cfg(not(feature = "secrets"))]
         let manifest = build_local_manifest(dir.path(), "machine-1").await;
         assert!(manifest.connections.contains_key("notion"));
         assert_eq!(manifest.connections["notion"].integration_id, "notion");
