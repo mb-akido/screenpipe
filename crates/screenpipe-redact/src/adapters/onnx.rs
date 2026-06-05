@@ -575,6 +575,9 @@ mod runtime {
                         start,
                         end,
                         label,
+                        // Model spans carry the coarse label only; fine-grained
+                        // sub-types come from the deterministic detectors.
+                        subtype: None,
                         text: text[start..end].to_string(),
                     });
                 }
@@ -794,6 +797,7 @@ mod runtime {
                     start: 5,
                     end: 16,
                     label: SpanLabel::Secret,
+                    subtype: None,
                     text: "SECRETVALUE".into(),
                 },
                 // window A: same secret, plus a split half of "KEY"
@@ -801,12 +805,14 @@ mod runtime {
                     start: 5,
                     end: 11,
                     label: SpanLabel::Secret,
+                    subtype: None,
                     text: "SECRET".into(),
                 },
                 RedactedSpan {
                     start: 22,
                     end: 24,
                     label: SpanLabel::Secret,
+                    subtype: None,
                     text: "KE".into(),
                 },
                 // window B: the other half of "KEY", overlapping
@@ -814,6 +820,7 @@ mod runtime {
                     start: 23,
                     end: 25,
                     label: SpanLabel::Secret,
+                    subtype: None,
                     text: "EY".into(),
                 },
             ];
@@ -840,6 +847,7 @@ mod cross_feature_tests {
             start: 5,
             end: 18,
             label: SpanLabel::Sensitive,
+            subtype: None,
             text: "Schizophrenia".to_string(),
         }];
         let text = "Note Schizophrenia at chart";

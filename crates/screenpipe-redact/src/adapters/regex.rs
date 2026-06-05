@@ -23,6 +23,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::{
+    adapters::national_id,
     span::{RedactedSpan, SpanLabel},
     RedactError, RedactionOutput, Redactor,
 };
@@ -30,12 +31,34 @@ use crate::{
 /// Bumped whenever we add or change a pattern in [`PATTERNS`]. Cached
 /// rows redacted under an old version are eligible for re-redaction by
 /// the worker.
-pub const REGEX_REDACTOR_VERSION: u32 = 1;
+pub const REGEX_REDACTOR_VERSION: u32 = 2;
 
 struct Pattern {
     re: Regex,
     label: SpanLabel,
+    /// Fine-grained identifier sub-type tagged onto the span (e.g.
+    /// `"iban"`). `None` for generic shapes. See
+    /// [`crate::span::KNOWN_SUBTYPES`].
+    subtype: Option<&'static str>,
+    /// Lowercase keywords that must appear in the ~48 bytes before the
+    /// match for it to count. Empty = no requirement. Gates
+    /// weak-checksum numeric IDs (a bare 9-digit Luhn number is as
+    /// plausibly an order ID as a Canada SIN — issue #2340).
+    context: &'static [&'static str],
+    /// Structural validator (checksum). `None` = the shape is specific
+    /// enough alone. Returning false drops the match.
+    validate: Option<fn(&str) -> bool>,
 }
+
+/// Build spec for a structured-ID detector:
+/// `(regex, coarse label, subtype, context keywords, validator)`.
+type DetectorSpec = (
+    &'static str,
+    SpanLabel,
+    Option<&'static str>,
+    &'static [&'static str],
+    Option<fn(&str) -> bool>,
+);
 
 /// Order matters: longer / more-specific patterns first so they don't
 /// get nibbled by a more general match. Each pattern is built once at
@@ -98,49 +121,115 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             r"(?:\+\d{1,3}[-.\s]?\(?[2-9]\d{2}\)?[-.\s]?\d{3}[-.\s]?\d{4})|(?:\(?[2-9]\d{2}\)[-.\s]?\d{3}[-.\s]?\d{4})|(?:[2-9]\d{2}[-.\s]\d{3}[-.\s]\d{4})",
             SpanLabel::Phone,
         ),
-        // ---- Government IDs ----
-        // US SSN (formatted)
-        (r"\b\d{3}-\d{2}-\d{4}\b", SpanLabel::Id),
         // ---- Network ----
         (
             r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b",
             SpanLabel::Url,
         ),
-        // ---- Financial: 13-19 digit Luhn-validated cards. We use a
-        // simple pattern here and validate with [`luhn_ok`] below. ----
-        (r"\b(?:\d[ -]?){13,19}\b", SpanLabel::Id),
     ];
 
-    raw.iter()
+    let mut patterns: Vec<Pattern> = raw
+        .iter()
         .map(|(p, l)| Pattern {
             re: Regex::new(p).expect("regex pattern compiles"),
             label: *l,
+            subtype: None,
+            context: &[],
+            validate: None,
         })
-        .collect()
-});
+        .collect();
 
-/// Luhn check for credit-card / Mod-10 IDs. Used to suppress the
-/// false-positive where a long numeric DB ID gets flagged as a card.
-fn luhn_ok(s: &str) -> bool {
-    let digits: Vec<u32> = s.chars().filter_map(|c| c.to_digit(10)).collect();
-    if digits.len() < 13 {
-        return false;
-    }
-    let mut sum = 0u32;
-    let mut alt = false;
-    for d in digits.iter().rev() {
-        let mut x = *d;
-        if alt {
-            x *= 2;
-            if x > 9 {
-                x -= 9;
-            }
-        }
-        sum += x;
-        alt = !alt;
-    }
-    sum.is_multiple_of(10)
-}
+    // ---- Structured national / financial IDs ----
+    // Regex shape + checksum, and a context keyword for the ones whose
+    // checksum is too weak to stand alone (a random 9-digit number passes
+    // Luhn 1-in-10). Each carries a `subtype` so a customer can opt a
+    // single ID class in via `piiRedactionLabels`. Ordered BEFORE the
+    // catch-all card pattern so a 15-digit IMEI isn't grabbed as a
+    // 15-digit Amex.
+    //
+    // Tuple: (regex, coarse label, subtype, context keywords, validator).
+    let detailed: &[DetectorSpec] = &[
+        // US SSN (formatted) — shape is specific enough on its own.
+        (
+            r"\b\d{3}-\d{2}-\d{4}\b",
+            SpanLabel::Id,
+            Some("us_ssn"),
+            &[],
+            None,
+        ),
+        // IBAN — 2-letter country + 2 check digits + mod-97 body. Strong
+        // enough to run without a context keyword.
+        (
+            r"\b[A-Z]{2}\d{2}(?: ?[A-Za-z0-9]){11,30}",
+            SpanLabel::Id,
+            Some("iban"),
+            &[],
+            Some(national_id::iban),
+        ),
+        // Spain DNI / NIF — 8 digits + mod-23 control letter.
+        (
+            r"\b\d{8}[A-Za-z]\b",
+            SpanLabel::Id,
+            Some("spain_dni"),
+            &["dni", "nif"],
+            Some(national_id::spain_dni),
+        ),
+        // Brazil CPF — 11 digits, two mod-11 check digits.
+        (
+            r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b",
+            SpanLabel::Id,
+            Some("brazil_cpf"),
+            &["cpf"],
+            Some(national_id::cpf),
+        ),
+        // India Aadhaar — 12 digits, Verhoeff check.
+        (
+            r"\b\d{4} ?\d{4} ?\d{4}\b",
+            SpanLabel::Id,
+            Some("india_aadhaar"),
+            &["aadhaar", "aadhar", "uidai"],
+            Some(national_id::aadhaar),
+        ),
+        // Canada SIN — 9 digits, Luhn. Weak checksum → context-gated.
+        (
+            r"\b\d{3}[- ]?\d{3}[- ]?\d{3}\b",
+            SpanLabel::Id,
+            Some("canada_sin"),
+            &["sin", "social insurance"],
+            Some(national_id::luhn),
+        ),
+        // IMEI — 15 digits, Luhn. Context-gated to avoid 15-digit Amex.
+        (
+            r"\b\d{15}\b",
+            SpanLabel::Id,
+            Some("imei"),
+            &["imei"],
+            Some(national_id::luhn),
+        ),
+        // Credit / debit card — 13-19 digits, Luhn. Catch-all; keep last.
+        (
+            r"\b(?:\d[ -]?){13,19}\b",
+            SpanLabel::Id,
+            Some("credit_card"),
+            &[],
+            Some(national_id::luhn),
+        ),
+    ];
+
+    patterns.extend(
+        detailed
+            .iter()
+            .map(|(p, l, subtype, context, validate)| Pattern {
+                re: Regex::new(p).expect("regex pattern compiles"),
+                label: *l,
+                subtype: *subtype,
+                context,
+                validate: *validate,
+            }),
+    );
+
+    patterns
+});
 
 /// On-device deterministic redactor. See module docs.
 #[derive(Default)]
@@ -176,17 +265,26 @@ impl Redactor for RegexRedactor {
 /// async trait.
 pub fn redact_one(text: &str) -> RedactionOutput {
     let mut spans: Vec<RedactedSpan> = Vec::new();
+    // ASCII-lowercased copy for context-keyword lookups. `to_ascii_lowercase`
+    // preserves byte length, so match offsets stay valid against it.
+    let lower = text.to_ascii_lowercase();
 
     for pat in PATTERNS.iter() {
         for m in pat.re.find_iter(text) {
             let matched = &text[m.start()..m.end()];
 
-            // Reject Luhn-failing card-shaped numbers — they're almost
-            // always database IDs.
-            if matches!(pat.label, SpanLabel::Id)
-                && matched.chars().filter(|c| c.is_ascii_digit()).count() >= 13
-                && !luhn_ok(matched)
-            {
+            // Structural validator (checksum) — drop shapes that don't
+            // check out (a 16-digit DB ID that fails Luhn, a random
+            // 12-digit number that fails Verhoeff, ...).
+            if let Some(validate) = pat.validate {
+                if !validate(matched) {
+                    continue;
+                }
+            }
+
+            // Context requirement — weak-checksum numeric IDs only count
+            // when one of their keywords sits just before the match.
+            if !pat.context.is_empty() && !has_context(&lower, m.start(), pat.context) {
                 continue;
             }
 
@@ -201,6 +299,7 @@ pub fn redact_one(text: &str) -> RedactionOutput {
                 start: m.start(),
                 end: m.end(),
                 label: pat.label,
+                subtype: pat.subtype.map(|s| s.to_string()),
                 text: matched.to_string(),
             });
         }
@@ -214,6 +313,19 @@ pub fn redact_one(text: &str) -> RedactionOutput {
         redacted,
         spans,
     }
+}
+
+/// Does one of `keys` (already lowercase) appear within the ~48 bytes
+/// before `match_start`? `lower` must be the ASCII-lowercased input so
+/// offsets line up. Used to gate weak-checksum numeric IDs so a bare
+/// digit run only counts next to its label ("SIN: …", "IMEI …").
+fn has_context(lower: &str, match_start: usize, keys: &[&str]) -> bool {
+    let mut start = match_start.saturating_sub(48);
+    while start > 0 && !lower.is_char_boundary(start) {
+        start -= 1;
+    }
+    let window = &lower[start..match_start];
+    keys.iter().any(|k| window.contains(k))
 }
 
 /// Replace each span's bytes with its label placeholder, leaving the
@@ -342,5 +454,91 @@ mod tests {
         let r = RegexRedactor::new();
         assert_eq!(r.version(), REGEX_REDACTOR_VERSION);
         assert_eq!(r.name(), "regex");
+    }
+
+    // ---- Structured national / financial IDs ----
+
+    fn has_subtype(out: &RedactionOutput, subtype: &str) -> bool {
+        out.spans
+            .iter()
+            .any(|s| s.subtype.as_deref() == Some(subtype))
+    }
+
+    #[test]
+    fn iban_caught_with_subtype() {
+        let out = run("Invoice IBAN GB82 WEST 1234 5698 7654 32 — please pay");
+        assert!(has_subtype(&out, "iban"), "spans: {:?}", out.spans);
+        assert!(out.redacted.contains("[ID]"));
+    }
+
+    #[test]
+    fn iban_bad_checksum_rejected() {
+        // Last digit flipped → fails mod-97 → must not be flagged.
+        let out = run("Invoice IBAN GB82 WEST 1234 5698 7654 33 — please pay");
+        assert!(!has_subtype(&out, "iban"), "spans: {:?}", out.spans);
+    }
+
+    #[test]
+    fn weak_checksum_ids_need_context() {
+        // A bare 9-digit Luhn number is ambiguous — must NOT fire alone.
+        let bare = run("046 454 286");
+        assert!(!has_subtype(&bare, "canada_sin"), "spans: {:?}", bare.spans);
+        // Same number next to its label → recognized.
+        let labelled = run("social insurance number 046 454 286 on file");
+        assert!(
+            has_subtype(&labelled, "canada_sin"),
+            "spans: {:?}",
+            labelled.spans
+        );
+    }
+
+    #[test]
+    fn spain_dni_and_cpf_caught() {
+        assert!(has_subtype(&run("DNI 12345678Z verified"), "spain_dni"));
+        assert!(has_subtype(
+            &run("CPF 111.444.777-35 on record"),
+            "brazil_cpf"
+        ));
+        // Wrong control letter → mod-23 rejects.
+        assert!(!has_subtype(&run("DNI 12345678A verified"), "spain_dni"));
+    }
+
+    #[test]
+    fn aadhaar_verhoeff_caught() {
+        use crate::adapters::national_id::verhoeff_check_digit;
+        // Build a valid 12-digit Aadhaar so we don't bake in a literal
+        // that might be wrong under Verhoeff.
+        let base = [2u8, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4];
+        let cd = verhoeff_check_digit(&base);
+        let num: String = base
+            .iter()
+            .chain(std::iter::once(&cd))
+            .map(|d| (d + b'0') as char)
+            .collect();
+        let out = run(&format!("Aadhaar {num} issued"));
+        assert!(has_subtype(&out, "india_aadhaar"), "spans: {:?}", out.spans);
+    }
+
+    #[test]
+    fn imei_context_gated_else_card() {
+        // With its label, a 15-digit Luhn number is an IMEI.
+        assert!(has_subtype(&run("IMEI 490154203237518 reported"), "imei"));
+        // Bare, the same number falls through to the card catch-all.
+        assert!(has_subtype(&run("490154203237518"), "credit_card"));
+    }
+
+    #[test]
+    fn every_pattern_subtype_is_registered() {
+        // Guards against a detector emitting a sub-type the policy layer
+        // can't be configured to allow (drift between this file and
+        // span::KNOWN_SUBTYPES).
+        for pat in PATTERNS.iter() {
+            if let Some(st) = pat.subtype {
+                assert!(
+                    crate::span::KNOWN_SUBTYPES.contains(&st),
+                    "subtype {st:?} not in KNOWN_SUBTYPES"
+                );
+            }
+        }
     }
 }
