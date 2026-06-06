@@ -774,12 +774,14 @@ pub fn iccid(s: &str) -> bool {
 /// Base58Check: decode the base58 string and verify the 4-byte trailer
 /// equals the first 4 bytes of double-SHA-256 over version+payload. Shared
 /// by Bitcoin and Litecoin legacy addresses.
-fn base58check_ok(s: &str) -> bool {
+/// Base58Check over an arbitrary 58-char dictionary (Bitcoin or Ripple).
+/// `alphabet[0]` is the "zero" symbol that encodes leading zero bytes.
+fn base58check_alpha_ok(s: &str, alphabet: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
-    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let zero = alphabet[0];
     let mut bytes: Vec<u8> = vec![0];
     for ch in s.bytes() {
-        let val = match ALPHABET.iter().position(|&c| c == ch) {
+        let val = match alphabet.iter().position(|&c| c == ch) {
             Some(p) => p as u32,
             None => return false,
         };
@@ -795,7 +797,7 @@ fn base58check_ok(s: &str) -> bool {
         }
     }
     for ch in s.bytes() {
-        if ch == b'1' {
+        if ch == zero {
             bytes.push(0);
         } else {
             break;
@@ -808,6 +810,20 @@ fn base58check_ok(s: &str) -> bool {
     let (payload, checksum) = bytes.split_at(bytes.len() - 4);
     let h2 = Sha256::digest(Sha256::digest(payload));
     &h2[..4] == checksum
+}
+
+const BASE58_BTC: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+fn base58check_ok(s: &str) -> bool {
+    base58check_alpha_ok(s, BASE58_BTC)
+}
+
+/// XRP (Ripple) classic address: Base58Check over the Ripple dictionary
+/// (version byte 0x00 → leading `r`).
+pub fn xrp_address(s: &str) -> bool {
+    const RIPPLE: &[u8] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+    let s = s.trim();
+    (25..=35).contains(&s.len()) && s.starts_with('r') && base58check_alpha_ok(s, RIPPLE)
 }
 
 /// Bitcoin legacy address (P2PKH `1…` / P2SH `3…`), Base58Check. Bech32
@@ -1803,6 +1819,11 @@ mod tests {
         assert!(!btc_bech32_address(
             "xy1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
         ));
+        // XRP classic addresses (Base58Check, Ripple dictionary).
+        assert!(xrp_address("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"));
+        assert!(xrp_address("rrrrrrrrrrrrrrrrrrrrrhoLvTp")); // ACCOUNT_ZERO
+        assert!(!xrp_address("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTi")); // flipped tail
+        assert!(!xrp_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")); // BTC, not XRP
     }
 
     #[test]

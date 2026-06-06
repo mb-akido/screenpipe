@@ -1280,6 +1280,14 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             &[],
             Some(national_id::eth_address),
         ),
+        // XRP (Ripple) classic address — Base58Check, Ripple dictionary.
+        (
+            r"\br[1-9A-HJ-NP-Za-km-z]{24,34}\b",
+            SpanLabel::Id,
+            Some("xrp_address"),
+            &[],
+            Some(national_id::xrp_address),
+        ),
         // ---- cloud / developer credentials (distinctive prefix = self-
         // identifying; SpanLabel::Secret is always redacted regardless of
         // the per-category allow-list). These complement the prefixless
@@ -1505,6 +1513,38 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             r"\bpul-[0-9a-f]{40}\b",
             SpanLabel::Secret,
             Some("pulumi_token"),
+            &[],
+            None,
+        ),
+        // PostHog project API key: phc_ + 43.
+        (
+            r"\bphc_[0-9A-Za-z]{43}\b",
+            SpanLabel::Secret,
+            Some("posthog_project_key"),
+            &[],
+            None,
+        ),
+        // Docker Hub personal access token: dckr_pat_ + body.
+        (
+            r"\bdckr_pat_[0-9A-Za-z_-]{20,}\b",
+            SpanLabel::Secret,
+            Some("docker_hub_pat"),
+            &[],
+            None,
+        ),
+        // Slack app-level token: xapp-<ver>-<id>-<ts>-<64 hex>.
+        (
+            r"\bxapp-[0-9]-[A-Z0-9]+-[0-9]+-[0-9a-f]{64}\b",
+            SpanLabel::Secret,
+            Some("slack_app_token"),
+            &[],
+            None,
+        ),
+        // PyPI upload token (macaroon): pypi- + long base64url body.
+        (
+            r"\bpypi-[A-Za-z0-9_-]{50,}\b",
+            SpanLabel::Secret,
+            Some("pypi_token"),
             &[],
             None,
         ),
@@ -1890,7 +1930,19 @@ mod tests {
 
     #[test]
     fn cloud_credentials_batch2_caught() {
-        let cases: [(String, &str); 14] = [
+        let cases: [(String, &str); 18] = [
+            (format!("phc_{}", "a".repeat(43)), "posthog_project_key"),
+            (format!("dckr_pat_{}", "a".repeat(30)), "docker_hub_pat"),
+            (
+                format!(
+                    "xapp-1-A{}-{}-{}",
+                    "B".repeat(9),
+                    "1".repeat(13),
+                    "a".repeat(64)
+                ),
+                "slack_app_token",
+            ),
+            (format!("pypi-{}", "a".repeat(55)), "pypi_token"),
             (
                 format!("github_pat_{}", "a".repeat(82)),
                 "github_fine_grained_pat",
@@ -2236,7 +2288,7 @@ mod tests {
             seed
         };
 
-        let validators: [fn(&str) -> bool; 34] = [
+        let validators: [fn(&str) -> bool; 35] = [
             nid::luhn,
             nid::iban,
             nid::spain_dni,
@@ -2271,6 +2323,7 @@ mod tests {
             nid::btc_bech32_address,
             nid::litecoin_address,
             nid::eth_address,
+            nid::xrp_address,
         ];
 
         for i in 0..200_000u64 {

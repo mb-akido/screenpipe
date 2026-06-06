@@ -142,6 +142,7 @@ pub const KNOWN_SUBTYPES: &[&str] = &[
     "btc_bech32_address",
     "litecoin_address",
     "ethereum_address",
+    "xrp_address",
     // cloud / developer credentials (SpanLabel::Secret)
     "google_api_key",
     "gitlab_pat",
@@ -171,6 +172,10 @@ pub const KNOWN_SUBTYPES: &[&str] = &[
     "fly_io_token",
     "notion_token",
     "pulumi_token",
+    "posthog_project_key",
+    "docker_hub_pat",
+    "slack_app_token",
+    "pypi_token",
     // EU VAT + national IDs
     "germany_vat",
     "france_vat",

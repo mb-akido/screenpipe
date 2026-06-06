@@ -198,6 +198,8 @@ fn shape(subtype: &str, r: &mut Rng) -> String {
         "litecoin_address" => "LdP8Qox1VAhCzLJNqrr74YovaWYyNBUWvL".to_string(),
         // all-lowercase eth address has no checksum nibbles, always valid
         "ethereum_address" => format!("0x{}", (0..40).map(|_| r.hex()).collect::<String>()),
+        // valid Base58Check can't be brute-forced; documented XRP address
+        "xrp_address" => "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_string(),
         // cloud / developer credentials (hex/upper subset keeps each in the
         // vendor charset; the prefix is what the detector keys on).
         "google_api_key" => format!("AIza{}", (0..35).map(|_| r.hex()).collect::<String>()),
@@ -271,6 +273,15 @@ fn shape(subtype: &str, r: &mut Rng) -> String {
         "fly_io_token" => format!("fo1_{}", (0..43).map(|_| r.hex()).collect::<String>()),
         "notion_token" => format!("ntn_{}", (0..43).map(|_| r.hex()).collect::<String>()),
         "pulumi_token" => format!("pul-{}", (0..40).map(|_| r.hex()).collect::<String>()),
+        "posthog_project_key" => format!("phc_{}", (0..43).map(|_| r.hex()).collect::<String>()),
+        "docker_hub_pat" => format!("dckr_pat_{}", (0..30).map(|_| r.hex()).collect::<String>()),
+        "slack_app_token" => format!(
+            "xapp-1-{}-{}-{}",
+            (0..10).map(|_| r.upper()).collect::<String>(),
+            (0..13).map(|_| r.digit()).collect::<String>(),
+            (0..64).map(|_| r.hex()).collect::<String>()
+        ),
+        "pypi_token" => format!("pypi-{}", (0..55).map(|_| r.hex()).collect::<String>()),
         "imsi" => r.digits(15),
         "us_passport" => format!("{}{}", r.upper(), r.digits(8)),
         "icd10" => {
@@ -552,6 +563,7 @@ const CASES: &[(&str, &str)] = &[
     ("btc_bech32_address", ""),
     ("litecoin_address", ""),
     ("ethereum_address", ""),
+    ("xrp_address", ""),
     ("google_api_key", ""),
     ("gitlab_pat", ""),
     ("npm_token", ""),
@@ -580,6 +592,10 @@ const CASES: &[(&str, &str)] = &[
     ("fly_io_token", ""),
     ("notion_token", ""),
     ("pulumi_token", ""),
+    ("posthog_project_key", ""),
+    ("docker_hub_pat", ""),
+    ("slack_app_token", ""),
+    ("pypi_token", ""),
     ("imsi", "IMSI"),
     ("us_passport", "passport"),
     ("icd10", "diagnosis"),
