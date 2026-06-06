@@ -198,6 +198,42 @@ fn shape(subtype: &str, r: &mut Rng) -> String {
         "litecoin_address" => "LdP8Qox1VAhCzLJNqrr74YovaWYyNBUWvL".to_string(),
         // all-lowercase eth address has no checksum nibbles, always valid
         "ethereum_address" => format!("0x{}", (0..40).map(|_| r.hex()).collect::<String>()),
+        // cloud / developer credentials (hex/upper subset keeps each in the
+        // vendor charset; the prefix is what the detector keys on).
+        "google_api_key" => format!("AIza{}", (0..35).map(|_| r.hex()).collect::<String>()),
+        "gitlab_pat" => format!("glpat-{}", (0..20).map(|_| r.hex()).collect::<String>()),
+        "npm_token" => format!("npm_{}", (0..36).map(|_| r.hex()).collect::<String>()),
+        "sendgrid_api_key" => format!(
+            "SG.{}.{}",
+            (0..22).map(|_| r.hex()).collect::<String>(),
+            (0..43).map(|_| r.hex()).collect::<String>()
+        ),
+        "slack_webhook_url" => format!(
+            "https://hooks.slack.com/services/T{}/B{}/{}",
+            (0..10).map(|_| r.upper()).collect::<String>(),
+            (0..10).map(|_| r.upper()).collect::<String>(),
+            (0..24).map(|_| r.hex()).collect::<String>()
+        ),
+        "digitalocean_token" => format!("dop_v1_{}", (0..64).map(|_| r.hex()).collect::<String>()),
+        "doppler_token" => format!("dp.pt.{}", (0..42).map(|_| r.hex()).collect::<String>()),
+        "linear_api_key" => format!("lin_api_{}", (0..40).map(|_| r.hex()).collect::<String>()),
+        "postman_api_key" => format!(
+            "PMAK-{}-{}",
+            (0..24).map(|_| r.hex()).collect::<String>(),
+            (0..34).map(|_| r.hex()).collect::<String>()
+        ),
+        "shopify_token" => format!("shpat_{}", (0..32).map(|_| r.hex()).collect::<String>()),
+        "stripe_webhook_secret" => {
+            format!("whsec_{}", (0..40).map(|_| r.hex()).collect::<String>())
+        }
+        "square_oauth_token" => format!("sq0atp-{}", (0..30).map(|_| r.hex()).collect::<String>()),
+        "databricks_token" => format!("dapi{}", (0..32).map(|_| r.hex()).collect::<String>()),
+        "age_secret_key" => {
+            format!(
+                "AGE-SECRET-KEY-1{}",
+                (0..58).map(|_| r.upper()).collect::<String>()
+            )
+        }
         "imsi" => r.digits(15),
         "us_passport" => format!("{}{}", r.upper(), r.digits(8)),
         "icd10" => {
@@ -479,6 +515,20 @@ const CASES: &[(&str, &str)] = &[
     ("btc_bech32_address", ""),
     ("litecoin_address", ""),
     ("ethereum_address", ""),
+    ("google_api_key", ""),
+    ("gitlab_pat", ""),
+    ("npm_token", ""),
+    ("sendgrid_api_key", ""),
+    ("slack_webhook_url", ""),
+    ("digitalocean_token", ""),
+    ("doppler_token", ""),
+    ("linear_api_key", ""),
+    ("postman_api_key", ""),
+    ("shopify_token", ""),
+    ("stripe_webhook_secret", ""),
+    ("square_oauth_token", ""),
+    ("databricks_token", ""),
+    ("age_secret_key", ""),
     ("imsi", "IMSI"),
     ("us_passport", "passport"),
     ("icd10", "diagnosis"),

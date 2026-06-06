@@ -1280,6 +1280,122 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             &[],
             Some(national_id::eth_address),
         ),
+        // ---- cloud / developer credentials (distinctive prefix = self-
+        // identifying; SpanLabel::Secret is always redacted regardless of
+        // the per-category allow-list). These complement the prefixless
+        // secrets already in `raw` (OpenAI/Stripe/GitHub/Slack/AWS/JWT). ----
+        // Google API key (Maps/Firebase/GCP): "AIza" + 35.
+        (
+            r"\bAIza[0-9A-Za-z_-]{35}\b",
+            SpanLabel::Secret,
+            Some("google_api_key"),
+            &[],
+            None,
+        ),
+        // GitLab personal access token.
+        (
+            r"\bglpat-[0-9A-Za-z_-]{20}\b",
+            SpanLabel::Secret,
+            Some("gitlab_pat"),
+            &[],
+            None,
+        ),
+        // npm automation/access token.
+        (
+            r"\bnpm_[0-9A-Za-z]{36}\b",
+            SpanLabel::Secret,
+            Some("npm_token"),
+            &[],
+            None,
+        ),
+        // SendGrid API key: SG.<22>.<43>.
+        (
+            r"\bSG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}\b",
+            SpanLabel::Secret,
+            Some("sendgrid_api_key"),
+            &[],
+            None,
+        ),
+        // Slack incoming-webhook URL (carries the secret in the path).
+        (
+            r"https://hooks\.slack\.com/services/T[0-9A-Z]{8,12}/B[0-9A-Z]{8,12}/[0-9A-Za-z]{24}",
+            SpanLabel::Secret,
+            Some("slack_webhook_url"),
+            &[],
+            None,
+        ),
+        // DigitalOcean PAT / OAuth / refresh token: do[opr]_v1_ + 64 hex.
+        (
+            r"\bdo[opr]_v1_[0-9a-f]{64}\b",
+            SpanLabel::Secret,
+            Some("digitalocean_token"),
+            &[],
+            None,
+        ),
+        // Doppler service/CLI/SCIM token: dp.<kind>. + 40-44 alnum.
+        (
+            r"\bdp\.(?:pt|st|ct|scim|audit|sa)\.[0-9A-Za-z]{40,44}\b",
+            SpanLabel::Secret,
+            Some("doppler_token"),
+            &[],
+            None,
+        ),
+        // Linear API key.
+        (
+            r"\blin_api_[0-9A-Za-z]{40}\b",
+            SpanLabel::Secret,
+            Some("linear_api_key"),
+            &[],
+            None,
+        ),
+        // Postman API key: PMAK-<24 hex>-<34 hex>.
+        (
+            r"\bPMAK-[0-9a-fA-F]{24}-[0-9a-fA-F]{34}\b",
+            SpanLabel::Secret,
+            Some("postman_api_key"),
+            &[],
+            None,
+        ),
+        // Shopify access token: shp(at|ca|pa|ss)_ + 32 hex.
+        (
+            r"\bshp(?:at|ca|pa|ss)_[0-9a-fA-F]{32}\b",
+            SpanLabel::Secret,
+            Some("shopify_token"),
+            &[],
+            None,
+        ),
+        // Stripe webhook signing secret.
+        (
+            r"\bwhsec_[0-9A-Za-z]{32,48}\b",
+            SpanLabel::Secret,
+            Some("stripe_webhook_secret"),
+            &[],
+            None,
+        ),
+        // Square OAuth token: sq0(atp|csp)- + 22-43.
+        (
+            r"\bsq0(?:atp|csp)-[0-9A-Za-z_-]{22,43}\b",
+            SpanLabel::Secret,
+            Some("square_oauth_token"),
+            &[],
+            None,
+        ),
+        // Databricks personal access token: dapi + 32 hex.
+        (
+            r"\bdapi[0-9a-f]{32}\b",
+            SpanLabel::Secret,
+            Some("databricks_token"),
+            &[],
+            None,
+        ),
+        // age encryption secret key (Bech32-ish, fixed length).
+        (
+            r"\bAGE-SECRET-KEY-1[0-9A-Z]{58}\b",
+            SpanLabel::Secret,
+            Some("age_secret_key"),
+            &[],
+            None,
+        ),
         // IMSI — 15 digits, context-gated (shares the shape with IMEI).
         (r"\b\d{15}\b", SpanLabel::Id, Some("imsi"), &["imsi"], None),
         // US passport — 1 alnum + 8 digits, context-gated.
@@ -1592,6 +1708,67 @@ mod tests {
         let out = run("export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE");
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].label, SpanLabel::Secret);
+    }
+
+    #[test]
+    fn cloud_credentials_caught() {
+        // Synthetic (non-live) instances at each vendor's documented length.
+        let a35 = "A".repeat(35);
+        let cases: [(String, &str); 14] = [
+            (format!("AIza{a35}"), "google_api_key"),
+            (format!("glpat-{}", "a".repeat(20)), "gitlab_pat"),
+            (format!("npm_{}", "a".repeat(36)), "npm_token"),
+            (
+                format!("SG.{}.{}", "a".repeat(22), "b".repeat(43)),
+                "sendgrid_api_key",
+            ),
+            (
+                format!(
+                    "https://hooks.slack.com/services/T{}/B{}/{}",
+                    "A".repeat(10),
+                    "B".repeat(10),
+                    "a".repeat(24)
+                ),
+                "slack_webhook_url",
+            ),
+            (format!("dop_v1_{}", "a".repeat(64)), "digitalocean_token"),
+            (format!("dp.pt.{}", "a".repeat(42)), "doppler_token"),
+            (format!("lin_api_{}", "a".repeat(40)), "linear_api_key"),
+            (
+                format!("PMAK-{}-{}", "a".repeat(24), "b".repeat(34)),
+                "postman_api_key",
+            ),
+            (format!("shpat_{}", "a".repeat(32)), "shopify_token"),
+            (format!("whsec_{}", "a".repeat(40)), "stripe_webhook_secret"),
+            (format!("sq0atp-{}", "a".repeat(30)), "square_oauth_token"),
+            (format!("dapi{}", "a".repeat(32)), "databricks_token"),
+            (
+                format!("AGE-SECRET-KEY-1{}", "A".repeat(58)),
+                "age_secret_key",
+            ),
+        ];
+        for (tok, sub) in &cases {
+            let out = run(&format!("cred={tok} end"));
+            assert!(
+                out.spans
+                    .iter()
+                    .any(|s| s.label == SpanLabel::Secret && s.subtype.as_deref() == Some(*sub)),
+                "missed {sub} in {tok}"
+            );
+        }
+        // Near-misses (too short / wrong prefix) must not raise a Secret.
+        for neg in [
+            format!("AIza{}", "A".repeat(20)),
+            format!("glpat-{}", "a".repeat(10)),
+            "npm_tooShort".to_string(),
+            format!("dapi{}", "a".repeat(20)),
+        ] {
+            let out = run(&format!("x {neg} y"));
+            assert!(
+                out.spans.iter().all(|s| s.label != SpanLabel::Secret),
+                "false secret on {neg}"
+            );
+        }
     }
 
     #[test]
