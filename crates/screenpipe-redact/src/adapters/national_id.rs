@@ -857,6 +857,76 @@ pub fn eth_address(s: &str) -> bool {
     true
 }
 
+/// BIP-173 / BIP-350 BCH checksum over the 5-bit symbol stream.
+fn bech32_polymod(values: &[u8]) -> u32 {
+    const GEN: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
+    let mut chk: u32 = 1;
+    for &v in values {
+        let top = chk >> 25;
+        chk = ((chk & 0x1ff_ffff) << 5) ^ v as u32;
+        for (i, g) in GEN.iter().enumerate() {
+            if (top >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    chk
+}
+
+/// Bitcoin SegWit (BIP-173 bech32) / Taproot (BIP-350 bech32m) address.
+/// Verifies the BCH checksum and selects the constant by witness version
+/// (v0 = bech32, v1..=16 = bech32m). hrp restricted to `bc`/`tb`. Mixed
+/// case is rejected per BIP-173.
+pub fn btc_bech32_address(s: &str) -> bool {
+    let s = s.trim();
+    let has_upper = s.bytes().any(|b| b.is_ascii_uppercase());
+    let has_lower = s.bytes().any(|b| b.is_ascii_lowercase());
+    if has_upper && has_lower {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    let pos = match lower.rfind('1') {
+        Some(p) => p,
+        None => return false,
+    };
+    let (hrp, rest) = (&lower[..pos], &lower[pos + 1..]);
+    if hrp != "bc" && hrp != "tb" {
+        return false;
+    }
+    if rest.len() < 7 || rest.len() > 87 {
+        return false;
+    }
+    const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut values: Vec<u8> = Vec::with_capacity(rest.len());
+    for c in rest.bytes() {
+        match CHARSET.iter().position(|&x| x == c) {
+            Some(v) => values.push(v as u8),
+            None => return false,
+        }
+    }
+    let witver = values[0];
+    if witver > 16 {
+        return false;
+    }
+    let mut poly: Vec<u8> = Vec::with_capacity(hrp.len() * 2 + 1 + values.len());
+    for &b in hrp.as_bytes() {
+        poly.push(b >> 5);
+    }
+    poly.push(0);
+    for &b in hrp.as_bytes() {
+        poly.push(b & 31);
+    }
+    poly.extend_from_slice(&values);
+    let expected: u32 = if witver == 0 { 1 } else { 0x2bc8_30a3 };
+    bech32_polymod(&poly) == expected
+}
+
 // ---- shared checksum helpers (EU batch) ----
 
 /// Big-number `digits mod m`, computed digit-by-digit.
@@ -1711,6 +1781,28 @@ mod tests {
         assert!(btc_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"));
         assert!(litecoin_address("LdP8Qox1VAhCzLJNqrr74YovaWYyNBUWvL"));
         assert!(!litecoin_address("LdP8Qox1VAhCzLJNqrr74YovaWYyNBUWvX"));
+        // BIP-173 bech32 (SegWit v0) + uppercase-uniform variant.
+        assert!(btc_bech32_address(
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        ));
+        assert!(btc_bech32_address(
+            "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4"
+        ));
+        // BIP-350 bech32m (Taproot v1).
+        assert!(btc_bech32_address(
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"
+        ));
+        // flipped checksum char, mixed case, wrong hrp, and a v0 address
+        // re-checksummed as bech32m (witver/const mismatch) all fail.
+        assert!(!btc_bech32_address(
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"
+        ));
+        assert!(!btc_bech32_address(
+            "bc1Qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        ));
+        assert!(!btc_bech32_address(
+            "xy1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        ));
     }
 
     #[test]

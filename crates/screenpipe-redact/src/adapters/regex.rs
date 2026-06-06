@@ -1262,6 +1262,16 @@ static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
             &[],
             Some(national_id::litecoin_address),
         ),
+        // Bitcoin SegWit/Taproot — bech32/bech32m (bc1.../tb1...), BCH
+        // checksum verified. Charset is uniform-case; validator rejects
+        // mixed case per BIP-173.
+        (
+            r"\b(?:bc1|tb1|BC1|TB1)[AC-HJ-NP-Zac-hj-np-z02-9]{6,87}\b",
+            SpanLabel::Id,
+            Some("btc_bech32_address"),
+            &[],
+            Some(national_id::btc_bech32_address),
+        ),
         // Ethereum address — 0x + 40 hex, EIP-55 Keccak checksum.
         (
             r"\b0x[0-9a-fA-F]{40}\b",
@@ -1858,7 +1868,7 @@ mod tests {
             seed
         };
 
-        let validators: [fn(&str) -> bool; 31] = [
+        let validators: [fn(&str) -> bool; 34] = [
             nid::luhn,
             nid::iban,
             nid::spain_dni,
@@ -1890,6 +1900,9 @@ mod tests {
             nid::ipv6,
             nid::iccid,
             nid::btc_address,
+            nid::btc_bech32_address,
+            nid::litecoin_address,
+            nid::eth_address,
         ];
 
         for i in 0..200_000u64 {

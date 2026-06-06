@@ -193,6 +193,8 @@ fn shape(subtype: &str, r: &mut Rng) -> String {
         "iccid" => format!("89{}", r.digits(17)),
         // valid base58check can't be brute-forced; use a known-valid address
         "btc_address" => "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(),
+        // valid bech32 checksum can't be brute-forced; BIP-173 P2WPKH vector
+        "btc_bech32_address" => "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
         "litecoin_address" => "LdP8Qox1VAhCzLJNqrr74YovaWYyNBUWvL".to_string(),
         // all-lowercase eth address has no checksum nibbles, always valid
         "ethereum_address" => format!("0x{}", (0..40).map(|_| r.hex()).collect::<String>()),
@@ -474,6 +476,7 @@ const CASES: &[(&str, &str)] = &[
     ("ipv6", ""),
     ("iccid", "ICCID"),
     ("btc_address", ""),
+    ("btc_bech32_address", ""),
     ("litecoin_address", ""),
     ("ethereum_address", ""),
     ("imsi", "IMSI"),
@@ -621,6 +624,8 @@ fn run_hard_negatives() {
         "amount 1234567890123456 transferred",
         "the business plan is using a single sink node",
         "routing through 123456789 servers in the cluster",
+        "addr bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5 bad checksum",
+        "eth 0x5aaeb6053F3E94C9b9A09f33669435E7Ef1BeAed wrong eip55 case",
     ];
     let structured: Vec<&str> = CASES.iter().map(|c| c.0).collect();
     let mut violations = 0;
