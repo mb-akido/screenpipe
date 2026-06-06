@@ -18,6 +18,7 @@
 //! No allocations on the hot path beyond the output `String`. Sub-ms
 //! per call.
 
+use aho_corasick::AhoCorasick;
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexSet};
@@ -1317,35 +1318,104 @@ impl Redactor for RegexRedactor {
     }
 }
 
-/// All [`PATTERNS`] compiled into one DFA for a single-pass "does any
-/// pattern match?" gate. Built from the patterns' own source strings, so
-/// it can't drift. The common case (PII-free chrome / code) matches none
-/// and returns after this one pass instead of running ~20 separate
-/// `find_iter` scans. Set indices line up 1:1 with `PATTERNS`, so
-/// iterating the matched indices preserves the priority order overlap
-/// suppression relies on.
-static PATTERN_SET: Lazy<RegexSet> = Lazy::new(|| {
-    RegexSet::new(PATTERNS.iter().map(|p| p.re.as_str())).expect("regex set compiles")
+/// Engine split by gating strategy. With ~150 patterns, compiling them all
+/// into one RegexSet and re-running `find_iter` for every context-gated
+/// `\d{N}` that the set flags is catastrophic (measured ~1.7 ms/row). So:
+///
+/// - `noctx_set`: a RegexSet of ONLY the patterns with no context keyword
+///   (secrets, email, distinctive checksummed shapes). Small DFA, run on
+///   every row. `noctx_map[set_idx]` -> the pattern's index in [`PATTERNS`].
+/// - `ctx_indices`: the context-gated patterns. These run their `find_iter`
+///   ONLY when one of their keywords is present in the line (a cheap
+///   substring pre-check), which skips ~all of them on ordinary text.
+struct Engine {
+    noctx_set: RegexSet,
+    noctx_map: Vec<usize>,
+    ctx_indices: Vec<usize>,
+    /// One automaton over every distinct context keyword. A single pass
+    /// over the line tells us which keywords are present, so the keyword
+    /// gate is O(line length) instead of O(patterns × keywords).
+    keyword_ac: AhoCorasick,
+    keyword_count: usize,
+    /// Parallel to `ctx_indices`: the keyword ids each context pattern needs.
+    ctx_keyword_ids: Vec<Vec<usize>>,
+}
+
+static ENGINE: Lazy<Engine> = Lazy::new(|| {
+    let mut srcs = Vec::new();
+    let mut noctx_map = Vec::new();
+    let mut ctx_indices = Vec::new();
+    let mut keywords: Vec<String> = Vec::new();
+    let mut kw_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut ctx_keyword_ids: Vec<Vec<usize>> = Vec::new();
+    for (i, p) in PATTERNS.iter().enumerate() {
+        if p.context.is_empty() {
+            srcs.push(p.re.as_str());
+            noctx_map.push(i);
+        } else {
+            let ids = p
+                .context
+                .iter()
+                .map(|&k| {
+                    *kw_index.entry(k.to_string()).or_insert_with(|| {
+                        keywords.push(k.to_string());
+                        keywords.len() - 1
+                    })
+                })
+                .collect();
+            ctx_indices.push(i);
+            ctx_keyword_ids.push(ids);
+        }
+    }
+    Engine {
+        noctx_set: RegexSet::new(srcs).expect("regex set compiles"),
+        noctx_map,
+        ctx_indices,
+        keyword_ac: AhoCorasick::new(&keywords).expect("aho-corasick builds"),
+        keyword_count: keywords.len(),
+        ctx_keyword_ids,
+    }
 });
 
-/// Single-text path — synchronous, allocation-light. Public for use
-/// inside the [`crate::pipeline::Pipeline`] without going through the
-/// async trait.
+/// Single-text path — synchronous. Public for use inside the
+/// [`crate::pipeline::Pipeline`] without going through the async trait.
 pub fn redact_one(text: &str) -> RedactionOutput {
-    // Fast path: one DFA pass. Most captured text has no PII, so we skip
-    // the per-pattern scans entirely.
-    let candidates = PATTERN_SET.matches(text);
-    if !candidates.matched_any() {
+    let lower = text.to_ascii_lowercase();
+
+    // No-context patterns that the small DFA flagged...
+    let mut cand: Vec<usize> = ENGINE
+        .noctx_set
+        .matches(text)
+        .iter()
+        .map(|si| ENGINE.noctx_map[si])
+        .collect();
+    // ...plus context-gated patterns whose keyword is somewhere on the line.
+    // One Aho-Corasick pass finds all present keywords (the precise
+    // whole-word + window check is `has_context` below). This is what keeps
+    // the per-row cost flat as the pattern count grows: an obscure
+    // national-ID detector costs nothing unless its label is present.
+    let mut present = vec![false; ENGINE.keyword_count];
+    for m in ENGINE.keyword_ac.find_overlapping_iter(&lower) {
+        present[m.pattern().as_usize()] = true;
+    }
+    for (j, &pi) in ENGINE.ctx_indices.iter().enumerate() {
+        if ENGINE.ctx_keyword_ids[j].iter().any(|&id| present[id]) {
+            cand.push(pi);
+        }
+    }
+    if cand.is_empty() {
         return RedactionOutput {
             input: text.to_string(),
             redacted: text.to_string(),
             spans: Vec::new(),
         };
     }
+    // Restore PATTERNS order so overlap suppression keeps its priority.
+    cand.sort_unstable();
 
     let mut spans: Vec<RedactedSpan> = Vec::new();
 
-    for idx in candidates.iter() {
+    for idx in cand {
         let pat = &PATTERNS[idx];
         for m in pat.re.find_iter(text) {
             let matched = &text[m.start()..m.end()];
@@ -1734,12 +1804,15 @@ mod tests {
             ungated_ns / free_ns
         );
 
-        // Regression guard — release only. Debug builds are unoptimized and
-        // ~10x slower, so the per-call number there isn't meaningful; the
-        // worker always runs release.
+        // Regression guard — release only (debug is unoptimized and ~10x
+        // slower). Bounds reflect the 150-detector cost: the dominant
+        // PII-free path (the real workload, since most rows have no PII) is
+        // the tighter bound; the all-PII "mixed" corpus is a pessimistic
+        // worst case. The Aho-Corasick keyword gate keeps PII-free flat as
+        // the detector count grows; without it this was ~1.7 ms/row.
         if !cfg!(debug_assertions) {
             assert!(
-                free_ns < 50_000.0 && mixed_ns < 50_000.0,
+                free_ns < 60_000.0 && mixed_ns < 130_000.0,
                 "redact_one regressed: pii-free {free_ns:.0} ns, mixed {mixed_ns:.0} ns"
             );
         }

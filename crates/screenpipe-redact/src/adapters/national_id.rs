@@ -1763,13 +1763,13 @@ mod tests {
         assert!(!israel_teudat_zehut("000000019"));
         // VERIFY-flagged algorithms (no trustworthy public vector): prove
         // non-degenerate by constructing a value each validator accepts.
-        for (v, len) in [
-            (japan_my_number as fn(&str) -> bool, 12usize),
-            (thailand_national_id, 13),
-            (argentina_cuit, 11),
-            (colombia_nit, 10),
-            (uae_emirates_id, 15),
-            (saudi_arabia_id, 10),
+        for (v, len, prefix) in [
+            (japan_my_number as fn(&str) -> bool, 12usize, ""),
+            (thailand_national_id, 13, ""),
+            (argentina_cuit, 11, ""),
+            (colombia_nit, 10, ""),
+            (uae_emirates_id, 15, "784"),
+            (saudi_arabia_id, 10, "1"),
         ] {
             let mut seed = 0x51EDu64;
             let mut hit = false;
@@ -1777,15 +1777,10 @@ mod tests {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                let s: String = (0..len)
+                let body: String = (0..len - prefix.len())
                     .map(|i| (b'0' + (seed.rotate_left(i as u32 * 3) % 10) as u8) as char)
                     .collect();
-                let s = if v as usize == uae_emirates_id as usize {
-                    format!("784{}", &s[3..])
-                } else {
-                    s
-                };
-                if v(&s) {
+                if v(&format!("{prefix}{body}")) {
                     hit = true;
                     break;
                 }
