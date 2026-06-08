@@ -14,12 +14,14 @@ import {
   FileText,
   Globe,
   HardDrive,
+  History,
   Plug,
   Search,
   TerminalSquare,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SourceCitation, SourceCitationKind } from "@/lib/source-citations";
+import { jumpToTimelineMoment } from "@/lib/timeline-navigation";
 
 interface SourceCitationFooterProps {
   citations: SourceCitation[];
@@ -146,6 +148,10 @@ function SourceCitationRow({ citation }: { citation: SourceCitation }) {
   const Icon = KIND_ICON[citation.kind] ?? FileText;
   const kindLabel = KIND_LABEL[citation.kind] ?? citation.kind;
   const canOpen = Boolean(citation.href);
+  // Local screen captures carry a timestamp instead of an href — clicking jumps
+  // into the timeline at that moment rather than opening an external link.
+  const canJump = !canOpen && Boolean(citation.timestamp);
+  const interactive = canOpen || canJump;
 
   const inner = (
     <>
@@ -159,6 +165,7 @@ function SourceCitationRow({ citation }: { citation: SourceCitation }) {
             {kindLabel}
           </span>
           {canOpen && <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground/70" />}
+          {canJump && <History className="h-3 w-3 shrink-0 text-muted-foreground/70" />}
         </span>
         {citation.subtitle && (
           <span className="mt-0.5 block break-words text-muted-foreground">{citation.subtitle}</span>
@@ -167,7 +174,7 @@ function SourceCitationRow({ citation }: { citation: SourceCitation }) {
     </>
   );
 
-  if (!canOpen) {
+  if (!interactive) {
     return (
       <div className="flex min-w-0 items-start gap-2 rounded-md border border-border/40 bg-muted/20 px-2 py-1.5">
         {inner}
@@ -178,7 +185,12 @@ function SourceCitationRow({ citation }: { citation: SourceCitation }) {
   return (
     <button
       type="button"
+      title={canJump ? "open in timeline" : undefined}
       onClick={() => {
+        if (canJump && citation.timestamp) {
+          void jumpToTimelineMoment(citation.timestamp);
+          return;
+        }
         void openUrl(citation.href!);
       }}
       className="flex min-w-0 items-start gap-2 rounded-md border border-border/40 bg-muted/20 px-2 py-1.5 text-left transition-colors hover:border-border/70 hover:bg-muted/35"
