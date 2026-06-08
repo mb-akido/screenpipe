@@ -318,9 +318,10 @@ struct TapCallbackCtx {
 // vs "captures real audio" without forcing a debug rebuild.
 //
 // Callbacks also feed the silence watchdog in the spawn thread, which
-// triggers a rebuild if the tap delivers only zeros for too long (typical
-// symptom when the aggregate's sub-device goes idle because the user's
-// per-app output routing bypasses the system default).
+// triggers a rebuild if the tap delivers only zeros for too long. With the
+// tap-only aggregate this should be rare (the tap clocks itself rather than a
+// physical output device), so sustained zeros now mean a wedged tap, not the
+// old "call audio routed away from the anchored device" failure.
 static TAP_CALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAP_LAST_LOG_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAP_MAX_AMP_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -451,28 +452,15 @@ impl Drop for ProcessTapCapture {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Build a fresh Process Tap + aggregate device against the current default
-/// output. Returns the capture handle, its audio config, the UID of the
-/// device it's anchored to (so callers can detect when the default changes),
-/// and the exclusion snapshot the tap was built with (so callers can detect
-/// when the exclusion list drifts and a rebuild is needed).
+/// Build a fresh Process Tap + tap-only aggregate device. Returns the capture
+/// handle, its audio config, and the exclusion snapshot the tap was built with
+/// (so callers can detect when the exclusion list drifts and a rebuild is
+/// needed). The aggregate has no physical sub-device, so it is not bound to any
+/// output route.
 fn build_capture(
     tx: broadcast::Sender<Vec<f32>>,
     is_disconnected: Arc<AtomicBool>,
-) -> Result<(
-    ProcessTapCapture,
-    AudioStreamConfig,
-    String,
-    exclusions::Snapshot,
-)> {
-    let output_device = ca::System::default_output_device()
-        .map_err(|s| anyhow!("No default output device: {:?}", s))?;
-    let output_uid = output_device
-        .uid()
-        .map_err(|s| anyhow!("Failed to get output device UID: {:?}", s))?;
-    let output_uid_str = output_uid.to_string();
-    debug!("Process Tap: anchoring to '{}'", output_uid_str);
-
+) -> Result<(ProcessTapCapture, AudioStreamConfig, exclusions::Snapshot)> {
     let snapshot = exclusions::snapshot();
     let excluded_array = exclusions::build_exclusion_array(&snapshot.audio_object_ids);
     if !snapshot.bundle_ids.is_empty() {
@@ -497,19 +485,30 @@ fn build_capture(
         .map_err(|s| anyhow!("Failed to read tap format: {:?}", s))?;
     let channels = asbd.channels_per_frame as u16;
 
-    let sub_device =
-        cf::DictionaryOf::with_keys_values(&[sub_keys::uid()], &[output_uid.as_type_ref()]);
     let tap_uid = tap
         .uid()
         .map_err(|s| anyhow!("Failed to get tap UID: {:?}", s))?;
     let sub_tap = cf::DictionaryOf::with_keys_values(&[sub_keys::uid()], &[tap_uid.as_type_ref()]);
+
+    // Tap-only aggregate: an EMPTY sub-device list and NO main sub-device, so
+    // the tap itself is the aggregate's only timing source. The earlier design
+    // anchored the aggregate to the system default output device (the AudioCap
+    // pattern: main_sub_device + that device in the sub-device list). When an
+    // app routed its output per-app somewhere else (Zoom/Meet/Teams → AirPods,
+    // or AirPods used as both mic and speaker over HFP), the anchored sub-device
+    // received only zeros, so we recorded the user's mic but none of the other
+    // call participants for the whole meeting. With no physical sub-device the
+    // tap follows the tapped processes' rendered audio wherever it is routed, so
+    // capture is immune to per-app routing and default-device changes. (AudioTee
+    // pattern; Apple "Capturing system audio with Core Audio taps".)
+    let empty_sub_devices =
+        cf::ArrayOf::from_slice(&[] as &[&cf::DictionaryOf<cf::String, cf::Type>]);
     let agg_desc = cf::DictionaryOf::with_keys_values(
         &[
             agg_keys::is_private(),
             agg_keys::is_stacked(),
             agg_keys::tap_auto_start(),
             agg_keys::name(),
-            agg_keys::main_sub_device(),
             agg_keys::uid(),
             agg_keys::sub_device_list(),
             agg_keys::tap_list(),
@@ -519,21 +518,17 @@ fn build_capture(
             cf::Boolean::value_false(),
             cf::Boolean::value_true(),
             cf::str!(c"ScreenpipeProcessTap"),
-            &output_uid,
             &cf::Uuid::new().to_cf_string(),
-            &cf::ArrayOf::from_slice(&[sub_device.as_ref()]),
+            empty_sub_devices.as_ref(),
             &cf::ArrayOf::from_slice(&[sub_tap.as_ref()]),
         ],
     );
     let agg_device = ca::AggregateDevice::with_desc(&agg_desc)
         .map_err(|s| anyhow!("Failed to create aggregate device: {:?}", s))?;
 
-    // Use the aggregate device's nominal sample rate, not the tap's asbd.
-    // The aggregate is anchored to the output device (e.g. headphones), and its
-    // rate reflects what's actually being delivered. When the output device runs
-    // at 96kHz (common for headphone DACs), asbd may still report 48kHz, causing
-    // the recording pipeline to interpret 1.44M samples as 30s @ 48kHz when
-    // they're actually 15s @ 96kHz — produces files that play at 2x slowmo.
+    // Sample rate comes from the tap now (the aggregate has no physical sub-
+    // device to inherit a rate from). Prefer the aggregate's nominal rate and
+    // fall back to the tap's asbd; for a tap-only aggregate the two agree.
     let sample_rate = agg_device.nominal_sample_rate().unwrap_or(asbd.sample_rate);
     info!(
         "Process Tap: {:.0} Hz (asbd reported {:.0} Hz), {} ch, {} bit",
@@ -561,16 +556,18 @@ fn build_capture(
         _ctx_ptr: ctx_ptr,
     };
 
-    Ok((capture, config, output_uid_str, snapshot))
+    Ok((capture, config, snapshot))
 }
 
 /// Create and start a CoreAudio Process Tap for system audio capture.
 ///
 /// Returns the audio config and a thread handle. The thread keeps capture
-/// resources alive until `is_disconnected` flips, and **re-anchors the tap
-/// when the user switches the default output device** (speakers → AirPods,
-/// etc.). Without this, the aggregate device stays bound to the old sub-
-/// device UID and captures silence after a switch.
+/// resources alive until `is_disconnected` flips, watches the per-app
+/// exclusion list for drift, and runs a silence watchdog as a backstop. The
+/// aggregate is tap-only (see `build_capture`), so it does not need to
+/// re-anchor when the default output device changes: the tap follows the
+/// tapped processes' audio wherever the user routes output, which is what
+/// fixes meeting capture when call audio goes to a Bluetooth headset.
 ///
 /// `_is_running` is accepted for signature parity with the cpal path but
 /// deliberately not read — see the TapCallbackCtx comment.
@@ -580,17 +577,14 @@ pub fn spawn_process_tap_capture(
     is_disconnected: Arc<AtomicBool>,
 ) -> Result<(AudioStreamConfig, tokio::task::JoinHandle<()>)> {
     info!("Creating CoreAudio Process Tap for system audio");
-    let (capture, config, initial_uid, initial_snapshot) =
-        build_capture(tx.clone(), is_disconnected.clone())?;
+    let (capture, config, initial_snapshot) = build_capture(tx.clone(), is_disconnected.clone())?;
     info!(
-        "Process Tap capture started (device: {}, exclusions: {})",
-        initial_uid,
+        "Process Tap capture started (exclusions: {})",
         initial_snapshot.bundle_ids.len()
     );
 
     let handle = tokio::task::spawn_blocking(move || {
         let mut current: Option<ProcessTapCapture> = Some(capture);
-        let mut current_uid = initial_uid;
         let mut current_snapshot = initial_snapshot;
 
         // ~500ms poll: responsive enough that a device switch is inaudible
@@ -598,15 +592,12 @@ pub fn spawn_process_tap_capture(
         // enough that we don't hammer CoreAudio.
         const POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
-        // Silence watchdog — if the tap runs for this long with zero non-
-        // silent audio (AND the callback is firing, so it's not just that
-        // the IO proc stalled), rebuild the aggregate once. This catches
-        // the "tap anchored to BuiltInSpeaker while all app audio is
-        // routed to AirPods" failure mode reported on v2.4.46. The
-        // tap runs happily, the callback fires, but every buffer is
-        // zeros because the aggregate's sub-device has no signal and the
-        // global-tap → aggregate delivery path stays mute. See the
-        // pseudo-silent-for-a-whole-call reports around 2026-04-24.
+        // Silence watchdog backstop. The tap-only aggregate clocks off the tap
+        // itself, so it no longer goes silent when the user routes call audio
+        // away from the system default output (the v2.4.46 "recorded my mic but
+        // none of the other participants" failure). But a tap can still wedge in
+        // rare cases (a CoreAudio glitch, a sleep/wake hiccup), firing callbacks
+        // with all-zero buffers. If that persists this long, rebuild once.
         const WATCHDOG_SILENCE_SECS: u64 = 45;
         // Peak f32 amplitude below this counts as "silent enough to
         // rebuild". Legit call audio peaks at ~0.05–0.5; this threshold
@@ -614,8 +605,7 @@ pub fn spawn_process_tap_capture(
         const SILENCE_AMP_EPS: f32 = 0.002;
         // After a rebuild, give the tap this long to deliver real audio
         // before we consider another rebuild. Avoids ping-pong when the
-        // actual cause is that nothing is playing (e.g. user isn't in a
-        // call) rather than a broken anchor.
+        // actual cause is that nothing is playing (e.g. user isn't in a call).
         const REBUILD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
         let mut silence_started: Option<std::time::Instant> = None;
@@ -633,15 +623,11 @@ pub fn spawn_process_tap_capture(
                 silence_started = None;
             } else if window_callbacks > 0 {
                 // Callback IS firing — buffers are just silent. Start (or
-                // continue) the silence window.
+                // continue) the silence window. window_callbacks == 0 means
+                // nothing is playing (not a wedged tap), so we leave it alone
+                // rather than rebuild on a quiet machine.
                 silence_started.get_or_insert_with(std::time::Instant::now);
             }
-            // If window_callbacks == 0, the IO proc isn't firing at all —
-            // that's a different failure (handled by the next default-
-            // output check and/or logged by the main diagnostic tick).
-            // We don't trigger rebuild on pure stall because the existing
-            // device-change path already covers it, and rebuilding when
-            // the device is genuinely asleep will just fail.
 
             let should_rebuild_for_silence = silence_started
                 .map(|t| t.elapsed().as_secs() >= WATCHDOG_SILENCE_SECS)
@@ -649,18 +635,6 @@ pub fn spawn_process_tap_capture(
                 && last_rebuild
                     .map(|t| t.elapsed() >= REBUILD_COOLDOWN)
                     .unwrap_or(true);
-
-            // Check the current default output device UID.
-            let new_uid = match ca::System::default_output_device().and_then(|d| d.uid()) {
-                Ok(uid) => uid.to_string(),
-                Err(_) => {
-                    // Transient — output device may be momentarily absent
-                    // during Bluetooth pairing / USB reconnect. Next tick.
-                    continue;
-                }
-            };
-
-            let should_rebuild_for_switch = new_uid != current_uid;
 
             // Re-snapshot the exclusion list. Cheap: one stat() + one
             // NSRunningApp::with_bundle_id per configured bundle ID
@@ -676,26 +650,15 @@ pub fn spawn_process_tap_capture(
                     .map(|t| t.elapsed() >= REBUILD_COOLDOWN)
                     .unwrap_or(true);
 
-            if !should_rebuild_for_switch
-                && !should_rebuild_for_silence
-                && !should_rebuild_for_exclusions
-            {
+            if !should_rebuild_for_silence && !should_rebuild_for_exclusions {
                 continue;
             }
 
-            if should_rebuild_for_silence && !should_rebuild_for_switch {
+            if should_rebuild_for_silence {
                 warn!(
-                    "Process Tap delivered only silence for {}s on '{}' \
-                     (callbacks firing, peak_amp < {:.3}). This often means \
-                     the user's per-app audio routing (Zoom/Meet → AirPods) \
-                     bypasses the system default output the aggregate is \
-                     anchored to. Rebuilding capture.",
-                    WATCHDOG_SILENCE_SECS, current_uid, SILENCE_AMP_EPS
-                );
-            } else if should_rebuild_for_switch {
-                info!(
-                    "Default output changed ({} → {}), respawning Process Tap",
-                    current_uid, new_uid
+                    "Process Tap delivered only silence for {}s (callbacks firing, \
+                     peak_amp < {:.3}) — the tap appears wedged. Rebuilding capture.",
+                    WATCHDOG_SILENCE_SECS, SILENCE_AMP_EPS
                 );
             } else {
                 let reason = if exclusion_mtime_changed && !exclusion_set_changed {
@@ -713,38 +676,29 @@ pub fn spawn_process_tap_capture(
                 );
             }
 
-            // Drop the old capture BEFORE building the new one. The old
-            // aggregate device is still bound to the previous sub-device
-            // which is no longer the default — keeping it alive just wastes
-            // a CoreAudio slot and leaks a device entry if rebuild succeeds.
+            // Drop the old capture BEFORE building the new one so its CoreAudio
+            // slot and aggregate-device entry are released first.
             current = None;
 
             match build_capture(tx.clone(), is_disconnected.clone()) {
-                Ok((cap, _cfg, uid, snapshot)) => {
+                Ok((cap, _cfg, snapshot)) => {
                     info!(
-                        "Process Tap re-anchored to '{}' (exclusions: {})",
-                        uid,
+                        "Process Tap rebuilt (exclusions: {})",
                         snapshot.bundle_ids.len()
                     );
                     current = Some(cap);
-                    current_uid = uid;
                     current_snapshot = snapshot;
                     silence_started = None;
                     last_rebuild = Some(std::time::Instant::now());
                 }
                 Err(e) => {
-                    // Rebuild failed — most commonly because the new device
-                    // isn't fully available yet (Bluetooth handoff). Update
-                    // current_uid so we don't retry the same switch every
-                    // tick; capture stays silent until the user switches
-                    // again or the next default-change fires. Also update
-                    // current_snapshot so an exclusion-driven retry doesn't
-                    // hammer on every tick either.
+                    // Rebuild failed (e.g. tap creation transiently denied).
+                    // Update current_snapshot so an exclusion-driven retry
+                    // doesn't hammer every tick, and back off via last_rebuild.
                     warn!(
-                        "Process Tap rebuild failed (switch={}, exclusions={}): {}",
-                        should_rebuild_for_switch, should_rebuild_for_exclusions, e
+                        "Process Tap rebuild failed (silence={}, exclusions={}): {}",
+                        should_rebuild_for_silence, should_rebuild_for_exclusions, e
                     );
-                    current_uid = new_uid;
                     current_snapshot = new_snapshot;
                     last_rebuild = Some(std::time::Instant::now());
                 }
