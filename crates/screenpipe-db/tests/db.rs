@@ -9,6 +9,7 @@ mod tests {
     use chrono::Utc;
     use screenpipe_db::{
         AudioDevice, ContentType, DatabaseManager, DeviceType, Frame, OcrEngine, SearchResult,
+        TagContentType,
     };
 
     async fn setup_test_db() -> DatabaseManager {
@@ -93,6 +94,127 @@ mod tests {
         } else {
             panic!("Expected OCR result");
         }
+    }
+
+    /// `search_with_tags` restricts OCR/audio results to captures carrying ALL
+    /// of the given tags (intersection), an empty slice disables the filter,
+    /// and `count_search_results_with_tags` agrees so pagination stays correct.
+    #[tokio::test]
+    async fn test_search_filter_by_tags() {
+        let db = setup_test_db().await;
+        db.insert_video_chunk("test_video.mp4", "test_device")
+            .await
+            .unwrap();
+
+        async fn frame(db: &DatabaseManager, app: &str, text: &str) -> i64 {
+            let id = db
+                .insert_frame("test_device", None, None, Some(app), Some(""), false, None)
+                .await
+                .unwrap();
+            db.insert_ocr_text(id, text, "", Arc::new(OcrEngine::Tesseract))
+                .await
+                .unwrap();
+            id
+        }
+
+        // Run an OCR search restricted to `tags` (empty = no filter).
+        async fn run(db: &DatabaseManager, tags: &[String]) -> Vec<SearchResult> {
+            db.search_with_tags(
+                "",
+                ContentType::OCR,
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                tags,
+            )
+            .await
+            .unwrap()
+        }
+
+        let a = frame(&db, "alpha", "first capture").await;
+        let b = frame(&db, "beta", "second capture").await;
+        let _c = frame(&db, "gamma", "third capture").await;
+
+        db.add_tags(
+            a,
+            TagContentType::Vision,
+            vec!["person:ada".to_string(), "project:atlas".to_string()],
+        )
+        .await
+        .unwrap();
+        db.add_tags(
+            b,
+            TagContentType::Vision,
+            vec!["project:atlas".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Single tag → only the frame carrying it.
+        let only_ada = run(&db, &["person:ada".to_string()]).await;
+        assert_eq!(only_ada.len(), 1);
+        match &only_ada[0] {
+            SearchResult::OCR(o) => assert_eq!(o.frame_id, a),
+            other => panic!("expected OCR, got {other:?}"),
+        }
+
+        // Shared tag → both frames carrying it.
+        let atlas = run(&db, &["project:atlas".to_string()]).await;
+        assert_eq!(atlas.len(), 2);
+
+        // Multiple tags → AND semantics: frame must carry all of them.
+        let both = run(
+            &db,
+            &["person:ada".to_string(), "project:atlas".to_string()],
+        )
+        .await;
+        assert_eq!(both.len(), 1);
+        match &both[0] {
+            SearchResult::OCR(o) => assert_eq!(o.frame_id, a),
+            other => panic!("expected OCR, got {other:?}"),
+        }
+
+        // Unknown tag → nothing.
+        assert_eq!(run(&db, &["person:nobody".to_string()]).await.len(), 0);
+
+        // No tag filter → all three frames (the filter is strictly opt-in).
+        assert_eq!(run(&db, &[]).await.len(), 3);
+
+        // Count must agree with the result length so `total` stays correct.
+        let count_atlas = db
+            .count_search_results_with_tags(
+                "",
+                ContentType::OCR,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["project:atlas".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_atlas, 2);
     }
 
     #[tokio::test]
@@ -550,14 +672,14 @@ mod tests {
 
         // After inserting both audio transcriptions, let's check all audio entries
         let all_audio = db
-            .search_audio("", 100, 0, None, None, None, None, None, None, None, None)
+            .search_audio("", 100, 0, None, None, None, None, None, None, None, None, &[])
             .await
             .unwrap();
         println!("All audio entries: {:?}", all_audio);
 
         // Then try specific search
         let audio_results = db
-            .search_audio("2", 100, 0, None, None, None, None, None, None, None, None)
+            .search_audio("2", 100, 0, None, None, None, None, None, None, None, None, &[])
             .await
             .unwrap();
         println!("Audio results for '2': {:?}", audio_results);

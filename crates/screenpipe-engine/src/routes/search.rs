@@ -133,6 +133,13 @@ pub(crate) struct SearchQuery {
     /// off unless the caller will forward these results to an LLM.
     #[serde(default, deserialize_with = "deserialize_flexible_bool")]
     filter_pii: bool,
+    /// Restrict results to screen (OCR) and audio captures carrying ALL of
+    /// these tags. Comma-separated, e.g. `tags=person:ada,project:atlas`.
+    /// These are the junction-table tags written via `POST /tags/:type/:id`.
+    /// Content types with no tag table (input, accessibility, memory) return
+    /// nothing when a tag filter is set. Omit for no tag filtering.
+    #[serde(default, deserialize_with = "from_comma_separated_string_array")]
+    tags: Option<Vec<String>>,
 }
 
 #[derive(OaSchema, Deserialize)]
@@ -355,6 +362,9 @@ pub(crate) fn compute_search_cache_key(query: &SearchQuery) -> u64 {
     query.device_name.hash(&mut hasher);
     query.machine_id.hash(&mut hasher);
     query.filter_pii.hash(&mut hasher);
+    // Tags change the result set materially — must be in the cache key so a
+    // cached untagged response can't be served for a tag-filtered query.
+    query.tags.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -405,11 +415,12 @@ pub(crate) async fn search(
     let query_str = query.q.as_deref().unwrap_or("");
 
     let content_type = query.content_type.clone();
+    let tags = query.tags.as_deref().unwrap_or(&[]);
 
     let (results, total) = timeout(
         Duration::from_secs(30),
         try_join(
-            state.db.search(
+            state.db.search_with_tags(
                 query_str,
                 content_type.clone(),
                 query.pagination.limit,
@@ -428,8 +439,9 @@ pub(crate) async fn search(
                 query.device_name.as_deref(),
                 query.machine_id.as_deref(),
                 query.on_screen,
+                tags,
             ),
-            state.db.count_search_results(
+            state.db.count_search_results_with_tags(
                 query_str,
                 content_type,
                 query.start_time,
@@ -444,6 +456,7 @@ pub(crate) async fn search(
                 query.focused,
                 query.speaker_name.as_deref(),
                 query.on_screen,
+                tags,
             ),
         ),
     )
@@ -815,6 +828,30 @@ where
         .map(Some)
 }
 
+/// Split a comma-separated `tags` query param into a trimmed, non-empty list.
+/// `?tags=person:ada,project:atlas` → `["person:ada", "project:atlas"]`.
+/// Returns `None` when the param is absent or contains only blanks, so a
+/// dangling `?tags=` doesn't switch tag filtering on.
+pub(crate) fn from_comma_separated_string_array<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(deserializer).unwrap_or(None);
+    let s = match s {
+        None => return Ok(None),
+        Some(s) => s,
+    };
+    let tags: Vec<String> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+    Ok((!tags.is_empty()).then_some(tags))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +900,7 @@ mod tests {
             device_name: None,
             machine_id: None,
             filter_pii: false,
+            tags: None,
         };
 
         let query2 = SearchQuery {
@@ -890,6 +928,7 @@ mod tests {
             device_name: None,
             machine_id: None,
             filter_pii: false,
+            tags: None,
         };
 
         let key1 = compute_search_cache_key(&query1);
@@ -925,6 +964,7 @@ mod tests {
             device_name: None,
             machine_id: None,
             filter_pii: false,
+            tags: None,
         };
 
         let query2 = SearchQuery {
@@ -952,6 +992,7 @@ mod tests {
             device_name: None,
             machine_id: None,
             filter_pii: false,
+            tags: None,
         };
 
         let key1 = compute_search_cache_key(&query1);
@@ -994,6 +1035,7 @@ mod tests {
             device_name: None,
             machine_id: None,
             filter_pii: false,
+            tags: None,
         };
         let none = compute_search_cache_key(&mk(None));
         let yes = compute_search_cache_key(&mk(Some(true)));

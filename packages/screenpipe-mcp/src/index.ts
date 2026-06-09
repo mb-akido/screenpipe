@@ -302,6 +302,11 @@ const TOOLS: Tool[] = [
         },
         speaker_ids: { type: "string", description: "Comma-separated speaker IDs to filter audio" },
         speaker_name: { type: "string", description: "Filter audio by speaker name (case-insensitive partial match)" },
+        tags: {
+          type: "string",
+          description:
+            "Comma-separated tags; returns only screen + audio captures carrying ALL of them (e.g. 'person:ada,project:atlas'). Tags are the labels written by add-tags. Use namespaced tags (person:, project:, topic:) to link people/projects/topics across screen and voice — two captures sharing a tag are connected. Note: content_type 'input', 'accessibility', and 'memory' have no tags and return nothing when this is set (memories have their own tag filter).",
+        },
         max_content_length: {
           type: "integer",
           description: "Truncate each result's text via middle-truncation. Use 200-500 to keep responses compact.",
