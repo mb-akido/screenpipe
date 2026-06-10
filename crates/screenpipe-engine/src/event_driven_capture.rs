@@ -320,8 +320,6 @@ pub struct EventDrivenCapture {
     last_capture: Instant,
     /// Time reference for periodic idle captures.
     last_idle_reference: Instant,
-    /// Last known idle_ms from ActivityFeed
-    last_idle_ms: u64,
 }
 
 impl EventDrivenCapture {
@@ -331,7 +329,6 @@ impl EventDrivenCapture {
             config,
             last_capture: now,
             last_idle_reference: now,
-            last_idle_ms: 0,
         }
     }
 
@@ -364,10 +361,7 @@ impl EventDrivenCapture {
             >= Duration::from_millis(self.config.idle_capture_interval_ms)
     }
 
-    /// Poll activity state and return a trigger if a capture should happen.
-    ///
-    /// Call this in a loop at ~50ms intervals. Returns `Some(trigger)` when
-    /// a state transition is detected that warrants a capture.
+    /// Poll timer-driven state and return a trigger if a capture should happen.
     ///
     /// Note: `TypingPause` used to fire from here based on ActivityFeed
     /// timing, but that path was untraceable — the resulting frame
@@ -376,14 +370,11 @@ impl EventDrivenCapture {
     /// event (already burst-end-debounced at `text_timeout_ms`),
     /// carrying that row's correlation_id so the linker can populate
     /// `frame_id`.
-    pub fn poll_activity(&mut self, feed: &ActivityFeed) -> Option<CaptureTrigger> {
-        let idle_ms = feed.idle_ms();
-        // Detect idle capture need
+    pub fn poll_activity(&mut self) -> Option<CaptureTrigger> {
         if self.needs_idle_capture() {
             return Some(CaptureTrigger::Idle);
         }
 
-        self.last_idle_ms = idle_ms;
         None
     }
 }
@@ -1055,7 +1046,7 @@ pub async fn event_driven_capture_loop(
         if let Some(warm) = warm_trigger_override.take() {
             trigger = Some(warm);
         } else if trigger_channel_closed {
-            trigger = state.poll_activity(&activity_feed);
+            trigger = state.poll_activity();
             if trigger.is_none() {
                 tokio::time::sleep(poll_interval).await;
             }
@@ -1157,7 +1148,7 @@ pub async fn event_driven_capture_loop(
             }
             // If draining produced nothing, fall back to internal sources.
             if trigger.is_none() {
-                trigger = state.poll_activity(&activity_feed);
+                trigger = state.poll_activity();
             }
         }
 
@@ -1420,8 +1411,8 @@ pub async fn event_driven_capture_loop(
                         consecutive_capture_errors += 1;
 
                         // Mark captured on failure to reset idle timer — without
-                        // this, needs_idle_capture() fires every poll tick (50ms)
-                        // once 30s elapses, creating ~20 capture attempts/second
+                        // this, needs_idle_capture() fires every poll tick
+                        // once 30s elapses, creating repeated capture attempts
                         // on systems where capture fundamentally can't work
                         // (e.g. Wayland without ZwlrScreencopy).
                         state.mark_captured();
