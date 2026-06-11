@@ -801,7 +801,15 @@ pub async fn set_cloud_token(
     state: tauri::State<'_, crate::recording::RecordingState>,
 ) -> Result<(), String> {
     let normalized = token.filter(|t| !t.is_empty());
+    let should_clear_pi_auth = normalized.is_none();
     state.cloud_token.store(std::sync::Arc::new(normalized));
+
+    if should_clear_pi_auth {
+        if let Err(e) = crate::pi::clear_screenpipe_auth_token_files() {
+            warn!("failed to clear pi screenpipe auth token: {}", e);
+        }
+    }
+
     Ok(())
 }
 
