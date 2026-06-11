@@ -1912,8 +1912,7 @@ async fn main() -> anyhow::Result<()> {
                 "fetching v45 phase 3 ONNX text redactor (~278 MB INT8 on first run, \
                  cached at ~/.screenpipe/models/v45_phase3_onnx/)"
             );
-            let (pipeline, gate) = match OnnxRedactor::load_or_download(OnnxConfig::default())
-                .await
+            let (pipeline, gate) = match OnnxRedactor::load_or_download(OnnxConfig::default()).await
             {
                 Ok(adapter) => {
                     info!(

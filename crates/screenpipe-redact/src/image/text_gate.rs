@@ -131,10 +131,8 @@ fn region_text(words: &[OcrWord], bbox: [u32; 4], dims: (u32, u32)) -> String {
     inside.sort_by(|a, b| {
         let la = (a.cy / 0.008) as i64;
         let lb = (b.cy / 0.008) as i64;
-        la.cmp(&lb).then(
-            a.cx.partial_cmp(&b.cx)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+        la.cmp(&lb)
+            .then(a.cx.partial_cmp(&b.cx).unwrap_or(std::cmp::Ordering::Equal))
     });
     inside
         .iter()
@@ -232,7 +230,7 @@ pub async fn gate_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RedactError, RedactionOutput, RedactedSpan, SpanLabel};
+    use crate::{RedactError, RedactedSpan, RedactionOutput, SpanLabel};
     use async_trait::async_trait;
     use sqlx::sqlite::SqlitePoolOptions;
 
