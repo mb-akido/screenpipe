@@ -633,7 +633,7 @@ export function TranscriptPanel({
       if (!isLive) return "no transcript was captured for this meeting";
       return (
         captureState?.transcriptEmptyCopy ??
-        "listening — transcript will appear when the first segment arrives"
+        "no transcript yet — audio can take a minute to appear; keep the meeting open"
       );
     }
     if (filteredBlocks.length === 0 && query.trim()) {
