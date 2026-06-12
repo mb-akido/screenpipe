@@ -561,10 +561,7 @@ pub fn create_tree_walker(config: TreeWalkerConfig) -> Box<dyn TreeWalkerPlatfor
     if ignored_urls.is_empty() {
         walker
     } else {
-        Box::new(UrlFilteredWalker {
-            inner: walker,
-            ignored_urls,
-        })
+        Box::new(UrlFilteredWalker::new(walker, ignored_urls))
     }
 }
 
@@ -573,7 +570,16 @@ pub fn create_tree_walker(config: TreeWalkerConfig) -> Box<dyn TreeWalkerPlatfor
 /// platform walker) applies the filter uniformly across macOS/Windows/Linux.
 struct UrlFilteredWalker {
     inner: Box<dyn TreeWalkerPlatform>,
-    ignored_urls: Vec<String>,
+    ignored_url_patterns: Vec<String>,
+}
+
+impl UrlFilteredWalker {
+    fn new(inner: Box<dyn TreeWalkerPlatform>, ignored_urls: Vec<String>) -> Self {
+        Self {
+            inner,
+            ignored_url_patterns: crate::url_filter::normalize_blocked_patterns(&ignored_urls),
+        }
+    }
 }
 
 impl TreeWalkerPlatform for UrlFilteredWalker {
@@ -581,7 +587,10 @@ impl TreeWalkerPlatform for UrlFilteredWalker {
         let result = self.inner.walk_focused_window()?;
         if let TreeWalkResult::Found(ref snapshot) = result {
             if let Some(ref url) = snapshot.browser_url {
-                if crate::url_filter::is_url_blocked(url, &self.ignored_urls) {
+                if crate::url_filter::is_url_blocked_by_normalized_patterns(
+                    url,
+                    &self.ignored_url_patterns,
+                ) {
                     return Ok(TreeWalkResult::Skipped(SkipReason::BlockedUrl));
                 }
             }
@@ -633,10 +642,10 @@ mod tests {
 
     #[test]
     fn test_url_filtered_walker_blocks_matching_url() {
-        let walker = UrlFilteredWalker {
-            inner: Box::new(FakeWalker(Some("https://www.chase.com/login".into()))),
-            ignored_urls: vec!["chase.com".into()],
-        };
+        let walker = UrlFilteredWalker::new(
+            Box::new(FakeWalker(Some("https://www.chase.com/login".into()))),
+            vec!["chase.com".into()],
+        );
         assert!(matches!(
             walker.walk_focused_window().unwrap(),
             TreeWalkResult::Skipped(SkipReason::BlockedUrl)
@@ -645,10 +654,10 @@ mod tests {
 
     #[test]
     fn test_url_filtered_walker_passes_other_urls() {
-        let walker = UrlFilteredWalker {
-            inner: Box::new(FakeWalker(Some("https://example.com".into()))),
-            ignored_urls: vec!["chase.com".into()],
-        };
+        let walker = UrlFilteredWalker::new(
+            Box::new(FakeWalker(Some("https://example.com".into()))),
+            vec!["chase.com".into()],
+        );
         assert!(matches!(
             walker.walk_focused_window().unwrap(),
             TreeWalkResult::Found(_)
@@ -657,10 +666,7 @@ mod tests {
 
     #[test]
     fn test_url_filtered_walker_passes_non_browser_windows() {
-        let walker = UrlFilteredWalker {
-            inner: Box::new(FakeWalker(None)),
-            ignored_urls: vec!["chase.com".into()],
-        };
+        let walker = UrlFilteredWalker::new(Box::new(FakeWalker(None)), vec!["chase.com".into()]);
         assert!(matches!(
             walker.walk_focused_window().unwrap(),
             TreeWalkResult::Found(_)
