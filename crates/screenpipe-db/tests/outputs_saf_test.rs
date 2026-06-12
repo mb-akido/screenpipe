@@ -11,7 +11,10 @@ async fn setup_test_db() -> DatabaseManager {
     let db = DatabaseManager::new("sqlite::memory:", Default::default())
         .await
         .unwrap();
-    sqlx::migrate!("./src/migrations").run(&db.pool).await.unwrap();
+    sqlx::migrate!("./src/migrations")
+        .run(&db.pool)
+        .await
+        .unwrap();
     db
 }
 
@@ -55,7 +58,15 @@ async fn outputs_insert_and_get_roundtrip_saf_columns() {
         Some(3),
     )
     .await;
-    let plain_id = insert(&db, "my-pipe", "/outputs/pipe/my-pipe/notes.md", None, None, None).await;
+    let plain_id = insert(
+        &db,
+        "my-pipe",
+        "/outputs/pipe/my-pipe/notes.md",
+        None,
+        None,
+        None,
+    )
+    .await;
 
     let saf = db.get_output_by_id(saf_id).await.unwrap();
     assert_eq!(saf.kind, "saf");
@@ -134,7 +145,15 @@ async fn outputs_get_by_artifact_id_scoped_by_source() {
 #[tokio::test]
 async fn outputs_update_sets_and_clears_saf_columns() {
     let db = setup_test_db().await;
-    let id = insert(&db, "my-pipe", "/outputs/pipe/my-pipe/a.json", None, None, None).await;
+    let id = insert(
+        &db,
+        "my-pipe",
+        "/outputs/pipe/my-pipe/a.json",
+        None,
+        None,
+        None,
+    )
+    .await;
 
     // upgrade a plain row to SAF
     db.update_output(
@@ -210,9 +229,20 @@ async fn outputs_list_carries_saf_columns() {
         Some(4),
     )
     .await;
-    insert(&db, "my-pipe", "/outputs/pipe/my-pipe/notes.md", None, None, None).await;
+    insert(
+        &db,
+        "my-pipe",
+        "/outputs/pipe/my-pipe/notes.md",
+        None,
+        None,
+        None,
+    )
+    .await;
 
-    let rows = db.list_outputs(Some("my-pipe"), None, None, 100, 0).await.unwrap();
+    let rows = db
+        .list_outputs(Some("my-pipe"), None, None, 100, 0)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 2);
     let saf_row = rows.iter().find(|r| r.kind == "saf").unwrap();
     assert_eq!(saf_row.saf_kind.as_deref(), Some("sop"));

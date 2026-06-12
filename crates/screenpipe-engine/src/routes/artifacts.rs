@@ -214,10 +214,7 @@ pub(crate) fn validate_saf_envelope(v: &Value) -> Result<SafFields, String> {
         _ => return Err("saf_version must be the number 1".to_string()),
     }
 
-    let artifact_id = obj
-        .get("artifact_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let artifact_id = obj.get("artifact_id").and_then(Value::as_str).unwrap_or("");
     if artifact_id.is_empty() {
         return Err("artifact_id must be a non-empty string".to_string());
     }
@@ -433,7 +430,11 @@ pub(crate) async fn register_artifact_handler(
         payload.kind.as_str()
     };
     let (saf_kind, saf_artifact_id, saf_artifact_version) = match &saf {
-        Some(f) => (Some(f.kind.as_str()), Some(f.artifact_id.as_str()), Some(f.version)),
+        Some(f) => (
+            Some(f.kind.as_str()),
+            Some(f.artifact_id.as_str()),
+            Some(f.version),
+        ),
         None => (None, None, None),
     };
 
@@ -876,7 +877,11 @@ pub async fn auto_register_pipe_artifacts(
         let saf = detect_saf_for_file(&dest, filename, size_bytes, pipe_name).await;
         let kind: &str = if saf.is_some() { "saf" } else { declared_kind };
         let (saf_kind, saf_artifact_id, saf_artifact_version) = match &saf {
-            Some(f) => (Some(f.kind.as_str()), Some(f.artifact_id.as_str()), Some(f.version)),
+            Some(f) => (
+                Some(f.kind.as_str()),
+                Some(f.artifact_id.as_str()),
+                Some(f.version),
+            ),
             None => (None, None, None),
         };
 
@@ -1184,10 +1189,7 @@ mod tests {
 
     #[test]
     fn saf_outputs_detect_plain_json_without_marker_is_plain() {
-        assert_eq!(
-            detect_saf(r#"{"a": 1}"#, "data.json"),
-            SafDetection::NotSaf
-        );
+        assert_eq!(detect_saf(r#"{"a": 1}"#, "data.json"), SafDetection::NotSaf);
         // non-object JSON in a regular file is plain too
         assert_eq!(detect_saf("[1, 2]", "data.json"), SafDetection::NotSaf);
     }
@@ -1275,7 +1277,10 @@ mod tests {
         )
         .await;
 
-        let rows = db.list_outputs(Some("my-pipe"), None, None, 100, 0).await.unwrap();
+        let rows = db
+            .list_outputs(Some("my-pipe"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "saf");
         assert_eq!(rows[0].saf_kind.as_deref(), Some("sop"));
@@ -1305,14 +1310,20 @@ mod tests {
         // higher version, same file → same row, bumped version
         std::fs::write(&f, envelope_json("process-refund", 2)).unwrap();
         auto_register_pipe_artifacts(&db, items(), "my-pipe", &sp_dir).await;
-        let rows = db.list_outputs(Some("my-pipe"), None, None, 100, 0).await.unwrap();
+        let rows = db
+            .list_outputs(Some("my-pipe"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1, "re-emit must not duplicate");
         assert_eq!(rows[0].id, first_id);
         assert_eq!(rows[0].saf_version, Some(2));
 
         // same version again → idempotent
         auto_register_pipe_artifacts(&db, items(), "my-pipe", &sp_dir).await;
-        let rows = db.list_outputs(Some("my-pipe"), None, None, 100, 0).await.unwrap();
+        let rows = db
+            .list_outputs(Some("my-pipe"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1, "same-version re-emit must be idempotent");
         assert_eq!(rows[0].id, first_id);
         assert_eq!(rows[0].saf_version, Some(2));
@@ -1347,8 +1358,15 @@ mod tests {
         )
         .await;
 
-        let rows = db.list_outputs(Some("my-pipe"), None, None, 100, 0).await.unwrap();
-        assert_eq!(rows.len(), 1, "artifact_id match must update, not duplicate");
+        let rows = db
+            .list_outputs(Some("my-pipe"), None, None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "artifact_id match must update, not duplicate"
+        );
         assert_eq!(rows[0].saf_version, Some(2));
         assert!(
             rows[0].output_path.ends_with("process-refund-v2.saf.json"),
@@ -1376,7 +1394,10 @@ mod tests {
         )
         .await;
 
-        let rows = db.list_outputs(Some("my-pipe"), None, None, 100, 0).await.unwrap();
+        let rows = db
+            .list_outputs(Some("my-pipe"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1, "invalid SAF must still register");
         assert_eq!(rows[0].kind, "text", "kind stays the declared default");
         assert_eq!(rows[0].saf_kind, None);
@@ -1397,7 +1418,10 @@ mod tests {
         auto_register_pipe_artifacts(&db, vec![(decl("out/notes.md"), f)], "my-pipe", &sp_dir)
             .await;
 
-        let rows = db.list_outputs(Some("my-pipe"), None, None, 100, 0).await.unwrap();
+        let rows = db
+            .list_outputs(Some("my-pipe"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "text");
         assert_eq!(rows[0].saf_kind, None);
@@ -1426,8 +1450,14 @@ mod tests {
         }
 
         // same artifact_id from two pipes → two distinct rows (source scoping)
-        let a = db.list_outputs(Some("pipe-a"), None, None, 100, 0).await.unwrap();
-        let b = db.list_outputs(Some("pipe-b"), None, None, 100, 0).await.unwrap();
+        let a = db
+            .list_outputs(Some("pipe-a"), None, None, 100, 0)
+            .await
+            .unwrap();
+        let b = db
+            .list_outputs(Some("pipe-b"), None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 1);
         assert_ne!(a[0].id, b[0].id);
