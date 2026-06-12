@@ -42,9 +42,11 @@ fn recheck() -> &'static Notify {
 }
 
 /// Wake the publisher immediately (e.g. right after a Google Calendar OAuth
-/// connect) instead of waiting out the not-connected backoff.
+/// connect) instead of waiting out the not-connected backoff. `notify_one`
+/// stores a permit when the publisher is mid-fetch rather than waiting, so a
+/// poke is never lost (it would be with `notify_waiters`).
 pub fn poke() {
-    recheck().notify_waiters();
+    recheck().notify_one();
 }
 
 #[derive(Debug, Deserialize)]
