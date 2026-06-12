@@ -408,9 +408,9 @@ pub struct RecordArgs {
     /// Enable the async PII reconciliation worker. Runs a background
     /// task after capture that OVERWRITES PII in the source columns
     /// of ocr_text, audio_transcriptions, frames.accessibility_text,
-    /// and ui_events.text_content. Raw secrets are gone after the
-    /// worker processes the row. Off by default — capture path is
-    /// unaffected either way.
+    /// ui_events.text_content, and elements.text. Raw secrets are
+    /// gone after the worker processes the row. Off by default —
+    /// capture path is unaffected either way.
     #[arg(long, default_value_t = false)]
     pub async_pii_redaction: bool,
 

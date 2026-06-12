@@ -12,7 +12,7 @@
 //!
 //! ## What we redact
 //!
-//! Four logical surfaces, five [`TargetTable`] variants (UI events
+//! Five logical surfaces, six [`TargetTable`] variants (UI events
 //! split into keyboard vs clipboard):
 //!
 //! 1. **`ocr_text`** — OCR'd screen text. Source column `text`.
@@ -29,6 +29,11 @@
 //!    clipboard contents (`event_type = 'clipboard'`). Source column
 //!    `text_content`. Split into two variants so the row-fetch SQL
 //!    can filter by `event_type`.
+//! 5. **`elements`** — per-element OCR + accessibility rows (issue
+//!    #3993). Source column `text` (NULL on container nodes; the
+//!    fetch predicate skips those). The `elements_fts` mirror is
+//!    content-synced via the `elements_au` AFTER UPDATE trigger, so
+//!    overwriting the source row swaps the indexed text too.
 //!
 //! ## "Needs redaction" predicate
 //!
@@ -57,6 +62,10 @@ pub enum TargetTable {
     /// Clipboard payloads captured via UI events
     /// (`ui_events.text_content` filtered to `event_type='clipboard'`).
     UiEventsClipboard,
+    /// Per-element OCR + accessibility text (`elements.text`).
+    /// Watermark column added by
+    /// `20260613000000_add_elements_redacted_at.sql` (issue #3993).
+    Elements,
 }
 
 pub const ALL_TARGET_TABLES: &[TargetTable] = &[
@@ -65,6 +74,7 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
     TargetTable::Accessibility,
     TargetTable::UiEventsKeyboard,
     TargetTable::UiEventsClipboard,
+    TargetTable::Elements,
 ];
 
 /// One row to redact.
@@ -84,6 +94,7 @@ impl TargetTable {
             // consolidation; see the variant docs above.
             Self::Accessibility => "frames",
             Self::UiEventsKeyboard | Self::UiEventsClipboard => "ui_events",
+            Self::Elements => "elements",
         }
     }
 
@@ -94,6 +105,7 @@ impl TargetTable {
             Self::AudioTranscription => "transcription",
             Self::Accessibility => "accessibility_text",
             Self::UiEventsKeyboard | Self::UiEventsClipboard => "text_content",
+            Self::Elements => "text",
         }
     }
 
@@ -136,6 +148,7 @@ impl TargetTable {
             Self::Accessibility => "frames:accessibility_text",
             Self::UiEventsKeyboard => "ui_events:keyboard",
             Self::UiEventsClipboard => "ui_events:clipboard",
+            Self::Elements => "elements",
         }
     }
 }
@@ -244,6 +257,14 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
                 text_content TEXT,
+                redacted_at INTEGER
+            );
+            -- Per-element OCR/accessibility rows; `text` is NULL on
+            -- container nodes. Watermark column added by the
+            -- 20260613 migration (issue #3993).
+            CREATE TABLE elements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT,
                 redacted_at INTEGER
             );
             "#,
@@ -364,6 +385,50 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "AXButton[Send to alice@x.io]");
+    }
+
+    #[tokio::test]
+    async fn elements_fetch_skips_container_nodes_and_redacted_rows() {
+        let pool = setup().await;
+        // Container node: NULL text — must never reach the redactor.
+        sqlx::query("INSERT INTO elements (text) VALUES (NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO elements (text) VALUES ('SSN 123-45-6789')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO elements (text, redacted_at) VALUES ('[SSN]', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = fetch_unredacted(&pool, TargetTable::Elements, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "SSN 123-45-6789");
+    }
+
+    #[tokio::test]
+    async fn elements_writes_overwrite_source_and_stamp_redacted_at() {
+        let pool = setup().await;
+        sqlx::query("INSERT INTO elements (text) VALUES ('alice@example.com')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        write_redacted(&pool, TargetTable::Elements, 1, "[EMAIL]")
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT text, redacted_at FROM elements WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let raw: String = row.get(0);
+        let when: Option<i64> = row.get(1);
+        assert_eq!(raw, "[EMAIL]", "source must be overwritten");
+        assert!(when.is_some(), "redacted_at must be stamped");
     }
 
     #[tokio::test]
