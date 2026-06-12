@@ -851,8 +851,8 @@ pub async fn reconcile_default_slot_after_instanced_save(
     };
 
     let default_email = default_val["email"].as_str();
-    let is_distinct_recoverable = oauth_json_is_recoverable(&default_val)
-        && default_email.is_some_and(|e| e != new_instance);
+    let is_distinct_recoverable =
+        oauth_json_is_recoverable(&default_val) && default_email.is_some_and(|e| e != new_instance);
 
     if is_distinct_recoverable {
         let email = default_email.expect("distinct_recoverable implies Some email");
