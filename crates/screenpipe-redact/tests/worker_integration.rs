@@ -108,12 +108,10 @@ async fn seed(pool: &sqlx::SqlitePool) {
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO elements (text) VALUES ('AXStaticText[carol@example.com]')",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO elements (text) VALUES ('AXStaticText[carol@example.com]')")
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
