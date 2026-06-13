@@ -10,6 +10,7 @@ import { RateLimiter, checkRateLimit } from './utils/rate-limiter';
 import { trackUsage, getUsageStatus, isModelAllowed, getTierConfig, getCreditBalance } from './services/usage-tracker';
 import { handleChatCompletions } from './handlers/chat';
 import { handleModelListing } from './handlers/models';
+import { RETIRED_MODELS } from './providers';
 import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
 import { handleRealtimeTranscriptionUpgrade } from './handlers/realtime-transcription';
 import { handleVoiceTranscription, handleVoiceQuery, handleTextToSpeech, handleVoiceChat } from './handlers/voice';
@@ -110,6 +111,15 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 					error: 'missing_model',
 					message: 'Request body must include a non-empty "model" string.',
 				})));
+			}
+
+			// Retired models (e.g. Fable 5) are transparently served by a current
+			// replacement. Rewrite up front so the tier gate, quota weight, usage
+			// tracking, and cost rows all attribute to the model actually served.
+			const retiredReplacement = RETIRED_MODELS[body.model];
+			if (retiredReplacement) {
+				console.log(`retired model ${body.model} → ${retiredReplacement}`);
+				body = { ...body, model: retiredReplacement };
 			}
 
 			// Check if model is allowed for this tier

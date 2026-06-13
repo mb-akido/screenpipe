@@ -7,6 +7,7 @@ import { createSuccessResponse, createErrorResponse, addCorsHeaders } from '../u
 import { getTierConfig, getModelWeight } from '../services/usage-tracker';
 import { listAnthropicModels } from '../providers/anthropic-proxy';
 import { getModelHealth, ModelHealthStatus } from '../services/model-health';
+import { RETIRED_MODELS } from '../providers';
 
 /** Enriched model metadata — OpenAI-compatible (extra fields ignored by standard clients) */
 interface ModelEntry {
@@ -593,6 +594,10 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
     // Avoid advertising models that would immediately fail because their
     // provider secret is not configured in the Worker environment yet.
     models = models.filter(model => !model.requires_env || hasConfiguredSecret(env[model.requires_env]));
+
+    // Hide retired models (transparently remapped to a replacement at the
+    // router) so they're no longer newly selectable in the picker.
+    models = models.filter(model => !(model.id in RETIRED_MODELS));
 
     // Filter models based on tier allowlist
     if (tier !== 'subscribed') {
