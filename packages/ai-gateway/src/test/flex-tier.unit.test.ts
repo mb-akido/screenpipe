@@ -39,9 +39,18 @@ describe('resolveLatencyClass', () => {
 		expect(resolveLatencyClass(req({ 'x-screenpipe-latency': 'interactive' }), { ...BODY, stream: false }, {} as Env)).toBe('interactive');
 	});
 
-	it('FLEX_TIER_ENABLED=false forces interactive (kill switch, overrides the header)', () => {
+	it('routes to background on the /v1bg path signal (header-less pipe clients)', () => {
+		// pathBackground=true behaves like the header — for the Pi binary which
+		// cannot set custom headers, so pipes hit /v1bg/chat/completions instead.
+		expect(resolveLatencyClass(req(), { ...BODY }, {} as Env, true)).toBe('background');
+		// pathBackground=false (normal /v1) stays interactive
+		expect(resolveLatencyClass(req(), { ...BODY }, {} as Env, false)).toBe('interactive');
+	});
+
+	it('FLEX_TIER_ENABLED=false forces interactive (kill switch, overrides header AND path)', () => {
 		const env = { FLEX_TIER_ENABLED: 'false' } as unknown as Env;
 		expect(resolveLatencyClass(req({ 'x-screenpipe-latency': 'background' }), { ...BODY, stream: false }, env)).toBe('interactive');
+		expect(resolveLatencyClass(req(), { ...BODY }, env, true)).toBe('interactive');
 	});
 });
 

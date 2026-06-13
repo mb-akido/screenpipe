@@ -28,7 +28,14 @@ export { RateLimiter };
 // Handler function for the worker
 async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const url = new URL(request.url);
-	const path = url.pathname;
+	let path = url.pathname;
+
+	// Background tier path prefix. Header-less clients (the Pi binary that pipes
+	// run on) can't set x-screenpipe-latency, so background callers hit /v1bg/*.
+	// Strip the prefix to the normal route and force the background class via
+	// resolveLatencyClass(pathBackground) below. Cheaper, best-effort latency.
+	const isBackgroundPath = path.startsWith('/v1bg/');
+	if (isBackgroundPath) path = '/v1' + path.slice('/v1bg'.length);
 
 	// Early test endpoint - before any initialization
 	if (path === '/test') {
@@ -185,7 +192,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			}
 
 			// Route latency-tolerant (background) traffic to the cheaper flex tier.
-			const latency = resolveLatencyClass(request, body, env);
+			const latency = resolveLatencyClass(request, body, env, isBackgroundPath);
 
 			// Add credit info header if paid via credits
 			let response = await handleChatCompletions(body, env, latency);

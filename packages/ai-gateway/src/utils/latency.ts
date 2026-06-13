@@ -20,13 +20,20 @@ export type LatencyClass = 'interactive' | 'background';
  *   1. FLEX_TIER_ENABLED=false → always interactive (kill switch, no redeploy)
  *   2. x-screenpipe-latency header: 'background'|'flex' → background;
  *      'interactive'|'standard' → interactive
- *   3. default → interactive (no header = treat as user-facing)
+ *   3. pathBackground: the request came in on the /v1bg/* prefix — a header-less
+ *      signal for clients that can't set headers (the Pi binary pipes run on).
+ *   4. default → interactive (no signal = treat as user-facing)
  */
-export function resolveLatencyClass(request: Request, _body: RequestBody, env: Env): LatencyClass {
+export function resolveLatencyClass(
+	request: Request,
+	_body: RequestBody,
+	env: Env,
+	pathBackground = false,
+): LatencyClass {
 	if (String((env as any)?.FLEX_TIER_ENABLED ?? 'true').toLowerCase() === 'false') {
 		return 'interactive';
 	}
 	const hint = request.headers.get('x-screenpipe-latency')?.toLowerCase();
-	if (hint === 'background' || hint === 'flex') return 'background';
+	if (hint === 'background' || hint === 'flex' || pathBackground) return 'background';
 	return 'interactive';
 }

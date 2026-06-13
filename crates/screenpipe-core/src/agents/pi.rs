@@ -20,6 +20,16 @@ const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.75.4";
 const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 
+/// Background tier base URL for the cloud gateway. Same worker as
+/// `SCREENPIPE_API_URL`, but the `/v1bg` prefix tells the gateway to serve the
+/// request on the cheaper, best-effort Vertex flex tier (it strips the prefix
+/// and forces the background latency class). The Pi binary can't set a custom
+/// header, so pipes signal "background" via this URL. PiExecutor defaults to it
+/// because the executor only ever runs pipes (scheduled / run-now), which are
+/// latency-tolerant by definition. Interactive agents must override with
+/// `with_api_url(SCREENPIPE_API_URL)`.
+pub const SCREENPIPE_API_URL_BG: &str = "https://api.screenpipe.com/v1bg";
+
 /// Bounded retries for provider rate limiting (HTTP 429) in streaming runs.
 const MAX_RATE_LIMIT_RETRIES: usize = 3;
 /// Fallback wait when the 429 payload carries no `reset_in` hint.
@@ -168,10 +178,13 @@ pub struct PiExecutor {
 }
 
 impl PiExecutor {
+    // PiExecutor only ever runs pipes (PipeManager: scheduled + run-now), which
+    // are latency-tolerant, so it defaults to the background/flex base URL. An
+    // interactive consumer must opt out via `with_api_url(SCREENPIPE_API_URL)`.
     pub fn new(user_token: Option<String>) -> Self {
         Self {
             user_token: Arc::new(ArcSwap::new(Arc::new(user_token))),
-            api_url: SCREENPIPE_API_URL.to_string(),
+            api_url: SCREENPIPE_API_URL_BG.to_string(),
             api_auth_key: None,
         }
     }
@@ -184,9 +197,17 @@ impl PiExecutor {
     pub fn with_shared_user_token(user_token: Arc<ArcSwap<Option<String>>>) -> Self {
         Self {
             user_token,
-            api_url: SCREENPIPE_API_URL.to_string(),
+            api_url: SCREENPIPE_API_URL_BG.to_string(),
             api_auth_key: None,
         }
+    }
+
+    /// Override the cloud base URL. Use `SCREENPIPE_API_URL` for an interactive
+    /// agent (standard tier); the constructors default to the background/flex
+    /// `SCREENPIPE_API_URL_BG` since the executor only runs pipes.
+    pub fn with_api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.api_url = api_url.into();
+        self
     }
 
     /// Read the current cloud token. Returns an owned `Option<String>`.
