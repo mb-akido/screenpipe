@@ -53,7 +53,6 @@ sentry = { workspace = true }
 axum = { workspace = true }
 http-body-util = "0.1"
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 tower-http = { version = "0.5.2", features = ["cors", "trace"] }
 
 # Log

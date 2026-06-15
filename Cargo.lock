@@ -8467,7 +8467,6 @@ dependencies = [
  "tikv-jemallocator",
  "tinfoil",
  "tokio",
- "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
  "tower 0.4.13",
