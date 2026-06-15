@@ -11096,16 +11096,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "screenpipe-apple-intelligence"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "screenpipe-audio"
 version = "0.4.19"
 dependencies = [
@@ -11342,7 +11332,6 @@ dependencies = [
  "reqwest 0.13.3",
  "rpassword",
  "screenpipe-a11y",
- "screenpipe-apple-intelligence",
  "screenpipe-audio",
  "screenpipe-capture",
  "screenpipe-config",
@@ -11364,7 +11353,6 @@ dependencies = [
  "tempfile",
  "tinfoil",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tower-http 0.5.2",
  "tracing",
