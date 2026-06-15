@@ -209,7 +209,13 @@ pub async fn fetch_unredacted(
         .into_iter()
         .map(|r| UnredactedRow {
             id: r.get::<i64, _>("id"),
-            text: r.get::<String, _>("text"),
+            // Some OCR/transcription rows hold invalid UTF-8 (e.g. a truncated
+            // multi-byte sequence). `get::<String>` panics on the column decode
+            // and takes down the whole redaction worker thread; the row is then
+            // re-fetched and re-panics forever. Read the raw bytes and decode
+            // lossily so the row still gets redacted and stamped, with the bad
+            // bytes replaced by U+FFFD.
+            text: String::from_utf8_lossy(&r.get::<Vec<u8>, _>("text")).into_owned(),
         })
         .collect();
     Ok(out)
