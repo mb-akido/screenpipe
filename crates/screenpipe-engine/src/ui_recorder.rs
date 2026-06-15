@@ -573,6 +573,12 @@ pub async fn start_ui_recording(
         let mut batch = EventBatch::with_capacity(batch_size);
         let mut last_flush = std::time::Instant::now();
         let mut consecutive_failures: u32 = 0;
+        // Upper bound on events retained across failed flushes. `flush_batch`
+        // keeps the batch on error so a transient write-pool stall doesn't drop
+        // captured events (SCREENPIPE-CLI-FZ); this cap stops that retention from
+        // growing without limit — and keeps the retried INSERT cheap — when the
+        // DB stays unavailable. `batch_size * 2` leaves a useful retry buffer.
+        let max_retained = batch_size.saturating_mul(2).max(200);
         let max_batch_age = Duration::from_secs(30); // Drop events older than 30s during storms
                                                      // Track the tail of an in-progress scroll burst so we can emit a
                                                      // single `ScrollStop` trigger when it settles. 300ms matches the
@@ -673,8 +679,12 @@ pub async fn start_ui_recording(
                         batch.push(db_event, correlation_id);
                     }
 
-                    // Flush if batch is full
-                    if batch.len() >= batch_size {
+                    // Flush when the batch is full — but only while writes are
+                    // healthy. Once a flush has failed, the batch is retained
+                    // for retry; defer those retries to the timeout path below
+                    // so they're paced by the backoff instead of re-attempted on
+                    // every incoming event (which would hammer a stalled DB).
+                    if batch.len() >= batch_size && consecutive_failures == 0 {
                         flush_batch(
                             &db,
                             &mut batch,
@@ -686,21 +696,10 @@ pub async fn start_ui_recording(
                     }
                 }
                 None => {
-                    // Timeout - check if we should flush
+                    // Timeout - check if we should flush. This path also drives
+                    // retries of a retained (previously failed) batch, paced by
+                    // the backoff at the end of the block.
                     if !batch.is_empty() && last_flush.elapsed() >= batch_timeout {
-                        // During contention storms, drop old events to prevent unbounded growth
-                        if consecutive_failures > 3 && batch.len() > batch_size * 2 {
-                            let old_len = batch.len();
-                            // Keep only the most recent batch_size events
-                            let drain_count = old_len.saturating_sub(batch_size);
-                            batch.drain_oldest(drain_count);
-                            warn!(
-                                "UI recorder: dropped {} old events during DB contention (kept {})",
-                                drain_count,
-                                batch.len()
-                            );
-                        }
-
                         flush_batch(
                             &db,
                             &mut batch,
@@ -723,6 +722,21 @@ pub async fn start_ui_recording(
                             tokio::time::sleep(backoff).await;
                         }
                     }
+                }
+            }
+
+            // Bound the events retained across failed flushes. `flush_batch`
+            // keeps the batch on error (so a transient stall doesn't drop
+            // captured events), and this cap keeps that retention from growing
+            // without limit. Runs every iteration so it bounds BOTH the
+            // full-batch and timeout flush paths, not just the idle one.
+            if consecutive_failures > 0 {
+                let dropped = cap_retained_batch(&mut batch, max_retained);
+                if dropped > 0 {
+                    warn!(
+                        "UI recorder: dropped {} oldest events (retained batch capped at {} during DB contention)",
+                        dropped, max_retained
+                    );
                 }
             }
 
@@ -808,6 +822,20 @@ fn should_record_input_event(
     }
 }
 
+/// Drop the oldest events so at most `max_retained` remain, returning how many
+/// were dropped (0 when already within the cap). Bounds the batch while failed
+/// flushes are being retained for retry during a DB stall — see `flush_batch`.
+fn cap_retained_batch(batch: &mut EventBatch, max_retained: usize) -> usize {
+    let len = batch.len();
+    if len > max_retained {
+        let excess = len - max_retained;
+        batch.drain_oldest(excess);
+        excess
+    } else {
+        0
+    }
+}
+
 async fn flush_batch(
     db: &Arc<DatabaseManager>,
     batch: &mut EventBatch,
@@ -852,6 +880,14 @@ async fn flush_batch(
                     }
                 }
             }
+
+            // Clear ONLY on success. A failed insert leaves the batch intact so
+            // the next flush retries it — otherwise a transient write-pool stall
+            // (e.g. PoolTimedOut) silently drops captured events and leaves a
+            // hole in the timeline. See SCREENPIPE-CLI-FZ. Growth across a
+            // sustained stall is bounded by the caller (max_retained /
+            // max_batch_age).
+            batch.clear();
         }
         Err(e) => {
             *consecutive_failures += 1;
@@ -864,9 +900,10 @@ async fn flush_batch(
                     consecutive_failures, e
                 );
             }
+            // Retain the batch (do NOT clear) so the next flush retries it.
+            // See the comment in the Ok arm.
         }
     }
-    batch.clear();
 }
 
 /// Marker for legacy trigger-side gates. Key and clipboard events are
@@ -1175,6 +1212,90 @@ mod event_batch_tests {
         );
 
         assert_eq!(timeout, UI_RECORDER_MIN_RECV_TIMEOUT);
+    }
+
+    #[test]
+    fn cap_retained_batch_drops_oldest_beyond_cap() {
+        let mut b = EventBatch::with_capacity(8);
+        for i in 1..=6 {
+            b.push(evt(), Some(i));
+        }
+        let dropped = cap_retained_batch(&mut b, 4);
+        assert_eq!(dropped, 2, "two oldest dropped to fit the cap of 4");
+        assert_eq!(b.len(), 4);
+        // Newest events survive, oldest are dropped, vecs stay aligned.
+        assert_eq!(b.correlation_ids, vec![Some(3), Some(4), Some(5), Some(6)]);
+    }
+
+    #[test]
+    fn cap_retained_batch_is_noop_within_cap() {
+        let mut b = EventBatch::with_capacity(8);
+        b.push(evt(), Some(1));
+        b.push(evt(), Some(2));
+        let dropped = cap_retained_batch(&mut b, 4);
+        assert_eq!(dropped, 0);
+        assert_eq!(b.len(), 2);
+    }
+
+    /// Regression for SCREENPIPE-CLI-FZ: a failed insert must NOT discard the
+    /// captured events. Before the fix `flush_batch` cleared unconditionally,
+    /// so any transient write-pool stall (PoolTimedOut) silently dropped the
+    /// batch and left a hole in the timeline.
+    #[tokio::test]
+    async fn flush_batch_retains_events_when_insert_fails() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        // Make every insert fail deterministically by removing the table.
+        sqlx::query("DROP TABLE ui_events")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let mut batch = EventBatch::with_capacity(8);
+        batch.push(evt(), Some(1));
+        batch.push(evt(), Some(2));
+        batch.push(evt(), None);
+        let mut consecutive_failures = 0u32;
+
+        flush_batch(&db, &mut batch, &mut consecutive_failures, None).await;
+
+        assert_eq!(
+            batch.len(),
+            3,
+            "a failed flush must retain captured events for retry, not drop them"
+        );
+        assert_eq!(consecutive_failures, 1, "the failure should be counted");
+        assert_eq!(
+            batch.correlation_ids,
+            vec![Some(1), Some(2), None],
+            "retained events stay aligned with their correlation ids"
+        );
+    }
+
+    /// The flip side: a successful flush clears the batch and resets the
+    /// failure counter so the full-batch flush path re-engages.
+    #[tokio::test]
+    async fn flush_batch_clears_events_on_success() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let mut batch = EventBatch::with_capacity(8);
+        batch.push(evt(), None);
+        batch.push(evt(), None);
+        let mut consecutive_failures = 3u32;
+
+        flush_batch(&db, &mut batch, &mut consecutive_failures, None).await;
+
+        assert!(batch.is_empty(), "a successful flush clears the batch");
+        assert_eq!(
+            consecutive_failures, 0,
+            "success resets the failure counter"
+        );
     }
 }
 
