@@ -10,7 +10,9 @@
 //! parses configs, runs the scheduler, and delegates execution to an
 //! [`AgentExecutor`].
 
+pub mod connections;
 pub mod favorites;
+pub mod mcp_access;
 pub mod permissions;
 pub mod preset_fallback;
 pub mod sync;
@@ -19,6 +21,8 @@ use crate::agents::{
     pi::{PiExecutor, SCREENPIPE_API_URL},
     AgentExecutor, ExecutionHandle,
 };
+use crate::pipes::connections::parse_mcp_connection_id;
+use crate::pipes::mcp_access::McpSessionAccessRegistry;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, Utc};
 use cron::Schedule as CronSchedule;
@@ -1356,6 +1360,8 @@ pub struct PipeManager {
     last_reload: Arc<Mutex<Instant>>,
     /// Optional token registry for server-side permission enforcement.
     token_registry: Option<Arc<dyn permissions::PipeTokenRegistry>>,
+    /// Optional registry for per-pipe MCP server allowlists.
+    mcp_session_access: Option<McpSessionAccessRegistry>,
     /// Extra context appended to every pipe prompt (e.g. connected integrations).
     extra_context: Option<String>,
     /// Connected integrations context injected into every pipe *system* prompt.
@@ -1401,6 +1407,7 @@ impl PipeManager {
                     .unwrap_or(Instant::now()),
             )),
             token_registry: None,
+            mcp_session_access: None,
             extra_context: None,
             connections_context: None,
             local_api_key: None,
@@ -1465,6 +1472,11 @@ impl PipeManager {
     /// Set a token registry for server-side permission enforcement.
     pub fn set_token_registry(&mut self, registry: Arc<dyn permissions::PipeTokenRegistry>) {
         self.token_registry = Some(registry);
+    }
+
+    /// Set the registry used by the local MCP API to enforce per-pipe MCP scopes.
+    pub fn set_mcp_session_access(&mut self, registry: McpSessionAccessRegistry) {
+        self.mcp_session_access = Some(registry);
     }
 
     /// Set a callback to be invoked after each scheduled pipe run.
@@ -2182,6 +2194,7 @@ impl PipeManager {
         let on_output = self.on_output_line.clone();
         let pipes_dir_for_log = self.pipes_dir.clone();
         let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let mcp_session_access = self.mcp_session_access.clone();
 
         // Spawn the actual execution in a background task
         tokio::spawn(async move {
@@ -2205,6 +2218,17 @@ impl PipeManager {
                 }
             });
 
+            let mcp_server_allowlist = selected_mcp_server_ids(&config);
+            let session_owner = format!("pipe:{pipe_name}");
+            if let Some(ref registry) = mcp_session_access {
+                if mcp_server_allowlist.is_empty() {
+                    registry.clear_session(&session_owner).await;
+                } else {
+                    registry
+                        .set_allowlist(session_owner.clone(), mcp_server_allowlist.clone())
+                        .await;
+                }
+            }
             let run_result = tokio::time::timeout(
                 timeout_duration,
                 executor.run_streaming(
@@ -2218,14 +2242,18 @@ impl PipeManager {
                     line_tx,
                     history_enabled,
                     Some(&pipe_system_prompt),
+                    mcp_allowlist_arg(&mcp_server_allowlist),
                     // Owner tag: a pipe's owned-browser navigations are
                     // `pipe:<name>`, which never matches an open chat's
                     // conversationId, so they stay out of whatever chat is on
                     // screen. See screenpipe-core::agents::bash_env.
-                    Some(format!("pipe:{pipe_name}").as_str()),
+                    Some(session_owner.as_str()),
                 ),
             )
             .await;
+            if let Some(ref registry) = mcp_session_access {
+                registry.clear_session(&session_owner).await;
+            }
 
             let finished_at = Utc::now();
 
@@ -2698,6 +2726,17 @@ impl PipeManager {
                 }
             });
 
+            let mcp_server_allowlist = selected_mcp_server_ids(&config);
+            let session_owner = format!("pipe:{name}");
+            if let Some(ref registry) = self.mcp_session_access {
+                if mcp_server_allowlist.is_empty() {
+                    registry.clear_session(&session_owner).await;
+                } else {
+                    registry
+                        .set_allowlist(session_owner.clone(), mcp_server_allowlist.clone())
+                        .await;
+                }
+            }
             let run_result = tokio::time::timeout(
                 timeout_duration,
                 executor.run_streaming(
@@ -2711,14 +2750,18 @@ impl PipeManager {
                     line_tx,
                     history_enabled,
                     Some(&pipe_system_prompt),
+                    mcp_allowlist_arg(&mcp_server_allowlist),
                     // Owner tag: a pipe's owned-browser navigations are
                     // `pipe:<name>`, which never matches an open chat's
                     // conversationId, so they stay out of whatever chat is on
                     // screen. See screenpipe-core::agents::bash_env.
-                    Some(format!("pipe:{name}").as_str()),
+                    Some(session_owner.as_str()),
                 ),
             )
             .await;
+            if let Some(ref registry) = self.mcp_session_access {
+                registry.clear_session(&session_owner).await;
+            }
 
             // Remove from running + clean up PID file
             let _removed_handle = {
@@ -3376,6 +3419,7 @@ impl PipeManager {
         let store = self.store.clone();
         let api_port = self.api_port;
         let token_registry = self.token_registry.clone();
+        let mcp_session_access = self.mcp_session_access.clone();
         let extra_context = self.extra_context.clone();
         let connections_context = self.connections_context.clone();
         let local_api_key = self.local_api_key.clone();
@@ -3576,10 +3620,72 @@ impl PipeManager {
                         if let Some(check) = &connection_check {
                             let missing = check(config.connections.clone()).await;
                             if !missing.is_empty() {
-                                debug!(
+                                let skipped_at = Utc::now();
+                                let trigger = if triggered_by_event {
+                                    "event"
+                                } else {
+                                    "scheduled"
+                                };
+                                let message = format!(
+                                    "pipe '{}' skipped: missing required connections: {}",
+                                    name,
+                                    missing.join(", ")
+                                );
+                                warn!(
                                     "scheduler: pipe '{}' in setup mode (missing connections: {:?}), skipping",
                                     name, missing
                                 );
+                                last_run.insert(name.clone(), skipped_at);
+                                if let Some(ref store) = store {
+                                    match store
+                                        .create_execution(
+                                            name,
+                                            trigger,
+                                            &config.model,
+                                            config.provider.as_deref(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(id) => {
+                                            let _ = store
+                                                .finish_execution(
+                                                    id,
+                                                    "failed",
+                                                    "",
+                                                    &message,
+                                                    None,
+                                                    Some("missing_connections"),
+                                                    Some(&message),
+                                                    None,
+                                                )
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            warn!("failed to create skipped execution row: {}", e);
+                                        }
+                                    }
+                                    let _ = store.upsert_scheduler_state(name, false).await;
+                                }
+                                {
+                                    let mut logs_guard = logs.lock().await;
+                                    let entry = logs_guard
+                                        .entry(name.clone())
+                                        .or_insert_with(VecDeque::new);
+                                    entry.push_front(PipeRunLog {
+                                        pipe_name: name.clone(),
+                                        started_at: skipped_at,
+                                        finished_at: skipped_at,
+                                        success: false,
+                                        stdout: String::new(),
+                                        stderr: message.clone(),
+                                    });
+                                    if entry.len() > 50 {
+                                        entry.pop_back();
+                                    }
+                                }
+                                if let Some(ref cb) = on_run_complete {
+                                    cb(name, false, 0.0, Some("missing_connections"));
+                                }
                                 continue;
                             }
                         }
@@ -3763,10 +3869,12 @@ impl PipeManager {
                     let on_output = on_output_line.clone();
                     let store_ref = store.clone();
                     let token_registry_ref = token_registry.clone();
+                    let mcp_session_access_ref = mcp_session_access.clone();
                     let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
                     let semaphore = execution_semaphore.clone();
                     let pipes_dir_for_mark = pipes_dir.clone();
                     let queued_ref = queued_or_running.clone();
+                    let mcp_server_allowlist = selected_mcp_server_ids(config);
 
                     tokio::spawn(async move {
                         // Event-triggered pipes skip the queue for low-latency response.
@@ -3876,6 +3984,19 @@ impl PipeManager {
                             }
                         });
 
+                        let session_owner = format!("pipe:{pipe_name}");
+                        if let Some(ref registry) = mcp_session_access_ref {
+                            if mcp_server_allowlist.is_empty() {
+                                registry.clear_session(&session_owner).await;
+                            } else {
+                                registry
+                                    .set_allowlist(
+                                        session_owner.clone(),
+                                        mcp_server_allowlist.clone(),
+                                    )
+                                    .await;
+                            }
+                        }
                         let run_result = tokio::time::timeout(
                             timeout_duration,
                             executor.run_streaming(
@@ -3889,11 +4010,15 @@ impl PipeManager {
                                 line_tx,
                                 history_enabled,
                                 Some(&pipe_system_prompt),
+                                mcp_allowlist_arg(&mcp_server_allowlist),
                                 // Owner tag — see run_pipe_with_trigger.
-                                Some(format!("pipe:{pipe_name}").as_str()),
+                                Some(session_owner.as_str()),
                             ),
                         )
                         .await;
+                        if let Some(ref registry) = mcp_session_access_ref {
+                            registry.clear_session(&session_owner).await;
+                        }
 
                         let finished_at = Utc::now();
 
@@ -4412,6 +4537,22 @@ fn render_pipe_system_prompt(
     sys
 }
 
+fn selected_mcp_server_ids(config: &PipeConfig) -> Vec<String> {
+    config
+        .connections
+        .iter()
+        .filter_map(|connection| parse_mcp_connection_id(connection).map(str::to_string))
+        .collect()
+}
+
+fn mcp_allowlist_arg(allowlist: &[String]) -> Option<&[String]> {
+    if allowlist.is_empty() {
+        None
+    } else {
+        Some(allowlist)
+    }
+}
+
 /// Build the dynamic user prompt for a pipe.
 ///
 /// Contains time-varying context (time range, date, timezone) and any extra context.
@@ -4602,16 +4743,18 @@ fn parse_human_schedule(s: &str) -> Option<CronSchedule> {
     // Schedules are evaluated against the user's local timezone (see
     // `cron_should_fire`), so encode the local hour directly — no UTC shift.
     // "day" → every day at that hour; "monday".. → specific weekday.
+    // The `cron` crate evaluates day-of-week via chrono's `number_from_sunday()`
+    // which is 1-indexed: Sun=1, Mon=2, Tue=3, Wed=4, Thu=5, Fri=6, Sat=7.
     let cron_str = match prefix {
         "day" => format!("0 0 {} * * * *", local_hour),
         "daily" => format!("0 0 {} * * * *", local_hour),
-        "monday" | "mon" => format!("0 0 {} * * 1 *", local_hour),
-        "tuesday" | "tue" => format!("0 0 {} * * 2 *", local_hour),
-        "wednesday" | "wed" => format!("0 0 {} * * 3 *", local_hour),
-        "thursday" | "thu" => format!("0 0 {} * * 4 *", local_hour),
-        "friday" | "fri" => format!("0 0 {} * * 5 *", local_hour),
-        "saturday" | "sat" => format!("0 0 {} * * 6 *", local_hour),
-        "sunday" | "sun" => format!("0 0 {} * * 0 *", local_hour),
+        "sunday" | "sun" => format!("0 0 {} * * 1 *", local_hour),
+        "monday" | "mon" => format!("0 0 {} * * 2 *", local_hour),
+        "tuesday" | "tue" => format!("0 0 {} * * 3 *", local_hour),
+        "wednesday" | "wed" => format!("0 0 {} * * 4 *", local_hour),
+        "thursday" | "thu" => format!("0 0 {} * * 5 *", local_hour),
+        "friday" | "fri" => format!("0 0 {} * * 6 *", local_hour),
+        "saturday" | "sat" => format!("0 0 {} * * 7 *", local_hour),
         _ => return None,
     };
 
@@ -5044,6 +5187,15 @@ mod tests {
             "daily"
         ));
         assert!(!is_pipe_completed_event("workflow_event"));
+    }
+
+    #[test]
+    fn empty_mcp_allowlist_is_unscoped_for_legacy_pipes() {
+        let empty: Vec<String> = Vec::new();
+        let selected = vec!["linear".to_string()];
+
+        assert!(mcp_allowlist_arg(&empty).is_none());
+        assert_eq!(mcp_allowlist_arg(&selected), Some(selected.as_slice()));
     }
 
     #[test]
@@ -5618,8 +5770,7 @@ mod tests {
     fn human_schedule_pm_hour_is_local() {
         use chrono::{TimeZone, Timelike};
         // "every monday at 6pm" must encode local hour 18 (no UTC shift baked into
-        // the cron expression) — issue #3851. (Weekday-number mapping is a separate
-        // concern tracked outside this fix.)
+        // the cron expression) — issue #3851.
         let cron = parse_human_schedule("every monday at 6pm").expect("should parse");
         let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let next = cron.after(&from).next().unwrap();
@@ -5628,6 +5779,44 @@ mod tests {
             18,
             "6pm must encode local hour 18, not a shifted hour"
         );
+    }
+
+    #[test]
+    fn human_schedule_weekday_fires_on_correct_day() {
+        use chrono::{Datelike, TimeZone, Weekday};
+        // The cron crate uses number_from_sunday() (Sun=1..Sat=7). Each weekday
+        // name must map to the right number so the schedule fires on the named day,
+        // not the day before. 2026-06-04 is a Thursday; search from just after
+        // midnight so the next slot for each day is unambiguous.
+        let cases: &[(&str, Weekday)] = &[
+            ("every sunday at 1pm", Weekday::Sun),
+            ("every monday at 1pm", Weekday::Mon),
+            ("every tuesday at 1pm", Weekday::Tue),
+            ("every wednesday at 1pm", Weekday::Wed),
+            ("every thursday at 1pm", Weekday::Thu),
+            ("every friday at 1pm", Weekday::Fri),
+            ("every saturday at 1pm", Weekday::Sat),
+        ];
+        // Start from Thursday 2026-06-04 00:01 UTC so every day except Thursday
+        // has a clear "next occurrence" this week or next.
+        let from = chrono::Utc.with_ymd_and_hms(2026, 6, 4, 0, 1, 0).unwrap();
+        for (schedule, expected_weekday) in cases {
+            let cron = parse_human_schedule(schedule)
+                .unwrap_or_else(|| panic!("failed to parse: {}", schedule));
+            let next = cron
+                .after(&from)
+                .next()
+                .unwrap_or_else(|| panic!("no next occurrence for: {}", schedule));
+            assert_eq!(
+                next.weekday(),
+                *expected_weekday,
+                "'{}' should fire on {:?} but fired on {:?} ({})",
+                schedule,
+                expected_weekday,
+                next.weekday(),
+                next
+            );
+        }
     }
 
     #[test]

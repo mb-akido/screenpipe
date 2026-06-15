@@ -19,7 +19,14 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { useToast } from "@/components/ui/use-toast";
 import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
 import { notifyConnectionsUpdated } from "@/lib/connections-events";
-import { CONNECTION_CATEGORY_BY_ID } from "@/lib/constants/connections";
+import {
+  CONNECTION_CATEGORY_BY_ID,
+  CONNECTION_HARDCODED_DESCRIPTIONS,
+  compareConnectionTiles,
+  getSuggestedConnectionsForDevice,
+  normalizeConnectionCategory,
+  type ConnectionSuggestionTile,
+} from "@/lib/constants/connections";
 import { Command } from "@tauri-apps/plugin-shell";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { message, open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -28,7 +35,6 @@ import { exists, writeFile, readTextFile, mkdir } from "@tauri-apps/plugin-fs";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { platform } from "@tauri-apps/plugin-os";
 import { join, homeDir, tempDir, dirname } from "@tauri-apps/api/path";
-import { AppleIntelligenceCard } from "./apple-intelligence-card";
 import { AppleCalendarCard } from "./apple-calendar-card";
 import { GoogleCalendarCard } from "./google-calendar-card";
 import { GoogleDocsCard } from "./google-docs-card";
@@ -553,7 +559,6 @@ const INTEGRATION_ICONS: Record<string, React.ReactNode> = {
         <path d="M20.32 4.37a19.8 19.8 0 00-4.89-1.52.07.07 0 00-.08.04c-.21.38-.44.87-.6 1.25a18.27 18.27 0 00-5.49 0 12.64 12.64 0 00-.62-1.25.08.08 0 00-.08-.04 19.74 19.74 0 00-4.89 1.52.07.07 0 00-.03.03C1.11 8.39.34 12.27.74 16.1a.08.08 0 00.03.06 19.9 19.9 0 005.99 3.03.08.08 0 00.08-.03c.46-.63.87-1.3 1.22-2a.08.08 0 00-.04-.11 13.1 13.1 0 01-1.87-.9.08.08 0 01-.01-.13c.13-.09.25-.19.37-.29a.08.08 0 01.08-.01c3.93 1.79 8.18 1.79 12.07 0a.08.08 0 01.08.01c.12.1.25.2.37.29a.08.08 0 01 0 .13c-.6.35-1.22.65-1.87.9a.08.08 0 00-.04.1c.36.7.77 1.37 1.22 2a.08.08 0 00.08.03 19.83 19.83 0 006-3.03.08.08 0 00.04-.05c.46-4.54-.78-8.38-3.36-11.77a.06.06 0 00-.03-.03zM8.02 13.72c-1.02 0-1.86-.93-1.86-2.08s.82-2.08 1.86-2.08c1.05 0 1.88.94 1.86 2.08 0 1.15-.82 2.08-1.86 2.08zm6.88 0c-1.02 0-1.86-.93-1.86-2.08s.82-2.08 1.86-2.08c1.05 0 1.88.94 1.86 2.08 0 1.15-.81 2.08-1.86 2.08z"/>
       </svg>
     ),
-    "apple-intelligence": <img src="/images/apple-intelligence.png" alt="Apple Intelligence" className="w-5 h-5 rounded" />,
     "input-monitoring": <Keyboard className="h-5 w-5 text-muted-foreground" />,
     "apple-calendar": (
       <svg
@@ -781,130 +786,11 @@ export function IntegrationIcon({
 // Connection tile (compact grid item)
 // ---------------------------------------------------------------------------
 
-interface ConnectionTile {
-  id: string;
-  name: string;
-  icon: string;
-  connected: boolean;
-  detected?: boolean;
-  category?: string;
-  description?: string;
-}
-
-const HARDCODED_DESCRIPTIONS: Record<string, string> = {
-  "claude": "Search your screen & audio from Claude Desktop via MCP",
-  "cursor": "Give Cursor AI access to your screen history via MCP",
-  "codex": "Give Codex access to your screen & audio via MCP",
-  "claude-code": "Add screen memory to the Claude Code CLI",
-  "warp": "Search screen history from Warp terminal via MCP",
-  "chatgpt": "Search your screen history from ChatGPT",
-  "browser-url": "Capture visited URLs from your browser in real time",
-  "voice-memos": "Sync Apple Voice Memos for AI-powered search",
-  "apple-intelligence": "Connect Apple Intelligence writing tools",
-  "input-monitoring": "Track keyboard & mouse for productivity insights",
-  "apple-calendar": "Search Apple Calendar events with AI",
-  "google-calendar": "Search Google Calendar events with AI",
-  "google-docs": "Read and search your Google Docs",
-  "google-sheets": "Read and search your Google Sheets",
-  "gmail": "Read and search your Gmail inbox",
-  "ics-calendar": "Subscribe to any ICS calendar feed",
-  "openclaw": "Browse the web with OpenClaw agents",
-  "hermes": "AI-powered messaging assistant",
-  "whatsapp": "Search your WhatsApp conversations",
-  "anythingllm": "Give AnythingLLM access to your screen",
-  "ollama": "Connect local Ollama models to screenpipe",
-  "lmstudio": "Connect LM Studio models to screenpipe",
-  "msty": "Connect Msty models to screenpipe",
-  "obsidian": "Sync screen memory to your Obsidian vault",
-  "notion": "Search Notion pages with your screen context",
-  "linear": "Search Linear issues from your screen context",
-  "perplexity": "Search the web with Perplexity AI",
-  "krisp": "Search Krisp meeting transcripts and notes",
-  "plaud": "Search Plaud recordings and transcripts",
-  "excalidraw": "Search and edit your Excalidraw+ whiteboards",
-  "custom-mcp": "Connect any MCP-compatible server",
-  "skills": "Import Claude Code skills for AI automations",
-};
+type ConnectionTile = ConnectionSuggestionTile & { icon: string };
 
 type ConnectionSort = "suggested" | "alphabetical";
 
 const ALL_CONNECTION_CATEGORIES = "All";
-
-// High-activation defaults fill the suggested row when there are not enough
-// detected or already-connected apps on the device.
-const FEATURED_CONNECTION_IDS = [
-  "custom-mcp",
-  "claude",
-  "cursor",
-  "codex",
-  "claude-code",
-  "chatgpt",
-  "slack",
-  "obsidian",
-  "notion",
-];
-
-
-const DEVICE_CONNECTION_ORDER = [
-  "custom-mcp",
-  "claude",
-  "cursor",
-  "codex",
-  "claude-code",
-  "chatgpt",
-  "browser-url",
-  "input-monitoring",
-  "obsidian",
-  "notion",
-  "linear",
-  "slack",
-  "gmail",
-  "apple-calendar",
-  "google-calendar",
-  "google-docs",
-  "google-sheets",
-  "warp",
-  "ollama",
-  "lmstudio",
-  "msty",
-  "krisp",
-  "whatsapp",
-];
-
-function normalizeConnectionCategory(category: string | null | undefined): string {
-  const value = (category || "Other").trim();
-  if (!value) return "Other";
-  return value
-    .split(/[-_\s]+/)
-    .filter(Boolean)
-    // Preserve all-caps acronyms (AI, CRM) instead of mangling them to "Ai"/"Crm".
-    .map((part) =>
-      /^[A-Z0-9]{2,}$/.test(part)
-        ? part
-        : part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
-    )
-    .join(" ");
-}
-
-function connectionPriority(tile: ConnectionTile): number {
-  if (tile.connected) return 0;
-  if (tile.detected) return 1;
-  if (FEATURED_CONNECTION_IDS.includes(tile.id)) return 2;
-  return 3;
-}
-
-function connectionOrder(tile: ConnectionTile): number {
-  const index = DEVICE_CONNECTION_ORDER.indexOf(tile.id);
-  return index === -1 ? DEVICE_CONNECTION_ORDER.length : index;
-}
-
-function compareConnectionTiles(a: ConnectionTile, b: ConnectionTile): number {
-  const priority = connectionPriority(a) - connectionPriority(b);
-  if (priority !== 0) return priority;
-  const order = connectionOrder(a) - connectionOrder(b);
-  if (order !== 0) return order;
-  return a.name.localeCompare(b.name);
-}
 
 
 // Per-connection quickstart prompts shown when "Try in Chat" is clicked.
@@ -3564,7 +3450,6 @@ export function ConnectionsSection({
         { id: "browser-url", name: "Browser URL Capture", icon: "browser-url", connected: browserUrlConnected, detected: browserUrlDetected },
         { id: "voice-memos", name: "Voice Memos", icon: "voice-memos", connected: false },
       ] : []),
-      ...(os === "macos" ? [{ id: "apple-intelligence", name: "Apple Intelligence", icon: "apple-intelligence", connected: false }] : []),
       ...(os === "macos" ? [{ id: "input-monitoring", name: "Input Monitoring", icon: "input-monitoring", connected: inputMonitoringGranted }] : []),
       ...(os === "macos" ? [{ id: "apple-calendar", name: "Apple Calendar", icon: "apple-calendar", connected: appleCalendarConnected }] : []),
       { id: "google-calendar", name: "Google Calendar", icon: "google-calendar", connected: false },
@@ -3627,7 +3512,7 @@ export function ConnectionsSection({
       ...tile,
       // Our explicit map overrides the API's category so known tools always land in the right group
       category: CONNECTION_CATEGORY_BY_ID[tile.id] ?? tile.category ?? "Other",
-      description: tile.description ?? HARDCODED_DESCRIPTIONS[tile.id],
+      description: tile.description ?? CONNECTION_HARDCODED_DESCRIPTIONS[tile.id],
     }));
   }, [os, claudeInstalled, cursorInstalled, codexInstalled, chatgptConnected, browserUrlConnected, browserUrlDetected, integrations, appleCalendarConnected, googleCalendarConnected, googleDocsConnected, googleSheetsConnected, gmailConnected, customMcpConnected, customMcpServerCount, krispConnected, plaudConnected, excalidrawConnected, inputMonitoringGranted, importedSkillsCount, detectedConnectionIds]);
 
@@ -3635,14 +3520,7 @@ export function ConnectionsSection({
 
   const suggested = useMemo(() => {
     if (!isDefaultView) return [];
-    return [...allTiles]
-      .filter((tile) => (
-        tile.connected ||
-        tile.detected ||
-        FEATURED_CONNECTION_IDS.includes(tile.id)
-      ))
-      .sort(compareConnectionTiles)
-      .slice(0, 8);
+    return getSuggestedConnectionsForDevice(allTiles, 8);
   }, [allTiles, isDefaultView]);
 
   // Flat search results (used when search is active or category is programmatically focused)
@@ -3709,7 +3587,6 @@ export function ConnectionsSection({
       case "user-browser": return <UserBrowserCard />;
       case "browser-url": return <BrowserUrlCard onStatusChange={setBrowserUrlConnected} />;
       case "voice-memos": return <VoiceMemosCard />;
-      case "apple-intelligence": return <AppleIntelligenceCard />;
       case "input-monitoring": return <InputMonitoringPanel onStatusChange={setInputMonitoringGranted} />;
       case "apple-calendar": return <AppleCalendarCard onStatusChange={setAppleCalendarConnected} />;
       case "google-calendar": return <GoogleCalendarCard

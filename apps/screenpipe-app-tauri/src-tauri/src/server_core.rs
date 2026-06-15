@@ -457,12 +457,27 @@ impl ServerCore {
             pipe_store,
             config.port,
         );
+        let mcp_session_access =
+            screenpipe_core::pipes::mcp_access::McpSessionAccessRegistry::new();
+        pipe_manager.set_mcp_session_access(mcp_session_access.clone());
         if let Some(cb) = on_pipe_output {
             pipe_manager.set_on_output_line(cb);
         }
         // Inject local API key so pipe subprocesses can authenticate to localhost
         if config.api_auth {
             pipe_manager.set_local_api_key(config.api_auth_key.clone());
+        }
+        {
+            let secret_store_for_check = server.secret_store.clone();
+            let screenpipe_dir_for_check = config.data_dir.clone();
+            pipe_manager.set_connection_check(Arc::new(move |required| {
+                let ss = secret_store_for_check.clone();
+                let dir = screenpipe_dir_for_check.clone();
+                Box::pin(async move {
+                    screenpipe_connect::missing_pipe_connections(ss.as_deref(), &dir, &required)
+                        .await
+                })
+            }));
         }
         pipe_manager.install_builtin_pipes().ok();
         if let Err(e) = pipe_manager.load_pipes().await {
@@ -491,7 +506,7 @@ impl ServerCore {
                     }
                     analytics::capture_event_nonblocking("pipe_scheduled_run", props);
 
-                    // Auto-register pipe outputs to ~/.screenpipe/outputs/
+                    // Auto-register pipe artifacts to ~/.screenpipe/outputs/
                     if success {
                         let db = db_for_cb.clone();
                         let dir = screenpipe_dir_for_cb.clone();
@@ -503,7 +518,7 @@ impl ServerCore {
                                 let mgr = pm.lock().await;
                                 let all = mgr
                                     .list_artifact_declarations(
-                                        screenpipe_engine::pipes_api::ARTIFACT_FALLBACK_CAP,
+                                        screenpipe_engine::routes::artifacts::ARTIFACT_FALLBACK_CAP,
                                     )
                                     .await;
                                 all.into_iter()
@@ -512,7 +527,7 @@ impl ServerCore {
                                     .unwrap_or_default()
                             };
                             if !items.is_empty() {
-                                screenpipe_engine::routes::outputs::auto_register_pipe_outputs(
+                                screenpipe_engine::routes::artifacts::auto_register_pipe_artifacts(
                                     &db, items, &name, &dir,
                                 )
                                 .await;
@@ -610,6 +625,7 @@ impl ServerCore {
 
         let server = server
             .with_pipe_manager(shared_pipe_manager.clone())
+            .with_mcp_session_access(mcp_session_access)
             .with_high_fps_controller(high_fps_controller.clone());
 
         // Install pi agent in background

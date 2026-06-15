@@ -182,6 +182,10 @@ export interface ChatConversation {
 	/** Title source priority: user > ai > fallback. Used to prevent
 	 *  lower-priority titles from overwriting higher-priority ones. */
 	titleSource?: "user" | "ai" | "fallback";
+	/** The AI preset ID last used in this conversation. Used to restore
+	 *  the model selection when switching between chats. Persisted to disk
+	 *  so the selection survives app restart. */
+	presetId?: string;
 }
 
 export interface ChatHistoryStore {
@@ -277,6 +281,8 @@ export type Settings = SettingsStore & {
 	disableClipboardCapture?: boolean;
 	/** Skip keyboard / typed-text capture in the UI recorder. Defaults to true (keyboard capture OFF) — the a11y tree + OCR still capture on-screen text, this only drops the raw keystroke stream where secrets get typed. */
 	disableKeyboardCapture?: boolean;
+	/** Skip mouse-click rows in the UI recorder. Defaults to false (click capture ON) — clicks carry no text payload and drive workflow/task mining. Clicks still wake event-driven capture when disabled. */
+	disableClickCapture?: boolean;
 	/** Experimental: capture System Audio via CoreAudio Process Tap (macOS 14.4+) instead of ScreenCaptureKit.
 	 *  Off by default. Ignored on macOS <14.4 and non-macOS — falls back to SCK. */
 	experimentalCoreaudioSystemAudio?: boolean;
@@ -297,6 +303,11 @@ export type Settings = SettingsStore & {
 	translucentSidebar?: boolean;
 	/** Hide model "thinking" reasoning blocks in chat (default: true) */
 	hideThinkingBlocks?: boolean;
+	/** Show the chat suggestion chips above the input — the "follow up"
+	 *  questions and the connection-aware suggested prompts. The single inline
+	 *  X on the chips flips this to false; re-enable from Settings → Display.
+	 *  Default true. */
+	showChatSuggestions?: boolean;
 	/** Auto-generate chat titles with the LLM after the first message.
 	 *  Costs one extra inference per new chat. Disable to save tokens —
 	 *  chats fall back to a title derived from the first message (default: true) */
@@ -315,6 +326,9 @@ export type Settings = SettingsStore & {
 		audioCaptureStalled?: boolean;
 		/** In-app /notify when audio is captured but no live transcript arrives within 60s. Default true. */
 		liveTranscriptStalled?: boolean;
+		/** Toast on informational power-profile transitions (Balanced / Saver), e.g. when unplugging AC.
+		 *  Critical AudioPaused/FullPause alerts always fire regardless. Default true. */
+		powerModeChanges?: boolean;
 		mutedPipes: string[];
 	};
 	/** Remote devices to monitor pipes on (LAN addresses) */
@@ -596,6 +610,7 @@ let DEFAULT_SETTINGS: Settings = {
 			pauseOnDrmContent: false,
 			disableClipboardCapture: true,
 			disableKeyboardCapture: true,
+			disableClickCapture: false,
 			keepComputerAwake: false,
 			experimentalCoreaudioSystemAudio: false,
 			windowsInputAecEnabled: false,
@@ -660,6 +675,65 @@ export const saveAndEncrypt = async (store: Store) => {
 	await commands.reencryptStore().catch(() => {});
 };
 
+/**
+ * #3943: persist settings WITHOUT the cloud auth token in plaintext.
+ *
+ * The Clerk JWT must never land in store.bin (or its .last-good snapshot). When
+ * the settings being saved carry a token, mirror it to the authoritative
+ * encrypted secret store FIRST (so it's never lost), then write a stripped copy
+ * to disk. A token-less save never clears the secret store — only explicit
+ * logout (`setCloudToken(null)`) does — so a save during a transient
+ * pre-hydration state can't sign the user out.
+ */
+async function setSettingsStripped(store: Store, settings: Settings) {
+	const token = settings?.user?.token;
+	// Default to "safe to write as-is" when there's no token to protect.
+	let persisted = !token;
+	if (token) {
+		try {
+			const res = await commands.setCloudToken(token);
+			if (res.status === "ok") {
+				persisted = true;
+			} else {
+				console.warn("cloud token not persisted to secret store:", res.error);
+			}
+		} catch (e) {
+			console.warn("failed to mirror cloud token to secret store:", e);
+		}
+	}
+	// Only strip the plaintext token from store.bin once it's safely in the
+	// encrypted secret store. If persistence failed, keep it on disk so the user
+	// isn't silently signed out on the next restart (#3943).
+	const toPersist =
+		token && persisted
+			? { ...settings, user: { ...settings.user, token: undefined } }
+			: settings;
+	await store.set("settings", toPersist);
+}
+
+/**
+ * #3943: the cloud auth token no longer lives in store.bin (it's in the
+ * encrypted secret store). Neither `store.get("settings")` nor the cross-window
+ * `onKeyChange` broadcast carries it, so hydrate it back into the in-memory
+ * settings here. Every reader of `settings.user.token` (the account "logged in"
+ * indicator, the auth auto-refresh effect, the engine Bearer path) then keeps
+ * working unchanged across windows. Without this on the broadcast path, a login
+ * in one window ships a token-stripped user to every window (including the one
+ * that just logged in), so they all render "not logged in". Mutates in place and
+ * returns the same object for convenience.
+ */
+async function hydrateCloudToken(settings: Settings): Promise<Settings> {
+	if (settings.user && !settings.user.token) {
+		try {
+			const token = await commands.getCloudToken();
+			if (token) settings.user.token = token;
+		} catch (e) {
+			console.warn("failed to hydrate cloud token from secret store:", e);
+		}
+	}
+	return settings;
+}
+
 // Store utilities similar to Cap's implementation
 function createSettingsStore() {
 	const get = async (): Promise<Settings> => {
@@ -668,6 +742,9 @@ function createSettingsStore() {
 		if (!settings) {
 			return createDefaultSettingsObject();
 		}
+
+		// #3943: re-hydrate the cloud token that no longer persists in store.bin.
+		await hydrateCloudToken(settings);
 
 		// Migration: Ensure existing users have deviceId for free tier tracking
 		let needsUpdate = false;
@@ -876,7 +953,7 @@ function createSettingsStore() {
 
 		// Save migrations if needed
 		if (needsUpdate) {
-			await store.set("settings", settings);
+			await setSettingsStripped(store, settings);
 			await saveAndEncrypt(store);
 		}
 
@@ -895,7 +972,7 @@ function createSettingsStore() {
 			}
 			newSettings = applyProCloudAudioDefaults(newSettings);
 		}
-		await store.set("settings", newSettings);
+		await setSettingsStripped(store, newSettings);
 		await saveAndEncrypt(store);
 	};
 
@@ -913,8 +990,15 @@ function createSettingsStore() {
 
 	const listen = (callback: (settings: Settings) => void) => {
 		return getStore().then((store) => {
-			return store.onKeyChange("settings", (newValue: Settings | null | undefined) => {
-				callback(newValue || createDefaultSettingsObject());
+			// #3943: the broadcast value is token-stripped (see setSettingsStripped),
+			// so hydrate the cloud token before handing settings to React, mirroring
+			// get(). A monotonic seq drops a slow hydration that a newer broadcast
+			// (e.g. a logout fired right after a login) has already superseded.
+			let seq = 0;
+			return store.onKeyChange("settings", async (newValue: Settings | null | undefined) => {
+				const mySeq = ++seq;
+				const next = await hydrateCloudToken(newValue || createDefaultSettingsObject());
+				if (mySeq === seq) callback(next);
 			});
 		});
 	};

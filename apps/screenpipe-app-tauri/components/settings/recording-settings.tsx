@@ -81,7 +81,7 @@ import {
   CheckCircle2,
   XCircle,
   Circle,
-  Upload,
+  Download,
   Trash2,
   Search,
   ListTodo,
@@ -143,6 +143,7 @@ import * as Sentry from "@sentry/react";
 import { defaultOptions } from "tauri-plugin-sentry-api";
 import { useLoginDialog } from "../login-dialog";
 import { BatterySaverSection } from "./battery-saver-section";
+import { ApplyRestartBar } from "./apply-restart-bar";
 // ScheduleSettings moved to privacy-section
 import { ValidatedInput } from "../ui/validated-input";
 import {
@@ -1294,7 +1295,7 @@ function TranscriptionDictionary({
               className="h-7 text-xs px-2 gap-1"
               onClick={() => setShowBulk(!showBulk)}
             >
-              <Upload className="h-3 w-3" />
+              <Download className="h-3 w-3" />
               bulk import
             </Button>
             {vocabularyWords.length > 0 && (
@@ -3783,24 +3784,14 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </DialogContent>
       </Dialog>
 
-      {/* Floating apply & restart button — always visible when changes pending */}
-      {hasUnsavedChanges && (
-        <div className="sticky bottom-4 flex justify-end pointer-events-none z-50">
-          <Button
-            onClick={handleUpdate}
-            disabled={isUpdating || Object.keys(validationErrors).length > 0}
-            size="sm"
-            className="pointer-events-auto flex items-center gap-1.5 h-9 px-4 text-sm bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150 shadow-lg"
-          >
-            {isUpdating ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            Apply & Restart
-          </Button>
-        </div>
-      )}
+      {/* Floating apply & restart bar — always visible when changes pending */}
+      <ApplyRestartBar
+        visible={hasUnsavedChanges}
+        onApply={handleUpdate}
+        isUpdating={isUpdating}
+        disabled={Object.keys(validationErrors).length > 0}
+        message="unsaved recording changes. restart to apply."
+      />
     </div>
   );
 }

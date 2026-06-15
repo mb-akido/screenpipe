@@ -10,7 +10,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use screenpipe_connect::connections::render_context;
-use screenpipe_connect::mcp_servers::render_context as mcp_render_context;
 use screenpipe_core::pipes::PipeManager;
 use screenpipe_secrets::SecretStore;
 use serde::Deserialize;
@@ -166,36 +165,32 @@ pub async fn run_pipe_now(
     };
 
     // Validate required connections are configured before running the pipe
-    if let Some(pipe_status) = mgr.get_pipe(&id).await {
-        let required = &pipe_status.config.connections;
-        if !required.is_empty() {
-            let screenpipe_dir = mgr
-                .pipes_dir()
-                .parent()
-                .unwrap_or(mgr.pipes_dir())
-                .to_path_buf();
-            let ss = secret_store.as_ref().map(|e| e.0.as_ref());
-            let mut missing = Vec::new();
-            for conn_id in required {
-                let configured = screenpipe_connect::connections::is_connection_configured(
-                    ss,
-                    &screenpipe_dir,
-                    conn_id,
+    let required_connections = mgr
+        .get_pipe(&id)
+        .await
+        .map(|pipe_status| pipe_status.config.connections)
+        .unwrap_or_default();
+    if !required_connections.is_empty() {
+        let screenpipe_dir = mgr
+            .pipes_dir()
+            .parent()
+            .unwrap_or(mgr.pipes_dir())
+            .to_path_buf();
+        let ss = secret_store.as_ref().map(|e| e.0.as_ref());
+        let missing = screenpipe_connect::missing_pipe_connections(
+            ss,
+            &screenpipe_dir,
+            &required_connections,
+        )
+        .await;
+        if !missing.is_empty() {
+            return Json(json!({
+                "error": format!(
+                    "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
+                    id,
+                    missing.join(", ")
                 )
-                .await;
-                if !configured {
-                    missing.push(conn_id.as_str());
-                }
-            }
-            if !missing.is_empty() {
-                return Json(json!({
-                    "error": format!(
-                        "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
-                        id,
-                        missing.join(", ")
-                    )
-                }));
-            }
+            }));
         }
     }
 
@@ -208,14 +203,7 @@ pub async fn run_pipe_now(
         .to_path_buf();
     let api_port = mgr.api_port();
     let ss = secret_store.as_ref().map(|e| e.0.as_ref());
-    let mut conn_ctx = render_context(&screenpipe_dir, api_port, ss).await;
-    // Append user-supplied MCP servers — the `mcp-bridge.ts` extension
-    // surfaces them as tools, but the model also needs a natural-language
-    // listing in its system prompt so it knows what's available.
-    let mcp_ctx = mcp_render_context(&screenpipe_dir, api_port).await;
-    if !mcp_ctx.is_empty() {
-        conn_ctx.push_str(&mcp_ctx);
-    }
+    let conn_ctx = render_context(&screenpipe_dir, api_port, ss).await;
     mgr.set_connections_context(conn_ctx);
 
     let result = mgr.start_pipe_background(&id).await;
@@ -392,75 +380,4 @@ pub async fn set_pipe_favorite(
         Ok(list) => Json(json!({ "success": true, "data": list })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
-}
-
-/// Fallback glob cap: pipes without explicit `artifacts:` declarations
-/// contribute at most this many files (newest by mtime) to listings.
-pub const ARTIFACT_FALLBACK_CAP: usize = 50;
-
-/// GET /pipes/artifacts — list all declared artifacts across pipes.
-///
-/// Iterates pipe configs, resolves artifact paths relative to each pipe
-/// directory, and checks the filesystem for existence, size, and mtime.
-/// Returns a flat list of artifacts with metadata. No database, no
-/// migration — the data is fully derivable at request time.
-///
-/// Prefer GET /artifacts, which unifies these with registered outputs and
-/// supports pagination + filtering. Kept for backward compatibility.
-pub async fn list_artifacts(State(pm): State<SharedPipeManager>) -> Json<Value> {
-    let mgr = pm.lock().await;
-    if let Err(e) = mgr.reload_pipes().await {
-        tracing::warn!("failed to reload pipes from disk: {}", e);
-    }
-    let declarations = mgr.list_artifact_declarations(ARTIFACT_FALLBACK_CAP).await;
-    drop(mgr);
-
-    let mut artifacts = Vec::new();
-    for (pipe_name, items) in declarations {
-        for (decl, abs_path) in items {
-            let mut entry = json!({
-                "pipe_name": pipe_name,
-                "title": decl.title.as_deref().unwrap_or_else(|| {
-                    abs_path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                }),
-                "kind": decl.kind.as_deref().unwrap_or("text"),
-                "path": abs_path.to_string_lossy(),
-            });
-
-            match tokio::fs::metadata(&abs_path).await {
-                Ok(meta) => {
-                    entry["exists"] = json!(true);
-                    entry["size_bytes"] = json!(meta.len());
-                    if let Ok(modified) = meta.modified() {
-                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
-                        entry["modified_at"] = json!(datetime.to_rfc3339());
-                    }
-
-                    // Read a short preview for text-like files (first 256
-                    // bytes only — no need to load the whole file).
-                    let kind = decl.kind.as_deref().unwrap_or("text");
-                    if kind != "image" && meta.len() > 0 {
-                        if let Ok(file) = tokio::fs::File::open(&abs_path).await {
-                            use tokio::io::AsyncReadExt;
-                            let mut buf = vec![0u8; 256];
-                            let mut reader = tokio::io::BufReader::new(file);
-                            if let Ok(n) = reader.read(&mut buf).await {
-                                if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                                    entry["preview"] = json!(text);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    entry["exists"] = json!(false);
-                }
-            }
-            artifacts.push(entry);
-        }
-    }
-
-    Json(json!({ "data": artifacts }))
 }

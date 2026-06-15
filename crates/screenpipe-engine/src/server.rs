@@ -17,6 +17,7 @@ use crate::{
     hot_frame_cache::HotFrameCache,
     routes::{
         activity_summary::get_activity_summary,
+        artifacts::{delete_artifact_handler, list_artifacts_handler, register_artifact_handler},
         audio::{
             api_list_audio_devices, audio_device_status, start_audio, start_audio_device,
             stop_audio, stop_audio_device,
@@ -49,10 +50,6 @@ use crate::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
             list_memories_handler, list_memory_tags_handler, sync_external_memories_handler,
             update_memory_handler,
-        },
-        outputs::{
-            delete_output_handler, get_output_handler, list_artifacts_unified_handler,
-            list_outputs_handler, register_output_handler,
         },
         retranscribe::retranscribe_meeting_handler,
         search::{keyword_search_handler, search},
@@ -231,6 +228,8 @@ pub struct SCServer {
     /// Shared pipe permission token registry — set before starting so PipeManager can use it.
     pub pipe_permissions:
         Arc<DashMap<String, Arc<screenpipe_core::pipes::permissions::PipePermissions>>>,
+    /// Per-pipe MCP allowlist registry shared by PipeManager and /mcp-servers.
+    pub mcp_session_access: Option<screenpipe_core::pipes::mcp_access::McpSessionAccessRegistry>,
     /// Shared manual meeting lock — pass in from binary so persister and server share the same state.
     pub manual_meeting: Option<Arc<tokio::sync::RwLock<Option<i64>>>>,
     /// Owned browser instance — set by the desktop shell so it can attach an
@@ -302,6 +301,7 @@ impl SCServer {
             hot_frame_cache: None,
             power_manager: None,
             pipe_permissions: Arc::new(DashMap::new()),
+            mcp_session_access: None,
             manual_meeting: None,
             owned_browser: None,
             api_auth: false,
@@ -344,6 +344,15 @@ impl SCServer {
     /// Set the pipe manager
     pub fn with_pipe_manager(mut self, pm: crate::pipes_api::SharedPipeManager) -> Self {
         self.pipe_manager = Some(pm);
+        self
+    }
+
+    /// Set the per-pipe MCP allowlist registry.
+    pub fn with_mcp_session_access(
+        mut self,
+        registry: screenpipe_core::pipes::mcp_access::McpSessionAccessRegistry,
+    ) -> Self {
+        self.mcp_session_access = Some(registry);
         self
     }
 
@@ -405,106 +414,110 @@ impl SCServer {
 
     pub async fn create_router(&self) -> Router {
         let api_request_count = Arc::new(AtomicUsize::new(0));
+        let analytics_enabled = analytics::is_enabled();
+        let api_usage_counter = analytics_enabled.then(|| api_request_count.clone());
 
-        // Spawn periodic API usage reporter (every 5 minutes)
-        let counter_clone = api_request_count.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                let count = counter_clone.swap(0, Ordering::Relaxed);
-                if count > 0 {
-                    info!("api_usage_5min: {} requests", count);
-                    // Fire analytics event for API usage tracking
-                    analytics::track_api_usage(count);
+        if analytics_enabled {
+            // Spawn periodic API usage reporter (every 5 minutes)
+            let counter_clone = api_request_count.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(300));
+                loop {
+                    interval.tick().await;
+                    let count = counter_clone.swap(0, Ordering::Relaxed);
+                    if count > 0 {
+                        info!("api_usage_5min: {} requests", count);
+                        // Fire analytics event for API usage tracking
+                        analytics::track_api_usage(count);
+                    }
                 }
-            }
-        });
+            });
 
-        // Spawn periodic vision pipeline metrics reporter (every 60 seconds)
-        let metrics_for_posthog = self.vision_metrics.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                let snap = metrics_for_posthog.snapshot();
-                // Only report if the pipeline has captured any frames
-                if snap.frames_captured > 0 {
-                    analytics::capture_event_nonblocking(
-                        "vision_pipeline_health",
-                        json!({
-                            "uptime_secs": snap.uptime_secs,
-                            "frames_captured": snap.frames_captured,
-                            "frames_skipped": snap.frames_skipped,
-                            "ocr_completed": snap.ocr_completed,
-                            "ocr_cache_hits": snap.ocr_cache_hits,
-                            "ocr_cache_misses": snap.ocr_cache_misses,
-                            "avg_ocr_latency_ms": snap.avg_ocr_latency_ms,
-                            "frames_video_written": snap.frames_video_written,
-                            "frames_db_written": snap.frames_db_written,
-                            "frames_dropped": snap.frames_dropped,
-                            "avg_db_latency_ms": snap.avg_db_latency_ms,
-                            "frame_drop_rate": snap.frame_drop_rate,
-                            "capture_fps_actual": snap.capture_fps_actual,
-                            "time_to_first_frame_ms": snap.time_to_first_frame_ms,
-                            "ocr_queue_depth": snap.ocr_queue_depth,
-                            "video_queue_depth": snap.video_queue_depth,
-                            "pipeline_stall_count": snap.pipeline_stall_count,
-                        }),
-                    );
+            // Spawn periodic vision pipeline metrics reporter (every 60 seconds)
+            let metrics_for_posthog = self.vision_metrics.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let snap = metrics_for_posthog.snapshot();
+                    // Only report if the pipeline has captured any frames
+                    if snap.frames_captured > 0 {
+                        analytics::capture_event_nonblocking(
+                            "vision_pipeline_health",
+                            json!({
+                                "uptime_secs": snap.uptime_secs,
+                                "frames_captured": snap.frames_captured,
+                                "frames_skipped": snap.frames_skipped,
+                                "ocr_completed": snap.ocr_completed,
+                                "ocr_cache_hits": snap.ocr_cache_hits,
+                                "ocr_cache_misses": snap.ocr_cache_misses,
+                                "avg_ocr_latency_ms": snap.avg_ocr_latency_ms,
+                                "frames_video_written": snap.frames_video_written,
+                                "frames_db_written": snap.frames_db_written,
+                                "frames_dropped": snap.frames_dropped,
+                                "avg_db_latency_ms": snap.avg_db_latency_ms,
+                                "frame_drop_rate": snap.frame_drop_rate,
+                                "capture_fps_actual": snap.capture_fps_actual,
+                                "time_to_first_frame_ms": snap.time_to_first_frame_ms,
+                                "ocr_queue_depth": snap.ocr_queue_depth,
+                                "video_queue_depth": snap.video_queue_depth,
+                                "pipeline_stall_count": snap.pipeline_stall_count,
+                            }),
+                        );
+                    }
                 }
-            }
-        });
+            });
 
-        // Spawn periodic audio pipeline metrics reporter (every 60 seconds)
-        let audio_metrics_for_posthog = self.audio_metrics.clone();
-        let audio_manager_for_posthog = self.audio_manager.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                let snap = audio_metrics_for_posthog.snapshot();
-                // Only report if the pipeline has processed any chunks
-                if snap.chunks_sent > 0 || snap.vad_rejected > 0 {
-                    let devices: Vec<String> = audio_manager_for_posthog
-                        .current_devices()
-                        .iter()
-                        .map(|d| d.to_string())
-                        .collect();
-                    let device_count = devices.len();
-                    analytics::capture_event_nonblocking(
-                        "audio_pipeline_health",
-                        json!({
-                            "uptime_secs": snap.uptime_secs,
-                            "chunks_sent": snap.chunks_sent,
-                            "chunks_received": snap.chunks_received,
-                            "chunks_channel_full": snap.chunks_channel_full,
-                            "stream_timeouts": snap.stream_timeouts,
-                            "process_errors": snap.process_errors,
-                            "vad_passed": snap.vad_passed,
-                            "vad_rejected": snap.vad_rejected,
-                            "avg_speech_ratio": snap.avg_speech_ratio,
-                            "vad_passthrough_rate": snap.vad_passthrough_rate,
-                            "transcriptions_completed": snap.transcriptions_completed,
-                            "transcriptions_empty": snap.transcriptions_empty,
-                            "transcription_errors": snap.transcription_errors,
-                            "db_inserted": snap.db_inserted,
-                            "db_duplicates_blocked": snap.db_duplicates_blocked,
-                            "db_overlaps_trimmed": snap.db_overlaps_trimmed,
-                            "total_words": snap.total_words,
-                            "words_per_minute": snap.words_per_minute,
-                            "audio_level_rms": snap.audio_level_rms,
-                            "segments_deferred": snap.segments_deferred,
-                            "segments_batch_processed": snap.segments_batch_processed,
-                            "batch_pause_events": snap.batch_pause_events,
-                            "batch_resume_events": snap.batch_resume_events,
-                            "audio_devices": devices,
-                            "audio_device_count": device_count,
-                        }),
-                    );
+            // Spawn periodic audio pipeline metrics reporter (every 60 seconds)
+            let audio_metrics_for_posthog = self.audio_metrics.clone();
+            let audio_manager_for_posthog = self.audio_manager.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let snap = audio_metrics_for_posthog.snapshot();
+                    // Only report if the pipeline has processed any chunks
+                    if snap.chunks_sent > 0 || snap.vad_rejected > 0 {
+                        let devices: Vec<String> = audio_manager_for_posthog
+                            .current_devices()
+                            .iter()
+                            .map(|d| d.to_string())
+                            .collect();
+                        let device_count = devices.len();
+                        analytics::capture_event_nonblocking(
+                            "audio_pipeline_health",
+                            json!({
+                                "uptime_secs": snap.uptime_secs,
+                                "chunks_sent": snap.chunks_sent,
+                                "chunks_received": snap.chunks_received,
+                                "chunks_channel_full": snap.chunks_channel_full,
+                                "stream_timeouts": snap.stream_timeouts,
+                                "process_errors": snap.process_errors,
+                                "vad_passed": snap.vad_passed,
+                                "vad_rejected": snap.vad_rejected,
+                                "avg_speech_ratio": snap.avg_speech_ratio,
+                                "vad_passthrough_rate": snap.vad_passthrough_rate,
+                                "transcriptions_completed": snap.transcriptions_completed,
+                                "transcriptions_empty": snap.transcriptions_empty,
+                                "transcription_errors": snap.transcription_errors,
+                                "db_inserted": snap.db_inserted,
+                                "db_duplicates_blocked": snap.db_duplicates_blocked,
+                                "db_overlaps_trimmed": snap.db_overlaps_trimmed,
+                                "total_words": snap.total_words,
+                                "words_per_minute": snap.words_per_minute,
+                                "audio_level_rms": snap.audio_level_rms,
+                                "segments_deferred": snap.segments_deferred,
+                                "segments_batch_processed": snap.segments_batch_processed,
+                                "batch_pause_events": snap.batch_pause_events,
+                                "batch_resume_events": snap.batch_resume_events,
+                                "audio_devices": devices,
+                                "audio_device_count": device_count,
+                            }),
+                        );
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Use pre-set hot frame cache or create a new one, then warm from DB.
         // Spawn warm_from_db in the background — the cache starts empty but fills
@@ -683,11 +696,9 @@ impl SCServer {
             .get("/memories/:id", get_memory_handler)
             .put("/memories/:id", update_memory_handler)
             .delete("/memories/:id", delete_memory_handler)
-            .post("/outputs/register", register_output_handler)
-            .get("/artifacts", list_artifacts_unified_handler)
-            .get("/outputs", list_outputs_handler)
-            .get("/outputs/:id", get_output_handler)
-            .delete("/outputs/:id", delete_output_handler)
+            .post("/artifacts/register", register_artifact_handler)
+            .get("/artifacts", list_artifacts_handler)
+            .delete("/artifacts/:id", delete_artifact_handler)
             .post("/experimental/frames/merge", merge_frames_handler)
             .get("/experimental/validate/media", validate_media_handler)
             .post("/audio/start", start_audio)
@@ -803,15 +814,6 @@ impl SCServer {
                     .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)), // 50MB
             );
 
-        // Apple Intelligence — generic OpenAI-compatible endpoint (macOS only)
-        #[cfg(feature = "apple-intelligence")]
-        let router = router
-            .route("/ai/status", get(crate::apple_intelligence_api::ai_status))
-            .route(
-                "/ai/chat/completions",
-                axum::routing::post(crate::apple_intelligence_api::chat_completions),
-            );
-
         // Pipe API routes (if pipe manager is available)
         let router = if let Some(ref pm) = self.pipe_manager {
             let pipe_routes = Router::new()
@@ -820,12 +822,8 @@ impl SCServer {
                     "/install",
                     axum::routing::post(crate::pipes_api::install_pipe),
                 )
-                // Artifacts & favorites — register before `/:id` so axum
-                // doesn't match these as a pipe id.
-                .route(
-                    "/artifacts",
-                    axum::routing::get(crate::pipes_api::list_artifacts),
-                )
+                // Favorites — register before `/:id` so axum doesn't match
+                // it as a pipe id.
                 .route(
                     "/favorites",
                     axum::routing::get(crate::pipes_api::list_favorites),
@@ -959,7 +957,10 @@ impl SCServer {
                 self.screenpipe_dir.clone(),
                 self.secret_store.clone(),
             ));
-        let router = router.nest("/mcp-servers", crate::mcp_servers_api::router(mcp_store));
+        let router = router.nest(
+            "/mcp-servers",
+            crate::mcp_servers_api::router(mcp_store, self.mcp_session_access.clone()),
+        );
 
         // Power management routes (if power manager is available)
         let router = if let Some(ref pm) = self.power_manager {
@@ -1032,9 +1033,11 @@ impl SCServer {
             ))
             .layer(axum::middleware::from_fn(
                 move |req: axum::extract::Request, next: axum::middleware::Next| {
-                    let counter = app_state.api_request_count.clone();
+                    let counter = api_usage_counter.clone();
                     async move {
-                        counter.fetch_add(1, Ordering::Relaxed);
+                        if let Some(counter) = counter {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
                         next.run(req).await
                     }
                 },

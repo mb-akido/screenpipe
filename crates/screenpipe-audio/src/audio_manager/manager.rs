@@ -830,6 +830,11 @@ impl AudioManager {
                             // Without this, audio files are written to disk but orphaned from the DB,
                             // causing silent data loss on the timeline.
                             let mut inserted = false;
+                            // Keep the last failure so the final error log can name
+                            // the actual cause. Without it every distinct DB failure
+                            // (pool timeout vs stuck transaction vs cantopen) collapses
+                            // into one undiagnosable Sentry issue.
+                            let mut last_err: Option<String> = None;
                             for retry in 0..3u32 {
                                 match db.insert_audio_chunk(&path, capture_dt).await {
                                     Ok(_) => {
@@ -842,6 +847,7 @@ impl AudioManager {
                                             retry + 1,
                                             e
                                         );
+                                        last_err = Some(format!("{:?}", e));
                                         if retry < 2 {
                                             tokio::time::sleep(std::time::Duration::from_millis(
                                                 500 * (retry as u64 + 1),
@@ -854,9 +860,12 @@ impl AudioManager {
                             if !inserted {
                                 // path is a structured field so Sentry dedups the
                                 // issue across different devices; otherwise every
-                                // device name creates a new Sentry issue.
+                                // device name creates a new Sentry issue. error is a
+                                // separate field so the underlying cause is filterable
+                                // within that one issue rather than lost.
                                 error!(
                                     audio_chunk_path = %path,
+                                    error = last_err.as_deref().unwrap_or("unknown"),
                                     "audio chunk DB insert failed after 3 retries, data may be missing from timeline"
                                 );
                             }
@@ -1071,6 +1080,16 @@ impl AudioManager {
             .iter()
             .map(|p| p.key().clone())
             .collect::<Vec<AudioDevice>>()
+    }
+
+    /// Non-blocking read of the *configured* transcription mode. Returns `None`
+    /// if the options lock is momentarily contended, so callers such as
+    /// `/health` never block on it.
+    pub fn configured_transcription_mode(&self) -> Option<TranscriptionMode> {
+        self.options
+            .try_read()
+            .ok()
+            .map(|o| o.transcription_mode.clone())
     }
 
     pub async fn enabled_devices(&self) -> HashSet<String> {

@@ -592,6 +592,68 @@ pub struct CalendarEventsQuery {
     pub hours_ahead: Option<i64>,
 }
 
+/// Why the native calendar produced no events. Only `Internal` is a server
+/// error; the other variants are expected machine states. They used to all
+/// collapse to HTTP 500, which made the app's 60-second calendar poll fire
+/// two `tower_http` ERROR lines per minute forever on hosts where the native
+/// calendar simply does not exist (Linux) or is not authorized (macOS).
+enum NativeCalendarError {
+    /// Platform has no native calendar integration at all (Linux).
+    #[allow(dead_code)] // constructed only on the non-macOS/non-Windows arm
+    Unsupported,
+    /// The OS appointment store could not be opened (Windows without a
+    /// calendar store). Permanent machine state, not a server error.
+    #[allow(dead_code)] // constructed only on the Windows arm
+    StoreUnavailable(String),
+    /// Calendar exists but screenpipe lacks permission (macOS TCC).
+    #[allow(dead_code)] // constructed only on the macOS arm
+    AuthRequired(String),
+    /// Real failure while reading events.
+    Internal(String),
+}
+
+/// Map a native-calendar failure to an HTTP response. Split out of the
+/// handler so the status mapping is unit-testable.
+fn native_calendar_error_response(e: NativeCalendarError) -> (StatusCode, Json<Value>) {
+    match e {
+        // Nothing to fix and nothing failed — same convention as the ICS
+        // events route returning 200 [] when no feed is configured. The
+        // explicit `connected: false` + `reason` let clients distinguish
+        // this from "connected, empty window".
+        NativeCalendarError::Unsupported => (
+            StatusCode::OK,
+            Json(json!({
+                "data": [],
+                "connected": false,
+                "reason": "unsupported_platform",
+            })),
+        ),
+        NativeCalendarError::StoreUnavailable(msg) => (
+            StatusCode::OK,
+            Json(json!({
+                "data": [],
+                "connected": false,
+                "reason": "store_unavailable",
+                "detail": msg,
+            })),
+        ),
+        // User-fixable: same 401 convention as the Google Calendar events
+        // route when OAuth is missing.
+        NativeCalendarError::AuthRequired(msg) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": msg,
+                "reason": "auth_required",
+                "connected": false,
+            })),
+        ),
+        NativeCalendarError::Internal(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": msg })),
+        ),
+    }
+}
+
 /// GET /connections/calendar/events — fetch native OS calendar events.
 async fn calendar_events(Query(params): Query<CalendarEventsQuery>) -> (StatusCode, Json<Value>) {
     let hours_back = params.hours_back.unwrap_or(1);
@@ -601,10 +663,7 @@ async fn calendar_events(Query(params): Query<CalendarEventsQuery>) -> (StatusCo
         .await
     {
         Ok(Ok(events)) => (StatusCode::OK, Json(json!({ "data": events }))),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        ),
+        Ok(Err(e)) => native_calendar_error_response(e),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("task join error: {}", e) })),
@@ -621,12 +680,22 @@ async fn calendar_status() -> Json<Value> {
 }
 
 #[cfg(target_os = "macos")]
-fn get_native_calendar_events(hours_back: i64, hours_ahead: i64) -> Result<Vec<Value>, String> {
-    use screenpipe_connect::calendar::ScreenpipeCalendar;
+fn get_native_calendar_events(
+    hours_back: i64,
+    hours_ahead: i64,
+) -> Result<Vec<Value>, NativeCalendarError> {
+    use screenpipe_connect::calendar::{CalendarError, ScreenpipeCalendar};
     let cal = ScreenpipeCalendar::new();
     let events = cal
         .get_events(hours_back, hours_ahead)
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| match e {
+            CalendarError::AuthorizationDenied => NativeCalendarError::AuthRequired(
+                "calendar access not granted — allow screenpipe under System Settings > \
+                 Privacy & Security > Calendars"
+                    .to_string(),
+            ),
+            other => NativeCalendarError::Internal(format!("{:?}", other)),
+        })?;
     Ok(events
         .into_iter()
         .map(|e| {
@@ -648,10 +717,18 @@ fn get_native_calendar_events(hours_back: i64, hours_ahead: i64) -> Result<Vec<V
 }
 
 #[cfg(target_os = "windows")]
-fn get_native_calendar_events(hours_back: i64, hours_ahead: i64) -> Result<Vec<Value>, String> {
+fn get_native_calendar_events(
+    hours_back: i64,
+    hours_ahead: i64,
+) -> Result<Vec<Value>, NativeCalendarError> {
     use screenpipe_connect::calendar_windows::ScreenpipeCalendar;
-    let cal = ScreenpipeCalendar::new()?;
-    let events = cal.get_events(hours_back, hours_ahead)?;
+    // Store open failure = no usable appointment store on this machine
+    // (expected on hosts without the WinRT calendar infrastructure);
+    // a query failure on an open store is a real error.
+    let cal = ScreenpipeCalendar::new().map_err(NativeCalendarError::StoreUnavailable)?;
+    let events = cal
+        .get_events(hours_back, hours_ahead)
+        .map_err(NativeCalendarError::Internal)?;
     Ok(events
         .into_iter()
         .map(|e| {
@@ -673,8 +750,14 @@ fn get_native_calendar_events(hours_back: i64, hours_ahead: i64) -> Result<Vec<V
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn get_native_calendar_events(_hours_back: i64, _hours_ahead: i64) -> Result<Vec<Value>, String> {
-    Err("native calendar not supported on this platform".into())
+fn get_native_calendar_events(
+    _hours_back: i64,
+    _hours_ahead: i64,
+) -> Result<Vec<Value>, NativeCalendarError> {
+    // Linux: there is no native OS calendar to read. This is an expected
+    // state of the world, not a 500 — the app polls this route every 60s
+    // and used to log two ERROR lines per minute forever.
+    Err(NativeCalendarError::Unsupported)
 }
 
 #[cfg(target_os = "macos")]
@@ -1105,6 +1188,46 @@ pub struct GoogleCalendarInstanceQuery {
     pub instance: Option<String>,
 }
 
+/// Typed "Google Calendar OAuth is missing/broken/ambiguous" failure, so the
+/// route handlers can map it to a structured 401 by downcast instead of
+/// string-matching the human-readable message (which silently broke whenever
+/// `describe_oauth_error` wording changed, collapsing an expected
+/// "not connected" state into a 500).
+#[derive(Debug)]
+struct GcalAuthError {
+    message: String,
+}
+
+impl std::fmt::Display for GcalAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GcalAuthError {}
+
+/// Map a Google Calendar events failure to an HTTP response. Auth failures
+/// (no token stored, broken token, ambiguous multi-account) become a 401 with
+/// a machine-readable body — `reason: "auth_required"` mirrors the native
+/// calendar route — so pollers can back off instead of retrying a state that
+/// can only change when the user reconnects. Everything else stays 500.
+fn gcal_events_error_response(e: &anyhow::Error) -> (StatusCode, Json<Value>) {
+    if let Some(auth) = e.downcast_ref::<GcalAuthError>() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": auth.message,
+                "reason": "auth_required",
+                "connected": false,
+            })),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
 /// Retrieve a valid Google Calendar OAuth token or return an error. See
 /// [`gmail_token`] for why "not connected" is split into distinct cases.
 async fn gcal_token(
@@ -1118,10 +1241,15 @@ async fn gcal_token(
     {
         return Ok(token);
     }
-    Err(anyhow::anyhow!(
-        oauth_store::describe_oauth_error(store, "google-calendar", "Google Calendar", instance)
-            .await
-    ))
+    Err(anyhow::Error::new(GcalAuthError {
+        message: oauth_store::describe_oauth_error(
+            store,
+            "google-calendar",
+            "Google Calendar",
+            instance,
+        )
+        .await,
+    }))
 }
 
 /// GET /connections/google-calendar/status — check connection + email.
@@ -1190,22 +1318,7 @@ async fn gcal_events(
     let client = reqwest::Client::new();
     match gcal_events_inner(&client, params, &state.secret_store).await {
         Ok(events) => (StatusCode::OK, Json(json!(events))),
-        Err(e) => {
-            let message = e.to_string();
-            // Recognize every variant of the OAuth-failure message from
-            // `describe_oauth_error` (not-connected, single-instance broken,
-            // multi-instance ambiguous, explicit-instance broken) and surface
-            // them as 401 so callers can distinguish auth from upstream 5xx.
-            let is_oauth_failure = message.contains("Google Calendar not connected")
-                || message.contains("Google Calendar account")
-                || message.contains("multiple Google Calendar accounts connected");
-            let status = if is_oauth_failure {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(json!({ "error": message })))
-        }
+        Err(e) => gcal_events_error_response(&e),
     }
 }
 
@@ -2861,6 +2974,74 @@ mod gcal_merge_tests {
         ]]);
         assert_eq!(merged[0]["id"], "good");
         assert_eq!(merged[1]["id"], "bad");
+    }
+}
+
+/// The "calendar configured but not usable" states must never be 500s: the
+/// app polls both calendar event routes every 60 seconds, so a 500 here is
+/// two tower_http ERROR log lines per minute forever (observed in user log
+/// bundles on Linux with no Google Calendar token stored).
+#[cfg(test)]
+mod calendar_error_response_tests {
+    use super::*;
+
+    #[test]
+    fn gcal_auth_failure_maps_to_structured_401() {
+        let err = anyhow::Error::new(GcalAuthError {
+            message: "Google Calendar not connected — use 'Connect Google Calendar' in Settings > Connections".to_string(),
+        });
+        let (status, Json(body)) = gcal_events_error_response(&err);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "auth_required");
+        assert_eq!(body["connected"], false);
+        assert!(body["error"].as_str().unwrap().contains("not connected"));
+    }
+
+    #[test]
+    fn gcal_non_auth_failure_stays_500() {
+        let err = anyhow::anyhow!("google api returned 503: backend unavailable");
+        let (status, Json(body)) = gcal_events_error_response(&err);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body["error"].as_str().unwrap().contains("503"));
+        assert!(body.get("reason").is_none());
+    }
+
+    #[test]
+    fn native_unsupported_platform_is_200_not_connected() {
+        let (status, Json(body)) = native_calendar_error_response(NativeCalendarError::Unsupported);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["connected"], false);
+        assert_eq!(body["reason"], "unsupported_platform");
+        assert!(body["data"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_store_unavailable_is_200_not_connected() {
+        let (status, Json(body)) = native_calendar_error_response(
+            NativeCalendarError::StoreUnavailable("RequestStoreAsync failed".to_string()),
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["connected"], false);
+        assert_eq!(body["reason"], "store_unavailable");
+    }
+
+    #[test]
+    fn native_auth_required_is_401_with_reason() {
+        let (status, Json(body)) = native_calendar_error_response(
+            NativeCalendarError::AuthRequired("calendar access not granted".to_string()),
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "auth_required");
+        assert_eq!(body["connected"], false);
+    }
+
+    #[test]
+    fn native_internal_error_stays_500() {
+        let (status, Json(body)) = native_calendar_error_response(NativeCalendarError::Internal(
+            "EventKit query failed".to_string(),
+        ));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body["error"].as_str().unwrap().contains("EventKit"));
     }
 }
 

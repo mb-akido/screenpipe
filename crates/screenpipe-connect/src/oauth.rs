@@ -1061,6 +1061,25 @@ pub async fn get_valid_token_instance(
     if let Some(token) = read_oauth_token_instance(store, integration_id, instance).await {
         return Some(token);
     }
+    // No token stored at all (never connected, or an interrupted OAuth flow
+    // that never reached the token write): a refresh cannot possibly succeed,
+    // so don't attempt one and don't WARN. Callers poll this path on a timer
+    // (the app's 60s calendar publisher, status checks), and the old
+    // unconditional WARN ("oauth refresh failed ...: no stored token") filled
+    // user log bundles twice a minute forever. This is an expected state, not
+    // a failure — keep it at debug. Real refresh failures (a token exists but
+    // the provider rejected it) still WARN below.
+    if load_oauth_json_with_instance(store, integration_id, instance)
+        .await
+        .is_none()
+    {
+        tracing::debug!(
+            "oauth: no stored token for {}(instance={:?}) — skipping refresh",
+            integration_id,
+            instance,
+        );
+        return None;
+    }
     match refresh_token_instance(store, client, integration_id, instance).await {
         Ok(token) => Some(token),
         Err(e) => {
@@ -1149,6 +1168,22 @@ mod tests {
     // never matches a real stored file on the developer's machine. Without
     // this, tests would pass/fail based on whether the tester happens to have
     // gmail connected locally.
+
+    #[tokio::test]
+    async fn get_valid_token_with_no_stored_token_returns_none_without_refresh() {
+        // Never-connected integration: there is nothing to refresh. The old
+        // path attempted a refresh anyway, hit "no stored token", and WARNed —
+        // and because the app polls calendar endpoints every 60s, that WARN
+        // (plus the resulting 5xx) repeated twice a minute in user logs
+        // forever. The short-circuit returns None before any network attempt
+        // (this test performs no real HTTP: with the pre-check the exchange
+        // proxy is never contacted).
+        let store = mem_store().await;
+        let client = reqwest::Client::new();
+        let token =
+            get_valid_token_instance(Some(&store), &client, "_t_never_connected", None).await;
+        assert!(token.is_none());
+    }
 
     #[tokio::test]
     async fn load_with_explicit_instance_hits_exact_key() {

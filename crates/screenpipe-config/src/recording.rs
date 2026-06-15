@@ -326,6 +326,13 @@ pub struct RecordingSettings {
     #[serde(rename = "disableKeyboardCapture", default = "default_true")]
     pub disable_keyboard_capture: bool,
 
+    /// Skip persisting mouse-click rows in the UI recorder. Defaults to
+    /// `false` (click DB capture ON — clicks carry no text payload and are
+    /// the backbone of workflow/task mining). Clicks still wake event-driven
+    /// capture when disabled; only the `ui_events` click rows are skipped.
+    #[serde(rename = "disableClickCapture", default)]
+    pub disable_click_capture: bool,
+
     /// Continue recording audio when the screen is locked.
     /// Default: false (audio pauses when screen is locked to save resources).
     #[serde(rename = "recordWhileLocked", default)]
@@ -582,6 +589,7 @@ impl Default for RecordingSettings {
             pause_on_drm_content: false,
             disable_clipboard_capture: true,
             disable_keyboard_capture: true,
+            disable_click_capture: false,
             record_while_locked: false,
             languages: vec![],
             use_pii_removal: false,

@@ -410,6 +410,13 @@ pub async fn oauth_connect(
         integration_id, store_instance, display_name
     );
 
+    // The background calendar publisher backs off to a long interval while
+    // Google Calendar is disconnected — wake it so prewarm/meeting-detection
+    // get events immediately after a connect instead of after the backoff.
+    if integration_id == "google-calendar" {
+        crate::google_calendar::poke();
+    }
+
     Ok(OAuthStatus {
         connected: true,
         display_name,

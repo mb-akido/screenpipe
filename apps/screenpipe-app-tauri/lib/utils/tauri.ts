@@ -514,17 +514,16 @@ async getCachedSuggestions() : Promise<Result<CachedSuggestions, string>> {
 }
 },
 /**
- * Read the user's screenpipe cloud session JWT from `~/.screenpipe/
- * auth.json`. Returns None when the file is missing, malformed, or the
- * token field is empty.
+ * Read the user's screenpipe cloud session JWT.
  *
- * The settings store (`store.bin → user.token`) is the canonical
- * runtime cache for this token but is only populated after a fresh
- * in-app sign-in. `auth.json` is the durable on-disk copy written by
- * the pi-agent configuration flow — it survives store resets and dev-
- * mode launches where the in-memory user object hasn't been hydrated
- * yet. Used by the enterprise-policy hook to send the Bearer header
- * even when the in-app user object is still null.
+ * #3943: the authoritative copy lives in the encrypted secret store and is
+ * mirrored into an in-process cache at startup and on every
+ * `set_cloud_token`; that cache is served first. The legacy plaintext
+ * `~/.screenpipe/auth.json` (the CLI credential file) remains as a fallback
+ * for installs that have not migrated yet; sign-out removes it. Returns
+ * None when signed out. Used by the settings hydration and the
+ * enterprise-policy hook to send the Bearer header even when the in-app
+ * user object is still null.
  */
 async getCloudToken() : Promise<string | null> {
     return await TAURI_INVOKE("get_cloud_token");
@@ -1839,11 +1838,13 @@ async setSyncEnabled(enabled: boolean) : Promise<Result<null, string>> {
 },
 /**
  * Called by the frontend after fetching the `syncStreams` block from
- * `/api/enterprise/policy`. Flat booleans rather than a struct so the
- * specta-generated TS binding stays trivial.
+ * `/api/enterprise/policy`. Flat params rather than a struct so the
+ * specta-generated TS binding stays trivial. `frame_images` is the mode
+ * string ("off" | "cited" | "all"; legacy "true" accepted) — parsed
+ * fail-closed by FrameImagesMode::parse.
  */
-async setSyncStreams(frames: boolean, audio: boolean, uiEvents: boolean, memories: boolean, snapshots: boolean) : Promise<void> {
-    await TAURI_INVOKE("set_sync_streams", { frames, audio, uiEvents, memories, snapshots });
+async setSyncStreams(frames: boolean, audio: boolean, uiEvents: boolean, memories: boolean, snapshots: boolean, frameImages: string) : Promise<void> {
+    await TAURI_INVOKE("set_sync_streams", { frames, audio, uiEvents, memories, snapshots, frameImages });
 },
 async setTrayHealthIcon() : Promise<void> {
     await TAURI_INVOKE("set_tray_health_icon");
@@ -2640,6 +2641,13 @@ disableClipboardCapture?: boolean;
  * Opt in to keyboard DB rows via the "Capture keyboard" toggle.
  */
 disableKeyboardCapture?: boolean;
+/**
+ * Skip persisting mouse-click rows in the UI recorder. Defaults to
+ * `false` (click DB capture ON — clicks carry no text payload and are
+ * the backbone of workflow/task mining). Clicks still wake event-driven
+ * capture when disabled; only the `ui_events` click rows are skipped.
+ */
+disableClickCapture?: boolean;
 /**
  * Continue recording audio when the screen is locked.
  * Default: false (audio pauses when screen is locked to save resources).

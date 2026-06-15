@@ -93,6 +93,10 @@ pub struct RecordingConfig {
     /// wake event-driven capture, and the a11y tree + OCR still capture on-screen text. See
     /// `RecordingSettings.disable_keyboard_capture`.
     pub disable_keyboard_capture: bool,
+    /// Skip persisting mouse-click rows in the UI recorder
+    /// (`UiRecorderConfig::record_click_events`). Clicks still wake
+    /// event-driven capture. See `RecordingSettings.disable_click_capture`.
+    pub disable_click_capture: bool,
     pub languages: Vec<Language>,
 
     // Cloud/auth
@@ -285,6 +289,7 @@ impl RecordingConfig {
             pause_on_drm_content: settings.pause_on_drm_content,
             disable_clipboard_capture: settings.disable_clipboard_capture,
             disable_keyboard_capture: settings.disable_keyboard_capture,
+            disable_click_capture: settings.disable_click_capture,
             languages: settings
                 .languages
                 .iter()
@@ -396,6 +401,9 @@ impl RecordingConfig {
             capture_keystrokes: true,
             record_keyboard_events: !self.disable_keyboard_capture,
             record_clipboard_events: !self.disable_clipboard_capture,
+            // Clicks stay captured at the hook level so they keep waking
+            // event-driven capture; only row persistence is gated.
+            record_click_events: !self.disable_click_capture,
             // Event-driven capture relies on same-app title changes reaching
             // the trigger mapper. The lower-level a11y default keeps this off
             // for libraries, but recording sessions need it on.
@@ -546,6 +554,7 @@ mod tests {
         let settings = screenpipe_config::RecordingSettings {
             disable_clipboard_capture: true,
             disable_keyboard_capture: true,
+            disable_click_capture: true,
             ignored_windows: vec!["Secret Notes".to_string(), "Password Manager".to_string()],
             included_windows: vec!["Work Browser".to_string()],
             capture_on_keystroke: Some(true),
@@ -565,6 +574,10 @@ mod tests {
         assert!(ui.capture_keystrokes);
         assert!(!ui.record_keyboard_events);
         assert!(!ui.record_clipboard_events);
+        assert!(!ui.record_click_events);
+        // The click hook itself stays alive so clicks keep waking
+        // event-driven capture even when click rows are disabled.
+        assert!(ui.capture_clicks);
         assert!(ui.capture_window_focus);
         assert_eq!(ui.ignored_windows, settings.ignored_windows);
         assert_eq!(ui.excluded_windows, settings.ignored_windows);
@@ -610,6 +623,23 @@ mod tests {
         assert!(ui.capture_keystrokes);
         assert!(ui.record_keyboard_events);
         assert!(ui.capture_on_keystroke);
+    }
+
+    #[test]
+    fn click_capture_defaults_on_and_rows_follow_setting() {
+        // Default: click rows recorded (workflow mining backbone).
+        let ui = build(&screenpipe_config::RecordingSettings::default()).to_ui_recorder_config();
+        assert!(ui.capture_clicks);
+        assert!(ui.record_click_events);
+
+        // Opt-out (user or enterprise policy): rows off, hook stays alive.
+        let settings = screenpipe_config::RecordingSettings {
+            disable_click_capture: true,
+            ..Default::default()
+        };
+        let ui = build(&settings).to_ui_recorder_config();
+        assert!(ui.capture_clicks);
+        assert!(!ui.record_click_events);
     }
 
     #[test]
