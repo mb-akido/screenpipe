@@ -680,6 +680,11 @@ pub async fn event_driven_capture_loop(
     // the video / slide-flip / demo-replay case the AX-text dedup otherwise
     // suppresses. Stays false when no controller is wired.
     let mut hd_active = false;
+    // Whether the meeting detector currently reports an active call. Read from
+    // the same per-tick HD snapshot as `hd_active`. Lets visual-change frames
+    // (slides, screen-share, demos) bypass AX-hash dedup during meetings even
+    // when no HD session is running. Stays false when no controller is wired.
+    let mut in_meeting = false;
 
     let capture_params = CaptureParams {
         db: &db,
@@ -724,6 +729,7 @@ pub async fn event_driven_capture_loop(
                 &mut walk_budget,
                 false, // screenshot enabled on startup
                 false, // hd not active at startup (Manual is dedup-exempt anyway)
+                false, // not in a meeting at startup
             ),
         )
         .await
@@ -1055,6 +1061,7 @@ pub async fn event_driven_capture_loop(
             // Source of truth for dedup-bypass this tick. Read from the same
             // snapshot as the interval install so the two can't disagree.
             hd_active = snap.active;
+            in_meeting = snap.meeting.unwrap_or(false);
             if let Some(new_ms) = high_fps.on_controller_state(
                 snap.effective_interval_ms(),
                 state.config.min_capture_interval_ms,
@@ -1334,6 +1341,7 @@ pub async fn event_driven_capture_loop(
                         &mut walk_budget,
                         screenshot_disabled,
                         hd_active,
+                        in_meeting,
                     ),
                 )
                 .await;
@@ -1745,8 +1753,24 @@ fn is_lock_screen_app(app_name: &str) -> bool {
 ///   clipboard actions, and shortcut keypresses must leave a durable checkpoint
 ///   even when visible text is unchanged.
 /// - the 30s time-floor has elapsed: forces a write even if the hash matches.
-fn dedup_applies(trigger: &CaptureTrigger, hd_active: bool, since_last_db_write: Duration) -> bool {
+/// - `in_meeting` + a `VisualChange` trigger: while a meeting is detected, a
+///   visual change means the shared screen / slide / video moved pixels even
+///   though the AX-tree text is unchanged — exactly the content the meeting
+///   summary needs. Hash dedup keyed on AX text would otherwise drop it, so we
+///   let these through at the visual-change cadence. This is a lighter-weight,
+///   meeting-scoped version of HD's full dedup bypass: it only fires while the
+///   detector reports `is_in_meeting()` AND only for visual-change triggers, so
+///   it can't bloat normal-desktop capture (a playing video on the desktop is
+///   still deduped; the same video shared in a call is not).
+fn dedup_applies(
+    trigger: &CaptureTrigger,
+    hd_active: bool,
+    in_meeting: bool,
+    since_last_db_write: Duration,
+) -> bool {
+    let meeting_visual_change = in_meeting && matches!(trigger, CaptureTrigger::VisualChange);
     !hd_active
+        && !meeting_visual_change
         && !is_workflow_checkpoint_trigger(trigger)
         && since_last_db_write < Duration::from_secs(30)
 }
@@ -1785,8 +1809,8 @@ fn bypasses_capture_throttles(trigger: &CaptureTrigger) -> bool {
 /// `CaptureOutput.result` will be `None` in that case — the caller should still
 /// update the frame comparer with the image but skip DB/metrics work.
 ///
-/// `hd_active` bypasses content dedup entirely for this capture — see
-/// [`dedup_applies`].
+/// `hd_active` bypasses content dedup entirely for this capture; `in_meeting`
+/// bypasses it only for visual-change triggers — see [`dedup_applies`].
 #[allow(clippy::too_many_arguments)]
 async fn do_capture(
     params: &CaptureParams<'_>,
@@ -1797,6 +1821,7 @@ async fn do_capture(
     walk_budget: &mut screenpipe_a11y::budget::AppWalkBudget,
     screenshot_disabled: bool,
     hd_active: bool,
+    in_meeting: bool,
 ) -> Result<CaptureOutput> {
     let captured_at = Utc::now();
     let bypass_capture_throttles = bypasses_capture_throttles(trigger);
@@ -1981,7 +2006,7 @@ async fn do_capture(
     // Content dedup: skip capture if accessibility text hasn't changed.
     // Never dedup Idle/Manual triggers, bypass entirely during HD sessions, and
     // force a write every 30s even if the hash matches — see `dedup_applies`.
-    let dedup_eligible = dedup_applies(trigger, hd_active, last_db_write.elapsed());
+    let dedup_eligible = dedup_applies(trigger, hd_active, in_meeting, last_db_write.elapsed());
     if dedup_eligible {
         if let Some(ref snap) = tree_snapshot {
             if !snap.text_content.is_empty() {
@@ -2328,10 +2353,17 @@ mod tests {
         let recent = Duration::from_secs(5);
         let stale = Duration::from_secs(31);
 
-        // Baseline: a change-driven trigger within the 30s floor → dedup applies.
-        assert!(dedup_applies(&CaptureTrigger::VisualChange, false, recent));
+        // Baseline (not in a meeting): a change-driven trigger within the 30s
+        // floor → dedup applies.
+        assert!(dedup_applies(
+            &CaptureTrigger::VisualChange,
+            false,
+            false,
+            recent
+        ));
         assert!(dedup_applies(
             &CaptureTrigger::Click { x: 10, y: 20 },
+            false,
             false,
             recent
         ));
@@ -2341,6 +2373,7 @@ mod tests {
                 target: None,
             },
             false,
+            false,
             recent
         ));
         assert!(!dedup_applies(
@@ -2349,29 +2382,69 @@ mod tests {
                 target: None,
             },
             false,
+            false,
             recent
         ));
-        assert!(!dedup_applies(&CaptureTrigger::TypingPause, false, recent));
-        assert!(!dedup_applies(&CaptureTrigger::ScrollStop, false, recent));
-        assert!(!dedup_applies(&CaptureTrigger::KeyPress, false, recent));
-        assert!(!dedup_applies(&CaptureTrigger::Clipboard, false, recent));
+        assert!(!dedup_applies(
+            &CaptureTrigger::TypingPause,
+            false,
+            false,
+            recent
+        ));
+        assert!(!dedup_applies(
+            &CaptureTrigger::ScrollStop,
+            false,
+            false,
+            recent
+        ));
+        assert!(!dedup_applies(&CaptureTrigger::KeyPress, false, false, recent));
+        assert!(!dedup_applies(&CaptureTrigger::Clipboard, false, false, recent));
 
         // HD active → dedup is bypassed even for an otherwise-eligible trigger.
         // This is the fix: video/demo replay moves pixels but not AX text, so
         // the hash would dedup it away without this bypass.
-        assert!(!dedup_applies(&CaptureTrigger::VisualChange, true, recent));
+        assert!(!dedup_applies(
+            &CaptureTrigger::VisualChange,
+            true,
+            false,
+            recent
+        ));
         assert!(!dedup_applies(
             &CaptureTrigger::Click { x: 10, y: 20 },
+            true,
+            false,
+            recent
+        ));
+
+        // In a meeting (no HD session): a VisualChange bypasses AX-hash dedup so
+        // slides / screen-share / shared video get captured at the visual-change
+        // cadence instead of being dropped when the AX text is unchanged.
+        assert!(!dedup_applies(
+            &CaptureTrigger::VisualChange,
+            false,
+            true,
+            recent
+        ));
+        // …but the meeting bypass is scoped to visual changes only — a Click in
+        // a meeting whose AX text is unchanged still dedups (no flood).
+        assert!(dedup_applies(
+            &CaptureTrigger::Click { x: 10, y: 20 },
+            false,
             true,
             recent
         ));
 
         // Idle/Manual are always dedup-exempt (timeline floor), HD or not.
-        assert!(!dedup_applies(&CaptureTrigger::Idle, false, recent));
-        assert!(!dedup_applies(&CaptureTrigger::Manual, false, recent));
+        assert!(!dedup_applies(&CaptureTrigger::Idle, false, false, recent));
+        assert!(!dedup_applies(&CaptureTrigger::Manual, false, false, recent));
 
         // 30s time-floor: once it elapses, write through regardless.
-        assert!(!dedup_applies(&CaptureTrigger::VisualChange, false, stale));
+        assert!(!dedup_applies(
+            &CaptureTrigger::VisualChange,
+            false,
+            false,
+            stale
+        ));
     }
 
     #[test]
