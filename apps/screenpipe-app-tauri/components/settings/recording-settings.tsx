@@ -1649,7 +1649,7 @@ function HighFpsCard({
             <div className="flex flex-col gap-1">
               {(
                 [
-                  { v: "ask" as const, label: "Ask me", hint: "Adds a “+ HD” action to the meeting-start notification (recommended)" },
+                  { v: "ask" as const, label: "Ask me", hint: "Adds an “open note + HD” action to the meeting-start notification — one click opens the note and starts HD (recommended)" },
                   { v: "always" as const, label: "Always record at HD", hint: "Auto-start every detected meeting — more disk + CPU per call" },
                   { v: "never" as const, label: "Never", hint: "No prompt; only the tray timer can start a session" },
                 ] satisfies Array<{ v: HdDefaultMode; label: string; hint: string }>
