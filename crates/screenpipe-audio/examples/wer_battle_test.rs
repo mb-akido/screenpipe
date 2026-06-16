@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         // Requires `--features parakeet`. Exercises the screenpipe→audiopipe
         // keyterm-biasing path (vocabulary flows to Parakeet keyterms).
         Ok("parakeet") => AudioTranscriptionEngine::Parakeet,
+        Ok("parakeet-mlx") => AudioTranscriptionEngine::ParakeetMlx,
         _ => AudioTranscriptionEngine::default(),
     };
     let engine_label = format!("{engine_enum:?}");
