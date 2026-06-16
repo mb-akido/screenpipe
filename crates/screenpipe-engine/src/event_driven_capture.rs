@@ -340,12 +340,26 @@ impl Default for EventDrivenCaptureConfig {
 /// Idle detection still polls the ActivityFeed at ~50ms intervals;
 /// typing-pause / scroll-stop bursts now flow through the UI recorder
 /// so the resulting frame can be linked back to the originating row.
+/// Idle-capture interval cap while a meeting is active. Outside meetings the
+/// idle fallback is 30s (a slide can sit uncaptured that long if the visual
+/// detector's pixel threshold doesn't trip); during a call we force a capture
+/// at least this often so shared screens / slides are covered on a *guaranteed*
+/// floor rather than only when `VisualChange` happens to fire. Idle captures
+/// bypass content dedup (they're a workflow-checkpoint trigger), so this also
+/// writes through an unchanged AX-text hash. ~12 frames/min — bounded, and only
+/// during meetings.
+const MEETING_IDLE_CAPTURE_INTERVAL_MS: u64 = 5_000;
+
 pub struct EventDrivenCapture {
     config: EventDrivenCaptureConfig,
     /// Time of last capture
     last_capture: Instant,
     /// Time reference for periodic idle captures.
     last_idle_reference: Instant,
+    /// Whether a meeting is currently active (mirrors the HD snapshot's
+    /// `meeting`). Caps the idle-capture interval to
+    /// `MEETING_IDLE_CAPTURE_INTERVAL_MS` while true.
+    in_meeting: bool,
 }
 
 impl EventDrivenCapture {
@@ -355,6 +369,20 @@ impl EventDrivenCapture {
             config,
             last_capture: now,
             last_idle_reference: now,
+            in_meeting: false,
+        }
+    }
+
+    /// Effective idle-capture interval, capped while in a meeting. Uses `min`
+    /// so it never *raises* an already-shorter interval set by HD or an
+    /// aggressive power profile.
+    fn effective_idle_capture_interval_ms(&self) -> u64 {
+        if self.in_meeting {
+            self.config
+                .idle_capture_interval_ms
+                .min(MEETING_IDLE_CAPTURE_INTERVAL_MS)
+        } else {
+            self.config.idle_capture_interval_ms
         }
     }
 
@@ -372,7 +400,7 @@ impl EventDrivenCapture {
 
     /// Phase the next idle capture without changing the normal debounce clock.
     pub fn phase_next_idle_capture(&mut self, delay: Duration) {
-        let idle_interval = Duration::from_millis(self.config.idle_capture_interval_ms);
+        let idle_interval = Duration::from_millis(self.effective_idle_capture_interval_ms());
         let now = Instant::now();
         self.last_idle_reference = if delay >= idle_interval {
             now
@@ -384,7 +412,7 @@ impl EventDrivenCapture {
     /// Check if we need an idle capture (no capture for too long).
     pub fn needs_idle_capture(&self) -> bool {
         self.last_idle_reference.elapsed()
-            >= Duration::from_millis(self.config.idle_capture_interval_ms)
+            >= Duration::from_millis(self.effective_idle_capture_interval_ms())
     }
 
     /// Poll timer-driven state and return a trigger if a capture should happen.
@@ -1062,6 +1090,10 @@ pub async fn event_driven_capture_loop(
             // snapshot as the interval install so the two can't disagree.
             hd_active = snap.active;
             in_meeting = snap.meeting.unwrap_or(false);
+            // Cap the idle-capture interval while in a meeting so the shared
+            // screen is captured on a guaranteed floor, not just when the
+            // visual detector trips.
+            state.in_meeting = in_meeting;
             if let Some(new_ms) = high_fps.on_controller_state(
                 snap.effective_interval_ms(),
                 state.config.min_capture_interval_ms,
@@ -2555,6 +2587,37 @@ mod tests {
 
         state.mark_captured();
         assert!(!state.needs_idle_capture());
+    }
+
+    #[test]
+    fn meeting_caps_the_idle_capture_interval() {
+        let config = EventDrivenCaptureConfig {
+            idle_capture_interval_ms: 30_000, // normal 30s floor
+            ..Default::default()
+        };
+        let mut state = EventDrivenCapture::new(config);
+
+        // ~6s since the last capture — past the meeting cap, well under 30s.
+        let six_s_ago = Instant::now()
+            .checked_sub(Duration::from_millis(MEETING_IDLE_CAPTURE_INTERVAL_MS + 1_000))
+            .unwrap_or(Instant::now());
+
+        // Not in a meeting: 6s < 30s → no idle capture yet.
+        state.last_idle_reference = six_s_ago;
+        assert!(!state.needs_idle_capture());
+
+        // In a meeting: the interval is capped to MEETING_IDLE_CAPTURE_INTERVAL_MS,
+        // so 6s > 5s → fire a guaranteed idle capture.
+        state.in_meeting = true;
+        assert!(state.needs_idle_capture());
+
+        // The cap only ever shortens: an already-tighter interval (HD / power
+        // profile) is left alone, not raised to 5s.
+        state.config.idle_capture_interval_ms = 1_000;
+        state.last_idle_reference = Instant::now()
+            .checked_sub(Duration::from_millis(1_200))
+            .unwrap_or(Instant::now());
+        assert!(state.needs_idle_capture());
     }
 
     #[test]
