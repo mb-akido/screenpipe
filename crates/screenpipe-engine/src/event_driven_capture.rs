@@ -743,6 +743,13 @@ pub async fn event_driven_capture_loop(
                     }
                     vision_metrics.record_capture();
                     vision_metrics.record_db_write(Duration::from_millis(result.duration_ms));
+                    // OCR metrics: record once per OCR run (each run = cache miss).
+                    if let Some(ocr_ms) = result.ocr_duration_ms {
+                        vision_metrics.record_ocr(Duration::from_millis(ocr_ms), 0, 1);
+                        if result.ocr_was_empty {
+                            vision_metrics.record_ocr_empty();
+                        }
+                    }
                     if let Some(ref cache) = hot_frame_cache {
                         push_to_hot_cache(cache, result, &device_name, &CaptureTrigger::Manual)
                             .await;
@@ -1375,6 +1382,15 @@ pub async fn event_driven_capture_loop(
                             vision_metrics.record_capture();
                             vision_metrics
                                 .record_db_write(Duration::from_millis(result.duration_ms));
+                            // OCR metrics: record once per OCR run. Each run is a
+                            // cache miss (no OCR result cache exists). `ocr_duration_ms`
+                            // is Some only when OCR actually ran for this frame.
+                            if let Some(ocr_ms) = result.ocr_duration_ms {
+                                vision_metrics.record_ocr(Duration::from_millis(ocr_ms), 0, 1);
+                                if result.ocr_was_empty {
+                                    vision_metrics.record_ocr_empty();
+                                }
+                            }
 
                             if let Some(ref cache) = hot_frame_cache {
                                 push_to_hot_cache(cache, result, &device_name, &trigger).await;
@@ -1461,6 +1477,11 @@ pub async fn event_driven_capture_loop(
                         // (e.g. Wayland without ZwlrScreencopy).
                         state.mark_captured();
 
+                        // Count the lost frame so telemetry can see it. Without
+                        // this the error path was invisible — `frames_dropped`
+                        // stayed 0 fleet-wide and the only signal was a log line.
+                        vision_metrics.record_drop_error();
+
                         if consecutive_capture_errors == 1 {
                             // First failure — log at error level (shows in Sentry)
                             error!(
@@ -1504,8 +1525,15 @@ pub async fn event_driven_capture_loop(
                     Err(_timeout) => {
                         consecutive_capture_errors += 1;
                         state.mark_captured();
+
+                        // Count the lost frame. This path drops a frame whose
+                        // JPEG may already be on disk (orphaned, no DB row) —
+                        // it is the silent-vision-loss path and was previously
+                        // uncounted, so `frames_dropped` read 0 fleet-wide.
+                        vision_metrics.record_drop_timeout();
                         warn!(
-                            "event capture timed out (trigger={}, monitor={}) — DB pool may be saturated",
+                            "event capture timed out after {:?} (trigger={}, monitor={}) — frame dropped; likely a stuck DB write / saturated write pool or a slow a11y/OCR step",
+                            CAPTURE_OPERATION_TIMEOUT,
                             trigger.as_str(),
                             monitor_id
                         );
@@ -1920,20 +1948,74 @@ async fn do_capture(
     // If the window was skipped (incognito/private browsing or user filter),
     // bail out entirely — don't OCR the screenshot.
 
-    // Record walk cost for adaptive budget before consuming the result
-    if let TreeWalkResult::Found(ref snap) = tree_walk_result {
-        walk_budget.record_walk(&snap.app_name, snap.walk_duration, snap.truncated);
-        if snap.walk_duration > std::time::Duration::from_millis(100) {
-            let next = walk_budget.should_walk(&snap.app_name);
-            debug!(
-                "walk budget: {}ms for {} → tier={:?} (next: max_nodes={}, timeout={}ms)",
-                snap.walk_duration.as_millis(),
-                snap.app_name,
-                next.tier,
-                next.max_nodes,
-                next.timeout.as_millis(),
-            );
+    // Record walk cost for adaptive budget before consuming the result, and
+    // feed the a11y health/analytics accumulator (ax_* counters) for EVERY
+    // walk outcome. Found → stored/deduped/empty (deduped when the content
+    // hash matches the previous frame under the same dedup gate used below);
+    // NotFound → error. Skipped windows are intentionally NOT counted as walk
+    // attempts — they're user/incognito filters, not real walks.
+    match tree_walk_result {
+        TreeWalkResult::Found(ref snap) => {
+            walk_budget.record_walk(&snap.app_name, snap.walk_duration, snap.truncated);
+            if snap.walk_duration > std::time::Duration::from_millis(100) {
+                let next = walk_budget.should_walk(&snap.app_name);
+                debug!(
+                    "walk budget: {}ms for {} → tier={:?} (next: max_nodes={}, timeout={}ms)",
+                    snap.walk_duration.as_millis(),
+                    snap.app_name,
+                    next.tier,
+                    next.max_nodes,
+                    next.timeout.as_millis(),
+                );
+            }
+
+            use screenpipe_a11y::tree::TruncationReason;
+            if snap.text_content.is_empty() {
+                crate::ui_recorder::record_tree_walk(crate::ui_recorder::TreeWalkOutcome::Empty);
+            } else {
+                let duration_ms = snap.walk_duration.as_millis() as u64;
+                let node_count = snap.node_count as u64;
+                let max_depth = snap.max_depth_reached as u64;
+                let text_chars = snap.text_content.chars().count() as u64;
+                let truncated = snap.truncated;
+                let truncated_timeout = matches!(snap.truncation_reason, TruncationReason::Timeout);
+                let truncated_max_nodes =
+                    matches!(snap.truncation_reason, TruncationReason::MaxNodes);
+                // Mirror the downstream content-dedup gate: a non-empty walk
+                // whose hash matches the previous frame (and which is dedup
+                // eligible) won't be stored — count it as deduped.
+                let is_dedup = dedup_applies(trigger, hd_active, last_db_write.elapsed())
+                    && previous_content_hash
+                        .is_some_and(|prev| prev == snap.content_hash as i64 && prev != 0);
+                let outcome = if is_dedup {
+                    crate::ui_recorder::TreeWalkOutcome::Deduped {
+                        duration_ms,
+                        node_count,
+                        max_depth,
+                        text_chars,
+                        truncated,
+                        truncated_timeout,
+                        truncated_max_nodes,
+                    }
+                } else {
+                    crate::ui_recorder::TreeWalkOutcome::Stored {
+                        duration_ms,
+                        node_count,
+                        max_depth,
+                        text_chars,
+                        truncated,
+                        truncated_timeout,
+                        truncated_max_nodes,
+                    }
+                };
+                crate::ui_recorder::record_tree_walk(outcome);
+            }
         }
+        TreeWalkResult::NotFound => {
+            crate::ui_recorder::record_tree_walk(crate::ui_recorder::TreeWalkOutcome::Error);
+        }
+        // Skipped: user filter / incognito — not a walk attempt, don't count.
+        TreeWalkResult::Skipped(_) => {}
     }
 
     let tree_snapshot = match tree_walk_result {

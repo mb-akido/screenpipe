@@ -264,6 +264,21 @@ pub struct PipelineHealthInfo {
     pub frames_db_written: u64,
     pub frames_dropped: u64,
     pub frame_drop_rate: f64,
+    /// Frames dropped because the capture op timed out (subset of frames_dropped).
+    pub frames_dropped_timeout: u64,
+    /// Frames dropped because the capture op errored (subset of frames_dropped).
+    pub frames_dropped_error: u64,
+    /// capture_attempts - frames_db_written - dedup_skips: real lost-frame count.
+    pub silent_loss: u64,
+    /// silent_loss / (capture_attempts - dedup_skips). The fleet's true stall rate.
+    pub silent_loss_rate: f64,
+    /// Total capture cycles attempted (loop heartbeat). Flat while uptime climbs
+    /// = trigger starvation (no capture events firing — the meeting-gap case).
+    pub capture_attempts: u64,
+    /// Capture cycles skipped by content dedup (static screen — expected/benign).
+    pub dedup_skips: u64,
+    /// Unix secs of the last capture attempt; consumers derive heartbeat age.
+    pub last_capture_attempt_ts: u64,
     pub capture_fps_actual: f64,
     pub avg_ocr_latency_ms: f64,
     pub avg_db_latency_ms: f64,
@@ -272,6 +287,9 @@ pub struct PipelineHealthInfo {
     pub time_to_first_frame_ms: Option<f64>,
     pub pipeline_stall_count: u64,
     pub ocr_cache_hit_rate: f64,
+    /// OCR runs that produced (near-)empty text (subset of ocr_completed).
+    /// `ocr_empty / ocr_completed` is the OCR-quality failure rate.
+    pub ocr_empty: u64,
 }
 
 #[derive(Serialize, OaSchema, Deserialize, Clone)]
@@ -1009,6 +1027,13 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
             frames_db_written: vision_snap.frames_db_written,
             frames_dropped: vision_snap.frames_dropped,
             frame_drop_rate: vision_snap.frame_drop_rate,
+            frames_dropped_timeout: vision_snap.frames_dropped_timeout,
+            frames_dropped_error: vision_snap.frames_dropped_error,
+            silent_loss: vision_snap.silent_loss,
+            silent_loss_rate: vision_snap.silent_loss_rate,
+            capture_attempts: vision_snap.capture_attempts,
+            dedup_skips: vision_snap.dedup_skips,
+            last_capture_attempt_ts: vision_snap.last_capture_attempt_ts,
             capture_fps_actual: vision_snap.capture_fps_actual,
             avg_ocr_latency_ms: vision_snap.avg_ocr_latency_ms,
             avg_db_latency_ms: vision_snap.avg_db_latency_ms,
@@ -1021,6 +1046,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
             } else {
                 0.0
             },
+            ocr_empty: vision_snap.ocr_empty,
         })
     } else {
         None

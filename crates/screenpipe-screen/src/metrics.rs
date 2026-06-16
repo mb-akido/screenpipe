@@ -59,6 +59,9 @@ pub struct PipelineMetrics {
     pub ocr_cache_hits: AtomicU64,
     /// OCR cache misses (had to run OCR engine)
     pub ocr_cache_misses: AtomicU64,
+    /// OCR runs that yielded (near-)empty text — an OCR-quality failure proxy.
+    /// Subset of `ocr_completed`; `ocr_empty / ocr_completed` is the failure rate.
+    pub ocr_empty: AtomicU64,
     /// Cumulative OCR latency in microseconds (divide by ocr_completed for average)
     pub ocr_total_latency_us: AtomicU64,
 
@@ -71,6 +74,13 @@ pub struct PipelineMetrics {
     pub frames_db_written: AtomicU64,
     /// Frames dropped (OCR done but not written to DB — e.g. tracker miss)
     pub frames_dropped: AtomicU64,
+    /// Frames dropped because the capture operation timed out (15s budget).
+    /// Subset of `frames_dropped`, kept separately so telemetry can tell a
+    /// write/DB-pool stall (timeout) apart from an outright capture failure.
+    pub frames_dropped_timeout: AtomicU64,
+    /// Frames dropped because the capture operation returned an error
+    /// (screenshot/a11y/OCR/DB failure). Subset of `frames_dropped`.
+    pub frames_dropped_error: AtomicU64,
     /// Cumulative DB insert latency in microseconds
     pub db_total_latency_us: AtomicU64,
 
@@ -120,10 +130,13 @@ impl PipelineMetrics {
             ocr_completed: AtomicU64::new(0),
             ocr_cache_hits: AtomicU64::new(0),
             ocr_cache_misses: AtomicU64::new(0),
+            ocr_empty: AtomicU64::new(0),
             ocr_total_latency_us: AtomicU64::new(0),
             frames_video_written: AtomicU64::new(0),
             frames_db_written: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
+            frames_dropped_timeout: AtomicU64::new(0),
+            frames_dropped_error: AtomicU64::new(0),
             db_total_latency_us: AtomicU64::new(0),
             started_at: Instant::now(),
             first_frame_at_us: AtomicU64::new(0),
@@ -167,6 +180,13 @@ impl PipelineMetrics {
         self.ocr_cache_hits.fetch_add(cache_hits, Ordering::Relaxed);
         self.ocr_cache_misses
             .fetch_add(cache_misses, Ordering::Relaxed);
+    }
+
+    /// Record that an OCR run produced (near-)empty text — an OCR-quality
+    /// failure. Call alongside `record_ocr` only when the run was empty, so
+    /// `ocr_empty` stays a subset of `ocr_completed`.
+    pub fn record_ocr_empty(&self) {
+        self.ocr_empty.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a frame written to video.
@@ -226,8 +246,25 @@ impl PipelineMetrics {
         }
     }
 
-    /// Record a dropped frame.
+    /// Record a dropped frame (generic — prefer the categorized variants
+    /// below so telemetry can distinguish *why* the frame was lost).
     pub fn record_drop(&self) {
+        self.frames_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a frame dropped because the capture operation timed out
+    /// (exceeded the 15s budget — typically a stuck DB write / saturated
+    /// write pool). Bumps both the timeout-specific and the total counter.
+    pub fn record_drop_timeout(&self) {
+        self.frames_dropped_timeout.fetch_add(1, Ordering::Relaxed);
+        self.frames_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a frame dropped because the capture operation returned an
+    /// error (screenshot / accessibility / OCR / DB insert failure).
+    /// Bumps both the error-specific and the total counter.
+    pub fn record_drop_error(&self) {
+        self.frames_dropped_error.fetch_add(1, Ordering::Relaxed);
         self.frames_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -249,6 +286,28 @@ impl PipelineMetrics {
         let ocr_completed = self.ocr_completed.load(Ordering::Relaxed);
         let uptime_secs = self.started_at.elapsed().as_secs_f64();
 
+        // Silent loss = capture cycles that ran but produced no frame and were
+        // NOT an expected dedup skip. `attempts - persisted - dedup_skips`.
+        // This is the real "lost screen data" signal: when the loop keeps
+        // attempting captures (heartbeat alive) but nothing reaches the DB and
+        // it isn't a static-screen dedup, frames are vanishing. The legacy
+        // `frame_drop_rate` (1 - written/captured) is structurally ~0 because
+        // `frames_captured` is only bumped alongside `frames_db_written`, so it
+        // never surfaced this — `silent_loss_rate` does.
+        let capture_attempts = self.capture_attempts.load(Ordering::Relaxed);
+        let dedup_skips = self.dedup_skips.load(Ordering::Relaxed);
+        let silent_loss = capture_attempts
+            .saturating_sub(frames_db_written)
+            .saturating_sub(dedup_skips);
+        // Denominator = cycles that intended to write (attempts minus the
+        // expected static-screen dedups). Guard against divide-by-zero.
+        let write_intent = capture_attempts.saturating_sub(dedup_skips);
+        let silent_loss_rate = if write_intent > 0 {
+            silent_loss as f64 / write_intent as f64
+        } else {
+            0.0
+        };
+
         MetricsSnapshot {
             uptime_secs,
             frames_captured,
@@ -256,6 +315,7 @@ impl PipelineMetrics {
             ocr_completed,
             ocr_cache_hits: self.ocr_cache_hits.load(Ordering::Relaxed),
             ocr_cache_misses: self.ocr_cache_misses.load(Ordering::Relaxed),
+            ocr_empty: self.ocr_empty.load(Ordering::Relaxed),
             avg_ocr_latency_ms: if ocr_completed > 0 {
                 (self.ocr_total_latency_us.load(Ordering::Relaxed) as f64 / ocr_completed as f64)
                     / 1000.0
@@ -265,6 +325,10 @@ impl PipelineMetrics {
             frames_video_written: self.frames_video_written.load(Ordering::Relaxed),
             frames_db_written,
             frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
+            frames_dropped_timeout: self.frames_dropped_timeout.load(Ordering::Relaxed),
+            frames_dropped_error: self.frames_dropped_error.load(Ordering::Relaxed),
+            silent_loss,
+            silent_loss_rate,
             avg_db_latency_ms: {
                 // Use rolling window average (recent ~200 writes) instead of lifetime
                 // accumulator — prevents early spikes from permanently inflating the metric.
@@ -284,10 +348,20 @@ impl PipelineMetrics {
                     0.0
                 }
             },
-            frame_drop_rate: if frames_captured > 0 {
-                1.0 - (frames_db_written as f64 / frames_captured as f64)
-            } else {
-                0.0
+            // Real drop rate: of all frames that reached a terminal outcome
+            // (persisted or explicitly dropped via timeout/error), the fraction
+            // dropped. The old `1 - written/captured` was structurally ~0
+            // because `frames_captured` is only bumped alongside a successful
+            // write, so it never surfaced loss. See `silent_loss_rate` for the
+            // broader attempts-based view that also catches trigger starvation.
+            frame_drop_rate: {
+                let dropped = self.frames_dropped.load(Ordering::Relaxed);
+                let terminal = dropped + frames_db_written;
+                if terminal > 0 {
+                    dropped as f64 / terminal as f64
+                } else {
+                    0.0
+                }
             },
             capture_fps_actual: if uptime_secs > 0.0 {
                 frames_captured as f64 / uptime_secs
@@ -307,8 +381,8 @@ impl PipelineMetrics {
             pipeline_stall_count: self.pipeline_stall_count.load(Ordering::Relaxed),
             last_db_write_ts: self.last_db_write_ts.load(Ordering::Relaxed),
             last_capture_attempt_ts: self.last_capture_attempt_ts.load(Ordering::Relaxed),
-            capture_attempts: self.capture_attempts.load(Ordering::Relaxed),
-            dedup_skips: self.dedup_skips.load(Ordering::Relaxed),
+            capture_attempts,
+            dedup_skips,
         }
     }
 }
@@ -328,12 +402,23 @@ pub struct MetricsSnapshot {
     pub ocr_completed: u64,
     pub ocr_cache_hits: u64,
     pub ocr_cache_misses: u64,
+    /// OCR runs that produced (near-)empty text (subset of ocr_completed).
+    pub ocr_empty: u64,
     pub avg_ocr_latency_ms: f64,
     pub frames_video_written: u64,
     pub frames_db_written: u64,
     pub frames_dropped: u64,
+    /// Frames dropped because the capture op timed out (subset of frames_dropped).
+    pub frames_dropped_timeout: u64,
+    /// Frames dropped because the capture op errored (subset of frames_dropped).
+    pub frames_dropped_error: u64,
+    /// capture_attempts - frames_db_written - dedup_skips. The real count of
+    /// capture cycles that lost their frame and weren't an expected dedup skip.
+    pub silent_loss: u64,
+    /// silent_loss / (capture_attempts - dedup_skips). 0.0 = healthy.
+    pub silent_loss_rate: f64,
     pub avg_db_latency_ms: f64,
-    /// 0.0 = no drops, 1.0 = all dropped
+    /// 0.0 = no drops, 1.0 = all dropped (drops / (drops + writes))
     pub frame_drop_rate: f64,
     pub capture_fps_actual: f64,
     /// None if no frame has reached DB yet
@@ -349,4 +434,86 @@ pub struct MetricsSnapshot {
     pub capture_attempts: u64,
     /// Total dedup skips (capture cycle ran but content matched previous frame).
     pub dedup_skips: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn silent_loss_and_drop_rate_reflect_real_loss() {
+        let m = PipelineMetrics::new();
+        // 10 attempts: 6 persisted, 2 dedup skips, 2 dropped (1 timeout, 1 error).
+        for _ in 0..10 {
+            m.record_capture_attempt();
+        }
+        for _ in 0..6 {
+            m.record_db_write(Duration::from_millis(5));
+        }
+        for _ in 0..2 {
+            m.record_dedup_skip();
+        }
+        m.record_drop_timeout();
+        m.record_drop_error();
+
+        let s = m.snapshot();
+        assert_eq!(s.capture_attempts, 10);
+        assert_eq!(s.frames_db_written, 6);
+        assert_eq!(s.dedup_skips, 2);
+        assert_eq!(s.frames_dropped, 2);
+        assert_eq!(s.frames_dropped_timeout, 1);
+        assert_eq!(s.frames_dropped_error, 1);
+        // silent_loss = attempts - written - dedup = 10 - 6 - 2 = 2
+        assert_eq!(s.silent_loss, 2);
+        // silent_loss_rate = silent_loss / (attempts - dedup) = 2 / 8 = 0.25
+        assert!((s.silent_loss_rate - 0.25).abs() < 1e-9);
+        // frame_drop_rate = dropped / (dropped + written) = 2 / 8 = 0.25
+        // (the old `1 - written/captured` formula would have reported ~0 here)
+        assert!((s.frame_drop_rate - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn healthy_pipeline_reports_zero_loss() {
+        let m = PipelineMetrics::new();
+        for _ in 0..5 {
+            m.record_capture_attempt();
+            m.record_db_write(Duration::from_millis(3));
+        }
+        let s = m.snapshot();
+        assert_eq!(s.silent_loss, 0);
+        assert_eq!(s.silent_loss_rate, 0.0);
+        assert_eq!(s.frame_drop_rate, 0.0);
+        assert_eq!(s.frames_dropped, 0);
+    }
+
+    #[test]
+    fn ocr_counters_track_completed_empty_and_latency() {
+        let m = PipelineMetrics::new();
+        // 3 OCR runs (each a cache miss), 1 of which yielded empty text.
+        m.record_ocr(Duration::from_millis(10), 0, 1);
+        m.record_ocr(Duration::from_millis(20), 0, 1);
+        m.record_ocr(Duration::from_millis(30), 0, 1);
+        m.record_ocr_empty();
+
+        let s = m.snapshot();
+        assert_eq!(s.ocr_completed, 3);
+        assert_eq!(s.ocr_cache_misses, 3);
+        assert_eq!(s.ocr_cache_hits, 0);
+        assert_eq!(s.ocr_empty, 1);
+        // avg latency = (10 + 20 + 30) / 3 = 20ms
+        assert!((s.avg_ocr_latency_ms - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drop_helpers_bump_total_and_category() {
+        let m = PipelineMetrics::new();
+        m.record_drop_timeout();
+        m.record_drop_timeout();
+        m.record_drop_error();
+        let s = m.snapshot();
+        assert_eq!(s.frames_dropped_timeout, 2);
+        assert_eq!(s.frames_dropped_error, 1);
+        assert_eq!(s.frames_dropped, 3);
+    }
 }
