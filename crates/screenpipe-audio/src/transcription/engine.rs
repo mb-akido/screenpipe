@@ -110,6 +110,19 @@ pub enum TranscriptionEngine {
     Disabled,
 }
 
+/// Build keyterm phrases from the configured vocabulary for Parakeet contextual
+/// biasing (audiopipe shallow fusion). Prefers the replacement spelling when set
+/// and caps at 100, matching the Deepgram keyterm path.
+#[cfg(any(feature = "parakeet", feature = "parakeet-mlx"))]
+fn parakeet_keyterms(vocabulary: &[VocabularyEntry]) -> Vec<String> {
+    vocabulary
+        .iter()
+        .map(|v| v.replacement.clone().unwrap_or_else(|| v.word.clone()))
+        .filter(|w| !w.trim().is_empty())
+        .take(100)
+        .collect()
+}
+
 impl TranscriptionEngine {
     /// Factory that only loads the model needed for the configured engine.
     pub async fn new(
@@ -647,15 +660,23 @@ impl TranscriptionSession {
             }
 
             #[cfg(feature = "parakeet")]
-            Self::Parakeet { model, .. } => {
+            Self::Parakeet { model, vocabulary } => {
                 let mut engine = model.lock().map_err(|e| anyhow!("stt model lock: {}", e))?;
+                // Contextual biasing: feed the vocabulary as keyterms so Parakeet
+                // prefers known names/products (audiopipe shallow-fusion; measured
+                // proper-name WER 21%→7%). The default boost (6) is the safe
+                // optimum — see audiopipe::TranscribeOptions.
+                let keyterms = parakeet_keyterms(vocabulary);
                 // parakeet's ONNX encoder supports up to ~50s but quality is best at <=30s.
                 // benchmarked: 30s hard chunks with no overlap gives 33.9% WER vs 34.5%
                 // with 1s overlap+LCS (the dedup algorithm eats correct words).
                 // this is a safety net — the reconciler already caps batches at 45s.
                 let chunk_samples = (sample_rate as usize) * 30;
                 if audio.len() <= chunk_samples {
-                    let opts = audiopipe::TranscribeOptions::default();
+                    let opts = audiopipe::TranscribeOptions {
+                        keyterms: keyterms.clone(),
+                        ..Default::default()
+                    };
                     let result = engine
                         .transcribe_with_sample_rate(audio, sample_rate, opts)
                         .map_err(|e| anyhow!("{}", e))?;
@@ -663,7 +684,10 @@ impl TranscriptionSession {
                 } else {
                     let mut texts = Vec::new();
                     for chunk in audio.chunks(chunk_samples) {
-                        let opts = audiopipe::TranscribeOptions::default();
+                        let opts = audiopipe::TranscribeOptions {
+                            keyterms: keyterms.clone(),
+                            ..Default::default()
+                        };
                         let result = engine
                             .transcribe_with_sample_rate(chunk, sample_rate, opts)
                             .map_err(|e| anyhow!("{}", e))?;
@@ -677,11 +701,15 @@ impl TranscriptionSession {
             }
 
             #[cfg(feature = "parakeet-mlx")]
-            Self::ParakeetMlx { model, .. } => {
+            Self::ParakeetMlx { model, vocabulary } => {
                 // GPU serialization is handled by audiopipe's Model::GPU_LOCK.
                 // The per-model mutex here just prevents concurrent Rust access
                 // to the same Model instance.
                 let mut engine = model.lock().map_err(|e| anyhow!("stt model lock: {}", e))?;
+                // Keyterms for contextual biasing. The MLX decoder ignores them
+                // today (biasing lives in the ONNX Parakeet path); passing them
+                // is a harmless no-op until MLX biasing lands.
+                let keyterms = parakeet_keyterms(vocabulary);
 
                 // Chunk to 30s like the CPU Parakeet path above. The Metal backend
                 // panics with command-buffer / GPU-memory-pressure errors on long
@@ -705,7 +733,10 @@ impl TranscriptionSession {
                     // buffer errors from memory pressure (prevents abort in the MLX
                     // completion handler) and to release resources held by a panic.
                     mlx_memory::clear_cache();
-                    let opts = audiopipe::TranscribeOptions::default();
+                    let opts = audiopipe::TranscribeOptions {
+                        keyterms: keyterms.clone(),
+                        ..Default::default()
+                    };
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         engine.transcribe_with_sample_rate(chunk, sample_rate, opts)
                     }));

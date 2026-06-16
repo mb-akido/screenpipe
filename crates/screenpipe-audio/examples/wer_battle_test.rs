@@ -76,6 +76,9 @@ async fn main() -> anyhow::Result<()> {
 
     let engine_enum = match std::env::var("WER_ENGINE").as_deref() {
         Ok("tiny") => AudioTranscriptionEngine::WhisperTinyQuantized,
+        // Requires `--features parakeet`. Exercises the screenpipe→audiopipe
+        // keyterm-biasing path (vocabulary flows to Parakeet keyterms).
+        Ok("parakeet") => AudioTranscriptionEngine::Parakeet,
         _ => AudioTranscriptionEngine::default(),
     };
     let engine_label = format!("{engine_enum:?}");
