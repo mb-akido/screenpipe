@@ -346,11 +346,12 @@ pub async fn oauth_connect(
         }
     }
 
-    // Slack's OAuth response nests the user-selected incoming webhook and team
-    // metadata. Copy stable, non-secret identifiers to top-level fields so the
+    // Slack's OAuth response nests team metadata plus either a user token
+    // (`authed_user`, the new no-bot flow) or an incoming webhook (legacy bot
+    // flow). Copy stable, non-secret identifiers to top-level fields so the
     // generic OAuth UI can display a useful account name and the local
     // connection config can expose channel/workspace context without exposing
-    // the webhook URL.
+    // the token or webhook URL.
     if integration_id == "slack" {
         if let Some(team_name) = token_data["team"]["name"].as_str().map(String::from) {
             token_data["workspace_name"] = serde_json::Value::String(team_name);
@@ -358,17 +359,34 @@ pub async fn oauth_connect(
         if let Some(team_id) = token_data["team"]["id"].as_str().map(String::from) {
             token_data["team_id"] = serde_json::Value::String(team_id);
         }
-        if let Some(channel) = token_data["incoming_webhook"]["channel"]
-            .as_str()
-            .map(String::from)
-        {
-            token_data["slack_channel"] = serde_json::Value::String(channel);
-        }
-        if let Some(channel_id) = token_data["incoming_webhook"]["channel_id"]
-            .as_str()
-            .map(String::from)
-        {
-            token_data["slack_channel_id"] = serde_json::Value::String(channel_id);
+        if token_data["incoming_webhook"].is_null() {
+            // New user-token flow: no bot, no channel picker. Default the send
+            // target to the connecting user's own DM so notifications land as a
+            // self-message until/unless a channel is passed explicitly.
+            if let Some(user_id) = token_data["authed_user"]["id"].as_str().map(String::from) {
+                token_data["slack_user_id"] = serde_json::Value::String(user_id.clone());
+                if token_data["slack_channel_id"].is_null() {
+                    token_data["slack_channel_id"] = serde_json::Value::String(user_id);
+                }
+                if token_data["slack_channel"].is_null() {
+                    token_data["slack_channel"] =
+                        serde_json::Value::String("direct message".to_string());
+                }
+            }
+        } else {
+            // Legacy incoming-webhook flow: the channel was chosen during OAuth.
+            if let Some(channel) = token_data["incoming_webhook"]["channel"]
+                .as_str()
+                .map(String::from)
+            {
+                token_data["slack_channel"] = serde_json::Value::String(channel);
+            }
+            if let Some(channel_id) = token_data["incoming_webhook"]["channel_id"]
+                .as_str()
+                .map(String::from)
+            {
+                token_data["slack_channel_id"] = serde_json::Value::String(channel_id);
+            }
         }
     }
 

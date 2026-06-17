@@ -247,6 +247,10 @@ pub struct SlackSendRequest {
     pub blocks: Option<Value>,
     #[serde(default)]
     pub attachments: Option<Value>,
+    /// Target channel/conversation id (or user id for a DM). Only used by the
+    /// user-token transport; defaults to the connecting user's own DM.
+    #[serde(default)]
+    pub channel: Option<String>,
     #[serde(default)]
     pub instance: Option<String>,
     #[serde(flatten)]
@@ -2189,8 +2193,14 @@ async fn connection_config(
     }
 }
 
-/// POST /connections/slack/send — send a Slack message through the incoming
-/// webhook selected during OAuth. The webhook URL remains server-side.
+/// POST /connections/slack/send — send a Slack message.
+///
+/// Preferred transport uses the connecting user's **user token** (`chat:write`)
+/// and posts via `chat.postMessage`, so the message appears as the person, with
+/// no bot installed. When no `channel` is supplied it defaults to the user's own
+/// DM. Connections made before the user-token switch fall back to the stored
+/// incoming-webhook URL so they keep working until the user reconnects. Neither
+/// the token nor the webhook URL ever leaves the server.
 async fn slack_send(
     State(state): State<ConnectionsState>,
     Json(body): Json<SlackSendRequest>,
@@ -2213,18 +2223,7 @@ async fn slack_send(
         }
     };
 
-    let webhook_url = match token_json["incoming_webhook"]["url"].as_str() {
-        Some(url) if !url.is_empty() => url,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    json!({ "error": "Slack connection does not include an incoming webhook. Reconnect Slack and choose a channel." }),
-                ),
-            );
-        }
-    };
-
+    // Build the message payload once; both transports accept the same fields.
     let mut payload = body.extra;
     if let Some(text) = body.text {
         payload.insert("text".to_string(), Value::String(text));
@@ -2235,15 +2234,89 @@ async fn slack_send(
     if let Some(attachments) = body.attachments {
         payload.insert("attachments".to_string(), attachments);
     }
-
     if payload.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(
-                json!({ "error": "Slack message requires text, blocks, attachments, or another webhook payload field." }),
+                json!({ "error": "Slack message requires text, blocks, attachments, or another payload field." }),
             ),
         );
     }
+
+    let team = token_json["workspace_name"]
+        .as_str()
+        .or_else(|| token_json["team"]["name"].as_str())
+        .map(String::from);
+
+    // Preferred: user token via chat.postMessage (posts as the person, no bot).
+    if let Some(user_token) = token_json["authed_user"]["access_token"].as_str() {
+        let channel = body
+            .channel
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .or_else(|| token_json["slack_channel_id"].as_str())
+            .or_else(|| token_json["authed_user"]["id"].as_str());
+        let channel = match channel {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "No Slack channel to send to. Pass \"channel\" or reconnect Slack." })),
+                );
+            }
+        };
+        payload.insert("channel".to_string(), Value::String(channel.clone()));
+
+        return match reqwest::Client::new()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(user_token)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let body_json: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+                // chat.postMessage returns HTTP 200 even on logical failure;
+                // the real status is in the `ok` field.
+                if body_json["ok"].as_bool().unwrap_or(false) {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "ok": true,
+                            "channel": body_json["channel"].as_str().unwrap_or(channel.as_str()),
+                            "ts": body_json["ts"].as_str(),
+                            "team": team,
+                        })),
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": "Slack rejected the message",
+                            "details": body_json["error"].as_str().unwrap_or("unknown error"),
+                        })),
+                    )
+                }
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("Slack request failed: {}", e) })),
+            ),
+        };
+    }
+
+    // Legacy fallback: incoming webhook (bot) connections.
+    let webhook_url = match token_json["incoming_webhook"]["url"].as_str() {
+        Some(url) if !url.is_empty() => url,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "error": "Slack connection is missing credentials. Reconnect Slack." }),
+                ),
+            );
+        }
+    };
 
     match reqwest::Client::new()
         .post(webhook_url)
@@ -2262,9 +2335,7 @@ async fn slack_send(
                         "channel": token_json["slack_channel"]
                             .as_str()
                             .or_else(|| token_json["incoming_webhook"]["channel"].as_str()),
-                        "team": token_json["workspace_name"]
-                            .as_str()
-                            .or_else(|| token_json["team"]["name"].as_str()),
+                        "team": team,
                     })),
                 )
             } else {
