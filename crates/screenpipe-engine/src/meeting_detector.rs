@@ -23,7 +23,9 @@
 //! and non-meeting contexts (Slack chat, etc.). A mute button counts only when
 //! accompanied by a leave/hangup signal (see `min_signals_required`).
 
-use crate::meeting_telemetry::{capture_detection_decision, MeetingDetectionScanSummary};
+use crate::meeting_telemetry::{
+    capture_detection_decision, capture_detection_outcome, MeetingDetectionScanSummary,
+};
 use crate::routes::meetings::{emit_meeting_status_changed, resolve_meeting_status_from};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
@@ -2735,6 +2737,10 @@ pub async fn run_meeting_detection_loop(
     // it for the rest of this detector lifetime. Cleared on app restart,
     // which is fine — the DB filter takes over from there.
     let mut last_explicit_stop_id: Option<i64> = None;
+    // Count Active<->Ending oscillations for the current meeting so end-detection
+    // health is observable (a clean auto end flaps ~0; sustained flapping flags a
+    // call that lost its controls but kept getting revived). Reset per meeting.
+    let mut flap_count: u32 = 0;
 
     info!(
         "meeting v2: detection loop started (base_interval={:?}, profiles={}, ignored_apps={})",
@@ -3098,7 +3104,17 @@ pub async fn run_meeting_detection_loop(
                 && has_active_calendar_event(&calendar_events, Utc::now()));
 
         // 3. Advance state machine
+        // Capture the state name before the move so we can detect Active<->Ending
+        // oscillation (end-detection health telemetry) without borrowing `state`
+        // after `advance_state` consumes it.
+        let prev_state_name = state.name();
         let (new_state, action) = advance_state(state, &scan_results, keep_alive);
+        let new_state_name = new_state.name();
+        if (prev_state_name == "Active" && new_state_name == "Ending")
+            || (prev_state_name == "Ending" && new_state_name == "Active")
+        {
+            flap_count = flap_count.saturating_add(1);
+        }
         state = new_state;
 
         // Adaptive interval based on state, gated on recent audio when Idle.
@@ -3117,6 +3133,8 @@ pub async fn run_meeting_detection_loop(
         if let Some(action) = action {
             match action {
                 StateAction::StartMeeting { app } => {
+                    // Fresh meeting -> reset the flap counter for outcome telemetry.
+                    flap_count = 0;
                     // Calendar enrichment: find overlapping calendar event
                     let (cal_title, cal_attendees) =
                         find_overlapping_calendar_event(&calendar_events);
@@ -3254,6 +3272,11 @@ pub async fn run_meeting_detection_loop(
                         {
                             Ok(()) => {
                                 info!("meeting v2: meeting ended (id={})", meeting_id);
+                                // End-detection health telemetry (privacy-safe buckets only).
+                                if let Ok(meeting) = db.get_meeting_by_id(meeting_id).await {
+                                    capture_detection_outcome(&meeting, "auto_timeout", flap_count);
+                                }
+                                flap_count = 0;
                                 // Emit event so triggered pipes can react
                                 if let Err(e) = screenpipe_events::send_event(
                                     "meeting_ended",
