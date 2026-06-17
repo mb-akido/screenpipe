@@ -9763,7 +9763,7 @@ export function StandaloneChat({
 
           <div
             className={cn(
-              "flex flex-col rounded-xl border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
+              "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
               "bg-background/80 border-border/50 shadow-lg shadow-black/5",
               disabledReason && "border-muted-foreground/30"
             )}
