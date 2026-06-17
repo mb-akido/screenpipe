@@ -2043,7 +2043,7 @@ async fn do_capture(
                 // Mirror the downstream content-dedup gate: a non-empty walk
                 // whose hash matches the previous frame (and which is dedup
                 // eligible) won't be stored — count it as deduped.
-                let is_dedup = dedup_applies(trigger, hd_active, last_db_write.elapsed())
+                let is_dedup = dedup_applies(trigger, hd_active, in_meeting, last_db_write.elapsed())
                     && previous_content_hash
                         .is_some_and(|prev| prev == snap.content_hash as i64 && prev != 0);
                 let outcome = if is_dedup {
