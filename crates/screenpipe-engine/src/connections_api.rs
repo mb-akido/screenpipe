@@ -258,6 +258,37 @@ pub struct SlackSendRequest {
 }
 
 #[derive(Deserialize)]
+pub struct SlackSearchQuery {
+    /// Slack search query string (same syntax as the Slack search box).
+    pub q: String,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SlackConversationsQuery {
+    /// Comma-separated conversation types. Defaults to all the user can see.
+    #[serde(default)]
+    pub types: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SlackHistoryQuery {
+    /// Conversation id (channel `C…`, DM `D…`, group `G…`).
+    pub channel: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct WhatsAppPairRequest {
     pub bun_path: String,
 }
@@ -2356,6 +2387,121 @@ async fn slack_send(
     }
 }
 
+/// Load the Slack **user token** for read calls, or return a ready HTTP error.
+/// Reading requires a connection made with the "Send + read" access level; a
+/// send-only or legacy webhook connection has no user token to read with.
+async fn slack_user_token(
+    state: &ConnectionsState,
+    instance: Option<&str>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let token_json = oauth_store::load_oauth_json(state.secret_store.as_deref(), "slack", instance)
+        .await
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Slack is not connected. Connect Slack in Settings > Connections." })),
+        ))?;
+    token_json["authed_user"]["access_token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "This Slack connection has no read access. Reconnect Slack and choose \"Send + read\"." })),
+        ))
+}
+
+/// Normalize a Slack Web API response. Slack returns HTTP 200 even on logical
+/// failure, with the real outcome in the `ok` field; map a few common errors to
+/// actionable hints.
+async fn slack_api_json(resp: Result<reqwest::Response, reqwest::Error>) -> (StatusCode, Json<Value>) {
+    match resp {
+        Ok(r) => {
+            let body: Value = r.json().await.unwrap_or_else(|_| json!({}));
+            if body["ok"].as_bool().unwrap_or(false) {
+                (StatusCode::OK, Json(body))
+            } else {
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                let hint = match err {
+                    "missing_scope" => " — reconnect Slack and choose \"Send + read\".",
+                    "not_in_channel" => " — you must be a member of that channel.",
+                    _ => "",
+                };
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": format!("Slack API error: {}{}", err, hint) })),
+                )
+            }
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("Slack request failed: {}", e) })),
+        ),
+    }
+}
+
+/// GET /connections/slack/search — search the user's accessible messages
+/// (`search.messages`). User-token only; bots can't search.
+async fn slack_search(
+    State(state): State<ConnectionsState>,
+    Query(q): Query<SlackSearchQuery>,
+) -> (StatusCode, Json<Value>) {
+    let token = match slack_user_token(&state, q.instance.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let count = q.count.unwrap_or(20).to_string();
+    let resp = reqwest::Client::new()
+        .get("https://slack.com/api/search.messages")
+        .bearer_auth(&token)
+        .query(&[("query", q.q.as_str()), ("count", count.as_str())])
+        .send()
+        .await;
+    slack_api_json(resp).await
+}
+
+/// GET /connections/slack/conversations — list the channels, DMs and groups the
+/// user can see (`conversations.list`).
+async fn slack_conversations(
+    State(state): State<ConnectionsState>,
+    Query(q): Query<SlackConversationsQuery>,
+) -> (StatusCode, Json<Value>) {
+    let token = match slack_user_token(&state, q.instance.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let types = q
+        .types
+        .unwrap_or_else(|| "public_channel,private_channel,im,mpim".to_string());
+    let limit = q.limit.unwrap_or(200).to_string();
+    let resp = reqwest::Client::new()
+        .get("https://slack.com/api/conversations.list")
+        .bearer_auth(&token)
+        .query(&[("types", types.as_str()), ("limit", limit.as_str())])
+        .send()
+        .await;
+    slack_api_json(resp).await
+}
+
+/// GET /connections/slack/history — read recent messages in one conversation
+/// (`conversations.history`).
+async fn slack_history(
+    State(state): State<ConnectionsState>,
+    Query(q): Query<SlackHistoryQuery>,
+) -> (StatusCode, Json<Value>) {
+    let token = match slack_user_token(&state, q.instance.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let limit = q.limit.unwrap_or(50).to_string();
+    let resp = reqwest::Client::new()
+        .get("https://slack.com/api/conversations.history")
+        .bearer_auth(&token)
+        .query(&[("channel", q.channel.as_str()), ("limit", limit.as_str())])
+        .send()
+        .await;
+    slack_api_json(resp).await
+}
+
 // ---------------------------------------------------------------------------
 // Browser extension pairing — lets the extension receive the local API token
 // after an explicit approval in the desktop app, instead of making non-dev
@@ -2975,6 +3121,9 @@ where
         .route("/gmail/send", post(gmail_send))
         // Slack-specific send route (must be before /:id to avoid conflict)
         .route("/slack/send", post(slack_send))
+        .route("/slack/search", get(slack_search))
+        .route("/slack/conversations", get(slack_conversations))
+        .route("/slack/history", get(slack_history))
         // WhatsApp-specific routes (must be before /:id to avoid conflict)
         .route("/whatsapp/pair", post(whatsapp_pair))
         .route("/whatsapp/status", get(whatsapp_status))

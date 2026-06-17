@@ -67,6 +67,7 @@ pub async fn oauth_connect(
     app_handle: AppHandle,
     integration_id: String,
     instance: Option<String>,
+    variant: Option<String>,
 ) -> Result<OAuthStatus, String> {
     let integrations = all_integrations();
     let integration = integrations
@@ -77,6 +78,21 @@ pub async fn oauth_connect(
     let config = integration
         .oauth_config()
         .ok_or_else(|| format!("{} does not use OAuth", integration_id))?;
+
+    // Resolve the requested access level. When the user picked a scope variant
+    // (e.g. Slack send-only vs send+read) use that variant's params; otherwise
+    // fall back to the integration's default `extra_auth_params`. The variant
+    // id is validated against the server-side whitelist — the UI never supplies
+    // raw scope strings.
+    let auth_params: &[(&str, &str)] = match variant.as_deref() {
+        Some(vid) => integration
+            .oauth_scope_variants()
+            .iter()
+            .find(|v| v.id == vid)
+            .map(|v| v.params)
+            .ok_or_else(|| format!("unknown scope variant '{}' for {}", vid, integration_id))?,
+        None => config.extra_auth_params,
+    };
 
     // Gate OAuth behind Pro subscription
     let is_pro = SettingsStore::get(&app_handle)
@@ -139,7 +155,7 @@ pub async fn oauth_connect(
             .append_pair("response_type", "code")
             .append_pair("redirect_uri", redirect_uri)
             .append_pair("state", &state);
-        for (k, v) in config.extra_auth_params {
+        for (k, v) in auth_params {
             pairs.append_pair(k, v);
         }
         // For Google OAuth, add login_hint to pre-select account
@@ -160,8 +176,8 @@ pub async fn oauth_connect(
         })?;
 
     info!(
-        "waiting for OAuth callback via /connections/oauth/callback ({}, instance={:?})",
-        integration_id, instance
+        "waiting for OAuth callback via /connections/oauth/callback ({}, instance={:?}, variant={:?})",
+        integration_id, instance, variant
     );
 
     let raw = tokio::time::timeout(std::time::Duration::from_secs(120), rx)

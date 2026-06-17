@@ -956,9 +956,9 @@ async oauthCancel(integrationId: string) : Promise<Result<null, string>> {
  * `integration_id` must match the integration's `def().id`.
  * `instance` is an optional name for multi-account support (e.g. email address).
  */
-async oauthConnect(integrationId: string, instance: string | null) : Promise<Result<OAuthStatus, string>> {
+async oauthConnect(integrationId: string, instance: string | null, variant: string | null) : Promise<Result<OAuthStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("oauth_connect", { integrationId, instance }) };
+    return { status: "ok", data: await TAURI_INVOKE("oauth_connect", { integrationId, instance, variant }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
