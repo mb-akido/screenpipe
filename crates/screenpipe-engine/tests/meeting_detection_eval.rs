@@ -17,7 +17,9 @@
 
 use std::time::{Duration, Instant};
 
-use screenpipe_engine::meeting_detector::{advance_state, MeetingState, ScanResult, StateAction};
+use screenpipe_engine::meeting_detector::{
+    advance_state, audio_or_calendar_keepalive, MeetingState, ScanResult, StateAction,
+};
 
 #[derive(Clone, Copy)]
 enum Step {
@@ -68,9 +70,10 @@ fn run(steps: &[Step]) -> Outcome {
                     is_in_call: in_call,
                     matched_signals: Vec::new(),
                 }];
-                // Mirror the loop's keep_alive: only relevant in Ending.
+                // Real shared composition (the exact fn the loop uses) so this
+                // harness genuinely guards the keep-alive logic, not a copy.
                 let keep_alive = matches!(state, MeetingState::Ending { .. })
-                    && ((output_chunk && voice) || calendar);
+                    && audio_or_calendar_keepalive(output_chunk, voice, calendar);
 
                 let prev = state.name();
                 let (next, action) = advance_state(state, &results, keep_alive);
@@ -173,6 +176,9 @@ struct Scenario {
     steps: Vec<Step>,
     want_started: bool,
     want_ended: bool,
+    /// Max tolerated Active<->Ending oscillations. A runaway here is the BUG-2
+    /// shape (a call that never settles); gate it so it can't regress silently.
+    max_flaps: u32,
 }
 
 fn scenarios() -> Vec<Scenario> {
@@ -220,6 +226,7 @@ fn scenarios() -> Vec<Scenario> {
             ],
             want_started: true,
             want_ended: true,
+            max_flaps: 1,
         },
         // BUG-2 regression: a silent (output) chunk must NOT pin the call open;
         // it must finalize after the grace, not flap forever.
@@ -235,6 +242,7 @@ fn scenarios() -> Vec<Scenario> {
             ],
             want_started: true,
             want_ended: true,
+            max_flaps: 1,
         },
         // Audible call with hidden controls (tab-switch / minimize / screen-share)
         // stays alive — the keep-alive we must not regress.
@@ -250,6 +258,7 @@ fn scenarios() -> Vec<Scenario> {
             ],
             want_started: true,
             want_ended: false,
+            max_flaps: 3,
         },
         // Start precision: media playback (audio but never call controls) must
         // never start a meeting.
@@ -262,6 +271,7 @@ fn scenarios() -> Vec<Scenario> {
             ],
             want_started: false,
             want_ended: false,
+            max_flaps: 0,
         },
         // Start precision: a single control blip needs a second confirming scan.
         Scenario {
@@ -269,6 +279,7 @@ fn scenarios() -> Vec<Scenario> {
             steps: vec![scan(true), quiet_no_controls()],
             want_started: false,
             want_ended: false,
+            max_flaps: 0,
         },
         // A scheduled calendar event sustains a meeting through hidden controls.
         Scenario {
@@ -282,6 +293,22 @@ fn scenarios() -> Vec<Scenario> {
             ],
             want_started: true,
             want_ended: false,
+            max_flaps: 2,
+        },
+        // Re-entry hysteresis: a single in-call scan in Ending must NOT flip back
+        // to Active (transient AX reflow); a second consecutive one re-enters.
+        Scenario {
+            name: "ending_hysteresis_absorbs_blip_then_reenters",
+            steps: vec![
+                in_call(),
+                in_call(),
+                quiet_no_controls(), // Active -> Ending
+                scan(true),          // controls reappear: hysteresis 1/2, stays Ending
+                scan(true),          // hysteresis 2/2: Ending -> Active
+            ],
+            want_started: true,
+            want_ended: false,
+            max_flaps: 2,
         },
     ]
 }
@@ -310,6 +337,12 @@ fn meeting_detection_scorecard() {
             failures.push(format!(
                 "{}: ended={} want={}",
                 s.name, o.ended, s.want_ended
+            ));
+        }
+        if o.flaps > s.max_flaps {
+            failures.push(format!(
+                "{}: flaps={} exceeds max {}",
+                s.name, o.flaps, s.max_flaps
             ));
         }
     }
