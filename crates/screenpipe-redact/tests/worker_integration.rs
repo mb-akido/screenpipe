@@ -504,3 +504,265 @@ async fn frame_fulltext_redaction_propagates_to_accessibility_once() {
         "accessibility_text must be propagated, never independently redacted"
     );
 }
+
+/// Don't clobber an `accessibility_text` that was already redacted in a
+/// prior run (watermark set) — and don't re-stamp it.
+#[tokio::test]
+async fn frame_fulltext_does_not_clobber_already_redacted_accessibility() {
+    let pool = setup_db().await;
+    sqlx::query(
+        "INSERT INTO frames (id, full_text, accessibility_text, accessibility_redacted_at) \
+         VALUES (1, 'key sk-proj-AbCdEf123456GhIjKlMnOp here', '[ALREADY]', 999)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let redactor = Arc::new(CountingPipeline {
+        inner: Pipeline::regex_only(),
+        map_calls: AtomicUsize::new(0),
+        batch_calls: AtomicUsize::new(0),
+    });
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handle.abort();
+
+    let row = sqlx::query(
+        "SELECT full_text, accessibility_text, accessibility_redacted_at FROM frames WHERE id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let full: String = row.get(0);
+    let acc: String = row.get(1);
+    let acc_when: Option<i64> = row.get(2);
+    assert!(
+        full.contains("[SECRET]"),
+        "full_text still redacted: {full:?}"
+    );
+    assert_eq!(
+        acc, "[ALREADY]",
+        "already-redacted accessibility must be left alone"
+    );
+    assert_eq!(
+        acc_when,
+        Some(999),
+        "accessibility watermark must not be re-stamped"
+    );
+    assert_eq!(redactor.batch_calls.load(Ordering::SeqCst), 0);
+}
+
+/// A frame with no PII still marks both columns done (verified-clean),
+/// from a single detection, without mangling the text.
+#[tokio::test]
+async fn frame_fulltext_clean_frame_marks_both_done() {
+    let pool = setup_db().await;
+    sqlx::query(
+        "INSERT INTO frames (id, full_text, accessibility_text) \
+         VALUES (1, 'ordinary text\nmore ordinary text', 'ordinary text')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let redactor = Arc::new(CountingPipeline {
+        inner: Pipeline::regex_only(),
+        map_calls: AtomicUsize::new(0),
+        batch_calls: AtomicUsize::new(0),
+    });
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handle.abort();
+
+    let row = sqlx::query(
+        "SELECT full_text, full_text_redacted_at, accessibility_text, accessibility_redacted_at \
+         FROM frames WHERE id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let full: String = row.get(0);
+    let full_when: Option<i64> = row.get(1);
+    let acc: String = row.get(2);
+    let acc_when: Option<i64> = row.get(3);
+    assert_eq!(
+        full, "ordinary text\nmore ordinary text",
+        "clean text must be untouched"
+    );
+    assert_eq!(
+        acc, "ordinary text",
+        "clean accessibility must be untouched"
+    );
+    assert!(
+        full_when.is_some() && acc_when.is_some(),
+        "both marked done with no PII"
+    );
+    assert_eq!(redactor.map_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(redactor.batch_calls.load(Ordering::SeqCst), 0);
+}
+
+/// With pseudonyms on, the propagated `accessibility_text` carries the
+/// SAME stable token as `full_text` for the same value — so the two
+/// columns stay correlatable (and propagation didn't re-detect).
+#[tokio::test]
+async fn frame_fulltext_pseudonym_token_is_identical_across_columns() {
+    let pool = setup_db().await;
+    let acc = "login sk-proj-AbCdEf123456GhIjKlMnOp now";
+    let full = format!("{acc}\nocr sk-proj-AbCdEf123456GhIjKlMnOp");
+    sqlx::query("INSERT INTO frames (id, full_text, accessibility_text) VALUES (1, ?, ?)")
+        .bind(&full)
+        .bind(acc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pseudo = Arc::new(Pseudonymizer::from_key([5u8; 32]));
+    let redactor = Arc::new(Pipeline::regex_only().with_pseudonyms(Some(pseudo)));
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor, cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handle.abort();
+
+    let row = sqlx::query("SELECT full_text, accessibility_text FROM frames WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let full_red: String = row.get(0);
+    let acc_red: String = row.get(1);
+    let tok = |s: &str| {
+        let i = s.find("[SECRET_").expect("a pseudonym token");
+        let j = s[i..].find(']').expect("token close") + i + 1;
+        s[i..j].to_string()
+    };
+    assert_eq!(
+        tok(&full_red),
+        tok(&acc_red),
+        "same secret must yield the identical token in both columns"
+    );
+    assert!(!acc_red.contains("sk-proj-AbCdEf123456GhIjKlMnOp"));
+}
+
+/// Several frames in one batch are each detected exactly once; every
+/// `accessibility_text` is propagated, none re-detected.
+#[tokio::test]
+async fn frame_fulltext_each_frame_detected_once() {
+    let pool = setup_db().await;
+    for id in [1_i64, 2, 3] {
+        let acc = format!("frame {id} key sk-proj-AbCdEf123456GhIjKlMnOp");
+        let full = format!("{acc}\nocr line {id}");
+        sqlx::query("INSERT INTO frames (id, full_text, accessibility_text) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(&full)
+            .bind(&acc)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let redactor = Arc::new(CountingPipeline {
+        inner: Pipeline::regex_only(),
+        map_calls: AtomicUsize::new(0),
+        batch_calls: AtomicUsize::new(0),
+    });
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    handle.abort();
+
+    assert_eq!(
+        redactor.map_calls.load(Ordering::SeqCst),
+        3,
+        "one detection per frame"
+    );
+    assert_eq!(
+        redactor.batch_calls.load(Ordering::SeqCst),
+        0,
+        "no accessibility re-detection"
+    );
+    for id in [1_i64, 2, 3] {
+        let row = sqlx::query("SELECT full_text, accessibility_text FROM frames WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let f: String = row.get(0);
+        let a: String = row.get(1);
+        assert!(
+            f.contains("[SECRET]") && a.contains("[SECRET]"),
+            "frame {id} not redacted"
+        );
+    }
+}
+
+/// When the redactor can't yield a map (default `redact_with_map` =>
+/// `None`, e.g. the span-less enclave — `RegexRedactor` stands in here),
+/// the frame path falls back: `full_text` is redacted inline and
+/// `accessibility_text` is left to its own pass. Both must still end up
+/// redacted — no silent data loss.
+#[tokio::test]
+async fn frame_fulltext_falls_back_when_no_map() {
+    let pool = setup_db().await;
+    let acc = "send to bob@example.com";
+    let full = format!("{acc}\nocr alice@example.com");
+    sqlx::query("INSERT INTO frames (id, full_text, accessibility_text) VALUES (1, ?, ?)")
+        .bind(&full)
+        .bind(acc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // RegexRedactor uses the trait-default redact_with_map => None.
+    let redactor = Arc::new(RegexRedactor::new()) as Arc<dyn Redactor>;
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor, cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort();
+
+    let row = sqlx::query(
+        "SELECT full_text, full_text_redacted_at, accessibility_text, accessibility_redacted_at \
+         FROM frames WHERE id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let f: String = row.get(0);
+    let fw: Option<i64> = row.get(1);
+    let a: String = row.get(2);
+    let aw: Option<i64> = row.get(3);
+    assert!(
+        f.contains("[EMAIL]") && fw.is_some(),
+        "full_text not redacted via fallback: {f:?}"
+    );
+    assert!(
+        a.contains("[EMAIL]") && aw.is_some(),
+        "accessibility not redacted by its pass: {a:?}"
+    );
+    assert!(!a.contains("bob@example.com"), "raw email survived: {a:?}");
+}

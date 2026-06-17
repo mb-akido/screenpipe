@@ -188,4 +188,139 @@ mod tests {
             assert!(!m.apply(frag).contains("sk-proj-ABCDEFGHIJKLMNOPQRST"));
         }
     }
+
+    #[test]
+    fn replaces_all_occurrences() {
+        let m = map(&[("bob@x.io", "[E]")]);
+        assert_eq!(m.apply("bob@x.io and bob@x.io again"), "[E] and [E] again");
+    }
+
+    #[test]
+    fn matches_at_string_start_and_end() {
+        let m = map(&[("alice@x.io", "[E]")]);
+        assert_eq!(m.apply("alice@x.io"), "[E]");
+        assert_eq!(m.apply("alice@x.io tail"), "[E] tail");
+        assert_eq!(m.apply("head alice@x.io"), "head [E]");
+    }
+
+    #[test]
+    fn numeric_boundary_guard() {
+        // A short numeric value must not redact the middle of a longer
+        // number (e.g. a detected "42" vs an unrelated id "4242").
+        let m = map(&[("42", "[ID]")]);
+        assert_eq!(m.apply("4242"), "4242");
+        assert_eq!(m.apply("v 42 end"), "v [ID] end");
+        assert_eq!(m.apply("(42)"), "([ID])");
+    }
+
+    #[test]
+    fn matching_is_case_sensitive() {
+        // Verbatim values from detection — derived copies share the case,
+        // and we must not redact a different-cased coincidence.
+        let m = map(&[("Alice", "[N]")]);
+        assert_eq!(m.apply("alice ALICE Alice"), "alice ALICE [N]");
+    }
+
+    #[test]
+    fn values_are_literal_not_regex() {
+        let m = map(&[("a.b*c+d", "[X]")]);
+        assert_eq!(m.apply("x a.b*c+d y"), "x [X] y");
+        assert_eq!(m.apply("x aXbYcZd y"), "x aXbYcZd y"); // regex would match; we don't
+    }
+
+    #[test]
+    fn duplicate_value_keeps_first_replacement() {
+        let m = RedactionMap::from_pairs(
+            [("k", "[FIRST]"), ("k", "[SECOND]")]
+                .iter()
+                .map(|(v, r)| (v.to_string(), r.to_string())),
+        );
+        assert_eq!(m.apply("k"), "[FIRST]");
+    }
+
+    #[test]
+    fn multibyte_values_and_neighbours() {
+        // Accented + CJK values, including flush against multibyte
+        // neighbours — must never panic on a byte slice and must match.
+        let m = map(&[("José", "[N]"), ("北京", "[CITY]")]);
+        assert_eq!(
+            m.apply("from José in 北京 today"),
+            "from [N] in [CITY] today"
+        );
+        // 'José' inside 'Josése' is a sub-token (next char 's' is a word
+        // char) → boundary guard leaves it.
+        assert_eq!(m.apply("Josése"), "Josése");
+        // non-word (emoji) neighbours → matches.
+        assert_eq!(m.apply("🎉José🎉"), "🎉[N]🎉");
+    }
+
+    #[test]
+    fn boundary_guard_blocks_glued_tokens_allows_separated() {
+        let m = map(&[("ab", "[X]")]);
+        // "abab" is a single alphanumeric token — redacting "ab" inside it
+        // would split a token, so the guard leaves it (the same safety
+        // that stops a value redacting the middle of a bigger word).
+        assert_eq!(m.apply("abab"), "abab");
+        // Separated by non-word chars → both occurrences replaced.
+        assert_eq!(m.apply("ab ab"), "[X] [X]");
+        assert_eq!(m.apply("ab-ab"), "[X]-[X]");
+    }
+
+    #[test]
+    fn replacement_length_independent() {
+        let m = map(&[("x", "[LONG_REPLACEMENT_TOKEN]"), ("yyyy", "[Y]")]);
+        assert_eq!(m.apply("x yyyy"), "[LONG_REPLACEMENT_TOKEN] [Y]");
+    }
+
+    #[test]
+    fn never_leaves_a_standalone_value_and_preserves_the_rest() {
+        let m = map(&[("sk-secret-123", "[SECRET]")]);
+        for input in [
+            "",
+            "nothing sensitive here",
+            "sk-secret-123",
+            "  sk-secret-123  ",
+            "<<sk-secret-123>>",
+            "a sk-secret-123 b sk-secret-123 c",
+        ] {
+            let out = m.apply(input);
+            assert!(!out.contains("sk-secret-123"), "value leaked in {out:?}");
+        }
+        // Non-matching text is byte-for-byte preserved.
+        assert_eq!(m.apply("untouched ✓ text"), "untouched ✓ text");
+    }
+
+    #[test]
+    fn apply_is_cheap_over_many_values() {
+        use std::time::Instant;
+        // 64 distinct values (a realistic per-frame PII count is far
+        // lower) over an ~8 KB blob — pure string scanning, no model.
+        let values: Vec<(String, String)> = (0..64)
+            .map(|i| (format!("secret-token-{i:04}"), format!("[S{i}]")))
+            .collect();
+        let m = RedactionMap::from_pairs(values.clone());
+        let mut blob = String::new();
+        for i in 0..400 {
+            blob.push_str(&format!(
+                "line {i} mentions secret-token-{:04} here\n",
+                i % 64
+            ));
+        }
+        let iters = 200u32;
+        let start = Instant::now();
+        let mut total = 0usize;
+        for _ in 0..iters {
+            total += m.apply(&blob).len();
+        }
+        let per = start.elapsed() / iters;
+        eprintln!(
+            "RedactionMap::apply: {} values over {} bytes => {:?}/call",
+            values.len(),
+            blob.len(),
+            per
+        );
+        assert!(total > 0);
+        // Generous ceiling; in practice this is tens of microseconds.
+        assert!(per.as_millis() < 50, "apply unexpectedly slow: {per:?}");
+    }
 }
