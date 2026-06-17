@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  RECOMMENDED_SERVERS,
   buildStdioCommand,
   displayName,
   installKind,
@@ -206,5 +207,23 @@ describe("mapRegistryEntryToDraft", () => {
 describe("normalizeUrl", () => {
   it("trims trailing slashes and whitespace", () => {
     expect(normalizeUrl("  https://a/mcp/  ")).toBe("https://a/mcp");
+  });
+});
+
+describe("RECOMMENDED_SERVERS", () => {
+  it("is non-empty and every entry is installable", () => {
+    expect(RECOMMENDED_SERVERS.length).toBeGreaterThan(0);
+    for (const s of RECOMMENDED_SERVERS) {
+      // A typo'd remote/package would make the curated row a dead "Add".
+      expect(installKind(s), `${s.name} must be installable`).not.toBe("none");
+      const draft = mapRegistryEntryToDraft(s, () => "id", () => 0);
+      expect(draft, `${s.name} must map to a draft`).not.toBeNull();
+    }
+  });
+
+  it("has a friendly title for each entry", () => {
+    for (const s of RECOMMENDED_SERVERS) {
+      expect(displayName(s)).toBe(s.title);
+    }
   });
 });

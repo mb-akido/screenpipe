@@ -236,3 +236,65 @@ export function mapRegistryEntryToDraft(
 export function normalizeUrl(url: string): string {
   return url.trim().replace(/\/+$/, "");
 }
+
+// ---------------------------------------------------------------------------
+// Recommended servers — shown at the top of the browser before the user
+// searches, the same idea as the curated "Featured" row in connections.
+//
+// These are REAL registry entries (verified vendor-official endpoints), so
+// each one maps cleanly through mapRegistryEntryToDraft() and one-click
+// pre-fills the editor. Picking one still goes through the normal
+// Connect/token + test/save path. Keep this list short and high-signal.
+// ---------------------------------------------------------------------------
+
+export const RECOMMENDED_SERVERS: RegistryServer[] = [
+  {
+    name: "com.notion/mcp",
+    title: "Notion",
+    description: "Search, read and write Notion pages and databases. OAuth sign-in.",
+    repository: { url: "https://github.com/makenotion/notion-mcp-server" },
+    remotes: [{ type: "streamable-http", url: "https://mcp.notion.com/mcp" }],
+  },
+  {
+    name: "app.linear/linear",
+    title: "Linear",
+    description: "Create and manage Linear issues, projects and cycles. OAuth sign-in.",
+    repository: { url: "https://linear.app/docs/mcp" },
+    remotes: [{ type: "sse", url: "https://mcp.linear.app/sse" }],
+  },
+  {
+    name: "com.stripe/mcp",
+    title: "Stripe",
+    description: "Query and manage Stripe — customers, payments, invoices, subscriptions.",
+    repository: { url: "https://docs.stripe.com/mcp" },
+    remotes: [{ type: "streamable-http", url: "https://mcp.stripe.com" }],
+  },
+  {
+    name: "com.figma.mcp/mcp",
+    title: "Figma",
+    description: "Read Figma files, frames and design context for your designs.",
+    repository: { url: "https://help.figma.com/hc/en-us/articles/32132100833559" },
+    remotes: [{ type: "streamable-http", url: "https://mcp.figma.com/mcp" }],
+  },
+  {
+    name: "co.huggingface/hf-mcp-server",
+    title: "Hugging Face",
+    description: "Search models, datasets and Spaces on the Hugging Face Hub.",
+    repository: { url: "https://github.com/evalstate/hf-mcp-server" },
+    remotes: [{ type: "streamable-http", url: "https://huggingface.co/mcp?login" }],
+  },
+  {
+    name: "io.github.getsentry/sentry-mcp",
+    title: "Sentry",
+    description: "Inspect Sentry issues, events and releases. Runs locally via npx.",
+    repository: { url: "https://github.com/getsentry/sentry-mcp" },
+    packages: [
+      {
+        registryType: "npm",
+        identifier: "@sentry/mcp-server",
+        runtimeHint: "npx",
+        transport: { type: "stdio" },
+      },
+    ],
+  },
+];

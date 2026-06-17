@@ -30,6 +30,7 @@ import {
   type McpServerDraft,
   type RegistrySearchResponse,
   type RegistryServer,
+  RECOMMENDED_SERVERS,
   displayName,
   installKind,
   mapRegistryEntryToDraft,
@@ -107,9 +108,18 @@ export function RegistryBrowser({
     [],
   );
 
-  // (Re)load the first page on open and whenever the search changes.
+  // (Re)load on open + when the search changes. With no query we show the
+  // curated Recommended list instead of fetching — keeps the first frame
+  // instant and avoids dumping the registry's raw newest-first order.
   useEffect(() => {
     if (!open) return;
+    if (!debounced) {
+      setServers([]);
+      setCursor(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -158,6 +168,24 @@ export function RegistryBrowser({
       ),
     [existingServers],
   );
+
+  const renderRow = (s: RegistryServer) => {
+    const remote = pickHttpRemote(s);
+    const installed = remote
+      ? installedHttpUrls.has(normalizeUrl(remote.url))
+      : false;
+    return (
+      <RegistryRow
+        key={`${s.name}@${s.version ?? ""}`}
+        server={s}
+        installed={installed}
+        onAdd={() => {
+          const draft = mapRegistryEntryToDraft(s, randomId, nowSeconds);
+          if (draft) onPick(draft);
+        }}
+      />
+    );
+  };
 
   return (
     <Dialog
@@ -220,35 +248,23 @@ export function RegistryBrowser({
               <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
               <span className="break-all">{error}</span>
             </div>
+          ) : !debounced ? (
+            <div className="space-y-1.5">
+              <p className="px-0.5 pb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                Recommended
+              </p>
+              {RECOMMENDED_SERVERS.map(renderRow)}
+              <p className="pt-1 text-[11px] text-muted-foreground text-center">
+                search above to browse the full registry.
+              </p>
+            </div>
           ) : servers.length === 0 ? (
             <div className="text-xs text-muted-foreground bg-muted/30 rounded-md px-3 py-6 text-center">
-              {debounced
-                ? `no servers match “${debounced}”.`
-                : "no servers found."}
+              no servers match “{debounced}”.
             </div>
           ) : (
             <div className="space-y-1.5">
-              {servers.map((s) => {
-                const remote = pickHttpRemote(s);
-                const installed = remote
-                  ? installedHttpUrls.has(normalizeUrl(remote.url))
-                  : false;
-                return (
-                  <RegistryRow
-                    key={`${s.name}@${s.version ?? ""}`}
-                    server={s}
-                    installed={installed}
-                    onAdd={() => {
-                      const draft = mapRegistryEntryToDraft(
-                        s,
-                        randomId,
-                        nowSeconds,
-                      );
-                      if (draft) onPick(draft);
-                    }}
-                  />
-                );
-              })}
+              {servers.map(renderRow)}
               {cursor && (
                 <div className="pt-1">
                   <Button
