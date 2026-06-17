@@ -1304,11 +1304,12 @@ export function PrivacySection() {
                     </span>
                     <span className="text-muted-foreground">
                       {" "}— replace each value with a stable token like{" "}
-                      <code>[PERSON_1a2b3c4d]</code> instead of a generic{" "}
+                      <code>[PERSON_1a2b3c4d5e6f]</code> instead of a generic{" "}
                       <code>[PERSON]</code>, so the same person or value stays
                       linkable across your timeline without being exposed.
                       One-way and on-device — the original can&apos;t be
-                      recovered.
+                      recovered. Applies to newly-recorded activity going
+                      forward.
                     </span>
                   </span>
                 </label>

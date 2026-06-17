@@ -57,9 +57,10 @@ pub struct RecordingConfig {
     /// policies.
     pub pii_redaction_labels: Vec<String>,
     /// Render redacted PII as consistent pseudonym tokens
-    /// (`[PERSON_1a2b3c4d]`) instead of static `[PERSON]` tags. Mirrors
-    /// the `piiRedactionPseudonyms` setting; consumed when building the
-    /// text worker pipeline (issue #4206). Off by default.
+    /// (`[PERSON_1a2b3c4d5e6f]`) instead of static `[PERSON]` tags.
+    /// Mirrors the `piiRedactionPseudonyms` setting; consumed when
+    /// building the text worker pipeline (issue #4206). Newly-redacted
+    /// rows only; ignored for the Tinfoil backend. Off by default.
     pub pii_redaction_pseudonyms: bool,
     /// Filter music-dominant audio before transcription using spectral analysis
     pub filter_music: bool,

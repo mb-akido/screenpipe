@@ -2751,10 +2751,13 @@ piiRedactionLabels?: string[];
 /**
  * Render redacted PII as **consistent pseudonyms** instead of static
  * `[LABEL]` tags when `asyncPiiRedaction` is on. Same value → same
- * stable token (e.g. `[PERSON_1a2b3c4d]`), so the timeline stays
+ * stable token (e.g. `[PERSON_1a2b3c4d5e6f]`), so the timeline stays
  * correlatable without exposing the value. Irreversible: a one-way
  * keyed hash with a random per-install key, no `token -> value`
- * store. Off by default. See issue #4206 and `screenpipe-redact`'s
+ * store. Applies to newly-redacted rows only — rows already redacted
+ * keep their existing tags (the worker redacts each row once).
+ * Ignored for the Tinfoil backend (the enclave returns no spans to
+ * tokenize). Off by default. See issue #4206 and `screenpipe-redact`'s
  * `Pseudonymizer`.
  */
 piiRedactionPseudonyms?: boolean;

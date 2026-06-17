@@ -85,7 +85,7 @@ fn apply_policy(
 /// Same shape as `adapters::regex::render_redacted`, kept private here
 /// to avoid widening the regex module's public surface. With a
 /// [`Pseudonymizer`] the replacement is a stable token derived from the
-/// span's value (`[PERSON_1a2b3c4d]`); without one it's the static
+/// span's value (`[PERSON_1a2b3c4d5e6f]`); without one it's the static
 /// `[PERSON]` placeholder.
 fn render_with_spans(
     text: &str,
@@ -163,14 +163,17 @@ impl Pipeline {
     }
 
     /// Render redacted spans as stable per-install pseudonym tokens
-    /// (`[PERSON_1a2b3c4d]`) instead of static `[PERSON]` placeholders.
-    /// `None` (the default) keeps the static placeholders.
+    /// (`[PERSON_1a2b3c4d5e6f]`) instead of static `[PERSON]`
+    /// placeholders. `None` (the default) keeps the static placeholders.
     ///
-    /// Opt-in; see [`Pseudonymizer`] and issue #4206. Has no effect on
-    /// span-less adapters (the Tinfoil enclave), whose redacted text
-    /// carries no spans to tokenize — that output is used verbatim.
+    /// Opt-in; see [`Pseudonymizer`] and issue #4206. **Forced off when
+    /// the AI step is the Tinfoil enclave**: it returns redacted text
+    /// with no spans, so its detections can't be tokenized — rather than
+    /// emit a confusing mix of tokenized regex spans and static enclave
+    /// placeholders, everything renders static for that backend.
     pub fn with_pseudonyms(mut self, pseudonyms: Option<Arc<Pseudonymizer>>) -> Self {
-        self.pseudonyms = pseudonyms;
+        let is_enclave = self.ai.as_ref().map(|a| a.name()) == Some("tinfoil");
+        self.pseudonyms = if is_enclave { None } else { pseudonyms };
         self
     }
 }
@@ -468,6 +471,27 @@ mod tests {
         let tc = tok(&c.redacted);
         assert_eq!(ta, tb, "same secret must map to the same token");
         assert_ne!(ta, tc, "different secrets must map to different tokens");
+    }
+
+    #[tokio::test]
+    async fn pseudonyms_forced_off_for_span_less_enclave() {
+        use crate::pseudonym::Pseudonymizer;
+        // UppercaseAi reports name "tinfoil" — stands in for the span-less
+        // enclave. Even with a pseudonymizer set, `with_pseudonyms` must
+        // disable it so the regex-detected secret renders static `[SECRET]`,
+        // never a token (avoids a mixed regex-token / enclave-static render).
+        let pseudo = Arc::new(Pseudonymizer::from_key([3u8; 32]));
+        let ai = Arc::new(UppercaseAi::new());
+        let p =
+            Pipeline::regex_then_ai(ai, PipelineConfig::default()).with_pseudonyms(Some(pseudo));
+        let out = p
+            .redact("api key sk-proj-ABCDEFGHIJKLMNOPQRST end")
+            .await
+            .unwrap();
+        // UppercaseAi uppercases its (span-less) output; the regex secret
+        // must still be a static tag, not a token.
+        assert!(out.redacted.contains("[SECRET]"));
+        assert!(!out.redacted.contains("[SECRET_"));
     }
 
     #[tokio::test]

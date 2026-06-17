@@ -444,11 +444,12 @@ pub struct RecordArgs {
     pub pii_redaction_labels: Vec<String>,
 
     /// Render redacted PII as consistent pseudonym tokens
-    /// (`[PERSON_1a2b3c4d]`) instead of static `[PERSON]` tags, so the
+    /// (`[PERSON_1a2b3c4d5e6f]`) instead of static `[PERSON]` tags, so the
     /// same value stays correlatable across rows without exposing it.
     /// Irreversible (one-way keyed hash, random per-install key, no
     /// reverse map). Applies to the text worker when
-    /// `--async-pii-redaction` is on. Off by default. See issue #4206.
+    /// `--async-pii-redaction` is on, for newly-redacted rows only;
+    /// ignored for the Tinfoil backend. Off by default. See issue #4206.
     #[arg(long, default_value_t = false)]
     pub pii_redaction_pseudonyms: bool,
 

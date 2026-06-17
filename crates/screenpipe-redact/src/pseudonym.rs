@@ -13,7 +13,7 @@
 //!
 //! A [`Pseudonymizer`] replaces the static tag with a **stable token**
 //! derived from a keyed hash of the value: same input → same token
-//! (e.g. `[PERSON_1a2b3c4d]`), different inputs → (almost always)
+//! (e.g. `[PERSON_1a2b3c4d5e6f]`), different inputs → (almost always)
 //! different tokens. The token preserves correlation while leaking no
 //! plaintext:
 //!
@@ -44,24 +44,24 @@ use hmac::{Hmac, Mac};
 // 0.9, so it is appropriate for generating a secret key.
 use rand::RngCore;
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::span::SpanLabel;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Bytes of HMAC output rendered into the token suffix. 4 bytes = 8 hex
-/// chars = 32 bits of token space. Birthday-collision math: a ~1% chance
-/// of *any* two distinct values colliding needs ~9,300 distinct values;
-/// 50% needs ~77,000. That comfortably covers a personal corpus's
-/// distinct people / emails / secrets while keeping the token short
-/// enough that it doesn't drown the surrounding searchable text.
+/// Bytes of HMAC output rendered into the token suffix. 6 bytes = 12 hex
+/// chars = 48 bits of token space. Birthday-collision math: a ~1% chance
+/// of *any* two distinct values colliding needs ~2.4M distinct values;
+/// 50% needs ~20M. That keeps silent entity *merges* off the table even
+/// for a multi-year personal corpus, while the token stays short enough
+/// that it doesn't drown the surrounding searchable text.
 ///
-/// (The issue illustrates a 4-hex suffix; we use 8 because 16 bits
-/// collides at only ~256 distinct values, which would silently *merge*
-/// distinct entities and defeat the whole point of pseudonyms —
-/// correlation.)
-const TOKEN_BYTES: usize = 4;
+/// (The issue illustrates a 4-hex = 16-bit suffix, which collides at
+/// only ~256 distinct values — that would merge distinct entities and
+/// defeat the whole point of pseudonyms. 32 bits is still reachable for
+/// a heavy corpus (~77k for a 50% chance), so we use 48.)
+const TOKEN_BYTES: usize = 6;
 
 /// Length of the per-install key, in bytes (HMAC-SHA256 key).
 const KEY_LEN: usize = 32;
@@ -104,35 +104,38 @@ impl Pseudonymizer {
         let dir = data_dir.join(KEY_SUBDIR);
         let path = dir.join(KEY_FILE);
 
-        if path.exists() {
-            let bytes = std::fs::read(&path)?;
-            if bytes.len() != KEY_LEN {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "pseudonym key at {} is {} bytes, expected {}; refusing to \
-                         regenerate (a new key would break every existing token) — \
-                         delete the file manually to intentionally rotate",
-                        path.display(),
-                        bytes.len(),
-                        KEY_LEN
-                    ),
-                ));
-            }
-            let mut key = [0u8; KEY_LEN];
-            key.copy_from_slice(&bytes);
+        // Fast path: an existing key always wins (it must stay stable).
+        if let Some(key) = read_key(&path)? {
             return Ok(Self::from_key(key));
         }
 
-        // First run: generate a CSPRNG key, persist owner-only, return.
+        // First run: generate a CSPRNG key and create the file
+        // *atomically* with owner-only perms — `create_new` (O_EXCL) plus
+        // mode 0600 means there is no world-readable window, and if a
+        // racing process (e.g. the desktop app and the CLI both hitting a
+        // fresh data dir) created it first, we lose the create and adopt
+        // its key instead of writing a divergent one.
+        std::fs::create_dir_all(&dir)?;
         let mut key = [0u8; KEY_LEN];
         rand::rng().fill_bytes(&mut key);
-        std::fs::create_dir_all(&dir)?;
-        write_key_file(&path, &key)?;
-        Ok(Self::from_key(key))
+        match create_new_key_file(&path, &key) {
+            Ok(()) => Ok(Self::from_key(key)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Lost a first-run race: discard our key and adopt the
+                // winner's so both processes tokenize identically.
+                key.zeroize();
+                match read_key(&path)? {
+                    Some(k) => Ok(Self::from_key(k)),
+                    None => Err(std::io::Error::other(
+                        "pseudonym key vanished immediately after a concurrent create",
+                    )),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Stable token for a redacted span value, e.g. `[PERSON_1a2b3c4d]`.
+    /// Stable token for a redacted span value, e.g. `[PERSON_1a2b3c4d5e6f]`.
     ///
     /// Same `(label, subtype, value)` → same token under a given key.
     /// The coarse [`SpanLabel`] supplies the human-readable prefix
@@ -178,15 +181,51 @@ fn normalize(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Persist the key with owner-only permissions where the platform
-/// supports them.
-fn write_key_file(path: &Path, key: &[u8; KEY_LEN]) -> std::io::Result<()> {
-    std::fs::write(path, key)?;
+/// Read an existing key. `Ok(None)` if the file doesn't exist yet; `Err`
+/// if it exists but is the wrong size (corrupt) — we never silently
+/// regenerate, since a new key would reshuffle every existing token.
+fn read_key(path: &Path) -> std::io::Result<Option<[u8; KEY_LEN]>> {
+    let mut bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if bytes.len() != KEY_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "pseudonym key at {} is {} bytes, expected {}; refusing to \
+                 regenerate (a new key would break every existing token) — \
+                 delete the file manually to intentionally rotate",
+                path.display(),
+                bytes.len(),
+                KEY_LEN
+            ),
+        ));
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&bytes);
+    bytes.zeroize(); // don't leave a second plaintext copy of the key on the heap
+    Ok(Some(key))
+}
+
+/// Create the key file atomically with owner-only permissions. `create_new`
+/// (O_EXCL) returns [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) if
+/// another process won the first-run race; on Unix `mode(0o600)` sets the
+/// perms at creation so the secret is never briefly world-readable.
+/// (Windows has no mode here — it inherits the user-profile dir's ACL.)
+fn create_new_key_file(path: &Path, key: &[u8; KEY_LEN]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut f = opts.open(path)?;
+    f.write_all(key)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -227,10 +266,10 @@ mod tests {
         let t = fixed().token(SpanLabel::Email, None, "alice@example.com");
         assert!(t.starts_with("[EMAIL_"), "got {t}");
         assert!(t.ends_with(']'), "got {t}");
-        // [EMAIL_ + 8 hex + ] == 1 + 5 + 1 + 8 + 1 = 16 chars.
-        assert_eq!(t.len(), "[EMAIL_".len() + 8 + 1);
+        // [EMAIL_ + 12 hex + ]  (TOKEN_BYTES=6 → 12 hex chars).
+        assert_eq!(t.len(), "[EMAIL_".len() + 12 + 1);
         let suffix = &t["[EMAIL_".len()..t.len() - 1];
-        assert_eq!(suffix.len(), 8);
+        assert_eq!(suffix.len(), 12);
         assert!(suffix
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
