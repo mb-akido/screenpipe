@@ -3814,6 +3814,15 @@ mod tests {
         assert!(SNAPSHOT_SCRIPT.contains("onclick"));
     }
 
+    #[test]
+    fn snapshot_script_guards_occlusion_and_pointer_events() {
+        // Ported from the established harnesses (Skyvern/browser-use idea, our
+        // own impl): don't offer to click an element covered by an overlay, and
+        // skip pointer-events:none nodes that clicks pass straight through.
+        assert!(SNAPSHOT_SCRIPT.contains("elementFromPoint"));
+        assert!(SNAPSHOT_SCRIPT.contains("pointerEvents"));
+    }
+
     // -- /act script -------------------------------------------------------
 
     #[test]

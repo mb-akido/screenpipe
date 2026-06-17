@@ -87,6 +87,11 @@ beforeAll(() => {
 beforeEach(() => {
   document.body.innerHTML = "";
   document.title = "Test Page";
+  // jsdom has no layout, so elementFromPoint is meaningless. Default it to
+  // "can't tell" (null) — isOccluded then treats everything as visible. The
+  // occlusion tests override it per-case to simulate an overlay.
+  // @ts-expect-error test stub for a layout-dependent API
+  document.elementFromPoint = () => null;
 });
 
 describe("snapshot.js — what gets a ref and what doesn't", () => {
@@ -181,6 +186,60 @@ describe("snapshot.js — shadow DOM piercing", () => {
     expect(snap.tree).toContain("Shadow Submit");
     const shadowBtn = root.querySelector("button");
     expect(refOf(shadowBtn)).toMatch(/^e\d+$/);
+  });
+});
+
+describe("snapshot.js — ported heuristics (occlusion, pointer-events, names)", () => {
+  it("excludes pointer-events:none elements (clicks pass through them)", async () => {
+    document.body.innerHTML = `<button id="ghost">Ghost</button><button id="real">Real</button>`;
+    (document.getElementById("ghost") as HTMLElement).style.pointerEvents = "none";
+    const snap = await runSnapshot();
+    expect(document.getElementById("real")!.getAttribute("data-sp-ref")).toMatch(/^e\d+$/);
+    expect(document.getElementById("ghost")!.getAttribute("data-sp-ref")).toBeNull();
+    expect(snap.tree).not.toContain("Ghost");
+  });
+
+  it("treats <summary> disclosure widgets as actionable", async () => {
+    document.body.innerHTML = `<details><summary>More options</summary><p>body</p></details>`;
+    const snap = await runSnapshot();
+    expect(refOf(document.querySelector("summary"))).toMatch(/^e\d+$/);
+    expect(snap.tree).toContain("More options");
+  });
+
+  it("names button-like inputs from their value, not a placeholder", async () => {
+    document.body.innerHTML = `<input type="submit" value="Place Order" />`;
+    const snap = await runSnapshot();
+    expect(snap.tree).toContain("Place Order");
+  });
+
+  it("names a field from its associated <label for>", async () => {
+    document.body.innerHTML = `<label for="qty">Quantity</label><input id="qty" type="number" />`;
+    const snap = await runSnapshot();
+    const line = snap.tree.split("\n").find((l) => l.includes(refOf(document.getElementById("qty"))));
+    expect(line).toContain("Quantity");
+  });
+
+  it("flags an element covered by an overlay as (covered) without dropping it", async () => {
+    document.body.innerHTML = `<button id="b">Covered Btn</button>`;
+    const overlay = document.createElement("div");
+    document.body.appendChild(overlay);
+    // @ts-expect-error simulate the overlay being the topmost element at center
+    document.elementFromPoint = () => overlay;
+    const snap = await runSnapshot();
+    const line = snap.tree.split("\n").find((l) => l.includes("Covered Btn"));
+    expect(line).toContain("(covered)");
+    // still actionable — the agent may dismiss the overlay first.
+    expect(refOf(document.getElementById("b"))).toMatch(/^e\d+$/);
+  });
+
+  it("does not flag an element that is itself the topmost at its center", async () => {
+    document.body.innerHTML = `<button id="b">Clear Btn</button>`;
+    const btn = document.getElementById("b")!;
+    // @ts-expect-error simulate the element being the topmost
+    document.elementFromPoint = () => btn;
+    const snap = await runSnapshot();
+    const line = snap.tree.split("\n").find((l) => l.includes("Clear Btn"));
+    expect(line).not.toContain("(covered)");
   });
 });
 

@@ -41,7 +41,7 @@ const out = [];
 // an accessible name; a bare unnamed landmark is pure noise.
 const structural = new Set([
     'h1','h2','h3','h4','h5','h6','nav','main','article','section',
-    'form','fieldset','legend','summary','dialog','header','footer','aside'
+    'form','fieldset','legend','dialog','header','footer','aside'
 ]);
 const interactiveRoles = new Set([
     'button','link','checkbox','menuitem','menuitemcheckbox','menuitemradio',
@@ -76,6 +76,31 @@ function isRendered(el, style) {
     return true;
 }
 
+// Associated <label> text — the accessible name a form control gets from a
+// `<label for>` or a wrapping `<label>`. `el.labels` is the native list of
+// both; this is the name source a browser exposes to assistive tech, which a
+// pure tag/placeholder read misses.
+function labelText(el) {
+    try {
+        if (el.labels && el.labels.length) {
+            return el.labels[0].innerText || el.labels[0].textContent || '';
+        }
+    } catch (_) { /* labels not supported on this element */ }
+    // Fallbacks for engines without `.labels`: explicit `for=` then a wrapping
+    // <label>.
+    try {
+        const id = el.getAttribute('id');
+        if (id) {
+            const esc = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(id) : id;
+            const forLabel = document.querySelector('label[for="' + esc + '"]');
+            if (forLabel) return forLabel.innerText || forLabel.textContent || '';
+        }
+        const wrap = el.closest && el.closest('label');
+        if (wrap) return wrap.innerText || wrap.textContent || '';
+    } catch (_) { /* selector / closest unsupported */ }
+    return '';
+}
+
 function accessibleName(el, tag, role) {
     const aria = el.getAttribute('aria-label');
     if (aria) return aria;
@@ -87,12 +112,45 @@ function accessibleName(el, tag, role) {
         }).join(' ');
         if (txt.trim()) return txt;
     }
-    if (tag === 'input') return el.getAttribute('placeholder') || el.getAttribute('name') || el.type || 'input';
-    if (formTags.has(tag)) return el.getAttribute('placeholder') || el.getAttribute('name') || tag;
-    if (tag === 'a' || tag === 'button' || /^h[1-6]$/.test(tag) || interactiveRoles.has(role)) {
-        return clip(el.innerText, 120);
+    if (tag === 'input') {
+        const ty = (el.type || '').toLowerCase();
+        // Button-like inputs label off their `value`, not a placeholder.
+        if (ty === 'submit' || ty === 'button' || ty === 'reset') return el.getAttribute('value') || ty;
+        return el.getAttribute('placeholder') || labelText(el) || el.getAttribute('name') || ty || 'input';
+    }
+    if (formTags.has(tag)) return el.getAttribute('placeholder') || labelText(el) || el.getAttribute('name') || tag;
+    if (tag === 'a' || tag === 'button' || tag === 'summary' || /^h[1-6]$/.test(tag) || interactiveRoles.has(role)) {
+        const txt = clip(el.innerText, 120);
+        if (txt) return txt;
+        // Icon-only button/link: fall back to a child image's alt, then title.
+        const img = el.querySelector('img[alt]');
+        if (img && (img.getAttribute('alt') || '').trim()) return clip(img.getAttribute('alt'), 120);
+        return clip(el.getAttribute('title') || el.getAttribute('value') || '', 120);
     }
     return clip(el.getAttribute('name') || el.getAttribute('title') || '', 80);
+}
+
+// Occlusion / top-element hit test. An element can pass every CSS/geometry
+// check yet be covered by a modal, cookie wall, or sticky header — offering it
+// as clickable misleads the agent and a click lands on the overlay. Hit-test
+// the element's center against its own root (document or shadow root) and see
+// whether the topmost element there is the element, its descendant, or its
+// ancestor. If something unrelated is on top, it's covered. Standard
+// elementFromPoint technique; when layout is unavailable (returns null) we
+// can't tell, so we assume visible and never drop on a maybe.
+function isOccluded(el) {
+    let rect;
+    try { rect = el.getBoundingClientRect(); } catch (_) { return false; }
+    if (!rect || rect.width < 2 || rect.height < 2) return false;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    let root;
+    try { root = el.getRootNode(); } catch (_) { root = document; }
+    if (!root || typeof root.elementFromPoint !== 'function') root = document;
+    let hit;
+    try { hit = root.elementFromPoint(cx, cy); } catch (_) { hit = null; }
+    if (!hit) return false; // can't determine → assume visible
+    return !(hit === el || el.contains(hit) || hit.contains(el));
 }
 
 function hasClickHandler(el) {
@@ -105,8 +163,12 @@ function hasClickHandler(el) {
 // wrapper of a real control doesn't get its own redundant ref. A bare <a name>
 // anchor (no href, no handler, no role) is NOT actionable.
 function isInteractive(el, tag, role, style) {
+    // pointer-events:none means clicks pass through the element — not actionable
+    // (a disabled control is the exception: still worth surfacing as state).
+    if (style && style.pointerEvents === 'none' && !el.disabled) return false;
     if (interactiveRoles.has(role)) return true;
     if (tag === 'button' || tag === 'select' || tag === 'textarea') return true;
+    if (tag === 'summary') return true; // the click target of a <details> disclosure
     if (tag === 'input') return el.type !== 'hidden';
     if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') return true;
     if (hasClickHandler(el)) return true;
@@ -223,6 +285,9 @@ function walk(el, depth) {
         const href = tag === 'a' ? navigableHref(el) : '';
         const value = (formTags.has(tag) && !isPassword) ? clip(el.value, 60) : '';
         const flags = interactive ? stateFlags(el, tag) : [];
+        // Covered by an overlay/modal/sticky header — keep the ref (the agent
+        // may dismiss the overlay first) but flag it so it isn't blindly clicked.
+        if (interactive && isOccluded(el)) flags.push('covered');
 
         let ref = '';
         if (interactive) {
