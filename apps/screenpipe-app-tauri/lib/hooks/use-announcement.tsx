@@ -7,11 +7,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import posthog from "posthog-js";
 import { useRouter } from "next/navigation";
+import { listen } from "@tauri-apps/api/event";
 import {
   type Announcement,
   loadDismissedIds,
   loadPreviewAnnouncement,
   markDismissed,
+  parseAnnouncement,
   selectAnnouncement,
 } from "@/lib/announcements";
 
@@ -50,6 +52,9 @@ export function useAnnouncement(): UseAnnouncementResult {
   const router = useRouter();
   const [payload, setPayload] = useState<unknown>(null);
   const [preview, setPreview] = useState<Announcement | null>(null);
+  // an announcement pushed at runtime via `POST /notify` (surface=…). emitted
+  // from the rust app server, see notifications/routes.rs.
+  const [triggered, setTriggered] = useState<Announcement | null>(null);
   const [dismissedIds, setDismissedIds] = useState<string[]>([]);
   // ids we've already reported as shown, so re-renders don't double-count.
   const reportedShownRef = useRef<Set<string>>(new Set());
@@ -91,13 +96,32 @@ export function useAnnouncement(): UseAnnouncementResult {
     return () => unsubscribe?.();
   }, []);
 
+  // Listen for runtime pushes from `POST /notify` (announcement surface). The
+  // rust side emits the `announcement` event with the announcement object.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen("announcement", (event) => {
+      const a = parseAnnouncement(event.payload);
+      if (a) setTriggered(a);
+    })
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch(() => {
+        // not running under tauri (e.g. tests) — nothing to listen to.
+      });
+    return () => unlisten?.();
+  }, []);
+
   const announcement = useMemo(() => {
     const now = Date.now();
-    // A preview override (set by QA via localStorage) wins and bypasses the
-    // dismissed set so the UI can be iterated on freely.
+    // An explicit runtime push (POST /notify) wins and bypasses the dismissed
+    // set so the trigger is reliable. A QA preview override (localStorage) is
+    // next. Otherwise fall back to the PostHog flag, which honors dismissal.
+    if (triggered) return selectAnnouncement(triggered, [], now);
     if (preview) return selectAnnouncement(preview, [], now);
     return selectAnnouncement(payload, dismissedIds, now);
-  }, [preview, payload, dismissedIds]);
+  }, [triggered, preview, payload, dismissedIds]);
 
   // Fire `announcement_shown` once per id.
   useEffect(() => {
@@ -124,6 +148,7 @@ export function useAnnouncement(): UseAnnouncementResult {
     } catch {}
     setDismissedIds(markDismissed(announcement.id));
     setPreview(null);
+    setTriggered(null);
   }, [announcement]);
 
   const activateCta = useCallback(() => {
@@ -150,6 +175,7 @@ export function useAnnouncement(): UseAnnouncementResult {
     // acting on the cta also marks it seen.
     setDismissedIds(markDismissed(announcement.id));
     setPreview(null);
+    setTriggered(null);
   }, [announcement, router]);
 
   return { announcement, dismiss, activateCta };
