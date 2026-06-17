@@ -4,7 +4,7 @@
 "use client";
 
 import * as React from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Check, Copy } from "lucide-react";
 import { PrismAsyncLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import {
@@ -25,41 +25,73 @@ import { cn } from "@/lib/utils";
  * shows up.
  */
 
-/**
- * Tracks the app's effective color scheme. Mirrors the rest of the app:
- * the `dark` class on <html> wins (explicit theme), otherwise we fall back to
- * the OS preference. Re-evaluates on both OS changes and class mutations.
- */
+// ---------------------------------------------------------------------------
+// Theme: one observer for the whole app, not one per code block.
+//
+// `dark` class on <html> wins (explicit theme), otherwise the OS preference.
+// A single matchMedia listener + a single MutationObserver feed every code
+// block via useSyncExternalStore, so a chat with 30 fences doesn't spin up 30
+// observers on documentElement.
+// ---------------------------------------------------------------------------
+
+function computeIsDark(): boolean {
+  if (typeof document === "undefined") return false;
+  const el = document.documentElement;
+  if (el.classList.contains("dark")) return true;
+  if (el.classList.contains("light")) return false;
+  if (typeof window === "undefined") return false;
+  return Boolean(window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+}
+
+let darkState = computeIsDark();
+const darkListeners = new Set<() => void>();
+let darkMedia: MediaQueryList | null = null;
+let darkObserver: MutationObserver | null = null;
+
+function recomputeDark(): void {
+  const next = computeIsDark();
+  if (next !== darkState) {
+    darkState = next;
+    darkListeners.forEach((listener) => listener());
+  }
+}
+
+function startWatchingTheme(): void {
+  if (typeof window === "undefined") return;
+  darkMedia = window.matchMedia?.("(prefers-color-scheme: dark)") ?? null;
+  darkMedia?.addEventListener?.("change", recomputeDark);
+  darkObserver = new MutationObserver(recomputeDark);
+  darkObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["class"],
+  });
+}
+
+function stopWatchingTheme(): void {
+  darkMedia?.removeEventListener?.("change", recomputeDark);
+  darkMedia = null;
+  darkObserver?.disconnect();
+  darkObserver = null;
+}
+
+function subscribeTheme(onChange: () => void): () => void {
+  if (darkListeners.size === 0) startWatchingTheme();
+  darkListeners.add(onChange);
+  // Catch any class/OS change that landed before the watcher attached.
+  recomputeDark();
+  return () => {
+    darkListeners.delete(onChange);
+    if (darkListeners.size === 0) stopWatchingTheme();
+  };
+}
+
+/** Tracks the app's effective color scheme, shared across all consumers. */
 export function useIsDarkMode(): boolean {
-  const [isDark, setIsDark] = useState(false);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
-    const compute = () => {
-      const hasDarkClass =
-        document.documentElement.classList.contains("dark");
-      const hasLightClass =
-        document.documentElement.classList.contains("light");
-      // An explicit theme class always wins over the OS preference so the
-      // code block matches the rest of the chrome the user actually sees.
-      if (hasDarkClass) return true;
-      if (hasLightClass) return false;
-      return Boolean(media?.matches);
-    };
-    const update = () => setIsDark(compute());
-    update();
-    media?.addEventListener?.("change", update);
-    const observer = new MutationObserver(update);
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-    return () => {
-      media?.removeEventListener?.("change", update);
-      observer.disconnect();
-    };
-  }, []);
-  return isDark;
+  return useSyncExternalStore(
+    subscribeTheme,
+    () => darkState,
+    () => false,
+  );
 }
 
 /** The Prism style object that matches the current theme. */
@@ -68,13 +100,48 @@ export function useSyntaxTheme() {
   return isDark ? coldarkDark : coldarkCold;
 }
 
-const HIGHLIGHTER_CUSTOM_STYLE: React.CSSProperties = {
+// ---------------------------------------------------------------------------
+// Streaming: highlight only once the text settles.
+//
+// react-syntax-highlighter re-tokenizes on every render. During a long
+// streaming response the fence grows token-by-token, so re-highlighting each
+// delta is the expensive path (Louis's "long response = laggy on Mac"). This
+// hook starts `true` so a finished/static block highlights on first paint with
+// no flash, and flips to `false` while the value is actively changing —
+// rendering fast plain text mid-stream and upgrading to highlighted on settle.
+// ---------------------------------------------------------------------------
+
+const SETTLE_MS = 120;
+
+function useSettled(value: string, delayMs = SETTLE_MS): boolean {
+  const [settled, setSettled] = useState(true);
+  const previous = useRef(value);
+
+  useEffect(() => {
+    if (previous.current === value) return;
+    previous.current = value;
+    setSettled(false);
+    const id = window.setTimeout(() => setSettled(true), delayMs);
+    return () => window.clearTimeout(id);
+  }, [value, delayMs]);
+
+  return settled;
+}
+
+const BLOCK_STYLE: React.CSSProperties = {
   margin: 0,
   padding: "12px 14px",
   background: "transparent",
   fontSize: "12px",
   lineHeight: 1.6,
   fontFamily: "var(--font-mono, monospace)",
+};
+
+const PLAIN_STYLE: React.CSSProperties = {
+  ...BLOCK_STYLE,
+  color: "var(--color-text-primary, currentColor)",
+  whiteSpace: "pre",
+  overflowWrap: "normal",
 };
 
 interface MarkdownCodeBlockProps {
@@ -85,8 +152,9 @@ interface MarkdownCodeBlockProps {
 
 /**
  * A fenced code block: syntax highlighted, theme-aware, horizontally
- * scrollable, with a hover/focus copy button. Used by every markdown surface
- * in the app via {@link createCodeMarkdownComponents}.
+ * scrollable, with a hover/focus copy button. Renders fast plain text while
+ * its content is still streaming, then upgrades to highlighted once it
+ * settles. Used by every markdown surface via {@link createCodeMarkdownComponents}.
  */
 export const MarkdownCodeBlock = React.memo(function MarkdownCodeBlock({
   value,
@@ -95,6 +163,7 @@ export const MarkdownCodeBlock = React.memo(function MarkdownCodeBlock({
 }: MarkdownCodeBlockProps) {
   const [copied, setCopied] = useState(false);
   const style = useSyntaxTheme();
+  const settled = useSettled(value);
 
   const handleCopy = async () => {
     if (!value || copied) return;
@@ -135,15 +204,21 @@ export const MarkdownCodeBlock = React.memo(function MarkdownCodeBlock({
         <span>{copied ? "Copied" : "Copy"}</span>
       </button>
       <div className="overflow-x-auto">
-        <SyntaxHighlighter
-          language={language || "text"}
-          style={style as never}
-          PreTag="div"
-          customStyle={HIGHLIGHTER_CUSTOM_STYLE}
-          codeTagProps={{ style: { fontFamily: "inherit" } }}
-        >
-          {value}
-        </SyntaxHighlighter>
+        {settled ? (
+          <SyntaxHighlighter
+            language={language || "text"}
+            style={style as never}
+            PreTag="div"
+            customStyle={BLOCK_STYLE}
+            codeTagProps={{ style: { fontFamily: "inherit" } }}
+          >
+            {value}
+          </SyntaxHighlighter>
+        ) : (
+          <pre data-testid="markdown-code-block-plain" style={PLAIN_STYLE}>
+            <code style={{ fontFamily: "inherit" }}>{value}</code>
+          </pre>
+        )}
       </div>
     </div>
   );
@@ -186,7 +261,9 @@ export function createCodeMarkdownComponents(
     pre({ children }) {
       return <>{children}</>;
     },
-    code({ className, children, ...props }) {
+    // `node` is react-markdown's hast node; drop it so it doesn't leak onto the
+    // DOM <code> element as an unknown attribute.
+    code({ node: _node, className, children, ...props }) {
       const content = String(children).replace(/\n$/, "");
       const match = /language-([\w-]+)/.exec(className || "");
       const language = match?.[1] ?? "";
