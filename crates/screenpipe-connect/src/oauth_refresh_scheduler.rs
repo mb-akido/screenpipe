@@ -346,7 +346,21 @@ async fn tick(
             }
         };
 
-        let policy = policies.get(integration_id).copied().unwrap_or_default();
+        // Only manage providers we actually know how to refresh. A secret can
+        // land under the `oauth:` prefix for something that isn't an OAuth
+        // integration in our registry (e.g. `chatgpt`) — the proxy rejects
+        // those with "unsupported provider", so attempting a refresh just fails
+        // and spams a `warn` every scan. Skip anything not in the registry.
+        let policy = match policies.get(integration_id) {
+            Some(policy) => *policy,
+            None => {
+                debug!(
+                    integration_id = %integration_id,
+                    "oauth refresh scheduler: no integration registered for stored secret — skipping (not refreshable)"
+                );
+                continue;
+            }
+        };
         if !needs_refresh_now(&value, policy, now) {
             continue;
         }
@@ -581,6 +595,15 @@ mod tests {
         HashMap::new()
     }
 
+    /// Policy table containing the given integration ids with default policy —
+    /// mirrors production, where the table is built from `all_integrations()`
+    /// and so contains an entry for every known provider.
+    fn policies_with(ids: &[&str]) -> HashMap<String, RefreshPolicy> {
+        ids.iter()
+            .map(|id| (id.to_string(), RefreshPolicy::default()))
+            .collect()
+    }
+
     #[tokio::test]
     async fn tick_refreshes_token_whose_access_is_expiring() {
         let store = mem_store().await;
@@ -597,7 +620,14 @@ mod tests {
         let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
         let metrics = Arc::new(MetricsInner::default());
         let failures = Arc::new(Mutex::new(HashMap::new()));
-        tick(&store, &runner, &metrics, &failures, &empty_policies()).await;
+        tick(
+            &store,
+            &runner,
+            &metrics,
+            &failures,
+            &policies_with(&["google-calendar"]),
+        )
+        .await;
 
         // Down-cast via Arc::clone to peek at the recorder.
         let snap = metrics.snapshot();
@@ -622,9 +652,51 @@ mod tests {
         let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
         let metrics = Arc::new(MetricsInner::default());
         let failures = Arc::new(Mutex::new(HashMap::new()));
-        tick(&store, &runner, &metrics, &failures, &empty_policies()).await;
+        tick(
+            &store,
+            &runner,
+            &metrics,
+            &failures,
+            &policies_with(&["google-calendar"]),
+        )
+        .await;
 
         assert_eq!(metrics.snapshot().refreshes_attempted, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_secret_for_unregistered_provider() {
+        // A secret stored under the `oauth:` prefix for a provider that isn't an
+        // OAuth integration in our registry (e.g. `chatgpt`). The proxy rejects
+        // the refresh as "unsupported provider", so the scheduler must not even
+        // attempt it — otherwise it logs a warn on every scan. Regression for
+        // the recurring `oauth refresh failed for chatgpt: unsupported provider`.
+        let store = mem_store().await;
+        let now = unix_now();
+        // Access token already expired → it WOULD be refreshed if registered.
+        store
+            .set_json("oauth:chatgpt", &token(true, Some(now - 60), None))
+            .await
+            .unwrap();
+
+        let runner: Arc<dyn RefreshRunner> = Arc::new(RecorderRunner::default());
+        let metrics = Arc::new(MetricsInner::default());
+        let failures = Arc::new(Mutex::new(HashMap::new()));
+        // Registry knows zoom + google-calendar, but NOT chatgpt.
+        tick(
+            &store,
+            &runner,
+            &metrics,
+            &failures,
+            &policies_with(&["zoom", "google-calendar"]),
+        )
+        .await;
+
+        assert_eq!(
+            metrics.snapshot().refreshes_attempted,
+            0,
+            "must not attempt refresh for a provider absent from the registry"
+        );
     }
 
     #[tokio::test]
