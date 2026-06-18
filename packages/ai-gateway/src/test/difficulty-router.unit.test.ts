@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'bun:test';
 import {
-  scoreDifficulty, routeTier, lastUserText, cosineSim, meanVector, nearestLabel,
+  scoreDifficulty, routeTier, routerArm, lastUserText, cosineSim, meanVector, nearestLabel,
   shouldEmbed, finalizeTier, TIER_HEAD, TIER_EXAMPLES, type Tier,
 } from '../handlers/difficulty-router';
 
@@ -63,6 +63,22 @@ describe('routeTier kill switch (no Workers AI needed)', () => {
   it('tool-use floor: never downgrades a function-calling request to trivial', async () => {
     expect(await routeTier([{ role: 'user', content: 'hi' }], { ROUTER_MODE: 'heuristic' }, { hasTools: true })).toBe('normal');
     expect(await routeTier([{ role: 'user', content: 'hi' }], { ROUTER_MODE: 'heuristic' }, { hasTools: false })).toBe('trivial');
+  });
+});
+
+describe('routerArm A/B sampling', () => {
+  it('off when ROUTER_MODE off; on at 100%; deterministic per device', () => {
+    expect(routerArm('dev1', { ROUTER_MODE: 'off' })).toBe('off');
+    expect(routerArm('dev1', { ROUTER_MODE: 'embedding' })).toBe('on');            // default 100%
+    expect(routerArm('dev1', { ROUTER_MODE: 'embedding', ROUTER_SAMPLE_PCT: '0' })).toBe('off');
+    const a = routerArm('dev-stable', { ROUTER_MODE: 'embedding', ROUTER_SAMPLE_PCT: '50' });
+    expect(routerArm('dev-stable', { ROUTER_MODE: 'embedding', ROUTER_SAMPLE_PCT: '50' })).toBe(a); // stable
+  });
+  it('splits devices at ~50% (sanity)', () => {
+    let on = 0;
+    for (let i = 0; i < 200; i++) if (routerArm('device-' + i, { ROUTER_MODE: 'embedding', ROUTER_SAMPLE_PCT: '50' }) === 'on') on++;
+    expect(on).toBeGreaterThan(60);
+    expect(on).toBeLessThan(140);
   });
 });
 

@@ -96,6 +96,23 @@ export async function buildCentroids(embed: (texts: string[]) => Promise<number[
   return out;
 }
 
+// ───────────────────────── A/B sampling ─────────────────────────
+// Deterministic per-device arm so a user gets a consistent experience AND we can
+// compare router-ON vs control concurrently (no time-of-day confound). 'off' when
+// ROUTER_MODE=off or the device hashes outside ROUTER_SAMPLE_PCT (default 100).
+function hashPct(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0) % 100;
+}
+export function routerArm(deviceId: string, env: any): 'on' | 'off' {
+  if (String(env?.ROUTER_MODE ?? 'off').toLowerCase() === 'off') return 'off';
+  const pct = Number(env?.ROUTER_SAMPLE_PCT ?? 100);
+  if (!(pct > 0)) return 'off';
+  if (pct >= 100) return 'on';
+  return hashPct(deviceId || 'anon') < pct ? 'on' : 'off';
+}
+
 // ───────────────────────── worker integration ─────────────────────────
 // bge-m3 is MULTILINGUAL (we have DE/FR/ES users); downstream cosine math is
 // dim-agnostic so it's a drop-in vs bge-base-en. Verify the exact CF model id at

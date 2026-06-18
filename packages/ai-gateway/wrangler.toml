@@ -65,6 +65,9 @@ GEMINI_FLEX_INTERACTIVE = "false"
 # - ROUTER_MODE ("off"): interactive auto difficulty router. "off" = always glm-5
 #   (today's behavior). "heuristic" = regex tiering (0 latency). "embedding" =
 #   bge centroid via Workers AI (best accuracy, +1 embed call). See difficulty-router.ts.
+# - ROUTER_SAMPLE_PCT ("100"): % of devices in the router arm for A/B (deterministic
+#   by device hash). 50 = half ON / half control → measure ON vs control in cost_log
+#   via the router_tier column ('control' = baseline arm). 0 = effectively off.
 
 # Secrets (set via `wrangler secret put <NAME>`):
 # - VERTEX_SERVICE_ACCOUNT_JSON: GCP service account JSON for Vertex AI
