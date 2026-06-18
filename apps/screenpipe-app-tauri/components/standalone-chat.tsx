@@ -79,6 +79,7 @@ import {
   parseMentions,
   buildAppMentionSuggestions,
   buildTagMentionSuggestions,
+  filterMentionSuggestions,
   normalizeAppTag,
   formatShortcutDisplay,
   extractConversationHistorySyncUserText,
@@ -4380,9 +4381,9 @@ export function StandaloneChat({
     return map;
   }, [appMentionSuggestions]);
 
-  const baseMentionSuggestions = React.useMemo(
-    () => [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions, ...tagMentionSuggestions],
-    [appMentionSuggestions, tagMentionSuggestions]
+  const atMentionSuggestions = React.useMemo(
+    () => [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions],
+    [appMentionSuggestions]
   );
 
   // Parse current input to extract active filters for chip display
@@ -4531,7 +4532,7 @@ export function StandaloneChat({
       return;
     }
 
-    const matchesBase = baseMentionSuggestions.some(
+    const matchesBase = atMentionSuggestions.some(
       s => s.tag.toLowerCase().includes(`@${mentionFilter.toLowerCase()}`)
     );
     if (matchesBase && mentionFilter.length < 3) {
@@ -4565,7 +4566,7 @@ export function StandaloneChat({
 
     const debounceTimeout = setTimeout(searchSpeakers, 300);
     return () => clearTimeout(debounceTimeout);
-  }, [mentionFilter, mentionTrigger, baseMentionSuggestions]);
+  }, [mentionFilter, mentionTrigger, atMentionSuggestions]);
 
   useEffect(() => {
     if (mentionTrigger !== "#" || !mentionFilter.trim()) {
@@ -4661,34 +4662,22 @@ export function StandaloneChat({
   }, [appFilterOpen, filterSearch]);
 
   const filteredMentions = React.useMemo(() => {
-    if (mentionTrigger === "#") {
-      const tagSuggestions = !mentionFilter
-        ? tagMentionSuggestions
-        : tagSearchSuggestions.length > 0
-          ? tagSearchSuggestions
-          : allTagMentionSuggestions.filter(
-              s => s.tag.toLowerCase().includes(mentionFilter.toLowerCase()) ||
-                   s.description.toLowerCase().includes(mentionFilter.toLowerCase())
-            );
-      return tagSuggestions;
-    }
-
-    const searchableSuggestions = mentionFilter
-      ? [...STATIC_MENTION_SUGGESTIONS, ...appMentionSuggestions, ...allTagMentionSuggestions]
-      : baseMentionSuggestions;
-    const suggestions = !mentionFilter
-      ? searchableSuggestions
-      : searchableSuggestions.filter(
-          s => s.tag.toLowerCase().includes(mentionFilter.toLowerCase()) ||
-               s.description.toLowerCase().includes(mentionFilter.toLowerCase())
-        );
-    return [...suggestions, ...speakerSuggestions];
+    return filterMentionSuggestions({
+      mentionTrigger,
+      mentionFilter,
+      atMentionSuggestions,
+      tagMentionSuggestions,
+      allTagMentionSuggestions,
+      tagSearchSuggestions,
+      speakerSuggestions,
+      recentSpeakers,
+    });
   }, [
     mentionFilter,
     mentionTrigger,
+    atMentionSuggestions,
     speakerSuggestions,
-    baseMentionSuggestions,
-    appMentionSuggestions,
+    recentSpeakers,
     tagMentionSuggestions,
     allTagMentionSuggestions,
     tagSearchSuggestions,
@@ -5014,9 +5003,11 @@ export function StandaloneChat({
     setIsUserScrolledUp(false);
   }, [scheduleScrollToBottom]);
 
-  // Preload recent speakers when filter popover opens
+  // Preload recent speakers when filter popover opens or the composer @ menu opens.
   useEffect(() => {
-    if (!appFilterOpen || recentSpeakers.length > 0) return;
+    const shouldLoadRecentSpeakers =
+      appFilterOpen || (showMentionDropdown && mentionTrigger === "@");
+    if (!shouldLoadRecentSpeakers || recentSpeakers.length > 0) return;
     (async () => {
       try {
         const response = await localFetch(
@@ -5038,7 +5029,7 @@ export function StandaloneChat({
         // silent
       }
     })();
-  }, [appFilterOpen, recentSpeakers.length]);
+  }, [appFilterOpen, showMentionDropdown, mentionTrigger, recentSpeakers.length]);
 
   // Apps/tags load on mount, but the first fetch often races server startup.
   // App names are stable enough to retry only when empty; tags can change
