@@ -164,7 +164,7 @@ export const ShareLogsButton = ({
 
     setIsSending(true);
     try {
-      const BASE_URL = "https://screenpi.pe";
+      const BASE_URL = "https://screenpipe.com";
       const identifier = settings.user?.id || machineId;
       const type = settings.user?.id ? "user" : "machine";
 

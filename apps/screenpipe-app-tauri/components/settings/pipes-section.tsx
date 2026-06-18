@@ -1127,7 +1127,7 @@ export function PipesSection() {
   const sharePipePublic = async (pipe: PipeStatus) => {
     setSharingPublic(pipe.config.name);
     try {
-      const res = await fetch("https://screenpi.pe/api/pipes/share", {
+      const res = await fetch("https://screenpipe.com/api/pipes/share", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -2293,7 +2293,7 @@ export function RecordingSettings() {
     // If trying to use cloud but not subscribed
     if (value === "screenpipe-cloud" && !settings.user?.cloud_subscribed) {
       try {
-        const response = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
+        const response = await fetch("https://screenpipe.com/api/cloud-sync/checkout", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",

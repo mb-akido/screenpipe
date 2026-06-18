@@ -132,7 +132,7 @@ export function AccountSection() {
         // New subscription checkout ($50/mo Pro). Pass the Clerk token so the
         // session pins customer_email + metadata.user_id to this account — the
         // webhook then links the sub even if a different email is used at Stripe.
-        const response = await fetch("https://screenpi.pe/api/subscription/checkout", {
+        const response = await fetch("https://screenpipe.com/api/subscription/checkout", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -158,7 +158,7 @@ export function AccountSection() {
             pollCount++;
             try {
               const subResponse = await fetch(
-                `https://screenpi.pe/api/cloud-sync/subscription?userId=${settings.user?.id}&email=${encodeURIComponent(settings.user?.email || "")}`,
+                `https://screenpipe.com/api/cloud-sync/subscription?userId=${settings.user?.id}&email=${encodeURIComponent(settings.user?.email || "")}`,
                 {
                   headers: { Authorization: `Bearer ${settings.user?.token}` },
                 }

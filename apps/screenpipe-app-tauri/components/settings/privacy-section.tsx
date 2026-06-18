@@ -1531,7 +1531,7 @@ export function PrivacySection() {
  * `team_api_token` is per-admin and grants the `read:devices` /
  * `read:search` / `read:records` scopes that the `screenpipe-team` pi
  * skill calls v1 endpoints with. An admin mints one at
- * https://screenpi.pe/enterprise?tab=tokens, pastes it here, and the
+ * https://screenpipe.com/enterprise?tab=tokens, pastes it here, and the
  * desktop persists it to ~/.screenpipe/enterprise.json. Every new pi
  * chat reads that file at boot and (un)installs the skill accordingly —
  * no app restart needed, just open a new chat. Revoke from the same
@@ -1639,10 +1639,10 @@ function AdminTeamTokenCard() {
                 <button
                   className="underline text-foreground hover:text-foreground/80"
                   onClick={() =>
-                    openUrl("https://screenpi.pe/enterprise?tab=tokens")
+                    openUrl("https://screenpipe.com/enterprise?tab=tokens")
                   }
                 >
-                  screenpi.pe/enterprise → api tokens
+                  screenpipe.com/enterprise → api tokens
                 </button>
                 .
               </p>

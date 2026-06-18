@@ -1113,7 +1113,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		};
 	}, []);
 
-	// Install global fetch interceptor to catch 401s from screenpi.pe
+	// Install global fetch interceptor to catch 401s from screenpipe.com
 	const settingsRef = useRef(settings);
 	settingsRef.current = settings;
 
@@ -1353,7 +1353,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		const generation = authGenerationRef.current;
 		const startingToken = settingsRef.current.user?.token ?? null;
 		try {
-			const response = await fetch(screenpipeWebUrl("/api/user", "https://screenpi.pe"), {
+			const response = await fetch(screenpipeWebUrl("/api/user", "https://screenpipe.com"), {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",

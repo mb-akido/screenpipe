@@ -36,7 +36,7 @@ export function ReferralCard() {
       setLoading(true);
       try {
         const res = await fetch(
-          `https://screenpi.pe/api/referral?email=${encodeURIComponent(settings.user!.email!)}`
+          `https://screenpipe.com/api/referral?email=${encodeURIComponent(settings.user!.email!)}`
         );
         if (res.status === 404) {
           setNoCode(true);
@@ -78,7 +78,7 @@ export function ReferralCard() {
     if (!email || !referral || sending) return;
     setSending(true);
     try {
-      const res = await fetch("https://screenpi.pe/api/referral/invite", {
+      const res = await fetch("https://screenpipe.com/api/referral/invite", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
