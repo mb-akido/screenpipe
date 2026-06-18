@@ -5,7 +5,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import { ChevronLeft, ChevronRight, RefreshCw, CalendarIcon, Search, Play, Pause, Loader2, Mic, Volume2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, ChevronDown, RefreshCw, CalendarIcon, Search, Play, Pause, Loader2, Mic, Volume2 } from "lucide-react";
 import {
 	format,
 	isAfter,
@@ -34,6 +34,10 @@ interface TimeRange {
 interface TimelineControlsProps {
 	startAndEndDates: TimeRange;
 	currentDate: Date;
+	// Timestamp of the frame currently under the playhead. Drives the time
+	// shown in the date pill so the label tracks the cursor minute-to-minute
+	// (currentDate only changes when the day changes). Null until frames load.
+	currentTime?: Date | null;
 	onDateChange: (date: Date) => Promise<any>;
 	onJumpToday: () => void;
 	onSearchClick?: () => void;
@@ -54,6 +58,7 @@ interface TimelineControlsProps {
 export function TimelineControls({
 	startAndEndDates,
 	currentDate,
+	currentTime,
 	onDateChange,
 	onJumpToday,
 	onSearchClick,
@@ -170,7 +175,15 @@ export function TimelineControls({
 								) : (
 									<CalendarIcon className="h-3 w-3" />
 								)}
-								<span>{format(currentDate, "d MMM yyyy")}</span>
+								{/* Show the cursor time alongside the date so the pill
+								    reads e.g. "Jan 6 16:18". Falls back to the day
+								    (with year) until a frame is under the playhead. */}
+								<span>
+									{currentTime
+										? format(currentTime, "MMM d HH:mm")
+										: format(currentDate, "MMM d yyyy")}
+								</span>
+								<ChevronDown className="h-3 w-3 opacity-60" />
 							</button>
 						</PopoverTrigger>
 						<PopoverContent
