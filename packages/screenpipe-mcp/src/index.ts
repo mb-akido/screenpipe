@@ -989,7 +989,6 @@ Make the prompt do three things, concretely:
    Always pass \`start_time\` — never scan the whole history.
 2. **Process / summarize** the results.
 3. **Output** somewhere: write a note/file, send a desktop notification (\`POST\` the Tauri sidecar on port 11435 \`/notify\`), or push to a configured connection (Telegram/Slack/Discord/Email — see the CLI \`connection\` commands).
-   - **Rendered HTML report** — for a human-facing visual (chart, dashboard, styled doc), write a self-contained \`.html\` whose FIRST line is \`<!-- screenpipe:render=human -->\`, then link it from the note/notification; the in-app viewer renders it as a page instead of source. It runs in a no-network sandbox: inline ALL CSS/JS and embed images as \`data:\` URIs — external scripts, stylesheets, \`fetch\`, and form posts are blocked (a CDN-loaded chart renders blank). For plain data, prefer a markdown note.
 
 Keep each pipe to **one bounded job**. A focused "summarize my day and write it to a note" beats a vague "monitor everything".
 
