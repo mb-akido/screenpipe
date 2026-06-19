@@ -41,7 +41,19 @@ type FrameMessage = {
 export function HtmlPreviewFrame({ html, onOpenExternal }: HtmlPreviewFrameProps) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(200);
-  const srcDoc = useMemo(() => wrapHtmlForSandbox(html), [html]);
+
+  // Match the host theme so unstyled artifacts stay readable in dark mode.
+  const theme = useMemo<"light" | "dark">(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return "light";
+    return window.matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark"
+      : "light";
+  }, []);
+
+  const srcDoc = useMemo(
+    () => wrapHtmlForSandbox(html, { theme }),
+    [html, theme],
+  );
 
   useEffect(() => {
     function onMessage(e: MessageEvent) {
@@ -59,10 +71,17 @@ export function HtmlPreviewFrame({ html, onOpenExternal }: HtmlPreviewFrameProps
 
       if (data.type === "openLink" && typeof data.url === "string") {
         const url = data.url;
-        const ok =
-          typeof window !== "undefined" &&
-          window.confirm(`open external link?\n\n${url}`);
-        if (!ok) return;
+        // Internal viewer links (`screenpipe://…`) are routed by the host
+        // without a scary external-link prompt; only true external schemes
+        // get a confirm before leaving the sandbox.
+        const internal = /^screenpipe:/i.test(url);
+        if (
+          !internal &&
+          !(typeof window !== "undefined" &&
+            window.confirm(`open external link?\n\n${url}`))
+        ) {
+          return;
+        }
         if (onOpenExternal) void onOpenExternal(url);
         else void openUrl(url);
       }
@@ -73,14 +92,22 @@ export function HtmlPreviewFrame({ html, onOpenExternal }: HtmlPreviewFrameProps
   }, [onOpenExternal]);
 
   return (
-    <iframe
-      ref={ref}
-      title="rendered html preview"
-      sandbox="allow-scripts"
-      srcDoc={srcDoc}
-      referrerPolicy="no-referrer"
-      className="w-full border border-border bg-white"
-      style={{ height }}
-    />
+    <div className="space-y-2">
+      <iframe
+        ref={ref}
+        title="rendered html preview"
+        sandbox="allow-scripts"
+        // Deny every Permissions-Policy feature (camera, mic, geolocation, …)
+        // on top of the sandbox. Belt-and-suspenders for an opaque origin.
+        allow=""
+        srcDoc={srcDoc}
+        referrerPolicy="no-referrer"
+        className="w-full border border-border"
+        style={{ height, background: theme === "dark" ? "#1c1c1c" : "#ffffff" }}
+      />
+      <div className="font-mono text-[10px] tracking-wide uppercase text-foreground/40">
+        sandboxed · no network — external scripts, images &amp; requests are blocked
+      </div>
+    </div>
   );
 }

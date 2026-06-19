@@ -37,6 +37,26 @@ describe("hasHumanRenderMarker", () => {
       true,
     );
   });
+
+  it("also accepts the meta form (survives comment-stripping minifiers)", () => {
+    expect(
+      hasHumanRenderMarker(
+        '<meta name="screenpipe:render" content="human">',
+      ),
+    ).toBe(true);
+    // attribute order is not significant
+    expect(
+      hasHumanRenderMarker(
+        "<meta content='html' name='screenpipe:render'>",
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a meta with the wrong content value", () => {
+    expect(
+      hasHumanRenderMarker('<meta name="screenpipe:render" content="nope">'),
+    ).toBe(false);
+  });
 });
 
 describe("isHtmlFileName", () => {
@@ -119,5 +139,27 @@ describe("wrapHtmlForSandbox", () => {
     expect(out).toContain("screenpipe-viewer");
     expect(out).toContain("type:'resize'");
     expect(out).toContain("type:'openLink'");
+  });
+
+  it("the bridge leaves in-page anchors and unresolved relative links alone", () => {
+    const out = wrapHtmlForSandbox("<p>hi</p>");
+    // hash links are not intercepted (native in-frame nav)
+    expect(out).toContain("charAt(0)==='#'");
+    // about:srcdoc (unresolved relative) is ignored
+    expect(out).toContain("about:srcdoc");
+  });
+
+  it("injects a light base + color-scheme by default", () => {
+    const out = wrapHtmlForSandbox("<p>hi</p>");
+    expect(out).toContain('content="light"');
+    expect(out).toContain("#ffffff");
+  });
+
+  it("injects a dark base + color-scheme when theme is dark", () => {
+    const out = wrapHtmlForSandbox("<p>hi</p>", { theme: "dark" });
+    expect(out).toContain('content="dark"');
+    expect(out).toContain("#1c1c1c");
+    // our CSP still leads the head, ahead of the base style
+    expect(out.indexOf(SANDBOX_CSP)).toBeLessThan(out.indexOf("color-scheme"));
   });
 });

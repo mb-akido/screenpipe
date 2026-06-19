@@ -18,7 +18,10 @@ vi.mock("@tauri-apps/plugin-shell", () => ({
   open: vi.fn(async () => undefined),
 }));
 
-function htmlContent(text: string): ViewerContent {
+function htmlContent(
+  text: string,
+  overrides: Partial<Extract<ViewerContent, { kind: "text" }>> = {},
+): ViewerContent {
   return {
     kind: "text",
     text,
@@ -26,6 +29,7 @@ function htmlContent(text: string): ViewerContent {
     path: "/tmp/report.html",
     truncated: false,
     total_bytes: text.length,
+    ...overrides,
   };
 }
 
@@ -51,6 +55,23 @@ describe("file viewer — html render gating", () => {
     render(<ViewerFileContent path={content.path} content={content} />);
     expect(screen.queryByTestId("html-render-toggle")).toBeNull();
     expect(document.querySelector("iframe")).toBeNull();
+  });
+
+  it("offers no preview for a TRUNCATED (>10MB) marked html — partial doc", () => {
+    const content = htmlContent("<!-- screenpipe:render=human --><h1>hi</h1>", {
+      truncated: true,
+      total_bytes: 20 * 1024 * 1024,
+    });
+    render(<ViewerFileContent path={content.path} content={content} />);
+    expect(screen.queryByTestId("html-render-toggle")).toBeNull();
+  });
+
+  it("accepts the meta-tag marker form too", () => {
+    const content = htmlContent(
+      '<meta name="screenpipe:render" content="human"><h1>hi</h1>',
+    );
+    render(<ViewerFileContent path={content.path} content={content} />);
+    expect(screen.getByTestId("html-render-toggle")).toBeTruthy();
   });
 
   it("offers a preview toggle ONLY when the producer opted in", () => {

@@ -65,9 +65,22 @@ export const SANDBOX_CSP = [
 export const HUMAN_RENDER_MARKER =
   /<!--\s*screenpipe:render\s*=\s*(?:human|html)\s*-->/i;
 
-/** True if `text` carries the explicit human-render opt-in marker. */
+/**
+ * Meta form: `<meta name="screenpipe:render" content="human">`. Survives HTML
+ * minifiers that strip comments; attribute order is not significant.
+ */
+function hasMetaRenderMarker(text: string): boolean {
+  const tag = text.match(/<meta\b[^>]*\bscreenpipe:render\b[^>]*>/i);
+  return !!tag && /\bcontent\s*=\s*["'](?:human|html)["']/i.test(tag[0]);
+}
+
+/**
+ * True if `text` carries the explicit human-render opt-in, in either the
+ * comment or the meta form. Both are accepted so a producer's choice of
+ * templating/minification can't silently drop the marker.
+ */
 export function hasHumanRenderMarker(text: string): boolean {
-  return HUMAN_RENDER_MARKER.test(text);
+  return HUMAN_RENDER_MARKER.test(text) || hasMetaRenderMarker(text);
 }
 
 /** True for `.html` / `.htm` filenames (case-insensitive). */
@@ -102,10 +115,13 @@ setTimeout(reportHeight,60);setTimeout(reportHeight,300);setTimeout(reportHeight
 document.addEventListener('click',function(ev){
 var n=ev.target;
 while(n&&n.nodeType===1&&n.tagName!=='A'){n=n.parentNode;}
-if(n&&n.tagName==='A'&&n.getAttribute('href')){
+if(!n||n.tagName!=='A')return;
+var raw=n.getAttribute('href')||'';
+if(!raw||raw.charAt(0)==='#')return;
+var href=n.href||raw;
+if(/^about:srcdoc/i.test(href))return;
 ev.preventDefault();
-parent.postMessage({source:TAG,type:'openLink',url:n.href},'*');
-}
+parent.postMessage({source:TAG,type:'openLink',url:href},'*');
 },true);
 })();</script>`;
 
@@ -118,10 +134,32 @@ parent.postMessage({source:TAG,type:'openLink',url:n.href},'*');
  *  - bare fragment            → wrap in a minimal document
  * Returned string is meant for an iframe `srcdoc`.
  */
-export function wrapHtmlForSandbox(raw: string): string {
+export interface SandboxWrapOptions {
+  /**
+   * Host theme. Drives `color-scheme` + a readable base background/foreground
+   * so artifacts that don't style themselves aren't unreadable in dark mode.
+   * Artifact styles (injected after ours) always win.
+   */
+  theme?: "light" | "dark";
+}
+
+export function wrapHtmlForSandbox(
+  raw: string,
+  opts: SandboxWrapOptions = {},
+): string {
+  const dark = opts.theme === "dark";
+  const scheme = dark ? "dark" : "light";
+  const bg = dark ? "#1c1c1c" : "#ffffff";
+  const fg = dark ? "#e6e6e6" : "#111111";
+  const base =
+    `<meta name="color-scheme" content="${scheme}">` +
+    `<style>html,body{background:${bg};color:${fg};margin:0;` +
+    `font:14px/1.6 system-ui,-apple-system,sans-serif}</style>`;
+
   const head =
     `<meta charset="utf-8">` +
     `<meta http-equiv="Content-Security-Policy" content="${SANDBOX_CSP}">` +
+    base +
     BRIDGE_SCRIPT;
 
   const headOpen = /<head[^>]*>/i;

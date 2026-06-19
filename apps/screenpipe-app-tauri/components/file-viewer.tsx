@@ -224,6 +224,10 @@ export function ViewerFileContent({
   // explicitly opted in via the marker. Unmarked .html stays source-only.
   const renderableHtml = useMemo(() => {
     if (!content || content.kind !== "text" || content.text === "") return false;
+    // A >10MB file is truncated server-side and could be cut mid-tag — never
+    // offer a rendered preview of a partial document. Source view + the
+    // existing truncation banner cover that case.
+    if (content.truncated) return false;
     return isHtmlFileName(content.name) && hasHumanRenderMarker(content.text);
   }, [content]);
 
