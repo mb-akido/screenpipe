@@ -60,11 +60,20 @@ export class GeminiProvider implements AIProvider {
 	}
 
 	/** Get auth headers — Bearer token for Vertex, none for API key (key is in URL) */
-	private async getAuthHeaders(): Promise<Record<string, string>> {
+	private async getAuthHeaders(serviceTier?: 'flex' | 'standard'): Promise<Record<string, string>> {
 		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 		if (this.vertexProvider) {
 			const token = await this.vertexProvider.getAccessToken();
 			headers['Authorization'] = `Bearer ${token}`;
+			// Flex tier — 50% cheaper, best-effort latency. Only meaningful on the
+			// Vertex path (the public generativelanguage endpoint ignores it). The
+			// router sets serviceTier='flex' for background traffic; the chat
+			// handler cascades to a standard-tier model if flex is throttled (429).
+			// Docs: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/flex
+			if (serviceTier === 'flex') {
+				headers['X-Vertex-AI-LLM-Request-Type'] = 'shared';
+				headers['X-Vertex-AI-LLM-Shared-Request-Type'] = 'flex';
+			}
 		}
 		return headers;
 	}
@@ -114,7 +123,7 @@ export class GeminiProvider implements AIProvider {
 		const requestBody = this.buildRequestBody(body);
 
 		console.log('[Gemini] Request to:', url.replace(this.apiKey || 'N/A', '***'));
-		const headers = await this.getAuthHeaders();
+		const headers = await this.getAuthHeaders(body.serviceTier);
 
 		const response = await fetch(url, {
 			method: 'POST',
@@ -150,7 +159,7 @@ export class GeminiProvider implements AIProvider {
 			toolNames: requestBody.tools?.[0]?.functionDeclarations?.map((f: any) => f.name) || [],
 			hasToolConfig: !!requestBody.toolConfig,
 		}));
-		const streamHeaders = await this.getAuthHeaders();
+		const streamHeaders = await this.getAuthHeaders(body.serviceTier);
 
 		const response = await fetch(url, {
 			method: 'POST',
@@ -171,6 +180,7 @@ export class GeminiProvider implements AIProvider {
 		let toolCallIndex = 0;
 		let inputTokens = 0;
 		let outputTokens = 0;
+		let cachedTokens = 0;
 
 		return new ReadableStream({
 			async start(controller) {
@@ -178,7 +188,9 @@ export class GeminiProvider implements AIProvider {
 					while (true) {
 						const { done, value } = await reader.read();
 						if (done) {
-							// Emit usage data in OpenAI format before [DONE]
+							// Emit usage data in OpenAI format before [DONE].
+							// cached_tokens = Gemini implicit caching subset of
+							// promptTokenCount, billed at a discount.
 							if (inputTokens > 0 || outputTokens > 0) {
 								controller.enqueue(
 									new TextEncoder().encode(
@@ -188,6 +200,7 @@ export class GeminiProvider implements AIProvider {
 												prompt_tokens: inputTokens,
 												completion_tokens: outputTokens,
 												total_tokens: inputTokens + outputTokens,
+												prompt_tokens_details: { cached_tokens: cachedTokens },
 											},
 										})}\n\n`
 									)
@@ -212,6 +225,7 @@ export class GeminiProvider implements AIProvider {
 									if (data.usageMetadata) {
 										inputTokens = data.usageMetadata.promptTokenCount ?? inputTokens;
 										outputTokens = data.usageMetadata.candidatesTokenCount ?? outputTokens;
+										cachedTokens = data.usageMetadata.cachedContentTokenCount ?? cachedTokens;
 									}
 
 									const parts = data.candidates?.[0]?.content?.parts || [];
@@ -229,6 +243,15 @@ export class GeminiProvider implements AIProvider {
 
 										if (part.functionCall) {
 											const funcName = part.functionCall.name;
+											// A nameless function call is unexecutable — Pi would see
+											// stopReason "toolUse" with no tool to run and silently
+											// no-op. Skip rather than forward a malformed tool_call
+											// (mirrors the input-side formatFunctionCallPart guard and
+											// the Anthropic provider's `if (!name) continue`).
+											if (typeof funcName !== 'string' || funcName.length === 0) {
+												console.warn('[Gemini] skipping function call with empty name:', JSON.stringify(part.functionCall));
+												continue;
+											}
 											console.log('[Gemini] Model called function:', funcName, JSON.stringify(part.functionCall.args || {}));
 
 											// Surface every tool call — web_search included — to the client.
@@ -649,6 +672,12 @@ export class GeminiProvider implements AIProvider {
 				content += part.text;
 			}
 			if (part.functionCall) {
+				// Drop nameless function calls (see streaming guard above) so the
+				// non-streaming path can't emit an unexecutable tool_call either.
+				if (typeof part.functionCall.name !== 'string' || part.functionCall.name.length === 0) {
+					console.warn('[Gemini] skipping function call with empty name:', JSON.stringify(part.functionCall));
+					continue;
+				}
 				const sig = part.thoughtSignature || '';
 				const callId = sig
 					? `call_${toolCalls.length}_ts_${btoa(sig)}`
@@ -682,13 +711,17 @@ export class GeminiProvider implements AIProvider {
 			choices: [{ message }],
 		};
 
-		// Include usage from Gemini's usageMetadata
+		// Include usage from Gemini's usageMetadata. cachedContentTokenCount is
+		// the implicit-caching subset of promptTokenCount (billed at a discount).
 		const usageMetadata = response.usageMetadata;
 		if (usageMetadata) {
 			result.usage = {
 				prompt_tokens: usageMetadata.promptTokenCount ?? 0,
 				completion_tokens: usageMetadata.candidatesTokenCount ?? 0,
 				total_tokens: usageMetadata.totalTokenCount ?? 0,
+				prompt_tokens_details: {
+					cached_tokens: usageMetadata.cachedContentTokenCount ?? 0,
+				},
 			};
 		}
 

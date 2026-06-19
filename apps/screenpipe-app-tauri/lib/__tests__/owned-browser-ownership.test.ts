@@ -18,6 +18,7 @@
 import { describe, it, expect } from "vitest";
 import {
   isForeignNavigation,
+  isMismatchedNavigation,
   parseNavigatePayload,
 } from "@/lib/owned-browser-ownership";
 
@@ -34,13 +35,11 @@ describe("owned-browser ownership", () => {
       expect(isForeignNavigation("conv-C", "conv-C")).toBe(false);
     });
 
-    it("honors untagged navigations (the sidebar's own restore/reload)", () => {
-      expect(isForeignNavigation(null, "conv-C")).toBe(false);
-      expect(isForeignNavigation(undefined, "conv-C")).toBe(false);
-      expect(isForeignNavigation("", "conv-C")).toBe(false);
-      // Untagged is honored even when no chat is bound — that's a fresh
-      // chat's own restore/reload, not a foreign pipe.
-      expect(isForeignNavigation(null, null)).toBe(false);
+    it("drops ownerless navigations (stale/legacy emits)", () => {
+      expect(isForeignNavigation(null, "conv-C")).toBe(true);
+      expect(isForeignNavigation(undefined, "conv-C")).toBe(true);
+      expect(isForeignNavigation("", "conv-C")).toBe(true);
+      expect(isForeignNavigation(null, null)).toBe(true);
     });
 
     it("gates a tagged navigation when no chat is bound (fresh/unsaved chat)", () => {
@@ -53,17 +52,65 @@ describe("owned-browser ownership", () => {
     });
   });
 
+  describe("isForeignNavigation — own-agent session match", () => {
+    it("reveals the chat's own agent navigation when conversationId lags/differs", () => {
+      // The agent runs under session S; the React conversationId state hasn't
+      // caught up (or never matched the spawn id). The navigation is owned by S,
+      // which is this chat's running agent → honored. This is the reveal bug:
+      // before, the owner only matched conversationId, so the chat's own agent
+      // page stayed hidden whenever the two diverged.
+      expect(isForeignNavigation("sess-S", "conv-LAGGED", "sess-S")).toBe(false);
+      expect(isForeignNavigation("sess-S", null, "sess-S")).toBe(false);
+    });
+
+    it("reveals on a conversationId match regardless of agentSessionId", () => {
+      expect(isForeignNavigation("conv-C", "conv-C", "sess-OTHER")).toBe(false);
+    });
+
+    it("still drops another chat's agent and background pipes", () => {
+      // owner is neither this chat's conversation nor its agent session.
+      expect(isForeignNavigation("conv-A", "conv-C", "sess-C")).toBe(true);
+      expect(isForeignNavigation("pipe:reddit", "conv-C", "sess-C")).toBe(true);
+    });
+
+    it("never matches a null/empty agentSessionId (no false reveal when unset)", () => {
+      expect(isForeignNavigation("conv-A", "conv-C", null)).toBe(true);
+      expect(isForeignNavigation("conv-A", "conv-C", undefined)).toBe(true);
+      expect(isForeignNavigation("conv-A", "conv-C", "")).toBe(true);
+      // An ownerless event stays dropped even with an agent session present.
+      expect(isForeignNavigation(null, "conv-C", "sess-C")).toBe(true);
+      expect(isForeignNavigation("", "conv-C", "sess-C")).toBe(true);
+    });
+
+    it("is backward compatible when agentSessionId is omitted", () => {
+      expect(isForeignNavigation("conv-C", "conv-C")).toBe(false);
+      expect(isForeignNavigation("conv-A", "conv-C")).toBe(true);
+    });
+  });
+
   describe("parseNavigatePayload", () => {
     it("parses the object payload with an owner", () => {
       expect(
-        parseNavigatePayload({ url: "https://example.com", owner: "pipe:x" }),
-      ).toEqual({ url: "https://example.com", owner: "pipe:x" });
+        parseNavigatePayload({
+          url: "https://example.com",
+          owner: "pipe:x",
+          navigationId: "nav-1",
+          reveal: false,
+        }),
+      ).toEqual({
+        url: "https://example.com",
+        owner: "pipe:x",
+        navigationId: "nav-1",
+        reveal: false,
+      });
     });
 
     it("treats a bare string (legacy/stale emit) as un-owned", () => {
       expect(parseNavigatePayload("https://example.com")).toEqual({
         url: "https://example.com",
         owner: null,
+        navigationId: null,
+        reveal: true,
       });
     });
 
@@ -71,9 +118,37 @@ describe("owned-browser ownership", () => {
       expect(parseNavigatePayload({ url: "https://example.com" })).toEqual({
         url: "https://example.com",
         owner: null,
+        navigationId: null,
+        reveal: true,
       });
-      expect(parseNavigatePayload({})).toEqual({ url: null, owner: null });
-      expect(parseNavigatePayload("")).toEqual({ url: null, owner: null });
+      expect(parseNavigatePayload({})).toEqual({
+        url: null,
+        owner: null,
+        navigationId: null,
+        reveal: true,
+      });
+      expect(parseNavigatePayload("")).toEqual({
+        url: null,
+        owner: null,
+        navigationId: null,
+        reveal: true,
+      });
+    });
+  });
+
+  describe("isMismatchedNavigation", () => {
+    it("rejects missing navigation ids", () => {
+      expect(isMismatchedNavigation(null, "nav-1")).toBe(true);
+      expect(isMismatchedNavigation(undefined, null)).toBe(true);
+    });
+
+    it("accepts the first adopted navigation when none is active yet", () => {
+      expect(isMismatchedNavigation("nav-1", null)).toBe(false);
+    });
+
+    it("rejects a different navigation once one is active", () => {
+      expect(isMismatchedNavigation("nav-2", "nav-1")).toBe(true);
+      expect(isMismatchedNavigation("nav-1", "nav-1")).toBe(false);
     });
   });
 });

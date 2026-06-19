@@ -18,6 +18,13 @@ export interface UnifiedArtifact {
   original_path: string | null;
   size_bytes: number;
   preview: string | null;
+  /** SAF envelope kind (e.g. "sop") when the file carried a valid SAF
+   * envelope; null for plain file outputs. */
+  saf_kind: string | null;
+  /** SAF stable artifact id. */
+  artifact_id: string | null;
+  /** SAF artifact version number. */
+  saf_version: number | null;
   modified_at: string;
   created_at: string | null;
 }
@@ -118,7 +125,7 @@ export function useUnifiedArtifacts(
   }, [fetchArtifacts]);
 
   const deleteRegistered = useCallback(async (id: number) => {
-    const res = await localFetch(`/outputs/${id}`, { method: "DELETE" });
+    const res = await localFetch(`/artifacts/${id}`, { method: "DELETE" });
     if (!res.ok) {
       throw new Error(`DELETE failed: HTTP ${res.status}`);
     }

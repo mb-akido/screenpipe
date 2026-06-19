@@ -86,6 +86,7 @@ export type ChatTargetWindow = "home" | "chat";
 export interface ChatLoadConversationPayload {
   conversationId: string;
   targetWindow?: ChatTargetWindow;
+  focusMessageId?: string;
 }
 
 export const RECENT_CHAT_SEARCH_HANDOFF_EVENT = "recent-chat-search-handoff";
@@ -340,6 +341,7 @@ export interface ParsedMentions {
   appName: string | null;
   usedSelection: boolean;
   speakerName: string | null;
+  tagNames: string[];
 }
 
 export interface ParseMentionsOptions {
@@ -385,6 +387,7 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
   let appName: string | null = null;
   let usedSelection = false;
   let speakerName: string | null = null;
+  const tagNames: string[] = [];
 
   // === TIME MENTIONS ===
 
@@ -533,7 +536,22 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
     }
   }
 
-  return { cleanedInput, timeRanges, contentType, appName, usedSelection, speakerName };
+  // === TAG MENTIONS ===
+  // #tagname — matches timeline/search tag syntax. Supports namespaced tags
+  // like person:ada used by the /search?tags= API.
+  const tagPattern = /#([\w:.-]+)/g;
+  let tagMatch: RegExpExecArray | null;
+  while ((tagMatch = tagPattern.exec(input)) !== null) {
+    const tag = tagMatch[1];
+    if (tag && !tagNames.includes(tag)) {
+      tagNames.push(tag);
+    }
+  }
+  if (tagNames.length > 0) {
+    cleanedInput = cleanedInput.replace(tagPattern, "").trim();
+  }
+
+  return { cleanedInput, timeRanges, contentType, appName, usedSelection, speakerName, tagNames };
 }
 
 // ============================================================================
@@ -543,13 +561,16 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
 export interface MentionSuggestion {
   tag: string;
   description: string;
-  category: "time" | "content" | "app" | "speaker";
+  category: "time" | "content" | "app" | "speaker" | "tag";
   appName?: string;
 }
 
 type AppAutocompleteItem = {
   name: string;
   count: number;
+  frame_count?: number;
+  audio_count?: number;
+  memory_count?: number;
 };
 
 export function normalizeAppTag(name: string) {
@@ -578,4 +599,69 @@ export function buildAppMentionSuggestions(
       appName: item.name,
     };
   });
+}
+
+export function buildTagMentionSuggestions(
+  items: AppAutocompleteItem[],
+  limit: number
+): MentionSuggestion[] {
+  return items.slice(0, limit).map((item) => ({
+    tag: `#${item.name}`,
+    description: formatTagAutocompleteDescription(item),
+    category: "tag" as const,
+  }));
+}
+
+function pluralize(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function formatTagAutocompleteDescription(item: AppAutocompleteItem) {
+  const parts = [
+    item.frame_count ? pluralize(item.frame_count, "frame") : null,
+    item.audio_count ? pluralize(item.audio_count, "audio clip") : null,
+    item.memory_count ? pluralize(item.memory_count, "memory", "memories") : null,
+  ].filter((part): part is string => Boolean(part));
+
+  if (parts.length > 0) return parts.join(", ");
+  return pluralize(item.count, "use");
+}
+
+export interface FilterMentionSuggestionsOptions {
+  mentionTrigger: "@" | "#";
+  mentionFilter: string;
+  atMentionSuggestions: MentionSuggestion[];
+  tagMentionSuggestions: MentionSuggestion[];
+  allTagMentionSuggestions: MentionSuggestion[];
+  tagSearchSuggestions: MentionSuggestion[];
+  speakerSuggestions: MentionSuggestion[];
+  recentSpeakers?: MentionSuggestion[];
+}
+
+export function filterMentionSuggestions({
+  mentionTrigger,
+  mentionFilter,
+  atMentionSuggestions,
+  tagMentionSuggestions,
+  allTagMentionSuggestions,
+  tagSearchSuggestions,
+  speakerSuggestions,
+  recentSpeakers = [],
+}: FilterMentionSuggestionsOptions): MentionSuggestion[] {
+  const filter = mentionFilter.trim().toLowerCase();
+  const matchesFilter = (suggestion: MentionSuggestion) =>
+    suggestion.tag.toLowerCase().includes(filter) ||
+    suggestion.description.toLowerCase().includes(filter);
+
+  if (mentionTrigger === "#") {
+    if (!filter) return tagMentionSuggestions;
+    if (tagSearchSuggestions.length > 0) return tagSearchSuggestions;
+    return allTagMentionSuggestions.filter(matchesFilter);
+  }
+
+  const atMatches = filter
+    ? atMentionSuggestions.filter(matchesFilter)
+    : atMentionSuggestions;
+  const speakerMatches = filter ? speakerSuggestions : recentSpeakers;
+  return [...atMatches, ...speakerMatches];
 }

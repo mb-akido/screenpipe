@@ -185,6 +185,45 @@ describe("source citations", () => {
     expect(citations[1].title).toBe("Read: standalone-chat.tsx");
   });
 
+  it("carries the absolute path on file/memory citations so the footer can open a preview", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "read",
+            args: { path: "/Users/louisbeaumont/.codex/memories/MEMORY.md" },
+            result: "notes",
+            isRunning: false,
+          },
+        },
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "write",
+            args: { path: "/tmp/out/report.md" },
+            result: "ok",
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations[0].path).toBe("/Users/louisbeaumont/.codex/memories/MEMORY.md");
+    expect(citations[1].path).toBe("/tmp/out/report.md");
+  });
+
+  it("preserves an explicit citation's path so server-provided file sources stay openable", () => {
+    const citations = sourceCitationsFromMessage({
+      sourceCitations: [
+        { id: "x", kind: "file", title: "Read: a.md", path: "/tmp/a.md" },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].path).toBe("/tmp/a.md");
+  });
+
   it("normalizes pi tool namespaces before deriving citations", () => {
     const citations = sourceCitationsFromMessage({
       contentBlocks: [
@@ -226,6 +265,7 @@ describe("source citations", () => {
     expect(citations[0].title).toBe("Local file: standalone-chat.tsx");
   });
 
+  // legacy name from sessions recorded before the sp_ rename
   it("extracts web links from web_search results and dedupes duplicates", () => {
     const citations = sourceCitationsFromMessage({
       contentBlocks: [
@@ -250,13 +290,13 @@ describe("source citations", () => {
     });
   });
 
-  it("uses structured web_search sources when available", () => {
+  it("uses structured sp_web_search sources when available", () => {
     const citations = sourceCitationsFromMessage({
       contentBlocks: [
         {
           type: "tool",
           toolCall: {
-            toolName: "web_search",
+            toolName: "sp_web_search",
             args: { query: "screenpipe docs" },
             result: {
               content: [{ type: "text", text: "See the docs." }],

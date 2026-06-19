@@ -21,41 +21,78 @@
  *  upgrade still navigates. */
 export type OwnedBrowserNavigatePayload =
   | string
-  | { url?: string | null; owner?: string | null };
+  | {
+      url?: string | null;
+      owner?: string | null;
+      navigationId?: string | null;
+      reveal?: boolean | null;
+    };
 
 export function parseNavigatePayload(payload: OwnedBrowserNavigatePayload): {
   url: string | null;
   owner: string | null;
+  navigationId: string | null;
+  reveal: boolean;
 } {
-  if (typeof payload === "string") return { url: payload || null, owner: null };
-  if (payload && typeof payload === "object") {
-    return { url: payload.url ?? null, owner: payload.owner ?? null };
+  if (typeof payload === "string") {
+    return { url: payload || null, owner: null, navigationId: null, reveal: true };
   }
-  return { url: null, owner: null };
+  if (payload && typeof payload === "object") {
+    return {
+      url: payload.url ?? null,
+      owner: payload.owner ?? null,
+      navigationId: payload.navigationId ?? null,
+      reveal: payload.reveal !== false,
+    };
+  }
+  return { url: null, owner: null, navigationId: null, reveal: true };
 }
 
 /**
  * True when a navigation belongs to a DIFFERENT chat than the one on screen, so
  * the sidebar must ignore it (no reveal, no persist).
  *
- * - owner null/empty → the sidebar's own restore/reload, always honored
- *   (regardless of whether a chat is bound).
- * - owner === conversationId → this chat's own agent, honored.
+ * - owner === conversationId → this chat's own browser lifecycle event,
+ *   honored.
+ * - owner === agentSessionId → this chat's own running agent. The navigation
+ *   `owner` is the session id the agent process was spawned under (the value
+ *   the bash shim forwards as `x-screenpipe-session`). That is normally equal
+ *   to `conversationId`, but the React `conversationId` state can lag the ref
+ *   the agent was started with, or a spawn can fall back to a non-matching
+ *   session id — in either case the agent's own page would otherwise never
+ *   reveal. Honor it when the owner matches the id the on-screen chat's agent
+ *   actually runs under. Still safe: another chat's agent / a background pipe
+ *   runs under a different session id, so its navigations are still dropped.
+ * - owner null/empty → foreign/stale, ignored. All supported restore/reload
+ *   paths now send the real `conversationId`; leaving ownerless events
+ *   writable lets the singleton browser leak into whichever chat is open.
  * - otherwise (a different owner, INCLUDING when no chat is bound) → foreign,
- *   ignored. A null/empty conversationId means a fresh, unsaved chat: a tagged
- *   navigation there can only come from a background pipe (`pipe:<name>`) or
- *   another chat's agent, never from this surface, so a background pipe must
- *   not pop into it. (Previously a null conversationId let any tagged
- *   navigation through — the hole this closes.)
+ *   ignored. A null/empty conversationId means a fresh chat: any tagged event
+ *   necessarily belongs to another chat or a background pipe.
  */
 export function isForeignNavigation(
   owner: string | null | undefined,
   conversationId: string | null | undefined,
+  agentSessionId?: string | null | undefined,
 ): boolean {
-  // The sidebar's own restore/reload is untagged — always honor it.
-  if (!owner) return false;
-  // A tagged navigation is honored only by the chat that issued it. When no
-  // chat is bound (conversationId null/empty), `owner !== conversationId` is
-  // true, so the navigation is treated as foreign and dropped.
-  return owner !== conversationId;
+  // Ownerless events are stale/legacy and must not mutate whichever chat is
+  // currently open. Every supported restore/reload path now tags itself with
+  // the foreground conversation id.
+  if (!owner) return true;
+  // The on-screen chat's own navigation — matched by conversation id...
+  if (owner === conversationId) return false;
+  // ...or by the session id the on-screen chat's own agent process runs under
+  // (robust to a lagging `conversationId` state or a non-matching spawn id).
+  if (agentSessionId && owner === agentSessionId) return false;
+  // Anything else belongs to another chat or a background pipe — dropped.
+  return true;
+}
+
+export function isMismatchedNavigation(
+  navigationId: string | null | undefined,
+  currentNavigationId: string | null | undefined,
+): boolean {
+  if (!navigationId) return true;
+  if (!currentNavigationId) return false;
+  return navigationId !== currentNavigationId;
 }

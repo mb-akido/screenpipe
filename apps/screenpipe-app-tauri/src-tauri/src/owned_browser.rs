@@ -30,6 +30,7 @@
 //! created, so the owned browser must not pass a per-window `--user-data-dir`
 //! through `additional_browser_args` on Windows.
 
+use crate::owned_browser_transport as transport;
 use async_trait::async_trait;
 use screenpipe_connect::connections::browser::{EvalResult, OwnedWebviewHandle};
 use serde::Serialize;
@@ -41,11 +42,13 @@ use std::time::{Duration, Instant};
 use tauri::webview::PageLoadEvent;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Rect, Size, Webview,
-    WebviewUrl, Window, Wry,
+    WebviewUrl, Window, WindowBuilder, Wry,
 };
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+const RECENT_NAVIGATION_CONTEXT_LIMIT: usize = 16;
 
 /// Embedded webview label — also used by the frontend Tauri commands.
 pub const WEBVIEW_LABEL: &str = "owned-browser";
@@ -78,49 +81,13 @@ const SESSION_ACCESS_REQUEST_EVENT: &str = "owned-browser:session-access-request
 const V20_COOKIE_BLOCK_EVENT: &str = "owned-browser:v20-cookie-blocked";
 const SESSION_ACCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Marker prefix for `document.title`-based result delivery. The bridge JS
-/// sets `document.title = "<MARKER>:<json>"`; the Rust eval polls
-/// the latest title observed from native title-change events until it sees
-/// this prefix and parses the
-/// trailing JSON. Title is universally writable from JS on every origin,
-/// which is why we use it instead of Tauri's IPC bridge (the latter is
-/// only available on app-origin pages, and the agent navigates the
-/// browser to arbitrary external sites).
-const RESULT_TITLE_PREFIX: &str = "__SP_OWNED_BROWSER_RESULT__:";
-
-/// Bridge script — runs on every page load via the child webview's
-/// initialization script. Defines `window.__SP_RESULT__(payload)` which sets
-/// the page title to a recognisable marker. Idempotent — re-running on the
-/// same page is a no-op (the function is already there).
-const BRIDGE_INIT_SCRIPT: &str = r#"
-(function () {
-    if (window.__SP_RESULT__) return;
-    window.__SP_RESULT__ = function (payload) {
-        try {
-            var json = JSON.stringify(payload);
-            document.title = "__SP_OWNED_BROWSER_RESULT__:" + json;
-        } catch (e) {
-            document.title = "__SP_OWNED_BROWSER_RESULT__:" + JSON.stringify({
-                ok: false,
-                error: "serialize result failed: " + (e && e.message || e),
-            });
-        }
-    };
-})();
-"#;
-
-fn title_after_eval_marker(original_title: &str, result_json: &str) -> String {
-    #[derive(serde::Deserialize)]
-    struct Payload {
-        #[serde(default)]
-        title: Option<String>,
-    }
-
-    serde_json::from_str::<Payload>(result_json)
-        .ok()
-        .and_then(|payload| payload.title)
-        .unwrap_or_else(|| original_title.to_string())
-}
+// The `document.title` result transport — marker prefix, bridge init script,
+// chunked-result codec, and title-restore helper — lives in
+// [`crate::owned_browser_transport`] (`transport`), so the large-result chunking
+// can be unit-tested in isolation. The title is universally writable from JS on
+// every origin, which is why we use it instead of Tauri's IPC bridge (the latter
+// is only injected on app-origin pages, and the agent navigates the browser to
+// arbitrary external sites).
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,22 +95,26 @@ struct OwnedBrowserStateEvent {
     url: Option<String>,
     title: Option<String>,
     loading: Option<bool>,
+    navigation_id: Option<String>,
     /// Conversation/session that issued the navigation currently in flight.
-    /// See [`OwnedBrowserNavigateEvent::owner`]. `None` for the sidebar's own
-    /// restore/reload; the frontend always honors those.
+    /// See [`OwnedBrowserNavigateEvent::owner`]. `None` means stale/legacy;
+    /// supported restore/reload paths now send the foreground conversation id.
     owner: Option<String>,
 }
 
 /// Payload of [`NAVIGATE_EVENT`]. `owner` is the chat/session id that drove the
 /// navigation — `sid` for a chat agent (equals the frontend `conversationId`),
-/// `pipe:<name>` for a background pipe, `None` for the sidebar's own
-/// restore/reload. The owned browser is a singleton broadcast to every window,
-/// so the frontend uses `owner` to ignore navigations that belong to a chat
-/// other than the one on screen.
+/// `pipe:<name>` for a background pipe. `None` means stale/legacy; supported
+/// restore/reload paths now send the foreground conversation id. The owned
+/// browser is a singleton broadcast to every window, so the frontend uses
+/// `owner` to ignore navigations that belong to a chat other than the one on
+/// screen.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OwnedBrowserNavigateEvent {
     url: String,
+    navigation_id: String,
+    reveal: bool,
     owner: Option<String>,
 }
 
@@ -160,6 +131,7 @@ struct BrowserSessionAccessRequestPayload {
     url: String,
     host: String,
     already_granted: bool,
+    navigation_id: Option<String>,
     /// Owner of the navigation that triggered this prompt — see
     /// [`OwnedBrowserNavigateEvent::owner`].
     owner: Option<String>,
@@ -177,6 +149,7 @@ struct V20CookieBlockPayload {
     /// "v20" = app-bound encryption blocked decrypt; "locked" = browser running, DB inaccessible
     #[serde(default)]
     reason: String,
+    navigation_id: Option<String>,
     /// Owner of the navigation that triggered this block — see
     /// [`OwnedBrowserNavigateEvent::owner`].
     owner: Option<String>,
@@ -304,9 +277,18 @@ struct OwnedBrowserInner {
     visible: bool,
 }
 
+#[derive(Clone)]
+struct NavigationContext {
+    navigation_id: String,
+    owner: Option<String>,
+    requested_url: String,
+}
+
 struct OwnedBrowserState {
     inner: Mutex<OwnedBrowserInner>,
     last_title: StdMutex<String>,
+    recent_navigations: StdMutex<Vec<NavigationContext>>,
+    pending_navigation_id: StdMutex<Option<String>>,
     /// Owner (chat/session id) of the most recent navigation. Set by
     /// `prepare_navigation` and read by the native page-state / cookie event
     /// emitters, which fire from sync callbacks that don't carry the owner.
@@ -323,8 +305,87 @@ impl OwnedBrowserState {
         Self {
             inner: Mutex::new(OwnedBrowserInner::default()),
             last_title: StdMutex::new(String::new()),
+            recent_navigations: StdMutex::new(Vec::new()),
+            pending_navigation_id: StdMutex::new(None),
             pending_owner: StdMutex::new(None),
         }
+    }
+
+    fn remember_navigation(
+        &self,
+        requested_url: String,
+        owner: Option<String>,
+    ) -> NavigationContext {
+        let context = NavigationContext {
+            navigation_id: Uuid::new_v4().to_string(),
+            owner,
+            requested_url,
+        };
+        if let Ok(mut guard) = self.recent_navigations.lock() {
+            guard.push(context.clone());
+            if guard.len() > RECENT_NAVIGATION_CONTEXT_LIMIT {
+                let drop_count = guard.len() - RECENT_NAVIGATION_CONTEXT_LIMIT;
+                guard.drain(0..drop_count);
+            }
+        }
+        context
+    }
+
+    fn context_for_url(&self, url: &str) -> Option<NavigationContext> {
+        self.recent_navigations
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .iter()
+                    .rev()
+                    .find(|ctx| ctx.requested_url == url)
+                    .cloned()
+            })
+    }
+
+    fn remember_committed_url_for_context(&self, url: &str, context: &NavigationContext) {
+        if let Ok(mut guard) = self.recent_navigations.lock() {
+            if guard
+                .iter()
+                .rev()
+                .any(|ctx| ctx.navigation_id == context.navigation_id && ctx.requested_url == url)
+            {
+                return;
+            }
+            guard.push(NavigationContext {
+                navigation_id: context.navigation_id.clone(),
+                owner: context.owner.clone(),
+                requested_url: url.to_string(),
+            });
+            if guard.len() > RECENT_NAVIGATION_CONTEXT_LIMIT {
+                let drop_count = guard.len() - RECENT_NAVIGATION_CONTEXT_LIMIT;
+                guard.drain(0..drop_count);
+            }
+        }
+    }
+
+    fn current_context(&self) -> Option<NavigationContext> {
+        let navigation_id = self.pending_navigation_id();
+        let owner = self.pending_owner();
+        navigation_id.map(|navigation_id| NavigationContext {
+            navigation_id,
+            owner,
+            requested_url: String::new(),
+        })
+    }
+
+    fn set_pending_navigation_id(&self, navigation_id: Option<String>) {
+        if let Ok(mut guard) = self.pending_navigation_id.lock() {
+            *guard = navigation_id;
+        }
+    }
+
+    fn pending_navigation_id(&self) -> Option<String> {
+        self.pending_navigation_id
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     fn set_pending_owner(&self, owner: Option<String>) {
@@ -388,14 +449,31 @@ fn emit_state_event(
     title: Option<String>,
     loading: Option<bool>,
 ) {
+    let state = browser_state();
+    let context = if let Some(ref current_url) = url {
+        if let Some(context) = state.context_for_url(current_url) {
+            Some(context)
+        } else {
+            let fallback = state.current_context();
+            if let Some(ref context) = fallback {
+                // Redirects commit a different main-document URL than the one
+                // we originally requested. Bind that committed URL onto the
+                // same navigation context so later title/state events resolve
+                // by exact URL instead of depending on the mutable pending
+                // fallback.
+                state.remember_committed_url_for_context(current_url, context);
+            }
+            fallback
+        }
+    } else {
+        state.current_context()
+    };
     let payload = OwnedBrowserStateEvent {
         url,
         title,
         loading,
-        // Native page-load/title callbacks don't know which navigation they
-        // belong to; tag with the owner of the most recent navigate so the
-        // frontend can drop state for a chat other than the one on screen.
-        owner: browser_state().pending_owner(),
+        navigation_id: context.as_ref().map(|ctx| ctx.navigation_id.clone()),
+        owner: context.and_then(|ctx| ctx.owner),
     };
     if let Err(e) = app.emit(STATE_EVENT, payload) {
         debug!("owned-browser: failed to emit state event: {e}");
@@ -417,7 +495,7 @@ fn child_webview_builder(
     let app_for_nav = app.clone();
     let app_for_page_load = app.clone();
     let builder = tauri::webview::WebviewBuilder::new(label.to_string(), url)
-        .initialization_script(BRIDGE_INIT_SCRIPT)
+        .initialization_script(transport::BRIDGE_INIT_SCRIPT)
         .on_navigation(move |_url| {
             // Browsers do not put subframe navigations in the omnibox. Wry's
             // `on_navigation` URL can be an iframe target on macOS (wry#1593),
@@ -439,7 +517,7 @@ fn child_webview_builder(
         .on_document_title_changed(move |webview, title| {
             let state = browser_state();
             state.record_title(title.clone());
-            if title.starts_with(RESULT_TITLE_PREFIX) {
+            if title.starts_with(transport::RESULT_TITLE_PREFIX) {
                 return;
             }
             let committed_url = webview_url(&webview);
@@ -534,17 +612,19 @@ impl TauriOwnedHandle {
             // is `None` for the plain `eval` entry point (snapshot, code-only
             // eval), which is fine — those don't pass a url, so this branch and
             // its navigate event don't fire.
-            prepare_navigation(&self.app, &self.state, parsed, owner).await;
+            prepare_navigation(&self.app, &self.state, parsed, owner, true).await;
         }
 
+        // If no child webview is attached — e.g. a background/scheduled pipe
+        // whose browser sidebar panel was never opened — create a hidden,
+        // offscreen one on demand instead of failing. The navigate/eval logic
+        // below already runs against a hidden webview, so this never paints over
+        // whatever the user is currently looking at. When the sidebar later
+        // mounts, `ensure_child_bounds` adopts this same child and positions it
+        // into the panel — a seamless handoff.
         let active = match self.state.active().await {
             Some(child) => child,
-            None if target_url.is_some() => {
-                wait_for_active_child(&self.state, timeout.min(Duration::from_secs(10)))
-                    .await
-                    .ok_or_else(|| "owned-browser child webview not attached".to_string())?
-            }
-            None => return Err("owned-browser child webview not attached".to_string()),
+            None => ensure_background_child(&self.app, &self.state).await?,
         };
 
         // Background reads (snapshot / code-only eval) must NOT reveal the
@@ -624,32 +704,32 @@ impl TauriOwnedHandle {
             .eval(wrapped)
             .map_err(|e| format!("webview.eval failed: {e}"))?;
 
-        // Poll the title for our marker. 50ms cadence is fine — most
-        // evals complete in <500ms and the timeout cap keeps a stuck
-        // page from blocking forever.
+        // Read the result the bridge ferries back via document.title. Small
+        // results arrive inline; large ones (e.g. a page snapshot) exceed the
+        // browser's ~1KB title cap, so they're pulled in base64 chunks and
+        // reassembled — see [`transport`]. The whole read honours `timeout`.
         let start = Instant::now();
-        let result_json = loop {
-            if start.elapsed() >= timeout {
-                if shown_for_eval && url.is_none() {
+        let payload = match self.read_eval_payload(&active, start, timeout).await {
+            Ok(payload) => payload,
+            Err(e) => {
+                // Restore hidden whenever we revealed the webview *only* to run
+                // a background eval (`shown_for_eval` is set only on Windows and
+                // only when it wasn't already visible). This must fire for the
+                // navigate-and-scrape URL path too — otherwise a headless pipe's
+                // eval-with-url would leave the webview painted over the user's
+                // current view on Windows. macOS evals while hidden, so
+                // `shown_for_eval` is always false there and this is a no-op.
+                if shown_for_eval {
                     let _ = active.hide();
                     self.state.set_visible(false).await;
                 }
-                return Err(format!(
-                    "owned-browser eval timed out after {}s (last title: {:?})",
-                    timeout.as_secs(),
-                    self.state.latest_title()
-                ));
+                return Err(e);
             }
-            let title = self.state.latest_title();
-            if let Some(rest) = title.strip_prefix(RESULT_TITLE_PREFIX) {
-                break rest.to_string();
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         };
 
         // Clear the marker without undoing a document.title mutation made by
         // the caller's eval code.
-        let restore_title = title_after_eval_marker(&original_title, &result_json);
+        let restore_title = transport::title_after_eval_marker(&original_title, &payload);
         let restore_lit = serde_json::to_string(&restore_title).unwrap_or_else(|_| "\"\"".into());
         let _ = active.eval(format!("document.title = {restore_lit};"));
         if shown_for_eval && url.is_none() {
@@ -657,37 +737,96 @@ impl TauriOwnedHandle {
             self.state.set_visible(false).await;
         }
 
-        // Parse the payload our wrapper emitted. We expect the same
-        // shape as before: { id, ok, result?, error? }.
-        #[derive(serde::Deserialize)]
-        struct Payload {
-            #[serde(default)]
-            id: String,
-            ok: bool,
-            #[serde(default)]
-            result: Option<serde_json::Value>,
-            #[serde(default)]
-            error: Option<String>,
-        }
-        let parsed: Payload = serde_json::from_str(&result_json)
-            .map_err(|e| format!("parse eval result: {e} (raw: {result_json})"))?;
-
-        // The id is informational — with eval_lock serialising calls,
-        // there's only ever one outstanding eval, so mismatches would
-        // indicate a stale title from a previous eval that didn't get
-        // restored. Log but accept.
-        if parsed.id != id {
+        // The id is informational — with eval_lock serialising calls, there's
+        // only ever one outstanding eval, so a mismatch would indicate a stale
+        // title from a previous eval that didn't get restored. Log but accept.
+        if payload.id != id {
             warn!(
                 "owned-browser eval got stale result id (got {}, expected {})",
-                parsed.id, id
+                payload.id, id
             );
         }
 
         Ok(EvalResult {
-            ok: parsed.ok,
-            result: parsed.result,
-            error: parsed.error,
+            ok: payload.ok,
+            result: payload.result,
+            error: payload.error,
         })
+    }
+
+    /// Read one eval's result from the `document.title` transport, honouring the
+    /// overall `timeout` (measured from `start`). An inline result returns
+    /// directly; a chunk header triggers a pull of every base64 chunk, which are
+    /// reassembled into the full payload — so results larger than the browser's
+    /// ~1KB title cap (e.g. a page snapshot) survive intact.
+    async fn read_eval_payload(
+        &self,
+        active: &Webview<Wry>,
+        start: Instant,
+        timeout: Duration,
+    ) -> Result<transport::EvalPayload, String> {
+        match self.poll_marker(start, timeout, None).await? {
+            transport::Marker::Result(payload) => Ok(payload),
+            transport::Marker::Chunk { seq, .. } => Err(format!(
+                "owned-browser eval: got chunk {seq} before a header"
+            )),
+            transport::Marker::Header { chunks, .. } => {
+                let mut parts: Vec<String> = Vec::with_capacity(chunks);
+                for i in 0..chunks {
+                    active
+                        .eval(transport::chunk_fetch_js(i))
+                        .map_err(|e| format!("owned-browser fetch chunk {i}: {e}"))?;
+                    match self.poll_marker(start, timeout, Some(i)).await? {
+                        transport::Marker::Chunk { seq, b64 } if seq == i => parts.push(b64),
+                        other => {
+                            return Err(format!(
+                                "owned-browser eval: expected chunk {i}, got {other:?}"
+                            ))
+                        }
+                    }
+                }
+                let json = transport::reassemble_chunks(&parts)?;
+                serde_json::from_str::<transport::EvalPayload>(&json)
+                    .map_err(|e| format!("parse chunked eval result: {e}"))
+            }
+        }
+    }
+
+    /// Poll the result-transport title (50ms cadence) until a marker appears or
+    /// `timeout` elapses. With `want_seq = Some(i)`, only a chunk marker with
+    /// that seq satisfies the wait — so we don't latch the header or a previous
+    /// chunk's still-current title; `None` accepts the first marker seen.
+    async fn poll_marker(
+        &self,
+        start: Instant,
+        timeout: Duration,
+        want_seq: Option<usize>,
+    ) -> Result<transport::Marker, String> {
+        loop {
+            if start.elapsed() >= timeout {
+                return Err(format!(
+                    "owned-browser eval timed out after {}s (last title: {:?})",
+                    timeout.as_secs(),
+                    self.state.latest_title()
+                ));
+            }
+            let title = self.state.latest_title();
+            if let Some(rest) = title.strip_prefix(transport::RESULT_TITLE_PREFIX) {
+                let marker = transport::parse_marker(rest)?;
+                match want_seq {
+                    // Waiting for a specific chunk: accept only that seq; a stale
+                    // header / earlier chunk title means keep polling.
+                    Some(want) => {
+                        if matches!(&marker, transport::Marker::Chunk { seq, .. } if *seq == want) {
+                            return Ok(marker);
+                        }
+                    }
+                    // First-marker wait (inline result or chunk header).
+                    None => return Ok(marker),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -716,6 +855,15 @@ impl OwnedWebviewHandle for TauriOwnedHandle {
         self.eval_inner(code, url, timeout, owner).await
     }
 
+    /// Serviceable if a child webview is already attached, or the app's GUI is
+    /// up so `ensure_background_child` can lazily create the off-screen host +
+    /// child. Returns `false` only during cold start before any app window
+    /// exists — so the owned browser is never advertised as ready while an eval
+    /// would still fail.
+    async fn is_ready(&self) -> bool {
+        self.state.active().await.is_some() || !self.app.webview_windows().is_empty()
+    }
+
     /// Native fire-and-forget navigate. Bypasses the eval round-trip so
     /// the HTTP caller doesn't sit in a 30s polling loop waiting for a
     /// `document.title` marker that real-world pages clobber with their
@@ -732,27 +880,33 @@ impl OwnedWebviewHandle for TauriOwnedHandle {
         // hook the agent always lands on the logged-out version of the
         // site even though the Tauri-command-driven sidebar restore
         // path was injecting correctly.
-        prepare_navigation(&self.app, &self.state, &parsed, owner).await;
+        prepare_navigation(&self.app, &self.state, &parsed, owner, true).await;
         inject_cookies_for_url(&self.app, &parsed).await;
 
-        if let Some(active) = self.state.active().await {
-            // Do NOT force the native webview visible here. Whether the panel is
-            // on screen is a frontend concern — the chat layer that hosts
-            // `<BrowserSidebar />` is `display:none` whenever the user is on
-            // Meeting notes / Timeline / Settings / etc. The sidebar reveals and
-            // positions the webview via `owned_browser_set_bounds` only when its
-            // host is actually visible, and hides it otherwise (the
-            // `offsetParent === null` guard in browser-sidebar.tsx). A
-            // background agent/pipe navigate that called `show()` here would pop
-            // the native browser over whatever the user is looking at. The
-            // navigate still loads while hidden, so the page is ready when the
-            // sidebar next reveals it.
-            active
-                .navigate(parsed)
-                .map_err(|e| format!("webview.navigate failed: {e}"))?;
-            self.state.clear_pending_url().await;
-        } else {
-            debug!("owned-browser navigate queued until sidebar attaches child webview");
+        // Attach a hidden offscreen child on demand if none exists, so a
+        // background/scheduled pipe can navigate without the sidebar ever being
+        // opened. Do NOT force the native webview visible here. Whether the
+        // panel is on screen is a frontend concern — the chat layer that hosts
+        // `<BrowserSidebar />` is `display:none` whenever the user is on Meeting
+        // notes / Timeline / Settings / etc. The sidebar reveals and positions
+        // the webview via `owned_browser_set_bounds` only when its host is
+        // actually visible, and hides it otherwise (the `offsetParent === null`
+        // guard in browser-sidebar.tsx). A background agent/pipe navigate that
+        // called `show()` here would pop the native browser over whatever the
+        // user is looking at. The navigate still loads while hidden, so the page
+        // is ready when the sidebar next reveals it.
+        match ensure_background_child(&self.app, &self.state).await {
+            Ok(active) => {
+                active
+                    .navigate(parsed)
+                    .map_err(|e| format!("webview.navigate failed: {e}"))?;
+                self.state.clear_pending_url().await;
+            }
+            // No window to host a webview yet (cold start). Keep the pending URL
+            // queued so the sidebar consumes it once it mounts, as before.
+            Err(e) => {
+                debug!("owned-browser navigate queued (no webview yet): {e}");
+            }
         }
 
         // Brief wait so the navigation has time to *commit* before we
@@ -905,41 +1059,117 @@ async fn prepare_navigation(
     state: &OwnedBrowserState,
     parsed: &url::Url,
     owner: Option<&str>,
+    reveal: bool,
 ) {
+    let context = state.remember_navigation(
+        parsed.as_str().to_string(),
+        owner.map(|s| s.to_string()),
+    );
     // Record the owner before emitting anything so the provisional state event
     // below — and the native page-load/title callbacks that follow — carry the
     // same tag. `owner` is the chat/session that issued this navigation; the
     // frontend uses it to keep a background pipe's page out of whatever chat is
     // on screen.
-    state.set_pending_owner(owner.map(|s| s.to_string()));
-    // Provisional omnibox URL while a top-level navigation is in flight
-    // (agent or sidebar initiated). Committed URL comes from `webview.url()`
-    // on main-document load finish / title change.
-    emit_state_event(app, Some(parsed.as_str().to_string()), None, Some(true));
+    state.set_pending_navigation_id(Some(context.navigation_id.clone()));
+    state.set_pending_owner(context.owner.clone());
     let _ = app.emit(
         NAVIGATE_EVENT,
         OwnedBrowserNavigateEvent {
             url: parsed.as_str().to_string(),
-            owner: owner.map(|s| s.to_string()),
+            navigation_id: context.navigation_id,
+            reveal,
+            owner: context.owner,
         },
     );
+    // Provisional omnibox URL while a top-level navigation is in flight
+    // (agent or sidebar initiated). Committed URL comes from `webview.url()`
+    // on main-document load finish / title change.
+    emit_state_event(app, Some(parsed.as_str().to_string()), None, Some(true));
     state.store_pending_url(parsed.clone()).await;
 }
 
-async fn wait_for_active_child(
-    state: &OwnedBrowserState,
-    timeout: Duration,
-) -> Option<Webview<Wry>> {
-    let start = Instant::now();
-    loop {
-        if let Some(child) = state.active().await {
-            return Some(child);
-        }
-        if start.elapsed() >= timeout {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+/// Label of the dedicated, off-screen window that hosts the owned-browser child
+/// webview during background / headless use (no sidebar open).
+///
+/// Why a separate window instead of parenting to `home`: a background pipe must
+/// not commandeer the chat window's native layer, and `Window::add_child` tears
+/// down the WebDriver context of whatever window it parents to — parenting the
+/// background child to `home` would break the e2e harness mid-run. Hosting it
+/// here keeps `home` untouched until the user actually reveals the browser, at
+/// which point `ensure_child_bounds` reparents this same child onto `home`.
+const BACKGROUND_HOST_LABEL: &str = "owned-browser-bg-host";
+
+/// Far-off-screen origin for the background host window. The window is tiny,
+/// undecorated, off the taskbar, and never focused, so it never paints on any
+/// real monitor. It is created **visible** (not `.visible(false)`) on purpose:
+/// Windows/WebView2 will not run script in a webview whose host window is
+/// hidden, so off-screen-but-visible is what gives us headless eval on every
+/// platform without the user ever seeing it. macOS evaluates fine either way.
+const BG_HOST_OFFSCREEN: f64 = -32000.0;
+
+/// Get-or-create the off-screen window that parents the owned-browser child
+/// during headless background use. Idempotent — reused across background calls.
+async fn background_host_window(app: &AppHandle) -> Result<Window<Wry>, String> {
+    if let Some(window) = app.get_window(BACKGROUND_HOST_LABEL) {
+        return Ok(window);
     }
+    WindowBuilder::new(app, BACKGROUND_HOST_LABEL)
+        .inner_size(1.0, 1.0)
+        .position(BG_HOST_OFFSCREEN, BG_HOST_OFFSCREEN)
+        .visible(true)
+        .focused(false)
+        .decorations(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .title("")
+        .build()
+        .map_err(|e| format!("owned-browser background host window failed: {e}"))
+}
+
+/// Lazily create the owned-browser child webview parented to the off-screen
+/// background host window, so a background/scheduled pipe — or any agent call
+/// that arrives before the sidebar mounts — can drive the browser headlessly
+/// instead of failing with "child webview not attached".
+///
+/// The child lives off-screen and is never painted over the user's current
+/// view. When the sidebar later mounts, `ensure_child_bounds` finds this same
+/// child (guarded by the same `state.inner` lock) and reparents it from the
+/// host window onto the visible chat window, repositioning and showing it.
+async fn ensure_background_child(
+    app: &AppHandle,
+    state: &OwnedBrowserState,
+) -> Result<Webview<Wry>, String> {
+    // Fast path: already attached (by the sidebar or a previous background eval).
+    if let Some(child) = state.active().await {
+        return Ok(child);
+    }
+
+    let host = background_host_window(app).await?;
+    let host_label = host.label().to_string();
+
+    // Hold `inner` across creation so a concurrent sidebar `ensure_child_bounds`
+    // can't race us into two webviews sharing WEBVIEW_LABEL.
+    let mut inner = state.inner.lock().await;
+    if let Some(child) = inner.child.clone() {
+        return Ok(child);
+    }
+    let blank: url::Url = "about:blank"
+        .parse()
+        .map_err(|e: url::ParseError| e.to_string())?;
+    let builder = child_webview_builder(app, WEBVIEW_LABEL, WebviewUrl::External(blank));
+    let child = host
+        .add_child(
+            builder,
+            LogicalPosition::new(0.0, 0.0),
+            LogicalSize::new(1.0, 1.0),
+        )
+        .map_err(|e| format!("owned-browser background child attach failed: {e}"))?;
+    inner.child = Some(child.clone());
+    inner.child_parent = Some(host_label);
+    // `visible` stays false: the child rides an off-screen window, so the
+    // sidebar/visibility paths must keep treating it as not-on-screen.
+    info!("owned-browser: background child webview attached on off-screen host (headless)");
+    Ok(child)
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,7 +1248,7 @@ fn normalize_url(raw: &str) -> Result<url::Url, String> {
 
 #[cfg(test)]
 mod normalize_url_tests {
-    use super::{normalize_url, title_after_eval_marker};
+    use super::{normalize_url, OwnedBrowserState};
 
     #[test]
     fn keeps_fully_qualified() {
@@ -1062,44 +1292,67 @@ mod normalize_url_tests {
         assert_eq!(u.scheme(), "data");
     }
 
-    #[test]
-    fn restores_title_changed_by_eval_code() {
-        let payload = r#"{"id":"1","ok":true,"title":"changed","result":null}"#;
-        assert_eq!(
-            title_after_eval_marker("Example Domain", payload),
-            "changed"
-        );
-    }
+    // The `document.title` result-transport logic (inline + chunked) and the
+    // title-restore helper are unit-tested in `owned_browser_transport`.
 
     #[test]
-    fn restores_original_title_when_payload_has_no_title() {
-        let payload = r#"{"id":"1","ok":true,"result":null}"#;
-        assert_eq!(
-            title_after_eval_marker("Example Domain", payload),
-            "Example Domain"
-        );
-    }
+    fn redirect_committed_url_keeps_same_navigation_context() {
+        let state = OwnedBrowserState::new();
+        let context =
+            state.remember_navigation("http://example.com".to_string(), Some("conv-1".to_string()));
 
-    #[test]
-    fn restores_original_title_when_payload_is_malformed() {
         assert_eq!(
-            title_after_eval_marker("Example Domain", "not json"),
-            "Example Domain"
+            state
+                .context_for_url("http://example.com")
+                .as_ref()
+                .map(|ctx| ctx.navigation_id.as_str()),
+            Some(context.navigation_id.as_str())
+        );
+        assert!(state.context_for_url("https://www.example.com").is_none());
+
+        state.remember_committed_url_for_context("https://www.example.com", &context);
+
+        let redirected = state
+            .context_for_url("https://www.example.com")
+            .expect("redirect target should resolve to the original navigation context");
+        assert_eq!(redirected.navigation_id, context.navigation_id);
+        assert_eq!(redirected.owner, context.owner);
+        assert_eq!(
+            state
+                .context_for_url("http://example.com")
+                .as_ref()
+                .map(|ctx| ctx.navigation_id.as_str()),
+            Some(context.navigation_id.as_str())
         );
     }
 }
 
-/// Navigate the embedded webview to `url`. Used by the sidebar when restoring
-/// per-chat state or on user reload — i.e. always an action of the chat that's
-/// on screen, so it carries no owner (`None`) and the frontend always honors
-/// it. The agent/pipe path is the connect-trait `navigate` (owner-tagged).
+/// Navigate the embedded webview to `url`.
+///
+/// Frontend restore/reload calls pass the foreground conversation id as
+/// `owner`, so the entire browser lifecycle stays scoped to that chat. Retry
+/// paths that are continuing a pipe/chat-owned navigation (for example after an
+/// extension or cookie-consent flow) can pass the original `owner` through so
+/// the follow-up navigate does not look like a fresh restore in every chat.
 #[specta::specta]
 #[tauri::command]
-pub async fn owned_browser_navigate(app: AppHandle, url: String) -> Result<(), String> {
+pub async fn owned_browser_navigate(
+    app: AppHandle,
+    url: String,
+    owner: Option<String>,
+    reveal: Option<bool>,
+) -> Result<(), String> {
     let state = browser_state();
     let parsed: url::Url = normalize_url(&url)?;
 
-    prepare_navigation(&app, &state, &parsed, None).await;
+    prepare_navigation(
+        &app,
+        &state,
+        &parsed,
+        owner.as_deref(),
+        reveal.unwrap_or(true),
+    )
+    .await;
     inject_cookies_for_url(&app, &parsed).await;
     if let Some(active) = state.active().await {
         // Visibility is owned by the frontend sidebar — never force-show here
@@ -1135,7 +1388,10 @@ pub async fn owned_browser_clear_browsing_data(app: AppHandle) -> Result<(), Str
     let _ = app;
     let state = browser_state();
     let Some(active) = state.active().await else {
-        return Err("owned-browser child webview not attached".to_string());
+        return Err(
+            "owned browser has no active webview to clear (open the browser panel first)"
+                .to_string(),
+        );
     };
     active
         .clear_all_browsing_data()
@@ -1156,6 +1412,37 @@ pub async fn e2e_owned_browser_visible() -> bool {
         return false;
     }
     browser_state().is_visible().await
+}
+
+/// E2E-only: detach and close the owned-browser child webview, resetting the
+/// singleton to its "no child attached" state. Lets
+/// `zzz-owned-browser-headless.spec.ts` establish a deterministic baseline so it
+/// can prove that a *fresh* background (headless) eval actually creates a
+/// working webview — not merely reuse one a prior spec left attached. Mirrors
+/// `e2e_owned_browser_visible`'s gating: a no-op in production binaries, only
+/// active under the `e2e` feature.
+#[specta::specta]
+#[tauri::command]
+pub async fn e2e_owned_browser_detach() -> Result<(), String> {
+    if !cfg!(feature = "e2e") {
+        return Ok(());
+    }
+    let state = browser_state();
+    let child = {
+        let mut inner = state.inner.lock().await;
+        inner.child_parent = None;
+        inner.pending_url = None;
+        inner.visible = false;
+        inner.child.take()
+    };
+    if let Some(child) = child {
+        let _ = child.hide();
+        let _ = child.close();
+        // Give Tauri a beat to tear the webview down and free WEBVIEW_LABEL
+        // before the next background attach re-creates a child under it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Ok(())
 }
 
 /// Cross-platform cookie pre-navigate hook. Resolves the URL's host,
@@ -1219,6 +1506,7 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) {
                     }
                 }
                 if cookies.is_empty() {
+                    let context = browser_state().context_for_url(url.as_str());
                     // Extension couldn't supply cookies — show the v20 card.
                     let payload = V20CookieBlockPayload {
                         url: url.as_str().to_string(),
@@ -1227,7 +1515,8 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) {
                         v20_count: block.v20_count,
                         sources: block.sources,
                         reason: "v20".to_string(),
-                        owner: browser_state().pending_owner(),
+                        navigation_id: context.as_ref().map(|ctx| ctx.navigation_id.clone()),
+                        owner: context.and_then(|ctx| ctx.owner),
                     };
                     if let Err(e) = app.emit(V20_COOKIE_BLOCK_EVENT, payload) {
                         warn!("owned-browser cookies: failed to emit v20 block event: {e}");
@@ -1439,6 +1728,7 @@ async fn browser_session_decision_for_url(
                 );
                 return BrowserSessionDecision::UseBrowserSession;
             }
+            let context = browser_state().context_for_url(url.as_str());
             let payload = V20CookieBlockPayload {
                 url: url.as_str().to_string(),
                 host: block.host,
@@ -1446,7 +1736,8 @@ async fn browser_session_decision_for_url(
                 v20_count: 0,
                 sources: block.sources,
                 reason: "locked".to_string(),
-                owner: browser_state().pending_owner(),
+                navigation_id: context.as_ref().map(|ctx| ctx.navigation_id.clone()),
+                owner: context.and_then(|ctx| ctx.owner),
             };
             if let Err(e) = app.emit(V20_COOKIE_BLOCK_EVENT, payload) {
                 warn!("owned-browser: failed to emit locked-browser event: {e}");
@@ -1546,12 +1837,14 @@ async fn browser_session_decision_for_url(
         .await
         .insert(request_id.clone(), tx);
 
+    let context = browser_state().context_for_url(url.as_str());
     let payload = BrowserSessionAccessRequestPayload {
         request_id: request_id.clone(),
         url: url.as_str().to_string(),
         host: host_key.clone(),
         already_granted,
-        owner: browser_state().pending_owner(),
+        navigation_id: context.as_ref().map(|ctx| ctx.navigation_id.clone()),
+        owner: context.and_then(|ctx| ctx.owner),
     };
 
     if let Err(e) = app.emit(SESSION_ACCESS_REQUEST_EVENT, payload) {

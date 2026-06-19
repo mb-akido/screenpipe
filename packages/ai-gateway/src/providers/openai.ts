@@ -69,27 +69,61 @@ export class OpenAIProvider implements AIProvider {
 	// other sampling knobs). When upstream returns 400 "Unsupported value:
 	// 'temperature'" we drop the offending field and retry once instead of
 	// blowing up — much more robust than chasing the prefix allowlist as
-	// OpenAI ships new model names.
+	// OpenAI ships new model names. Also matches "Unknown parameter" /
+	// "Unrecognized request argument" so optional params like stream_options
+	// degrade gracefully on OpenAI-compatible servers that don't know them.
 	private isUnsupportedSamplingParamError(error: any): string | null {
 		if (error?.status !== 400) return null;
 		const msg = String(error?.message ?? error?.error?.message ?? '');
-		const match = msg.match(/Unsupported value: '(\w+)'/i);
-		return match?.[1] ?? null;
+		const match =
+			msg.match(/Unsupported value: '([\w.]+)'/i) ??
+			msg.match(/Unknown parameter: '([\w.]+)'/i) ??
+			msg.match(/Unrecognized request argument(?: supplied)?: ([\w.]+)/i);
+		// "stream_options.include_usage" → strip the top-level param
+		return match?.[1]?.split('.')[0] ?? null;
+	}
+
+	// OpenAI requires the literal word "json" in the messages whenever
+	// response_format json_object is set. Agent/pipe callers regularly set
+	// the format without saying "json" anywhere (SCREENPIPE-AI-PROXY-17) —
+	// a deterministic 400 we can fix by injecting a minimal system nudge.
+	private isJsonMentionError(error: any): boolean {
+		if (error?.status !== 400) return false;
+		const msg = String(error?.message ?? error?.error?.message ?? '');
+		return /must contain the word 'json'/i.test(msg);
 	}
 
 	private async createWithUnsupportedParamRetry<T>(
 		params: ChatCompletionCreateParams,
 		invoke: (p: ChatCompletionCreateParams) => Promise<T>,
 	): Promise<T> {
-		try {
-			return await invoke(params);
-		} catch (error: any) {
-			const unsupported = this.isUnsupportedSamplingParamError(error);
-			if (!unsupported) throw error;
-			const next = params as ChatCompletionCreateParams & Record<string, unknown>;
-			if (next[unsupported] === undefined) throw error;
-			delete next[unsupported];
-			return await invoke(next);
+		// Bounded fix-and-retry loop: each pass repairs one distinct rejection
+		// (an unsupported sampling param, a missing "json" mention). Anything
+		// unfixable rethrows immediately; the cap guards against an upstream
+		// that keeps rejecting repaired requests.
+		let current = params as ChatCompletionCreateParams & Record<string, unknown>;
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return await invoke(current as ChatCompletionCreateParams);
+			} catch (error: any) {
+				if (attempt >= 3) throw error;
+				const unsupported = this.isUnsupportedSamplingParamError(error);
+				if (unsupported && current[unsupported] !== undefined) {
+					delete current[unsupported];
+					continue;
+				}
+				if (this.isJsonMentionError(error)) {
+					current = {
+						...current,
+						messages: [
+							{ role: 'system', content: 'Respond with a valid JSON object.' },
+							...(current.messages ?? []),
+						],
+					} as ChatCompletionCreateParams & Record<string, unknown>;
+					continue;
+				}
+				throw error;
+			}
 		}
 	}
 
@@ -133,6 +167,12 @@ export class OpenAIProvider implements AIProvider {
 			model: body.model,
 			messages: this.formatMessages(body.messages),
 			stream: true,
+			// Without include_usage OpenAI streams carry NO usage at all and the
+			// request is cost-logged as zero tokens. Cached tokens (automatic
+			// prompt caching, billed at a discount) ride along in
+			// usage.prompt_tokens_details. Stripped + retried automatically on
+			// OpenAI-compatible servers that reject unknown params.
+			stream_options: { include_usage: true },
 			response_format: this.formatResponseFormat(body.response_format),
 			tools: body.tools as ChatCompletionCreateParams['tools'],
 		};
@@ -153,10 +193,34 @@ export class OpenAIProvider implements AIProvider {
 			async start(controller) {
 				try {
 					let finishReason: string | null = null;
+					let usage: any = null;
 					for await (const chunk of stream) {
+						// include_usage delivers a final chunk with empty choices
+						// and the request's usage (incl. cached-token details)
+						if ((chunk as any).usage) {
+							usage = (chunk as any).usage;
+						}
 						const choice = chunk.choices[0];
 						if (choice?.finish_reason) {
 							finishReason = choice.finish_reason;
+						}
+						// Forward streamed tool-call fragments (delta.tool_calls:
+						// index/id/function.name + argument chunks). The content
+						// branch below only forwards delta.content, so without this
+						// a tool call (finish_reason "tool_calls") reached Pi as an
+						// empty assistant message → stopReason:"toolUse" with nothing
+						// to run, and background pipes silently no-op'd. Pi
+						// accumulates these in the same OpenAI shape the Anthropic
+						// provider already emits.
+						const toolCalls = choice?.delta?.tool_calls;
+						if (toolCalls && toolCalls.length > 0) {
+							controller.enqueue(
+								new TextEncoder().encode(
+									`data: ${JSON.stringify({
+										choices: [{ delta: { tool_calls: toolCalls } }],
+									})}\n\n`
+								)
+							);
 						}
 						if (body.response_format?.type === 'json_object' || body.response_format?.type === 'json_schema') {
 							const content = choice?.delta?.content;
@@ -190,6 +254,25 @@ export class OpenAIProvider implements AIProvider {
 							})}\n\n`
 						)
 					);
+					// Emit usage before [DONE] so cost logging records real token
+					// counts (previously OpenAI streams logged zero tokens).
+					if (usage) {
+						controller.enqueue(
+							new TextEncoder().encode(
+								`data: ${JSON.stringify({
+									choices: [],
+									usage: {
+										prompt_tokens: usage.prompt_tokens || 0,
+										completion_tokens: usage.completion_tokens || 0,
+										total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+										prompt_tokens_details: {
+											cached_tokens: usage.prompt_tokens_details?.cached_tokens || 0,
+										},
+									},
+								})}\n\n`
+							)
+						);
+					}
 					controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
 					controller.close();
 				} catch (error: any) {
@@ -327,6 +410,23 @@ export class OpenAIProvider implements AIProvider {
 					},
 				},
 			],
+			// Pass usage through (was dropped — non-streaming OpenAI requests
+			// were cost-logged with estimated token counts). cached_tokens =
+			// OpenAI automatic prompt caching, billed at a discount.
+			...(response.usage
+				? {
+						usage: {
+							prompt_tokens: response.usage.prompt_tokens ?? 0,
+							completion_tokens: response.usage.completion_tokens ?? 0,
+							total_tokens:
+								response.usage.total_tokens ??
+								(response.usage.prompt_tokens ?? 0) + (response.usage.completion_tokens ?? 0),
+							prompt_tokens_details: {
+								cached_tokens: response.usage.prompt_tokens_details?.cached_tokens ?? 0,
+							},
+						},
+				  }
+				: {}),
 		};
 	}
 

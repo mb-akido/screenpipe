@@ -7,7 +7,7 @@
 //! Implements [`AgentExecutor`] for the pi CLI (`@earendil-works/pi-coding-agent`).
 //! Pi is installed via bun and executed as a subprocess in "print" mode (`pi -p`).
 
-use super::{AgentExecutor, AgentOutput, ExecutionHandle};
+use super::{install_spawned_pid, AgentExecutor, AgentOutput, ExecutionHandle};
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use serde_json::json;
@@ -371,6 +371,10 @@ impl PiExecutor {
                 "screenpipe-cli",
                 include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
             ),
+            (
+                "render-html-report",
+                include_str!("../../assets/skills/render-html-report/SKILL.md"),
+            ),
         ];
 
         // Clean up deprecated skills from the 8→2 consolidation.
@@ -430,8 +434,12 @@ impl PiExecutor {
     /// [`Self::USER_SKILL_MARKER`], be deleted by a later sync. The desktop
     /// importer already rejects these names; this guards any folder that reaches
     /// the store another way.
-    const BASELINE_SKILL_NAMES: [&'static str; 3] =
-        ["screenpipe-api", "screenpipe-cli", "screenpipe-team"];
+    const BASELINE_SKILL_NAMES: [&'static str; 4] = [
+        "screenpipe-api",
+        "screenpipe-cli",
+        "screenpipe-team",
+        "render-html-report",
+    ];
 
     /// Mirror the user's imported skills from the global store
     /// (`<data_dir>/skills/<name>/`) into `project_dir/.pi/skills/` so every
@@ -567,6 +575,13 @@ impl PiExecutor {
                 include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
                 Box::new(|_| true), // always installed — pipe & connection management
             ),
+            (
+                "render-html-report",
+                include_str!("../../assets/skills/render-html-report/SKILL.md"),
+                // Output-formatting skill, not endpoint-gated — always staged,
+                // loaded on-demand by the agent only when the task is visual.
+                Box::new(|_| true),
+            ),
         ];
 
         for (name, content, should_install) in all_skills {
@@ -627,7 +642,7 @@ impl PiExecutor {
     }
 
     /// Install the register-artifact extension so pipes can register files
-    /// as artifacts mid-execution via the local /outputs/register API.
+    /// as artifacts mid-execution via the local /artifacts/register API.
     pub fn ensure_register_artifact_extension(project_dir: &Path) -> Result<()> {
         let ext_dir = project_dir.join(".pi").join("extensions");
         std::fs::create_dir_all(&ext_dir)?;
@@ -649,7 +664,7 @@ impl PiExecutor {
     }
 
     /// Install the MCP bridge extension. Registers two proxy tools
-    /// (`mcp_list_tools`, `mcp_call`) that the model uses to talk to
+    /// (`sp_mcp_list_tools`, `sp_mcp_call`) that the model uses to talk to
     /// user-registered MCP servers via the local `/mcp-servers/*` API.
     /// Always installed — does nothing harmful when zero servers are
     /// registered (the tools return a helpful "none registered" message).
@@ -714,8 +729,9 @@ impl PiExecutor {
     /// pi's existing config files.
     ///
     /// Unlike the old `write_pi_config`, this preserves any existing providers
-    /// and auth credentials the user set up via `pi /login` or by editing
-    /// `~/.pi/agent/auth.json` directly.
+    /// and auth credentials already present in the config dir (e.g. entries
+    /// seeded from the user's global `~/.pi/agent` on first run, or edits the
+    /// user made to the isolated `pi-config/` files directly).
     ///
     /// When a pipe uses a non-screenpipe provider (e.g. ollama, openai), pass
     /// the resolved `provider`, `model`, and optional `provider_url` so the
@@ -775,11 +791,19 @@ impl PiExecutor {
                 .unwrap_or_else(|| "SCREENPIPE_API_KEY".to_string());
             let api_key_value = api_key_value.as_str();
             let models = screenpipe_cloud_models(api_url, user_token).await;
+            // PiExecutor only runs pipes (PipeManager: scheduled / run-now),
+            // which are latency-tolerant, so tag every cloud LLM call as
+            // background. The gateway then serves it on the cheaper, best-effort
+            // Vertex flex tier (resolveLatencyClass). Pi merges provider
+            // `headers` into each request (see pi-coding-agent model-registry),
+            // and an old gateway simply ignores the unknown header (→ standard),
+            // so there's no deploy-order coupling.
             let screenpipe_provider = json!({
                 "baseUrl": api_url,
                 "api": "openai-completions",
                 "apiKey": api_key_value,
                 "authHeader": true,
+                "headers": { "x-screenpipe-latency": "background" },
                 "models": models
             });
 
@@ -896,7 +920,7 @@ impl PiExecutor {
                     }
 
                     info!(
-                        "pi config: merged provider '{}' (model '{}') into ~/.pi/agent/models.json",
+                        "pi config: merged provider '{}' (model '{}') into pi-config/models.json",
                         pi_provider_name, mdl
                     );
                 }
@@ -917,11 +941,19 @@ impl PiExecutor {
         std::fs::write(&models_tmp, serde_json::to_string_pretty(&models_config)?)?;
         std::fs::rename(&models_tmp, &models_path)?;
 
-        // -- auth.json: merge screenpipe token, preserve other providers --
-        // Only write screenpipe auth when screenpipe provider is actually being used
+        // models.json embeds the raw cloud JWT as the screenpipe provider's
+        // apiKey while signed in (#3943) — same hardening as auth.json below.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&models_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        // -- auth.json: merge/remove screenpipe token, preserve other providers --
+        // Only manage screenpipe auth when screenpipe provider is actually being used.
         if should_add_screenpipe {
-            if let Some(token) = user_token {
-                let auth_path = config_dir.join("auth.json");
+            let auth_path = config_dir.join("auth.json");
+            if let Some(token) = user_token.filter(|token| !token.is_empty()) {
                 let mut auth: serde_json::Value = if auth_path.exists() {
                     let content = std::fs::read_to_string(&auth_path).unwrap_or_default();
                     serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
@@ -951,6 +983,8 @@ impl PiExecutor {
                     let perms = std::fs::Permissions::from_mode(0o600);
                     let _ = std::fs::set_permissions(&auth_path, perms);
                 }
+            } else {
+                remove_screenpipe_auth_from_path(&auth_path)?;
             }
         }
 
@@ -1133,6 +1167,9 @@ impl PiExecutor {
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
+        apply_pi_isolation_env(&mut |k, v| {
+            cmd.env(k, v);
+        });
         // Flags MUST come before -p on Windows (see spawn_pi_streaming comment)
         if continue_session {
             cmd.arg("--continue");
@@ -1217,9 +1254,15 @@ impl PiExecutor {
         let child = cmd.spawn()?;
         let pid = child.id();
 
-        // Set PID synchronously — no async race
+        // Set PID synchronously. If a stop was requested before spawn
+        // completed, honor it immediately against the fresh process group.
         if let (Some(ref sp), Some(p)) = (&shared_pid, pid) {
-            sp.store(p, std::sync::atomic::Ordering::SeqCst);
+            if install_spawned_pid(sp, p) {
+                // If the child is still entering setsid(), this first TERM can
+                // race the new process group; kill_process_group's delayed
+                // SIGKILL pass covers that short window.
+                let _ = kill_process_group(p);
+            }
         }
 
         let output = child.wait_with_output().await?;
@@ -1252,10 +1295,14 @@ impl PiExecutor {
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
         continue_session: bool,
         pipe_system_prompt: Option<&str>,
+        mcp_server_allowlist: Option<&[String]>,
         session_owner: Option<&str>,
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
+        apply_pi_isolation_env(&mut |k, v| {
+            cmd.env(k, v);
+        });
         // Flags MUST come before -p on Windows: cmd.exe /C passes everything
         // as a single string, and the long prompt text can break arg parsing
         // if flags come after it.
@@ -1312,6 +1359,10 @@ impl PiExecutor {
             cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
         }
 
+        if let Some(ids) = mcp_server_allowlist {
+            cmd.env("SCREENPIPE_MCP_SERVER_ALLOWLIST", ids.join(","));
+        }
+
         // Tag this run's local API calls with the owning chat/session so the
         // owned-browser sidebar can route navigations to the right chat (the
         // bash shim reads SCREENPIPE_SESSION_ID and adds x-screenpipe-session;
@@ -1322,7 +1373,8 @@ impl PiExecutor {
             cmd.env("SCREENPIPE_SESSION_ID", owner);
             // Expose the bare pipe name for extensions (e.g. register-artifact)
             // that need it without the "pipe:" routing prefix.
-            if let Some(name) = owner.strip_prefix("pipe:") {
+            if let Some(rest) = owner.strip_prefix("pipe:") {
+                let name = rest.rsplit_once(':').map_or(rest, |(n, _)| n);
                 cmd.env("SCREENPIPE_PIPE_NAME", name);
             }
         }
@@ -1353,9 +1405,15 @@ impl PiExecutor {
         let mut child = cmd.spawn()?;
         let pid = child.id();
 
-        // Set PID synchronously — no async race
+        // Set PID synchronously. If a stop was requested before spawn
+        // completed, honor it immediately against the fresh process group.
         if let (Some(ref sp), Some(p)) = (&shared_pid, pid) {
-            sp.store(p, std::sync::atomic::Ordering::SeqCst);
+            if install_spawned_pid(sp, p) {
+                // If the child is still entering setsid(), this first TERM can
+                // race the new process group; kill_process_group's delayed
+                // SIGKILL pass covers that short window.
+                let _ = kill_process_group(p);
+            }
         }
 
         // Take stdout for streaming reads; stderr will be read after exit
@@ -1571,6 +1629,7 @@ impl AgentExecutor for PiExecutor {
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
         continue_session: bool,
         pipe_system_prompt: Option<&str>,
+        mcp_server_allowlist: Option<&[String]>,
         session_owner: Option<&str>,
     ) -> Result<AgentOutput> {
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
@@ -1630,6 +1689,7 @@ impl AgentExecutor for PiExecutor {
                 line_tx.clone(),
                 continue_session,
                 pipe_system_prompt,
+                mcp_server_allowlist,
                 session_owner,
             )
             .await?;
@@ -1663,6 +1723,7 @@ impl AgentExecutor for PiExecutor {
                     line_tx.clone(),
                     continue_session,
                     pipe_system_prompt,
+                    mcp_server_allowlist,
                     session_owner,
                 )
                 .await?;
@@ -1711,6 +1772,7 @@ impl AgentExecutor for PiExecutor {
                     line_tx.clone(),
                     continue_session,
                     pipe_system_prompt,
+                    mcp_server_allowlist,
                     session_owner,
                 )
                 .await?;
@@ -1720,7 +1782,11 @@ impl AgentExecutor for PiExecutor {
     }
 
     fn kill(&self, handle: &ExecutionHandle) -> Result<()> {
-        kill_process_group(handle.pid)
+        let pid = handle.current_pid();
+        if pid == 0 {
+            return Ok(());
+        }
+        kill_process_group(pid)
     }
 
     fn is_available(&self) -> bool {
@@ -1747,14 +1813,23 @@ impl AgentExecutor for PiExecutor {
 
         std::fs::create_dir_all(&install_dir)?;
 
-        info!("installing pi into {} via bun …", install_dir.display());
+        // Log the exact command + bun version up front so a failed install is
+        // reproducible from the log alone (and a bun that can't even run —
+        // e.g. SIGILL on an unsupported CPU — is exposed before the install).
+        let args = ["add", PI_PACKAGE, PI_AI_PACKAGE, "@anthropic-ai/sdk"];
+        info!(
+            "installing pi into {} via bun at {} (version: {}); command: bun {}",
+            install_dir.display(),
+            bun,
+            bun_version_string(&bun),
+            args.join(" "),
+        );
 
         // Seed package.json with overrides to fix lru-cache resolution on Windows
         seed_pi_package_json(&install_dir);
 
         let mut cmd = std::process::Command::new(&bun);
-        cmd.current_dir(&install_dir)
-            .args(["add", PI_PACKAGE, PI_AI_PACKAGE, "@anthropic-ai/sdk"]);
+        cmd.current_dir(&install_dir).args(args);
 
         #[cfg(windows)]
         {
@@ -1763,14 +1838,23 @@ impl AgentExecutor for PiExecutor {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let output = cmd.output()?;
+        let output = cmd.output().map_err(|e| {
+            anyhow!(
+                "pi installation failed: could not run bun at {}: {}",
+                bun,
+                e
+            )
+        })?;
         if output.status.success() {
             info!("pi installed successfully into {}", install_dir.display());
             Ok(())
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("pi installation failed: {}", stderr);
-            Err(anyhow!("pi installation failed: {}", stderr))
+            // Include exit status + both stream tails: bun can exit non-zero
+            // with an EMPTY stderr (signal death, or diagnostics on stdout),
+            // which used to log here as "pi installation failed: " — nothing.
+            let msg = format_subprocess_failure("bun add", &output);
+            error!("pi installation failed: {}", msg);
+            Err(anyhow!("pi installation failed: {}", msg))
         }
     }
 
@@ -1787,9 +1871,268 @@ impl AgentExecutor for PiExecutor {
 // Helpers (extracted from apps/screenpipe-app-tauri/src-tauri/src/pi.rs)
 // ---------------------------------------------------------------------------
 
+/// Screenpipe's private pi agent dir (models.json, auth.json, sessions, …).
+///
+/// Isolated from the user's global `~/.pi/agent` so screenpipe never rewrites
+/// config a standalone pi install owns
+/// (https://github.com/screenpipe/screenpipe/issues/4002) and never loads the user's
+/// global pi packages — whose tools can collide with ours and abort the run —
+/// into pipe/chat runs (https://github.com/screenpipe/screenpipe/issues/3812).
+/// Every pi spawn must pass this dir via the
+/// `PI_CODING_AGENT_DIR` env var (see [`apply_pi_isolation_env`]).
+///
+/// Escape hatch: `SCREENPIPE_PI_AGENT_DIR` overrides the location; setting it
+/// to `~/.pi/agent` restores the old shared-config behavior.
+pub fn pi_config_dir() -> Result<PathBuf> {
+    let dir = match std::env::var("SCREENPIPE_PI_AGENT_DIR") {
+        Ok(v) if !v.trim().is_empty() => {
+            let v = v.trim();
+            if v == "~" || v.starts_with("~/") || v.starts_with("~\\") {
+                let home =
+                    dirs::home_dir().ok_or_else(|| anyhow!("could not find home directory"))?;
+                if v == "~" {
+                    home
+                } else {
+                    home.join(&v[2..])
+                }
+            } else {
+                PathBuf::from(v)
+            }
+        }
+        _ => crate::paths::default_screenpipe_data_dir().join("pi-config"),
+    };
+    seed_pi_config_from_global(&dir);
+    Ok(dir)
+}
+
 fn get_pi_config_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not find home directory"))?;
-    Ok(home.join(".pi").join("agent"))
+    pi_config_dir()
+}
+
+/// Set the env vars that scope a pi subprocess to screenpipe's private agent
+/// dir. Applied to every spawn (pipes, chat, title-gen); child processes that
+/// pi itself spawns (e.g. sub-agent runs) inherit them.
+pub fn apply_pi_isolation_env(apply: &mut dyn FnMut(&str, &str)) {
+    if let Ok(dir) = pi_config_dir() {
+        apply("PI_CODING_AGENT_DIR", &dir.to_string_lossy());
+    }
+    // We pin the pi version ourselves (ensure_installed); don't let the
+    // subprocess phone pi.dev for update checks on every run.
+    apply("PI_SKIP_VERSION_CHECK", "1");
+}
+
+/// Marker file recording that the one-time seed from `~/.pi/agent` ran.
+const PI_MIGRATION_MARKER: &str = ".migrated-from-global";
+
+/// One-time seed of the isolated pi dir from the user's global `~/.pi/agent`.
+///
+/// Earlier releases wrote screenpipe's provider/auth into the global config
+/// and stored chat sessions there, and some users deliberately configured
+/// BYOK providers (ollama/openai) there for their pipes. Copy that state once
+/// so the switch to an isolated dir is invisible:
+///
+/// - `models.json` / `auth.json` / `trust.json`: copied verbatim (auth 0600).
+/// - `settings.json`: copied with the `packages` key stripped — globally
+///   installed pi packages are exactly the conflict vector from
+///   https://github.com/screenpipe/screenpipe/issues/3812.
+/// - `sessions/<encoded-cwd>/`: copied only for cwds under the screenpipe
+///   data dir (pi-chat, pi-title, pipes/*) so `--continue` keeps history.
+///
+/// Never deletes or modifies anything under `~/.pi/agent`. Concurrent callers
+/// (parallel pipes, app + CLI) are serialized via an exclusive-create lock;
+/// losers proceed without waiting — `ensure_pi_config` rewrites models.json
+/// and auth.json before every spawn anyway, so a half-seeded dir self-heals.
+fn seed_pi_config_from_global(dest: &Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Fast path: skip the fs checks after the first call in this process.
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(home) = dirs::home_dir() else { return };
+    let global = home.join(".pi").join("agent");
+    let data_dir = crate::paths::default_screenpipe_data_dir();
+    if seed_from_global(&global, dest, &data_dir) {
+        DONE.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Inner seed step (no process-wide statics so it's unit-testable).
+/// Returns `true` when the dest dir is fully seeded (marker present).
+fn seed_from_global(global: &Path, dest: &Path, data_dir: &Path) -> bool {
+    let marker = dest.join(PI_MIGRATION_MARKER);
+    if marker.exists() {
+        return true;
+    }
+
+    // Nothing to migrate, or the escape hatch points us *at* the global dir.
+    if !global.exists() || dest == global {
+        let _ = std::fs::create_dir_all(dest);
+        let _ = std::fs::write(&marker, "no global config to seed\n");
+        return true;
+    }
+
+    if std::fs::create_dir_all(dest).is_err() {
+        return false;
+    }
+    // Exclusive-create lock so concurrent first runs seed exactly once.
+    let lock = dest.join(".migration.lock");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    {
+        Ok(_) => {}
+        Err(_) => {
+            // A crashed earlier attempt leaves the lock behind with no
+            // marker; reclaim it once it's clearly stale so we don't stay
+            // unseeded forever. Otherwise someone is actively seeding —
+            // proceed without waiting (ensure_pi_config rewrites the files
+            // that matter before every spawn).
+            let stale = std::fs::metadata(&lock)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|age| age.as_secs() > 600)
+                .unwrap_or(false);
+            if !stale {
+                return false;
+            }
+            let _ = std::fs::remove_file(&lock);
+            if std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    info!(
+        "seeding isolated pi config at {:?} from global {:?}",
+        dest, global
+    );
+
+    for name in ["models.json", "auth.json", "trust.json"] {
+        let src = global.join(name);
+        if src.exists() {
+            if let Err(e) = std::fs::copy(&src, dest.join(name)) {
+                warn!("pi config seed: failed to copy {}: {}", name, e);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let auth = dest.join("auth.json");
+        if auth.exists() {
+            let _ = std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    // settings.json: copy run-affecting settings (thinking level, budgets,
+    // compaction, …) so behavior matches pre-isolation, but drop:
+    // - `packages`: global pi packages are the conflict vector from
+    //   https://github.com/screenpipe/screenpipe/issues/3812;
+    // - `defaultProvider`/`defaultModel`: those are the *user's* personal pi
+    //   defaults. Screenpipe passes --provider/--model on every spawn, so
+    //   they'd never be read — except by a future flagless spawn, which must
+    //   not silently land on the user's BYOK provider. Pin screenpipe's own
+    //   safe fallback instead ("screenpipe"/"auto": the gateway picks a
+    //   model server-side; on a BYOK-only setup it fails loudly rather than
+    //   billing the user's personal key).
+    let settings_src = global.join("settings.json");
+    let mut settings: serde_json::Value = std::fs::read_to_string(&settings_src)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = settings.as_object_mut() {
+        obj.remove("packages");
+        obj.insert("defaultProvider".to_string(), json!("screenpipe"));
+        obj.insert("defaultModel".to_string(), json!("auto"));
+    }
+    match serde_json::to_string_pretty(&settings) {
+        Ok(pretty) => {
+            if let Err(e) = std::fs::write(dest.join("settings.json"), pretty) {
+                warn!("pi config seed: failed to write settings.json: {}", e);
+            }
+        }
+        Err(e) => warn!("pi config seed: failed to serialize settings.json: {}", e),
+    }
+
+    // Sessions for screenpipe-owned cwds. Pi encodes a session dir name as
+    // `--<cwd with leading separator stripped and [/\:] replaced by ->--`
+    // (see pi's session-manager); match dirs whose decoded cwd lives under
+    // the screenpipe data dir.
+    let encoded_data_dir = data_dir
+        .to_string_lossy()
+        .trim_start_matches(['/', '\\'])
+        .replace(['/', '\\', ':'], "-");
+    let sessions_src = global.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions_src) {
+        let exact = format!("--{}--", encoded_data_dir);
+        let prefix = format!("--{}-", encoded_data_dir);
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !entry.path().is_dir() || !(name == exact || name.starts_with(&prefix)) {
+                continue;
+            }
+            let to = dest.join("sessions").join(&name);
+            if let Err(e) = crate::paths::copy_dir_all(&entry.path(), &to) {
+                warn!("pi config seed: failed to copy sessions {}: {}", name, e);
+            }
+        }
+    }
+
+    if let Err(e) = std::fs::write(
+        &marker,
+        format!("seeded from {}\n", global.to_string_lossy()),
+    ) {
+        warn!("pi config seed: failed to write marker: {}", e);
+        return false;
+    }
+    let _ = std::fs::remove_file(&lock);
+    info!("pi config seed complete at {:?}", dest);
+    true
+}
+
+fn remove_screenpipe_auth_from_path(auth_path: &Path) -> Result<()> {
+    if !auth_path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(auth_path)?;
+    let mut auth: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
+    let removed = auth
+        .as_object_mut()
+        .map(|obj| obj.remove("screenpipe").is_some())
+        .unwrap_or(false);
+
+    if !removed {
+        return Ok(());
+    }
+
+    let auth_tmp = auth_path.with_file_name(format!(
+        "auth.json.{}.{}.tmp",
+        std::process::id(),
+        format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+    ));
+    std::fs::write(&auth_tmp, serde_json::to_string_pretty(&auth)?)?;
+    std::fs::rename(&auth_tmp, auth_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(auth_path, perms);
+    }
+
+    Ok(())
 }
 
 pub fn find_bun_executable() -> Option<String> {
@@ -1821,6 +2164,87 @@ pub fn find_bun_executable() -> Option<String> {
     ];
 
     paths.into_iter().find(|p| std::path::Path::new(p).exists())
+}
+
+/// Human-readable description of how a subprocess terminated.
+///
+/// Always non-empty: "exit code N", "killed by signal N (NAME)" on unix, or
+/// "terminated without exit code". Signal names matter on Linux/AppImage where
+/// bun can die without writing a single byte to stderr (e.g. SIGILL when the
+/// bundled bun build needs CPU instructions the host lacks, or SIGKILL from
+/// the OOM killer) — exactly the case that used to log as an empty error.
+pub fn describe_exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit code {}", code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = match sig {
+                4 => " (SIGILL, illegal instruction; the bun binary may not support this CPU)",
+                6 => " (SIGABRT)",
+                9 => " (SIGKILL, possibly the OOM killer)",
+                11 => " (SIGSEGV)",
+                15 => " (SIGTERM)",
+                _ => "",
+            };
+            return format!("killed by signal {}{}", sig, name);
+        }
+    }
+    "terminated without exit code".to_string()
+}
+
+/// Last `max` bytes of a captured process stream, lossy-decoded and
+/// char-boundary safe, with an "(empty)" placeholder so a silent subprocess
+/// can never reduce an error message to nothing.
+pub fn output_tail(bytes: &[u8], max: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    if trimmed.len() <= max {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len().saturating_sub(max);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &trimmed[start..])
+}
+
+/// One-line, always-non-empty summary of a failed subprocess: exit status plus
+/// the tail of BOTH streams (bun reports some install failures on stdout, and
+/// signal deaths leave both streams empty — the status is then the only clue).
+pub fn format_subprocess_failure(what: &str, output: &std::process::Output) -> String {
+    const TAIL: usize = 2048;
+    format!(
+        "{} {}; stderr: {}; stdout: {}",
+        what,
+        describe_exit_status(&output.status),
+        output_tail(&output.stderr, TAIL),
+        output_tail(&output.stdout, TAIL),
+    )
+}
+
+/// Best-effort `bun --version` for install-start logging. Never fails; a
+/// crashing bun (e.g. SIGILL on unsupported CPUs) is reported inline, which
+/// diagnoses the install failure before the install is even attempted.
+pub fn bun_version_string(bun: &str) -> String {
+    let mut cmd = std::process::Command::new(bun);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => format!("unknown ({})", describe_exit_status(&o.status)),
+        Err(e) => format!("unknown (failed to run: {})", e),
+    }
 }
 
 /// Returns the screenpipe-managed pi install directory (`~/.screenpipe/pi-agent/` or SCREENPIPE_DATA_DIR/pi-agent).
@@ -2529,6 +2953,43 @@ pub fn ensure_bash_available() -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn clear_screenpipe_auth_preserves_other_provider_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "screenpipe": "stale-jwt",
+                "openai": "sk-keep",
+                "anthropic": {"apiKey": "anthropic-keep"}
+            }))
+            .unwrap(),
+        )
+        .expect("write auth");
+
+        remove_screenpipe_auth_from_path(&auth_path).expect("clear screenpipe auth");
+
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert!(auth.get("screenpipe").is_none());
+        assert_eq!(auth["openai"], serde_json::json!("sk-keep"));
+        assert_eq!(
+            auth["anthropic"]["apiKey"],
+            serde_json::json!("anthropic-keep")
+        );
+    }
+
+    #[test]
+    fn clear_screenpipe_auth_missing_file_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("missing-auth.json");
+
+        remove_screenpipe_auth_from_path(&auth_path).expect("missing auth is ok");
+
+        assert!(!auth_path.exists());
+    }
+
     /// `sync_user_skills_from` mirrors store skills into a session's
     /// `.pi/skills/`, leaves baseline/hand-authored skills alone, and removes
     /// its own mirrors once a skill leaves the store.
@@ -2623,6 +3084,123 @@ mod tests {
             "invalid bytes should become replacement chars"
         );
         assert_eq!(lines[1], "OK");
+    }
+
+    /// First-run seed copies config + screenpipe-owned sessions from the
+    /// global `~/.pi/agent`, strips `packages` from settings.json, and never
+    /// touches the global dir. A second call is a no-op via the marker.
+    #[test]
+    fn seed_from_global_copies_config_and_screenpipe_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let global = tmp.path().join("global");
+        let dest = tmp.path().join("isolated");
+        let data_dir = tmp.path().join("home").join(".screenpipe");
+
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(
+            global.join("models.json"),
+            r#"{"providers":{"ollama":{"baseUrl":"http://homelab:11434/v1"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(global.join("auth.json"), r#"{"screenpipe":"tok"}"#).unwrap();
+        std::fs::write(
+            global.join("settings.json"),
+            // The user's personal pi defaults must NOT leak into screenpipe's
+            // config; run-affecting settings (theme, thinking, …) must.
+            r#"{"theme":"dark","packages":["npm:pi-web-access"],"defaultProvider":"anthropic","defaultModel":"claude-opus-4-8"}"#,
+        )
+        .unwrap();
+
+        // Session dirs: one for a screenpipe cwd (copied), one for an
+        // unrelated project (left behind). Encoding mirrors pi's
+        // session-manager: leading separator stripped, [/\:] → '-'.
+        let encoded = data_dir
+            .to_string_lossy()
+            .trim_start_matches(['/', '\\'])
+            .replace(['/', '\\', ':'], "-");
+        let ours = global
+            .join("sessions")
+            .join(format!("--{}-pi-chat--", encoded));
+        let theirs = global.join("sessions").join("--Users-x-other-project--");
+        std::fs::create_dir_all(&ours).unwrap();
+        std::fs::write(ours.join("s1.jsonl"), "{}").unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("s2.jsonl"), "{}").unwrap();
+
+        assert!(seed_from_global(&global, &dest, &data_dir));
+
+        // Config copied; settings stripped of `packages`.
+        let models = std::fs::read_to_string(dest.join("models.json")).unwrap();
+        assert!(models.contains("homelab"));
+        assert!(dest.join("auth.json").exists());
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dest.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert!(settings.get("packages").is_none());
+        // Personal defaults replaced by screenpipe's safe fallback: a future
+        // flagless spawn must never silently run on the user's BYOK provider.
+        assert_eq!(settings["defaultProvider"], "screenpipe");
+        assert_eq!(settings["defaultModel"], "auto");
+
+        // Only the screenpipe-owned session dir came over.
+        assert!(dest
+            .join("sessions")
+            .join(format!("--{}-pi-chat--", encoded))
+            .join("s1.jsonl")
+            .exists());
+        assert!(!dest
+            .join("sessions")
+            .join("--Users-x-other-project--")
+            .exists());
+
+        // Marker written; global untouched; rerun is a no-op even if the
+        // global gains new files afterwards.
+        assert!(dest.join(PI_MIGRATION_MARKER).exists());
+        assert!(global.join("settings.json").exists());
+        std::fs::write(global.join("trust.json"), "{}").unwrap();
+        assert!(seed_from_global(&global, &dest, &data_dir));
+        assert!(!dest.join("trust.json").exists());
+    }
+
+    /// No global pi install: the dest dir is created and marked seeded
+    /// without copying anything (fresh-user path). Pointing the escape
+    /// hatch at the global dir itself must never self-copy.
+    #[test]
+    fn seed_from_global_handles_missing_global_and_self_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let global = tmp.path().join("no-such-global");
+        let dest = tmp.path().join("isolated");
+        let data_dir = tmp.path().join(".screenpipe");
+
+        assert!(seed_from_global(&global, &dest, &data_dir));
+        assert!(dest.join(PI_MIGRATION_MARKER).exists());
+
+        // dest == global (SCREENPIPE_PI_AGENT_DIR=~/.pi/agent escape hatch):
+        // marked seeded, nothing else happens.
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("models.json"), "{}").unwrap();
+        assert!(seed_from_global(&shared, &shared, &data_dir));
+        assert!(shared.join(PI_MIGRATION_MARKER).exists());
+    }
+
+    /// A fresh (non-stale) lock from a concurrent seeder makes the call
+    /// back off without seeding; the marker stays absent so a later call
+    /// retries.
+    #[test]
+    fn seed_from_global_backs_off_on_active_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let global = tmp.path().join("global");
+        let dest = tmp.path().join("isolated");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("models.json"), "{}").unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join(".migration.lock"), "").unwrap();
+
+        assert!(!seed_from_global(&global, &dest, tmp.path()));
+        assert!(!dest.join("models.json").exists());
+        assert!(!dest.join(PI_MIGRATION_MARKER).exists());
     }
 
     #[test]
@@ -2845,5 +3423,70 @@ mod tests {
             !lock_path.exists(),
             "stale bun.lock must be cleared so bun re-resolves from the fresh manifest"
         );
+    }
+
+    /// Regression guard for the empty "pi installation failed: " log (Linux
+    /// AppImage report, 2026-06-12): a bun that dies without writing to
+    /// stderr must still produce an actionable error message.
+    #[cfg(unix)]
+    #[test]
+    fn install_failure_message_is_never_empty() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        // Non-zero exit, NOTHING on either stream — the exact shape that used
+        // to format as an empty error.
+        let silent_failure = Output {
+            status: ExitStatus::from_raw(0x0100), // exit code 1
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let msg = format_subprocess_failure("bun add", &silent_failure);
+        assert_eq!(msg, "bun add exit code 1; stderr: (empty); stdout: (empty)");
+
+        // Killed by a signal (raw status = signal number, no exit code).
+        let sigill = Output {
+            status: ExitStatus::from_raw(4),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let msg = format_subprocess_failure("bun add", &sigill);
+        assert!(
+            msg.contains("killed by signal 4") && msg.contains("SIGILL"),
+            "signal deaths must be named: {}",
+            msg
+        );
+
+        // stderr empty but stdout has the diagnostics — both tails included.
+        let stdout_only = Output {
+            status: ExitStatus::from_raw(0x0100),
+            stdout: b"error: tarball download failed".to_vec(),
+            stderr: Vec::new(),
+        };
+        let msg = format_subprocess_failure("bun add", &stdout_only);
+        assert!(
+            msg.contains("stdout: error: tarball download failed"),
+            "stdout diagnostics must survive: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn output_tail_truncates_to_last_bytes() {
+        assert_eq!(output_tail(b"", 100), "(empty)");
+        assert_eq!(output_tail(b"   \n ", 100), "(empty)");
+        assert_eq!(output_tail(b"short error", 100), "short error");
+
+        let long = "x".repeat(3000) + "the real error is at the end";
+        let tail = output_tail(long.as_bytes(), 2048);
+        assert!(tail.starts_with("..."));
+        assert!(tail.ends_with("the real error is at the end"));
+        assert!(tail.len() <= 2048 + 3);
+
+        // Multi-byte chars at the cut point must not panic.
+        let unicode = "é".repeat(2000);
+        let tail = output_tail(unicode.as_bytes(), 101);
+        assert!(tail.starts_with("..."));
+        assert!(tail.ends_with('é'));
     }
 }

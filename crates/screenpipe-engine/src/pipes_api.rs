@@ -10,7 +10,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use screenpipe_connect::connections::render_context;
-use screenpipe_connect::mcp_servers::render_context as mcp_render_context;
 use screenpipe_core::pipes::PipeManager;
 use screenpipe_secrets::SecretStore;
 use serde::Deserialize;
@@ -166,36 +165,32 @@ pub async fn run_pipe_now(
     };
 
     // Validate required connections are configured before running the pipe
-    if let Some(pipe_status) = mgr.get_pipe(&id).await {
-        let required = &pipe_status.config.connections;
-        if !required.is_empty() {
-            let screenpipe_dir = mgr
-                .pipes_dir()
-                .parent()
-                .unwrap_or(mgr.pipes_dir())
-                .to_path_buf();
-            let ss = secret_store.as_ref().map(|e| e.0.as_ref());
-            let mut missing = Vec::new();
-            for conn_id in required {
-                let configured = screenpipe_connect::connections::is_connection_configured(
-                    ss,
-                    &screenpipe_dir,
-                    conn_id,
+    let required_connections = mgr
+        .get_pipe(&id)
+        .await
+        .map(|pipe_status| pipe_status.config.connections)
+        .unwrap_or_default();
+    if !required_connections.is_empty() {
+        let screenpipe_dir = mgr
+            .pipes_dir()
+            .parent()
+            .unwrap_or(mgr.pipes_dir())
+            .to_path_buf();
+        let ss = secret_store.as_ref().map(|e| e.0.as_ref());
+        let missing = screenpipe_connect::missing_pipe_connections(
+            ss,
+            &screenpipe_dir,
+            &required_connections,
+        )
+        .await;
+        if !missing.is_empty() {
+            return Json(json!({
+                "error": format!(
+                    "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
+                    id,
+                    missing.join(", ")
                 )
-                .await;
-                if !configured {
-                    missing.push(conn_id.as_str());
-                }
-            }
-            if !missing.is_empty() {
-                return Json(json!({
-                    "error": format!(
-                        "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
-                        id,
-                        missing.join(", ")
-                    )
-                }));
-            }
+            }));
         }
     }
 
@@ -208,14 +203,7 @@ pub async fn run_pipe_now(
         .to_path_buf();
     let api_port = mgr.api_port();
     let ss = secret_store.as_ref().map(|e| e.0.as_ref());
-    let mut conn_ctx = render_context(&screenpipe_dir, api_port, ss).await;
-    // Append user-supplied MCP servers — the `mcp-bridge.ts` extension
-    // surfaces them as tools, but the model also needs a natural-language
-    // listing in its system prompt so it knows what's available.
-    let mcp_ctx = mcp_render_context(&screenpipe_dir, api_port).await;
-    if !mcp_ctx.is_empty() {
-        conn_ctx.push_str(&mcp_ctx);
-    }
+    let conn_ctx = render_context(&screenpipe_dir, api_port, ss).await;
     mgr.set_connections_context(conn_ctx);
 
     let result = mgr.start_pipe_background(&id).await;
@@ -236,7 +224,14 @@ pub async fn run_pipe_now(
 pub async fn stop_pipe(State(pm): State<SharedPipeManager>, Path(id): Path<String>) -> Json<Value> {
     let mgr = pm.lock().await;
     match mgr.stop_pipe(&id).await {
-        Ok(()) => Json(json!({ "success": true })),
+        Ok(status) => Json(json!({
+            "success": matches!(
+                status,
+                screenpipe_core::pipes::PipeStopStatus::Stopping
+                    | screenpipe_core::pipes::PipeStopStatus::StopPending
+            ),
+            "status": status,
+        })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }
@@ -394,73 +389,262 @@ pub async fn set_pipe_favorite(
     }
 }
 
-/// Fallback glob cap: pipes without explicit `artifacts:` declarations
-/// contribute at most this many files (newest by mtime) to listings.
-pub const ARTIFACT_FALLBACK_CAP: usize = 50;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use axum::routing::post;
+    use axum::Router;
+    use screenpipe_core::agents::{
+        install_spawned_pid, AgentExecutor, AgentOutput, ExecutionHandle, SharedPid,
+    };
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use tempfile::TempDir;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
 
-/// GET /pipes/artifacts — list all declared artifacts across pipes.
-///
-/// Iterates pipe configs, resolves artifact paths relative to each pipe
-/// directory, and checks the filesystem for existence, size, and mtime.
-/// Returns a flat list of artifacts with metadata. No database, no
-/// migration — the data is fully derivable at request time.
-///
-/// Prefer GET /artifacts, which unifies these with registered outputs and
-/// supports pagination + filtering. Kept for backward compatibility.
-pub async fn list_artifacts(State(pm): State<SharedPipeManager>) -> Json<Value> {
-    let mgr = pm.lock().await;
-    if let Err(e) = mgr.reload_pipes().await {
-        tracing::warn!("failed to reload pipes from disk: {}", e);
+    #[derive(Clone, Copy)]
+    enum FakePublishMode {
+        Immediate,
+        Deferred,
     }
-    let declarations = mgr.list_artifact_declarations(ARTIFACT_FALLBACK_CAP).await;
-    drop(mgr);
 
-    let mut artifacts = Vec::new();
-    for (pipe_name, items) in declarations {
-        for (decl, abs_path) in items {
-            let mut entry = json!({
-                "pipe_name": pipe_name,
-                "title": decl.title.as_deref().unwrap_or_else(|| {
-                    abs_path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                }),
-                "kind": decl.kind.as_deref().unwrap_or("text"),
-                "path": abs_path.to_string_lossy(),
-            });
+    struct FakeExecutor {
+        mode: FakePublishMode,
+        pid: u32,
+        started: std::sync::Arc<Notify>,
+        pid_published: std::sync::Arc<AtomicBool>,
+        allow_pid_publish: std::sync::Arc<Notify>,
+        allow_finish: std::sync::Arc<Notify>,
+        kill_calls: std::sync::Arc<AtomicUsize>,
+        last_killed_pid: std::sync::Arc<AtomicU32>,
+    }
 
-            match tokio::fs::metadata(&abs_path).await {
-                Ok(meta) => {
-                    entry["exists"] = json!(true);
-                    entry["size_bytes"] = json!(meta.len());
-                    if let Ok(modified) = meta.modified() {
-                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
-                        entry["modified_at"] = json!(datetime.to_rfc3339());
-                    }
+    impl FakeExecutor {
+        fn new(mode: FakePublishMode, pid: u32) -> Self {
+            Self {
+                mode,
+                pid,
+                started: std::sync::Arc::new(Notify::new()),
+                pid_published: std::sync::Arc::new(AtomicBool::new(false)),
+                allow_pid_publish: std::sync::Arc::new(Notify::new()),
+                allow_finish: std::sync::Arc::new(Notify::new()),
+                kill_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+                last_killed_pid: std::sync::Arc::new(AtomicU32::new(0)),
+            }
+        }
 
-                    // Read a short preview for text-like files (first 256
-                    // bytes only — no need to load the whole file).
-                    let kind = decl.kind.as_deref().unwrap_or("text");
-                    if kind != "image" && meta.len() > 0 {
-                        if let Ok(file) = tokio::fs::File::open(&abs_path).await {
-                            use tokio::io::AsyncReadExt;
-                            let mut buf = vec![0u8; 256];
-                            let mut reader = tokio::io::BufReader::new(file);
-                            if let Ok(n) = reader.read(&mut buf).await {
-                                if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                                    entry["preview"] = json!(text);
-                                }
-                            }
-                        }
-                    }
+        fn publish_pid(&self, shared_pid: Option<&SharedPid>) -> bool {
+            let stop_requested = shared_pid
+                .map(|sp| install_spawned_pid(sp, self.pid))
+                .unwrap_or(false);
+            self.pid_published.store(true, Ordering::SeqCst);
+            stop_requested
+        }
+
+        async fn wait_for_pid_published(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !self.pid_published.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                Err(_) => {
-                    entry["exists"] = json!(false);
+            })
+            .await
+            .expect("fake executor never published pid");
+        }
+
+        async fn run_impl(&self, shared_pid: Option<SharedPid>) -> anyhow::Result<AgentOutput> {
+            self.started.notify_one();
+
+            match self.mode {
+                FakePublishMode::Immediate => {
+                    let _ = self.publish_pid(shared_pid.as_ref());
+                }
+                FakePublishMode::Deferred => {
+                    self.allow_pid_publish.notified().await;
+                    if self.publish_pid(shared_pid.as_ref()) {
+                        return Ok(AgentOutput {
+                            stdout: String::new(),
+                            stderr: "stopped before pid publication".to_string(),
+                            success: false,
+                            pid: Some(self.pid),
+                        });
+                    }
                 }
             }
-            artifacts.push(entry);
+
+            self.allow_finish.notified().await;
+            Ok(AgentOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+                pid: Some(self.pid),
+            })
         }
     }
 
-    Json(json!({ "data": artifacts }))
+    #[async_trait::async_trait]
+    impl AgentExecutor for FakeExecutor {
+        async fn run(
+            &self,
+            _prompt: &str,
+            _model: &str,
+            _working_dir: &Path,
+            _provider: Option<&str>,
+            _provider_url: Option<&str>,
+            _provider_api_key: Option<&str>,
+            shared_pid: Option<SharedPid>,
+            _continue_session: bool,
+        ) -> anyhow::Result<AgentOutput> {
+            self.run_impl(shared_pid).await
+        }
+
+        async fn run_streaming(
+            &self,
+            _prompt: &str,
+            _model: &str,
+            _working_dir: &Path,
+            _provider: Option<&str>,
+            _provider_url: Option<&str>,
+            _provider_api_key: Option<&str>,
+            shared_pid: Option<SharedPid>,
+            _line_tx: tokio::sync::mpsc::UnboundedSender<String>,
+            _continue_session: bool,
+            _pipe_system_prompt: Option<&str>,
+            _mcp_server_allowlist: Option<&[String]>,
+            _session_owner: Option<&str>,
+        ) -> anyhow::Result<AgentOutput> {
+            self.run_impl(shared_pid).await
+        }
+
+        fn kill(&self, handle: &ExecutionHandle) -> anyhow::Result<()> {
+            self.last_killed_pid
+                .store(handle.current_pid(), Ordering::SeqCst);
+            self.kill_calls.fetch_add(1, Ordering::SeqCst);
+            self.allow_finish.notify_waiters();
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn ensure_installed(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    fn write_test_pipe(dir: &TempDir, name: &str) {
+        let pipe_dir = dir.path().join(name);
+        std::fs::create_dir_all(&pipe_dir).unwrap();
+        std::fs::write(
+            pipe_dir.join("pipe.md"),
+            "---\nschedule: manual\nenabled: true\nagent: fake\n---\n\nstop test pipe\n",
+        )
+        .unwrap();
+    }
+
+    fn test_router(pm: SharedPipeManager) -> Router {
+        Router::new()
+            .route("/pipes/:id/stop", post(stop_pipe))
+            .with_state(pm)
+    }
+
+    async fn stop_payload(app: Router, pipe_name: &str) -> Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/pipes/{pipe_name}/stop"))
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn start_test_pipe(
+        pm: &SharedPipeManager,
+        dir: &TempDir,
+        executor: std::sync::Arc<FakeExecutor>,
+        name: &str,
+    ) {
+        write_test_pipe(dir, name);
+        let mgr = pm.lock().await;
+        mgr.reload_pipes().await.unwrap();
+        mgr.start_pipe_background(name).await.unwrap();
+        drop(mgr);
+        executor.started.notified().await;
+    }
+
+    #[tokio::test]
+    async fn stop_api_returns_not_running_when_pipe_is_absent() {
+        let dir = TempDir::new().unwrap();
+        let pm = std::sync::Arc::new(Mutex::new(PipeManager::new(
+            dir.path().to_path_buf(),
+            HashMap::new(),
+            None,
+            3030,
+        )));
+
+        let payload = stop_payload(test_router(pm), "missing").await;
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["status"], "not_running");
+    }
+
+    #[tokio::test]
+    async fn stop_api_returns_stopping_for_running_pipe_with_real_pid() {
+        let dir = TempDir::new().unwrap();
+        let live_pid = std::process::id();
+        let executor = std::sync::Arc::new(FakeExecutor::new(FakePublishMode::Immediate, live_pid));
+        let mut executors: HashMap<String, std::sync::Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("fake".to_string(), executor.clone());
+        let pm = std::sync::Arc::new(Mutex::new(PipeManager::new(
+            dir.path().to_path_buf(),
+            executors,
+            None,
+            3030,
+        )));
+
+        start_test_pipe(&pm, &dir, executor.clone(), "demo").await;
+        executor.wait_for_pid_published().await;
+
+        let payload = stop_payload(test_router(pm), "demo").await;
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["status"], "stopping");
+        assert_eq!(executor.kill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.last_killed_pid.load(Ordering::SeqCst), live_pid);
+    }
+
+    #[tokio::test]
+    async fn stop_api_returns_stop_pending_before_pid_is_available() {
+        let dir = TempDir::new().unwrap();
+        let executor = std::sync::Arc::new(FakeExecutor::new(FakePublishMode::Deferred, 4343));
+        let mut executors: HashMap<String, std::sync::Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("fake".to_string(), executor.clone());
+        let pm = std::sync::Arc::new(Mutex::new(PipeManager::new(
+            dir.path().to_path_buf(),
+            executors,
+            None,
+            3030,
+        )));
+
+        start_test_pipe(&pm, &dir, executor.clone(), "demo").await;
+
+        let payload = stop_payload(test_router(pm), "demo").await;
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["status"], "stop_pending");
+        assert_eq!(executor.kill_calls.load(Ordering::SeqCst), 0);
+
+        executor.allow_pid_publish.notify_waiters();
+        executor.wait_for_pid_published().await;
+    }
 }

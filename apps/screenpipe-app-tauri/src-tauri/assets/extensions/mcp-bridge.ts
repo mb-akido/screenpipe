@@ -8,8 +8,8 @@
 // tool individually burns ~7-9% of the model's context per server in
 // tool descriptions and runs into Anthropic's per-turn tool count cap
 // after 3-4 verbose servers. With this design the model spends ~200
-// tokens total and calls `mcp_list_tools` lazily before invoking
-// `mcp_call`. Same trade-off the `pi-mcp-adapter` extension makes.
+// tokens total and calls `sp_mcp_list_tools` lazily before invoking
+// `sp_mcp_call`. Same trade-off the `pi-mcp-adapter` extension makes.
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
@@ -18,11 +18,22 @@ const AUTH_KEY =
   process.env.SCREENPIPE_LOCAL_API_KEY ||
   process.env.SCREENPIPE_API_AUTH_KEY || // deprecated alias, drop next release
   "";
+const SESSION_ID = process.env.SCREENPIPE_SESSION_ID || "";
+const MCP_ALLOWLIST_RAW = process.env.SCREENPIPE_MCP_SERVER_ALLOWLIST;
+const MCP_ALLOWLIST =
+  MCP_ALLOWLIST_RAW === undefined
+    ? null
+    : new Set(
+        MCP_ALLOWLIST_RAW.split(",")
+          .map((id) => id.trim())
+          .filter(Boolean)
+      );
 
 function authHeaders(): Record<string, string> {
-  return AUTH_KEY
-    ? { Authorization: `Bearer ${AUTH_KEY}` }
-    : {};
+  return {
+    ...(AUTH_KEY ? { Authorization: `Bearer ${AUTH_KEY}` } : {}),
+    ...(SESSION_ID ? { "x-screenpipe-session": SESSION_ID } : {}),
+  };
 }
 
 interface ServerSummary {
@@ -47,7 +58,9 @@ async function fetchServers(signal: AbortSignal): Promise<ServerSummary[]> {
     throw new Error(`mcp-bridge: GET /mcp-servers returned ${res.status}`);
   }
   const body = (await res.json()) as { data?: ServerSummary[] };
-  return (body.data ?? []).filter((s) => s.enabled);
+  return (body.data ?? [])
+    .filter((s) => s.enabled)
+    .filter((s) => MCP_ALLOWLIST === null || MCP_ALLOWLIST.has(s.id));
 }
 
 const listToolsParams = {
@@ -66,7 +79,7 @@ const callParams = {
   properties: {
     server_id: {
       type: "string",
-      description: "The MCP server id (from mcp_list_tools).",
+      description: "The MCP server id (from sp_mcp_list_tools).",
     },
     tool: {
       type: "string",
@@ -82,10 +95,10 @@ const callParams = {
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
-    name: "mcp_list_tools",
+    name: "sp_mcp_list_tools",
     label: "List MCP tools",
     description:
-      "List the tools exposed by user-registered MCP (Model Context Protocol) servers. Call this BEFORE mcp_call so you know which server to target and what arguments each tool expects. Cheap to call. Returns server_id, server_name, and a list of { name, description } per server.",
+      "List the tools exposed by user-registered MCP (Model Context Protocol) servers. Call this BEFORE sp_mcp_call so you know which server to target and what arguments each tool expects. Cheap to call. Returns server_id, server_name, and a list of { name, description } per server.",
     parameters: listToolsParams,
 
     async execute(
@@ -171,7 +184,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `mcp_list_tools failed: ${e?.message ?? String(e)}`,
+              text: `sp_mcp_list_tools failed: ${e?.message ?? String(e)}`,
             },
           ],
         };
@@ -180,10 +193,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "mcp_call",
+    name: "sp_mcp_call",
     label: "Call MCP tool",
     description:
-      "Invoke a tool on a user-registered MCP server. Always call mcp_list_tools FIRST to find the server_id and tool name. The arguments object must match the tool's schema. Returns the raw MCP `content` array — typically text blocks but may include resources.",
+      "Invoke a tool on a user-registered MCP server. Always call sp_mcp_list_tools FIRST to find the server_id and tool name. The arguments object must match the tool's schema. Returns the raw MCP `content` array — typically text blocks but may include resources.",
     parameters: callParams,
 
     async execute(
@@ -214,7 +227,7 @@ export default function (pi: ExtensionAPI) {
             content: [
               {
                 type: "text" as const,
-                text: `mcp_call failed (${res.status}): ${bodyText.slice(0, 800)}`,
+                text: `sp_mcp_call failed (${res.status}): ${bodyText.slice(0, 800)}`,
               },
             ],
           };
@@ -267,7 +280,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `mcp_call failed: ${e?.message ?? String(e)}`,
+              text: `sp_mcp_call failed: ${e?.message ?? String(e)}`,
             },
           ],
         };

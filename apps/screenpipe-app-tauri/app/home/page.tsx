@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
 import {
+  isSessionForeground,
   sessionRecordFromMeta,
   useChatStore,
   type SessionStatus,
@@ -45,7 +46,6 @@ import { ChatHistoryView } from "@/components/chat/chat-history-view";
 import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
 import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
 import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
-import { NotificationBell } from "@/components/notification-bell";
 import { RecordingStatus, type RecordingDevice } from "@/components/recording-status";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
@@ -258,8 +258,8 @@ function HomeContent() {
             updatedAt,
           });
         }
-        if (unreadHint && store.currentId !== id && store.panelSessionId !== id) {
-          store.actions.markUnread(id);
+        if (unreadHint && !isSessionForeground(store, id)) {
+          store.actions.patch(id, { lastContentAt: Date.now() });
         }
       });
       unlistenFn = unlisten;
@@ -857,10 +857,10 @@ function HomeContent() {
     // The first nav item doubles as "go to chat view + start a fresh
     // conversation". Each click allocates a new session id (empty
     // rows are not reused — that felt like opening an old recent).
-    { id: "home", label: "New chat", icon: <Plus className="h-3.5 w-3.5" /> },
+    { id: "home", label: "Chat", icon: <Plus className="h-3.5 w-3.5" /> },
     { id: "pipes", label: "Pipes", icon: <Workflow className="h-3.5 w-3.5" /> },
     { id: "timeline", label: "Timeline", icon: <Clock className="h-3.5 w-3.5" /> },
-    { id: "meetings", label: "Meeting notes", icon: <NotebookPen className="h-3.5 w-3.5" /> },
+    { id: "meetings", label: "Meetings", icon: <NotebookPen className="h-3.5 w-3.5" /> },
     { id: "brain", label: "Brain", icon: <Brain className="h-3.5 w-3.5" /> },
     { id: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
   ]
@@ -891,7 +891,8 @@ function HomeContent() {
     activeSection === "home" ||
     activeSection === "timeline" ||
     activeSection === "meetings" ||
-    activeSection === "history";
+    activeSection === "history" ||
+    activeSection === "brain";
 
   return (
     <div className={cn("bg-transparent", isFullHeight ? "h-screen overflow-hidden" : "min-h-screen")} data-testid="home-page">
@@ -904,20 +905,22 @@ function HomeContent() {
           {/* Sidebar */}
           <TooltipProvider delayDuration={0}>
           {/* Top-left chrome strip — pinned next to the macOS traffic
-              lights: sidebar toggle, search, recording-status dot and
-              notification bell. No wordmark, no header row (Claude /
-              Codex style). When the sidebar is collapsed it is hidden
-              entirely and the strip floats over the content, reduced to
-              toggle + status dot. The h-8 drag region already keeps the
-              top band free of interactive content, so nothing collides.
-              Fixed positioning anchors the strip to the viewport so it
-              isn't clipped by AppSidebar's overflow. */}
+              lights: sidebar toggle, search and recording-status dot.
+              No wordmark, no header row (Claude / Codex style). When
+              the sidebar is collapsed it is hidden entirely and the
+              strip floats over the content, reduced to toggle + status
+              dot. The h-8 drag region already keeps the top band free
+              of interactive content, so nothing collides. Fixed
+              positioning anchors the strip to the viewport so it isn't
+              clipped by AppSidebar's overflow. The notification bell
+              lives in the Pipes view header (pipe-store.tsx) since
+              notifications are pipe output. */}
           <div
             className={cn(
               // top-0.5 + items-center puts each icon's center at y≈15px,
               // matching the vertical center of the macOS traffic lights
               // (which sit at y≈14).
-              "fixed top-0.5 z-20 flex items-center gap-1.5",
+              "fixed top-1 z-[46] flex items-center gap-1.5",
               reserveTrafficLights ? "left-[78px]" : "left-2"
             )}
           >
@@ -928,7 +931,9 @@ function HomeContent() {
                   aria-label={sidebarCollapsed ? "expand sidebar" : "collapse sidebar"}
                   className={cn(
                     "p-1 rounded-md transition-colors",
-                    isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    sidebarCollapsed && activeSection === "timeline"
+                      ? "backdrop-blur-sm bg-background/80 shadow-sm text-muted-foreground hover:text-foreground hover:bg-background"
+                      : isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
                   )}
                 >
                   {sidebarCollapsed
@@ -977,21 +982,21 @@ function HomeContent() {
               meetingLoading={meetingLoading}
               onToggleMeeting={() => void toggleMeeting()}
               isTranslucent={isTranslucent}
+              floatingOverMedia={sidebarCollapsed && activeSection === "timeline"}
             />
-            {!sidebarCollapsed && <NotificationBell />}
           </div>
 
           {/* Collapsed = hidden. No icon-rail fallback — the floating
               strip above (toggle + status dot) is the entire collapsed
               chrome, Claude-style. */}
           {!sidebarCollapsed && (
-          <AppSidebar className="pl-4">
+          <AppSidebar className="pl-1">
             {/* Navigation.
                 Outer flex column has no overflow — the chat-list section
                 inside owns its own scroll, otherwise the team promo +
                 bottom items would be pushed below the fold by long
                 conversation lists. */}
-            <div className="p-2 flex-1 flex flex-col min-h-0">
+            <div className="pt-2 pr-2 pb-2 flex-1 flex flex-col min-h-0">
               {/* Main sections */}
               <div className="space-y-0.5 shrink-0">
                 {mainSections.map((section) => {
@@ -1166,8 +1171,13 @@ function HomeContent() {
           )}
           </TooltipProvider>
 
-          {/* Content */}
-          <div className={cn("flex-1 flex flex-col h-full bg-background min-h-0 relative", isTranslucent ? "rounded-none" : "rounded-tr-lg")}>
+          {/* Content.
+              min-w-0 matters: without it this flex item refuses to shrink
+              below its content's min-content width (truncate spans are
+              nowrap, so that's the FULL untruncated text width), and in a
+              narrow window with the sidebar open the whole pane gets
+              clipped at the right window edge instead of truncating. */}
+          <div className={cn("flex-1 min-w-0 flex flex-col h-full bg-background min-h-0 relative", isTranslucent ? "rounded-none" : "rounded-tr-lg")}>
             {/* ALWAYS-MOUNTED chat layer.
                 Hidden via CSS (display:none) when the user is on a non-chat
                 section, so the StandaloneChat component never unmounts. This
@@ -1188,7 +1198,7 @@ function HomeContent() {
                 activeSection !== "home" && "hidden"
               )}
             >
-              <StandaloneChat className="h-full" hideInlineHistory />
+              <StandaloneChat className="h-full" hideInlineHistory sidebarCollapsed={sidebarCollapsed} />
             </div>
 
             {/* Non-chat sections render on top when active. */}

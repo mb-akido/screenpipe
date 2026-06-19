@@ -26,6 +26,10 @@ export interface SourceCitation {
   // search window (thumbnail grid of every matching capture) rather than
   // jumping to a single timeline moment.
   query?: string;
+  // Absolute path of a local file this source points at. When set, the footer
+  // opens the file in the in-chat preview sidebar (rendered markdown / code)
+  // instead of rendering as dead text. Only present for real, openable files.
+  path?: string;
 }
 
 interface ToolCallLike {
@@ -164,7 +168,10 @@ function sourceCitationsFromToolCall(toolCall: ToolCallLike | undefined): Source
   const args = isObject(toolCall.args) ? toolCall.args : {};
   const resultText = resultToText(toolCall.result);
 
-  if (toolName === "web_search") {
+  // "sp_web_search" is the current bundled tool; bare "web_search" still
+  // appears when replaying sessions recorded before the sp_ rename
+  // (https://github.com/screenpipe/screenpipe/issues/3812).
+  if (toolName === "sp_web_search" || toolName === "web_search") {
     return webSearchCitations(args, toolCall.result, resultText);
   }
 
@@ -401,6 +408,9 @@ function fileCitation(path: string, verb: string): SourceCitation {
     kind,
     title: kind === "memory" ? baseName : `${verb}: ${baseName}`,
     subtitle: shortenPath(path),
+    // Keep the absolute path so the footer can open the file in the preview
+    // sidebar. `subtitle` is only the shortened display form.
+    path,
   };
 }
 
@@ -440,6 +450,8 @@ function normalizeExplicitCitations(value: unknown): SourceCitation[] {
     const href = typeof item.href === "string" ? item.href : undefined;
     const timestamp = typeof item.timestamp === "string" ? navTimestamp(item.timestamp) : undefined;
     const query = typeof item.query === "string" && item.query.trim() ? item.query.trim() : undefined;
+    const path =
+      typeof item.path === "string" && item.path.trim() ? item.path : undefined;
     citations.push({
       id: typeof item.id === "string" && item.id ? item.id : stableId([kind, title, subtitle, href]),
       kind,
@@ -448,6 +460,7 @@ function normalizeExplicitCitations(value: unknown): SourceCitation[] {
       href,
       timestamp,
       query,
+      ...(path ? { path } : {}),
     });
   }
   return dedupeCitations(citations);
