@@ -561,22 +561,29 @@ pub struct UiEventTextRow {
 }
 
 /// Fetch up to `limit` `ui_events` rows that still need redaction
-/// (`redacted_at IS NULL`) and carry at least one non-empty free-text
-/// column. Newest-first, matching the other surfaces. Unlike the old
-/// keyboard/clipboard split this is NOT filtered by `event_type`: clicks
-/// and focus events carry element PII (`element_value` of a focused form
-/// field) and must be redacted too.
+/// (`redacted_at IS NULL`) and carry at least one non-empty cell among the
+/// caller-supplied `cols` (the configured free-text columns, a subset of
+/// [`UI_EVENT_TEXT_COLS`]). Newest-first. NOT filtered by `event_type`:
+/// clicks and focus events carry element PII (`element_value` of a focused
+/// form field) and must be redacted too. The returned `cols` are parallel
+/// to the `cols` argument, in the same order.
 pub async fn fetch_unredacted_ui_events(
     pool: &SqlitePool,
+    cols: &[&str],
     limit: u32,
 ) -> Result<Vec<UiEventTextRow>, sqlx::Error> {
-    // `col IS NOT NULL AND col != '' OR …` across every free-text column.
-    let any_nonempty = UI_EVENT_TEXT_COLS
+    debug_assert!(!cols.is_empty(), "caller must pass ≥1 column (else skip)");
+    debug_assert!(
+        cols.iter().all(|c| UI_EVENT_TEXT_COLS.contains(c)),
+        "unknown ui_events column requested"
+    );
+    // `col IS NOT NULL AND col != '' OR …` across every requested column.
+    let any_nonempty = cols
         .iter()
         .map(|c| format!("({c} IS NOT NULL AND {c} != '')"))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let select_cols = UI_EVENT_TEXT_COLS.join(", ");
+    let select_cols = cols.join(", ");
     let q = format!(
         "SELECT id, {select_cols} \
          FROM ui_events \
@@ -588,7 +595,7 @@ pub async fn fetch_unredacted_ui_events(
     let out = rows
         .into_iter()
         .map(|r| {
-            let cols = UI_EVENT_TEXT_COLS
+            let cols = cols
                 .iter()
                 .map(|c| {
                     // Lossy UTF-8 decode — same invalid-byte guard as
@@ -607,26 +614,27 @@ pub async fn fetch_unredacted_ui_events(
 }
 
 /// Overwrite the redacted free-text columns of one `ui_events` row and
-/// stamp `redacted_at`. `redacted` is parallel to [`UI_EVENT_TEXT_COLS`]
-/// and to [`UiEventTextRow::cols`]: a `Some` cell is written back, a
-/// `None` cell (originally NULL/empty) is left untouched. The watermark is
+/// stamp `redacted_at`. `cols` names the columns (same order/length as
+/// `redacted` and [`UiEventTextRow::cols`]); a `Some` cell is written back,
+/// a `None` cell (originally NULL/empty) is left untouched. The watermark is
 /// stamped regardless, so a row with no PII is still marked done and never
 /// re-fetched.
 pub async fn write_redacted_ui_events(
     pool: &SqlitePool,
+    cols: &[&str],
     id: i64,
     redacted: &[Option<String>],
 ) -> Result<(), sqlx::Error> {
     debug_assert_eq!(
         redacted.len(),
-        UI_EVENT_TEXT_COLS.len(),
-        "redacted vec must be parallel to UI_EVENT_TEXT_COLS"
+        cols.len(),
+        "redacted vec must be parallel to cols"
     );
     // Build `SET col = ?` only for the columns that actually changed,
     // always plus the watermark. Binding order matches the SET order.
     let mut set_clauses: Vec<String> = Vec::new();
     let mut values: Vec<&str> = Vec::new();
-    for (col, val) in UI_EVENT_TEXT_COLS.iter().zip(redacted.iter()) {
+    for (col, val) in cols.iter().zip(redacted.iter()) {
         if let Some(v) = val {
             set_clauses.push(format!("{col} = ?"));
             values.push(v);
@@ -836,7 +844,9 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
+        let rows = fetch_unredacted_ui_events(&pool, UI_EVENT_TEXT_COLS, 10)
+            .await
+            .unwrap();
         // The click (1), keyboard (2), clipboard (3), and the name/desc row
         // (5) — but NOT the empty move (4).
         assert_eq!(rows.len(), 4);
@@ -876,7 +886,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let rows = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
+        let rows = fetch_unredacted_ui_events(&pool, UI_EVENT_TEXT_COLS, 10)
+            .await
+            .unwrap();
         assert!(rows.is_empty());
     }
 
@@ -899,7 +911,9 @@ mod tests {
         let mut redacted: Vec<Option<String>> = vec![None; UI_EVENT_TEXT_COLS.len()];
         redacted[col_idx("element_value")] = Some("[EMAIL]".to_string());
 
-        write_redacted_ui_events(&pool, 1, &redacted).await.unwrap();
+        write_redacted_ui_events(&pool, UI_EVENT_TEXT_COLS, 1, &redacted)
+            .await
+            .unwrap();
 
         let row = sqlx::query(
             "SELECT text_content, element_value, element_name, redacted_at \
@@ -933,9 +947,13 @@ mod tests {
         // No column changed (clean text → redactor returns it verbatim, but
         // the worker still passes it through; here simulate no-op = all None).
         let redacted: Vec<Option<String>> = vec![None; UI_EVENT_TEXT_COLS.len()];
-        write_redacted_ui_events(&pool, 1, &redacted).await.unwrap();
+        write_redacted_ui_events(&pool, UI_EVENT_TEXT_COLS, 1, &redacted)
+            .await
+            .unwrap();
 
-        let pending = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
+        let pending = fetch_unredacted_ui_events(&pool, UI_EVENT_TEXT_COLS, 10)
+            .await
+            .unwrap();
         assert!(pending.is_empty(), "clean row must be marked done");
     }
 

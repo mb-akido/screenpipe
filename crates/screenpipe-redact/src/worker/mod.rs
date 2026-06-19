@@ -16,6 +16,7 @@
 //! oldest-first means the most-likely-to-be-queried rows have stale
 //! redactions until the worker catches up.
 
+mod columns;
 mod tables;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::Redactor;
 
+pub use columns::{keys as column_keys, RedactColumns};
 pub use tables::{TargetTable, ALL_TARGET_TABLES};
 
 /// Shared knobs for the worker.
@@ -67,6 +69,12 @@ pub struct WorkerConfig {
     /// Tables to reconcile. Default: all of [`ALL_TARGET_TABLES`]
     /// (frames:full_text, audio, accessibility, ui_events, elements).
     pub tables: Vec<TargetTable>,
+    /// WHICH columns within those tables to scrub (orthogonal to the
+    /// category policy on the redactor). `full_text` is always redacted (the
+    /// detection source); everything else is gated here. Default:
+    /// [`RedactColumns::default`] (clear PII on, browser_url / ui element
+    /// name+description / a11y url-field off).
+    pub columns: RedactColumns,
 }
 
 impl Default for WorkerConfig {
@@ -77,6 +85,7 @@ impl Default for WorkerConfig {
             poll_interval: Duration::from_secs(5),
             max_active_fraction: 0.4,
             tables: ALL_TARGET_TABLES.to_vec(),
+            columns: RedactColumns::default(),
         }
     }
 }
@@ -357,12 +366,19 @@ impl Worker {
     /// per-row path (issue #4115); everything else uses the generic
     /// single-column path.
     async fn process_one(&self, table: TargetTable) -> Result<u32, anyhow::Error> {
+        let cols = self.cfg.columns;
         match table {
             TargetTable::FullText => self.process_frames_fulltext().await,
             TargetTable::UiEvents => self.process_ui_events().await,
             // Elements is multi-column too: `text` PLUS the `properties` JSON
             // (the a11y value/placeholder/help_text of the control).
             TargetTable::Elements => self.process_elements().await,
+            // Single-column targets gated by the per-column config.
+            TargetTable::AudioTranscription if !cols.audio_transcription => Ok(0),
+            // `Accessibility` is the fallback pass for `frames.accessibility_text`
+            // (the primary path is propagation in process_frames_fulltext);
+            // both honor the same toggle.
+            TargetTable::Accessibility if !cols.accessibility_text => Ok(0),
             other => self.process_table(other).await,
         }
     }
@@ -383,6 +399,12 @@ impl Worker {
     /// still redact `text` and stamp, so a corrupt blob never busy-loops.
     /// The watermark is stamped per row regardless, marking clean rows done.
     async fn process_elements(&self) -> Result<u32, anyhow::Error> {
+        let cols = self.cfg.columns;
+        // Nothing in this table is enabled → don't even fetch.
+        if !cols.element_text && !cols.element_properties {
+            return Ok(0);
+        }
+        let fields = cols.a11y_json_fields();
         let rows = tables::fetch_unredacted_elements(&self.pool, self.cfg.batch_size).await?;
         if rows.is_empty() {
             return Ok(0);
@@ -402,16 +424,19 @@ impl Worker {
         let mut inputs: Vec<String> = Vec::new();
         let mut plans: Vec<Plan> = Vec::with_capacity(rows.len());
         for row in &rows {
-            let has_text = matches!(row.text.as_deref(), Some(t) if !t.is_empty());
+            // `text` only when the column is enabled.
+            let has_text =
+                cols.element_text && matches!(row.text.as_deref(), Some(t) if !t.is_empty());
             if has_text {
                 inputs.push(row.text.clone().unwrap());
             }
             let (properties, prop_count) = match row.properties.as_deref() {
-                Some(p) if !p.is_empty() => {
+                // `properties` only when that column is enabled.
+                Some(p) if cols.element_properties && !p.is_empty() => {
                     match serde_json::from_str::<serde_json::Value>(p) {
                         Ok(v) => {
                             let mut strs = Vec::new();
-                            crate::tree_json::collect_redactable(&v, &mut strs);
+                            crate::tree_json::collect_redactable(&v, &fields, &mut strs);
                             let n = strs.len();
                             inputs.extend(strs);
                             (Some(v), n)
@@ -473,7 +498,7 @@ impl Worker {
                     .map(|o| o.redacted.clone())
                     .collect();
                 k += plan.prop_count;
-                let changed = crate::tree_json::apply_redacted_strings(&mut v, &slice);
+                let changed = crate::tree_json::apply_redacted_strings(&mut v, &fields, &slice);
                 if changed {
                     Some(serde_json::to_string(&v)?)
                 } else {
@@ -500,25 +525,25 @@ impl Worker {
         Ok(n)
     }
 
-    /// Redact the runtime-authored free-text columns of a `ui_events` row
-    /// in one pass and stamp the single `redacted_at` watermark. Beyond
-    /// `text_content`, the in-scope columns ([`tables::UI_EVENT_TEXT_COLS`]
-    /// = `element_value` + `window_title`) carry user data on EVERY event —
-    /// a click on a filled form field persists its contents in
-    /// `element_value` — so before this path they kept raw PII indefinitely
-    /// even with "AI PII removal" on (issue #4115). The build-time
-    /// developer-authored fields (`element_name` / `element_description`)
-    /// never hold runtime user data and are deliberately skipped to avoid
-    /// wasted redactor CPU/GPU.
+    /// Redact the configured free-text columns of a `ui_events` row in one
+    /// pass and stamp the single `redacted_at` watermark. Which columns are
+    /// in scope is driven by [`RedactColumns::ui_event_columns`] (issue
+    /// #4115 + per-column config): `text_content` / `element_value` /
+    /// `window_title` by default, plus `element_name` / `element_description`
+    /// when enabled. A click on a filled form field persists its contents in
+    /// `element_value`, so the surface is not gated on `event_type`.
     ///
-    /// All non-empty columns of the batch are flattened into one
-    /// `redact_batch` call (the redactor amortizes a batch better than
-    /// per-column calls), then scattered back to their rows. The watermark
-    /// is stamped per row regardless of whether anything changed, so a row
-    /// with no PII is marked done and never re-fetched. Returns the number
-    /// of rows processed.
+    /// All non-empty cells of the batch are flattened into one `redact_batch`
+    /// call, then scattered back to their rows. The watermark is stamped per
+    /// row regardless of whether anything changed, so a row with no PII is
+    /// marked done and never re-fetched. Returns the number of rows processed.
     async fn process_ui_events(&self) -> Result<u32, anyhow::Error> {
-        let rows = tables::fetch_unredacted_ui_events(&self.pool, self.cfg.batch_size).await?;
+        let active = self.cfg.columns.ui_event_columns();
+        if active.is_empty() {
+            return Ok(0);
+        }
+        let rows =
+            tables::fetch_unredacted_ui_events(&self.pool, &active, self.cfg.batch_size).await?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -561,7 +586,7 @@ impl Worker {
         }
 
         for (row, redacted) in rows.iter().zip(outputs_by_row.iter()) {
-            tables::write_redacted_ui_events(&self.pool, row.id, redacted).await?;
+            tables::write_redacted_ui_events(&self.pool, &active, row.id, redacted).await?;
         }
 
         let n = rows.len() as u32;
@@ -659,56 +684,70 @@ impl Worker {
         row: &tables::FrameTextRow,
         map: &crate::RedactionMap,
     ) -> Result<u32, anyhow::Error> {
+        let cols = self.cfg.columns;
         let mut writes = 0u32;
 
         // accessibility_text ⊆ full_text — apply the map verbatim.
-        if let Some(acc) = row.accessibility_text.as_deref() {
-            if !acc.is_empty() && row.accessibility_redacted_at.is_none() {
-                tables::write_redacted(
-                    &self.pool,
-                    TargetTable::Accessibility,
-                    row.id,
-                    &map.apply(acc),
-                )
-                .await?;
-                writes += 1;
+        if cols.accessibility_text {
+            if let Some(acc) = row.accessibility_text.as_deref() {
+                if !acc.is_empty() && row.accessibility_redacted_at.is_none() {
+                    tables::write_redacted(
+                        &self.pool,
+                        TargetTable::Accessibility,
+                        row.id,
+                        &map.apply(acc),
+                    )
+                    .await?;
+                    writes += 1;
+                }
             }
         }
 
-        // accessibility_tree_json — scrub node text fields field-wise.
-        if let Some(tree) = row.accessibility_tree_json.as_deref() {
-            if !tree.is_empty() && row.accessibility_tree_redacted_at.is_none() {
-                match crate::tree_json::redact_tree_json(tree, map) {
-                    Ok(Some(json)) => {
-                        tables::write_redacted_tree(&self.pool, row.id, &json).await?;
-                        writes += 1;
+        // accessibility_tree_json — scrub the configured node fields field-wise.
+        if cols.accessibility_tree {
+            if let Some(tree) = row.accessibility_tree_json.as_deref() {
+                if !tree.is_empty() && row.accessibility_tree_redacted_at.is_none() {
+                    match crate::tree_json::redact_tree_json_with_fields(
+                        tree,
+                        map,
+                        &cols.a11y_json_fields(),
+                    ) {
+                        Ok(Some(json)) => {
+                            tables::write_redacted_tree(&self.pool, row.id, &json).await?;
+                            writes += 1;
+                        }
+                        // Ok(None) means the map was empty — impossible here
+                        // (we're inside the Some(map)-with-detections arm).
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            frame_id = row.id,
+                            error = %e,
+                            "skipping malformed accessibility_tree_json (leaving it un-stamped)"
+                        ),
                     }
-                    // Ok(None) means the map was empty — impossible here
-                    // (we're inside the Some(map)-with-detections arm).
-                    Ok(None) => {}
-                    Err(e) => warn!(
-                        frame_id = row.id,
-                        error = %e,
-                        "skipping malformed accessibility_tree_json (leaving it un-stamped)"
-                    ),
                 }
             }
         }
 
         // window_name — short prose, apply the map verbatim.
-        if let Some(wn) = row.window_name.as_deref() {
-            if !wn.is_empty() && row.window_name_redacted_at.is_none() {
-                tables::write_redacted_window_name(&self.pool, row.id, &map.apply(wn)).await?;
-                writes += 1;
+        if cols.window_name {
+            if let Some(wn) = row.window_name.as_deref() {
+                if !wn.is_empty() && row.window_name_redacted_at.is_none() {
+                    tables::write_redacted_window_name(&self.pool, row.id, &map.apply(wn)).await?;
+                    writes += 1;
+                }
             }
         }
 
         // browser_url — also frames_fts; apply the map verbatim (scrubs
-        // on-screen PII in the path/query that's also in full_text).
-        if let Some(url) = row.browser_url.as_deref() {
-            if !url.is_empty() && row.browser_url_redacted_at.is_none() {
-                tables::write_redacted_browser_url(&self.pool, row.id, &map.apply(url)).await?;
-                writes += 1;
+        // on-screen PII in the path/query that's also in full_text). OFF by
+        // default — URLs are structured and often non-PII (opt-in).
+        if cols.browser_url {
+            if let Some(url) = row.browser_url.as_deref() {
+                if !url.is_empty() && row.browser_url_redacted_at.is_none() {
+                    tables::write_redacted_browser_url(&self.pool, row.id, &map.apply(url)).await?;
+                    writes += 1;
+                }
             }
         }
 
@@ -731,52 +770,60 @@ impl Worker {
         &self,
         row: &tables::FrameTextRow,
     ) -> Result<u32, anyhow::Error> {
+        let cols = self.cfg.columns;
         let mut writes = 0u32;
 
-        if let Some(tree) = row.accessibility_tree_json.as_deref() {
-            if !tree.is_empty() && row.accessibility_tree_redacted_at.is_none() {
-                match crate::tree_json::redact_tree_json_with_redactor(
-                    tree,
-                    self.redactor.as_ref(),
-                )
-                .await
-                {
-                    Ok(Some(json)) => {
-                        tables::write_redacted_tree(&self.pool, row.id, &json).await?;
-                        writes += 1;
-                    }
-                    // No redactable text → stamp the verbatim blob so the
-                    // row isn't re-scanned for the tree forever.
-                    Ok(None) => {
-                        tables::write_redacted_tree(&self.pool, row.id, tree).await?;
-                        writes += 1;
-                    }
-                    Err(crate::tree_json::TreeRedactError::Json(e)) => warn!(
-                        frame_id = row.id,
-                        error = %e,
-                        "skipping malformed accessibility_tree_json on enclave path \
-                         (leaving it un-stamped)"
-                    ),
-                    Err(e @ crate::tree_json::TreeRedactError::Redact(_)) => {
-                        return Err(e.into());
+        if cols.accessibility_tree {
+            if let Some(tree) = row.accessibility_tree_json.as_deref() {
+                if !tree.is_empty() && row.accessibility_tree_redacted_at.is_none() {
+                    match crate::tree_json::redact_tree_json_with_redactor_fields(
+                        tree,
+                        self.redactor.as_ref(),
+                        &cols.a11y_json_fields(),
+                    )
+                    .await
+                    {
+                        Ok(Some(json)) => {
+                            tables::write_redacted_tree(&self.pool, row.id, &json).await?;
+                            writes += 1;
+                        }
+                        // No redactable text → stamp the verbatim blob so the
+                        // row isn't re-scanned for the tree forever.
+                        Ok(None) => {
+                            tables::write_redacted_tree(&self.pool, row.id, tree).await?;
+                            writes += 1;
+                        }
+                        Err(crate::tree_json::TreeRedactError::Json(e)) => warn!(
+                            frame_id = row.id,
+                            error = %e,
+                            "skipping malformed accessibility_tree_json on enclave path \
+                             (leaving it un-stamped)"
+                        ),
+                        Err(e @ crate::tree_json::TreeRedactError::Redact(_)) => {
+                            return Err(e.into());
+                        }
                     }
                 }
             }
         }
 
-        if let Some(wn) = row.window_name.as_deref() {
-            if !wn.is_empty() && row.window_name_redacted_at.is_none() {
-                let out = self.redactor.redact(wn).await?;
-                tables::write_redacted_window_name(&self.pool, row.id, &out.redacted).await?;
-                writes += 1;
+        if cols.window_name {
+            if let Some(wn) = row.window_name.as_deref() {
+                if !wn.is_empty() && row.window_name_redacted_at.is_none() {
+                    let out = self.redactor.redact(wn).await?;
+                    tables::write_redacted_window_name(&self.pool, row.id, &out.redacted).await?;
+                    writes += 1;
+                }
             }
         }
 
-        if let Some(url) = row.browser_url.as_deref() {
-            if !url.is_empty() && row.browser_url_redacted_at.is_none() {
-                let out = self.redactor.redact(url).await?;
-                tables::write_redacted_browser_url(&self.pool, row.id, &out.redacted).await?;
-                writes += 1;
+        if cols.browser_url {
+            if let Some(url) = row.browser_url.as_deref() {
+                if !url.is_empty() && row.browser_url_redacted_at.is_none() {
+                    let out = self.redactor.redact(url).await?;
+                    tables::write_redacted_browser_url(&self.pool, row.id, &out.redacted).await?;
+                    writes += 1;
+                }
             }
         }
 

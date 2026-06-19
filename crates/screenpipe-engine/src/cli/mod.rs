@@ -455,6 +455,22 @@ pub struct RecordArgs {
     #[arg(long, value_delimiter = ',', default_value = "secret")]
     pub pii_redaction_labels: Vec<String>,
 
+    /// WHICH columns the redaction worker scrubs (comma-separated stable
+    /// keys; orthogonal to --pii-redaction-labels which picks categories).
+    /// Keys: accessibility_text, accessibility_tree, window_name,
+    /// browser_url, audio_transcription, ui_text_content, ui_element_value,
+    /// ui_window_title, ui_element_name, ui_element_description, element_text,
+    /// element_properties, a11y_url_field. The list is exact (key present →
+    /// on, absent → off); `full_text` is always redacted. Default leaves
+    /// browser_url / ui_element_name / ui_element_description / a11y_url_field
+    /// OFF (opt-in).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "accessibility_text,accessibility_tree,window_name,audio_transcription,ui_text_content,ui_element_value,ui_window_title,element_text,element_properties"
+    )]
+    pub pii_redaction_columns: Vec<String>,
+
     /// Render redacted PII as consistent pseudonym tokens
     /// (`[PERSON_1a2b3c4d5e6f]`) instead of static `[PERSON]` tags, so the
     /// same value stays correlatable across rows without exposing it.
@@ -722,6 +738,7 @@ pub struct RecordArgSources {
     pub async_image_pii_redaction: bool,
     pub pii_backend: bool,
     pub pii_redaction_labels: bool,
+    pub pii_redaction_columns: bool,
     pub pii_redaction_pseudonyms: bool,
     pub filter_music: bool,
     pub disable_vision: bool,
@@ -774,6 +791,7 @@ impl RecordArgSources {
             async_image_pii_redaction: from_command_line(record, "async_image_pii_redaction"),
             pii_backend: from_command_line(record, "pii_backend"),
             pii_redaction_labels: from_command_line(record, "pii_redaction_labels"),
+            pii_redaction_columns: from_command_line(record, "pii_redaction_columns"),
             pii_redaction_pseudonyms: from_command_line(record, "pii_redaction_pseudonyms"),
             filter_music: from_command_line(record, "filter_music"),
             disable_vision: from_command_line(record, "disable_vision"),
@@ -818,6 +836,7 @@ impl RecordArgSources {
             || self.async_image_pii_redaction
             || self.pii_backend
             || self.pii_redaction_labels
+            || self.pii_redaction_columns
             || self.pii_redaction_pseudonyms
             || self.filter_music
             || self.disable_vision
@@ -963,6 +982,7 @@ impl RecordArgs {
             async_image_pii_redaction: self.async_image_pii_redaction,
             pii_backend: self.pii_backend.clone(),
             pii_redaction_labels: self.pii_redaction_labels.clone(),
+            pii_redaction_columns: self.pii_redaction_columns.clone(),
             pii_redaction_pseudonyms: self.pii_redaction_pseudonyms,
             filter_music: self.filter_music,
             audio_transcription_engine: engine_str.to_string(),
@@ -1238,6 +1258,9 @@ impl RecordArgs {
         }
         if sources.pii_redaction_labels {
             settings.pii_redaction_labels = self.pii_redaction_labels.clone();
+        }
+        if sources.pii_redaction_columns {
+            settings.pii_redaction_columns = self.pii_redaction_columns.clone();
         }
         if sources.pii_redaction_pseudonyms {
             settings.pii_redaction_pseudonyms = self.pii_redaction_pseudonyms;

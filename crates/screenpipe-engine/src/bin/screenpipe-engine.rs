@@ -1868,7 +1868,7 @@ async fn main() -> anyhow::Result<()> {
                 tinfoil::{TinfoilConfig, TinfoilRedactor},
             },
             pipeline::{Pipeline, PipelineConfig},
-            worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
+            worker::{RedactColumns, Worker, WorkerConfig, ALL_TARGET_TABLES},
             Pseudonymizer, Redactor, TextRedactionPolicy,
         };
         use std::sync::Arc;
@@ -2005,8 +2005,14 @@ async fn main() -> anyhow::Result<()> {
             let pipeline = pipeline.with_pseudonyms(pseudonymizer);
             let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
 
+            // WHICH columns to scrub, from the `piiRedactionColumns` setting
+            // (browser_url / ui element name+description / a11y url-field are
+            // off by default — opt-in). Orthogonal to the category policy above.
+            let columns = RedactColumns::from_keys(&config.pii_redaction_columns);
+            info!(?columns, "redaction column allow-list");
             let worker_cfg = WorkerConfig {
                 tables: ALL_TARGET_TABLES.to_vec(),
+                columns,
                 ..Default::default()
             };
             let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg).spawn();

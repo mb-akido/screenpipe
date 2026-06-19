@@ -16,11 +16,18 @@ use async_trait::async_trait;
 use screenpipe_redact::{
     adapters::regex::RegexRedactor,
     pipeline::Pipeline,
-    worker::{TargetTable, Worker, WorkerConfig, ALL_TARGET_TABLES},
+    worker::{column_keys, RedactColumns, TargetTable, Worker, WorkerConfig, ALL_TARGET_TABLES},
     Pseudonymizer, RedactError, RedactionMap, RedactionOutput, Redactor,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Row;
+
+/// Every column enabled — tests that want to verify full coverage opt in to
+/// the optional columns (browser_url / element_name+description / url-field)
+/// that are OFF in the production default.
+fn all_columns() -> RedactColumns {
+    RedactColumns::from_keys(column_keys::ALL)
+}
 
 async fn setup_db() -> sqlx::SqlitePool {
     let pool = SqlitePoolOptions::new()
@@ -169,6 +176,7 @@ async fn worker_redacts_all_targets() {
         idle_between_batches: Duration::from_millis(1),
         poll_interval: Duration::from_millis(20),
         tables: ALL_TARGET_TABLES.to_vec(),
+        columns: all_columns(),
         ..Default::default()
     };
     let worker = Worker::new(pool.clone(), redactor, cfg);
@@ -642,6 +650,7 @@ async fn frame_fulltext_propagates_to_all_derived_copies_once() {
         idle_between_batches: Duration::from_millis(1),
         poll_interval: Duration::from_millis(20),
         tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        columns: all_columns(),
         ..Default::default()
     };
     let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
@@ -716,6 +725,7 @@ async fn frame_fulltext_does_not_clobber_already_redacted_accessibility() {
         idle_between_batches: Duration::from_millis(1),
         poll_interval: Duration::from_millis(20),
         tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        columns: all_columns(),
         ..Default::default()
     };
     let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
@@ -769,6 +779,7 @@ async fn frame_fulltext_clean_frame_marks_both_done() {
         idle_between_batches: Duration::from_millis(1),
         poll_interval: Duration::from_millis(20),
         tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        columns: all_columns(),
         ..Default::default()
     };
     let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
@@ -874,6 +885,7 @@ async fn frame_fulltext_each_frame_detected_once() {
         idle_between_batches: Duration::from_millis(1),
         poll_interval: Duration::from_millis(20),
         tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        columns: all_columns(),
         ..Default::default()
     };
     let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
@@ -928,6 +940,7 @@ async fn frame_fulltext_falls_back_when_no_map() {
         idle_between_batches: Duration::from_millis(1),
         poll_interval: Duration::from_millis(20),
         tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        columns: all_columns(),
         ..Default::default()
     };
     let handle = Worker::new(pool.clone(), redactor, cfg).spawn();
@@ -1072,6 +1085,7 @@ async fn frame_fulltext_no_map_path_scrubs_all_derived_copies() {
         idle_between_batches: Duration::from_millis(1),
         poll_interval: Duration::from_millis(20),
         tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        columns: all_columns(),
         ..Default::default()
     };
     let handle = Worker::new(pool.clone(), redactor, cfg).spawn();
@@ -1112,4 +1126,80 @@ async fn frame_fulltext_no_map_path_scrubs_all_derived_copies() {
     // Structural (non-text) field preserved on the enclave path too.
     let tree_parsed: serde_json::Value = serde_json::from_str(&tree_red).unwrap();
     assert_eq!(tree_parsed[0]["automation_id"], "keepme");
+}
+
+/// The DEFAULT column config leaves the OPT-IN columns untouched:
+/// `browser_url`, `ui_events.element_name` / `element_description`, and the
+/// a11y `url` field are NOT redacted out of the box, while the core columns
+/// (full_text, window_name, element_value) still are. Proves the per-column
+/// config is honored (user's "by default url is not processed" requirement).
+#[tokio::test]
+async fn default_columns_leave_optin_columns_untouched() {
+    let pool = setup_db().await;
+    let email = "dana@example.com";
+    // Frame: full_text (core, on) + window_name (core, on) + browser_url (opt-in, off).
+    sqlx::query(
+        "INSERT INTO frames (id, full_text, window_name, browser_url) VALUES (1, ?, ?, ?)",
+    )
+    .bind(format!("page for {email}"))
+    .bind(format!("Inbox — {email}"))
+    .bind(format!("https://mail.example.com/u/{email}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // ui_event: element_value (core, on) + element_name (opt-in, off).
+    sqlx::query(
+        "INSERT INTO ui_events (event_type, element_value, element_name) VALUES ('click', ?, ?)",
+    )
+    .bind(email)
+    .bind(format!("field {email}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let redactor = Arc::new(RegexRedactor::new()) as Arc<dyn Redactor>;
+    // DEFAULT columns (no `columns:` override) — browser_url / element_name off.
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: ALL_TARGET_TABLES.to_vec(),
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor, cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort();
+
+    let frame = sqlx::query(
+        "SELECT full_text, full_text_redacted_at, window_name, browser_url, browser_url_redacted_at \
+         FROM frames WHERE id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let full: String = frame.get(0);
+    let win: String = frame.get(2);
+    let url: String = frame.get(3);
+    // Core ON: full_text + window_name redacted.
+    assert!(full.contains("[EMAIL]"), "full_text should be redacted: {full:?}");
+    assert!(win.contains("[EMAIL]"), "window_name should be redacted: {win:?}");
+    // Opt-in OFF: browser_url untouched, and its watermark NOT stamped (we
+    // skip it entirely, not stamp-without-change).
+    assert!(url.contains(email), "browser_url must be left raw by default: {url:?}");
+    assert!(
+        frame.get::<Option<i64>, _>(4).is_none(),
+        "browser_url watermark must stay NULL when the column is off"
+    );
+
+    let ev = sqlx::query("SELECT element_value, element_name FROM ui_events WHERE event_type='click'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let ev_val: String = ev.get(0);
+    let ev_name: String = ev.get(1);
+    assert!(ev_val.contains("[EMAIL]"), "element_value should be redacted: {ev_val:?}");
+    assert!(
+        ev_name.contains(email),
+        "element_name must be left raw by default: {ev_name:?}"
+    );
 }

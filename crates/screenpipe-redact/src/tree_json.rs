@@ -92,6 +92,18 @@ pub fn redact_tree_json(
     blob: &str,
     map: &RedactionMap,
 ) -> Result<Option<String>, serde_json::Error> {
+    redact_tree_json_with_fields(blob, map, REDACTABLE_FIELDS)
+}
+
+/// Like [`redact_tree_json`] but only the node fields in `allowed_fields`
+/// are scrubbed — lets the worker honor the per-column config (e.g. drop
+/// `url` when the `a11y_url_field` toggle is off). Pass [`REDACTABLE_FIELDS`]
+/// for the full set.
+pub fn redact_tree_json_with_fields(
+    blob: &str,
+    map: &RedactionMap,
+    allowed_fields: &[&str],
+) -> Result<Option<String>, serde_json::Error> {
     // Empty map → identity transform; signal "no write needed".
     if map.is_empty() {
         return Ok(None);
@@ -102,9 +114,9 @@ pub fn redact_tree_json(
 
     // The tree is serialized as a top-level array of node objects, but be
     // tolerant: also handle a single object, or a wrapper object whose
-    // values are nodes. We only ever touch string fields named in
-    // REDACTABLE_FIELDS, so walking the whole structure is safe.
-    redact_value(&mut value, map, &mut changed);
+    // values are nodes. We only ever touch string fields in `allowed_fields`,
+    // so walking the whole structure is safe.
+    redact_value(&mut value, allowed_fields, map, &mut changed);
 
     if !changed {
         // Parsed fine but nothing matched — preserve verbatim so the
@@ -120,8 +132,8 @@ pub fn redact_tree_json(
 /// child nodes (and any future nesting) are covered, but the field-name
 /// allowlist means structural strings (role, ids, class names) are never
 /// touched.
-fn redact_value(value: &mut Value, map: &RedactionMap, changed: &mut bool) {
-    redact_value_with(value, changed, &mut |s| {
+fn redact_value(value: &mut Value, allowed_fields: &[&str], map: &RedactionMap, changed: &mut bool) {
+    redact_value_with(value, allowed_fields, changed, &mut |s| {
         let redacted = map.apply(s);
         if redacted == *s {
             None
@@ -145,6 +157,7 @@ fn redact_value(value: &mut Value, map: &RedactionMap, changed: &mut bool) {
 /// offsets — correctness over partial-precision on the redaction path.
 fn redact_value_with(
     value: &mut Value,
+    allowed_fields: &[&str],
     changed: &mut bool,
     redact_str: &mut dyn FnMut(&str) -> Option<String>,
 ) {
@@ -152,7 +165,7 @@ fn redact_value_with(
         Value::Object(obj) => {
             let mut text_changed = false;
             for (key, child) in obj.iter_mut() {
-                if REDACTABLE_FIELDS.contains(&key.as_str()) {
+                if allowed_fields.contains(&key.as_str()) {
                     if let Value::String(s) = child {
                         if let Some(redacted) = redact_str(s) {
                             if key == "text" {
@@ -166,7 +179,7 @@ fn redact_value_with(
                     // Recurse into structural containers (e.g. nested
                     // children arrays) but never redact their
                     // non-allowlisted scalar strings.
-                    redact_value_with(child, changed, redact_str);
+                    redact_value_with(child, allowed_fields, changed, redact_str);
                 }
             }
             // The node's `text` changed length → its `lines` char offsets
@@ -178,7 +191,7 @@ fn redact_value_with(
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_value_with(item, changed, redact_str);
+                redact_value_with(item, allowed_fields, changed, redact_str);
             }
         }
         _ => {}
@@ -209,11 +222,21 @@ pub async fn redact_tree_json_with_redactor(
     blob: &str,
     redactor: &dyn Redactor,
 ) -> Result<Option<String>, TreeRedactError> {
+    redact_tree_json_with_redactor_fields(blob, redactor, REDACTABLE_FIELDS).await
+}
+
+/// Like [`redact_tree_json_with_redactor`] but only the node fields in
+/// `allowed_fields` are scrubbed (per-column config; e.g. drop `url`).
+pub async fn redact_tree_json_with_redactor_fields(
+    blob: &str,
+    redactor: &dyn Redactor,
+    allowed_fields: &[&str],
+) -> Result<Option<String>, TreeRedactError> {
     let mut value: Value = serde_json::from_str(blob).map_err(TreeRedactError::Json)?;
 
     // Pass 1: collect every allowlisted node text string in document order.
     let mut originals: Vec<String> = Vec::new();
-    collect_redactable(&value, &mut originals);
+    collect_redactable(&value, allowed_fields, &mut originals);
     if originals.is_empty() {
         // Parsed fine, no free text to scrub → preserve verbatim so the
         // caller still stamps the watermark (row is genuinely clean).
@@ -234,18 +257,8 @@ pub async fn redact_tree_json_with_redactor(
     }
 
     // Pass 2: write the redacted strings back in the same order.
-    let mut idx = 0usize;
-    let mut changed = false;
-    redact_value_with(&mut value, &mut changed, &mut |s| {
-        let out = &outputs[idx];
-        idx += 1;
-        debug_assert_eq!(out.input, *s, "tree redaction order desynced");
-        if out.redacted == *s {
-            None
-        } else {
-            Some(out.redacted.clone())
-        }
-    });
+    let redacted: Vec<String> = outputs.into_iter().map(|o| o.redacted).collect();
+    let changed = apply_redacted_strings(&mut value, allowed_fields, &redacted);
 
     if !changed {
         return Ok(Some(blob.to_string()));
@@ -255,8 +268,8 @@ pub async fn redact_tree_json_with_redactor(
     ))
 }
 
-/// Walk the tree collecting every allowlisted text string (the same
-/// allowlist [`redact_value_with`] mutates), in document order, so the
+/// Walk the tree collecting every string under a key in `allowed_fields`
+/// (the same set [`redact_value_with`] mutates), in document order, so the
 /// redactor batch and the write-back walk line up index-for-index.
 ///
 /// `pub(crate)` so the per-element worker can reuse this exact walker on the
@@ -264,22 +277,22 @@ pub async fn redact_tree_json_with_redactor(
 /// / `help_text` / `role_description` fields as a tree node) — issue #4115
 /// follow-up: a focused control's accessibility *value* (the typed contents,
 /// incl. password-field values a11y exposes that OCR never sees) lives there.
-pub(crate) fn collect_redactable(value: &Value, out: &mut Vec<String>) {
+pub(crate) fn collect_redactable(value: &Value, allowed_fields: &[&str], out: &mut Vec<String>) {
     match value {
         Value::Object(obj) => {
             for (key, child) in obj.iter() {
-                if REDACTABLE_FIELDS.contains(&key.as_str()) {
+                if allowed_fields.contains(&key.as_str()) {
                     if let Value::String(s) = child {
                         out.push(s.clone());
                     }
                 } else {
-                    collect_redactable(child, out);
+                    collect_redactable(child, allowed_fields, out);
                 }
             }
         }
         Value::Array(arr) => {
             for item in arr.iter() {
-                collect_redactable(item, out);
+                collect_redactable(item, allowed_fields, out);
             }
         }
         _ => {}
@@ -287,15 +300,19 @@ pub(crate) fn collect_redactable(value: &Value, out: &mut Vec<String>) {
 }
 
 /// Write `redacted` (parallel, in [`collect_redactable`] document order)
-/// back into the allowlisted string fields of `value`, returning whether
-/// anything changed. The caller is responsible for producing `redacted` by
-/// running its redactor over the strings `collect_redactable` yielded for
-/// the SAME `value` — same length, same order. Used by the per-element
-/// worker to scrub `elements.properties` after one shared detection batch.
-pub(crate) fn apply_redacted_strings(value: &mut Value, redacted: &[String]) -> bool {
+/// back into the `allowed_fields` string fields of `value`, returning
+/// whether anything changed. The caller produces `redacted` by running its
+/// redactor over the strings `collect_redactable` yielded for the SAME
+/// `value` + `allowed_fields` — same length, same order. Used by the
+/// per-element worker to scrub `elements.properties` after one shared batch.
+pub(crate) fn apply_redacted_strings(
+    value: &mut Value,
+    allowed_fields: &[&str],
+    redacted: &[String],
+) -> bool {
     let mut idx = 0usize;
     let mut changed = false;
-    redact_value_with(value, &mut changed, &mut |s| {
+    redact_value_with(value, allowed_fields, &mut changed, &mut |s| {
         // Defensive: if the caller under-supplied (shouldn't happen — it
         // collected from this same value), leave the field untouched.
         let out = redacted.get(idx)?;

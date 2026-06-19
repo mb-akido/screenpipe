@@ -420,6 +420,19 @@ pub struct RecordingSettings {
     )]
     pub pii_redaction_labels: Vec<String>,
 
+    /// WHICH captured columns the redaction worker scrubs (orthogonal to
+    /// `pii_redaction_labels`, which picks the PII *categories*). The full
+    /// list of columns to redact, by stable key (see `RedactColumns` in
+    /// screenpipe-redact). Default = every clear capture surface ON, with
+    /// the debatable / lossy ones OFF: `browser_url`, `ui_element_name`,
+    /// `ui_element_description`, and the a11y `url` JSON field. `full_text`
+    /// is always redacted (the detection source) regardless of this list.
+    #[serde(
+        rename = "piiRedactionColumns",
+        default = "default_pii_redaction_columns"
+    )]
+    pub pii_redaction_columns: Vec<String>,
+
     /// Render redacted PII as **consistent pseudonyms** instead of static
     /// `[LABEL]` tags when `asyncPiiRedaction` is on. Same value → same
     /// stable token (e.g. `[PERSON_1a2b3c4d5e6f]`), so the timeline stays
@@ -623,6 +636,7 @@ impl Default for RecordingSettings {
             async_image_pii_redaction: false,
             pii_backend: default_pii_backend(),
             pii_redaction_labels: default_pii_redaction_labels(),
+            pii_redaction_columns: default_pii_redaction_columns(),
             pii_redaction_pseudonyms: false,
             user_id: String::new(),
             user_name: None,
@@ -691,6 +705,28 @@ fn default_pii_backend() -> String {
 /// credentials are the one class where a miss is genuinely dangerous.
 fn default_pii_redaction_labels() -> Vec<String> {
     vec!["secret".to_string()]
+}
+
+/// Default columns the worker scrubs: every clear capture surface ON, the
+/// debatable / lossy ones OFF (browser_url, ui element name/description, a11y
+/// url-field). KEEP IN SYNC with `RedactColumns::default()` in
+/// screenpipe-redact (this crate can't depend on it). `full_text` is always
+/// redacted regardless and is intentionally not a key here.
+fn default_pii_redaction_columns() -> Vec<String> {
+    [
+        "accessibility_text",
+        "accessibility_tree",
+        "window_name",
+        "audio_transcription",
+        "ui_text_content",
+        "ui_element_value",
+        "ui_window_title",
+        "element_text",
+        "element_properties",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 fn default_hd_recording_default() -> String {
