@@ -360,8 +360,144 @@ impl Worker {
         match table {
             TargetTable::FullText => self.process_frames_fulltext().await,
             TargetTable::UiEvents => self.process_ui_events().await,
+            // Elements is multi-column too: `text` PLUS the `properties` JSON
+            // (the a11y value/placeholder/help_text of the control).
+            TargetTable::Elements => self.process_elements().await,
             other => self.process_table(other).await,
         }
+    }
+
+    /// Redact an `elements` batch: each row's `text` AND the redactable
+    /// string fields of its `properties` JSON (`value` / `placeholder` /
+    /// `help_text` / `role_description` / `url`) — the accessibility contents
+    /// of the control, including focused-field values (and password-field
+    /// values a11y exposes that OCR/`full_text` never sees, so this can NOT
+    /// be covered by frame propagation — it needs direct detection here).
+    ///
+    /// CPU: every non-empty string across the whole batch (texts + all
+    /// property fields) is flattened into ONE `redact_batch`, then scattered
+    /// back — same number of model calls as the old text-only Elements pass,
+    /// just a few more strings per call. Structural-only nodes never reach
+    /// here (the fetch LIKE-prefilters to rows that actually carry a
+    /// redactable field). Malformed `properties` → warn + skip that blob but
+    /// still redact `text` and stamp, so a corrupt blob never busy-loops.
+    /// The watermark is stamped per row regardless, marking clean rows done.
+    async fn process_elements(&self) -> Result<u32, anyhow::Error> {
+        let rows = tables::fetch_unredacted_elements(&self.pool, self.cfg.batch_size).await?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        debug!(count = rows.len(), "redacting elements batch (text + properties)");
+
+        // Per element: optional `text` (one slot) followed by its property
+        // strings in `collect_redactable` document order. Flatten all into
+        // one batch, remembering each element's slice so we can scatter back.
+        struct Plan {
+            has_text: bool,
+            /// Parsed `properties` (None when absent or malformed).
+            properties: Option<serde_json::Value>,
+            /// Number of redactable strings collected from `properties`.
+            prop_count: usize,
+        }
+        let mut inputs: Vec<String> = Vec::new();
+        let mut plans: Vec<Plan> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let has_text = matches!(row.text.as_deref(), Some(t) if !t.is_empty());
+            if has_text {
+                inputs.push(row.text.clone().unwrap());
+            }
+            let (properties, prop_count) = match row.properties.as_deref() {
+                Some(p) if !p.is_empty() => {
+                    match serde_json::from_str::<serde_json::Value>(p) {
+                        Ok(v) => {
+                            let mut strs = Vec::new();
+                            crate::tree_json::collect_redactable(&v, &mut strs);
+                            let n = strs.len();
+                            inputs.extend(strs);
+                            (Some(v), n)
+                        }
+                        // Malformed JSON: can't scrub it, but still redact
+                        // `text` + stamp so the row doesn't busy-loop.
+                        Err(e) => {
+                            warn!(
+                                element_id = row.id,
+                                error = %e,
+                                "skipping malformed elements.properties (text still redacted, row stamped)"
+                            );
+                            (None, 0)
+                        }
+                    }
+                }
+                _ => (None, 0),
+            };
+            plans.push(Plan {
+                has_text,
+                properties,
+                prop_count,
+            });
+        }
+
+        let outputs = if inputs.is_empty() {
+            Vec::new()
+        } else {
+            let o = self.redactor.redact_batch(&inputs).await?;
+            if o.len() != inputs.len() {
+                anyhow::bail!(
+                    "redactor returned {} outputs for {} element inputs",
+                    o.len(),
+                    inputs.len()
+                );
+            }
+            o
+        };
+
+        // Scatter back, consuming `outputs` in the same flatten order.
+        let mut k = 0usize;
+        for (row, plan) in rows.iter().zip(plans.iter()) {
+            let text_out = if plan.has_text {
+                let redacted = outputs[k].redacted.clone();
+                k += 1;
+                // Only write `text` back if it actually changed.
+                if Some(redacted.as_str()) != row.text.as_deref() {
+                    Some(redacted)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let props_out = if let Some(mut v) = plan.properties.clone() {
+                let slice: Vec<String> = outputs[k..k + plan.prop_count]
+                    .iter()
+                    .map(|o| o.redacted.clone())
+                    .collect();
+                k += plan.prop_count;
+                let changed = crate::tree_json::apply_redacted_strings(&mut v, &slice);
+                if changed {
+                    Some(serde_json::to_string(&v)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            tables::write_redacted_element(
+                &self.pool,
+                row.id,
+                text_out.as_deref(),
+                props_out.as_deref(),
+            )
+            .await?;
+        }
+
+        let n = rows.len() as u32;
+        let mut s = self.status.lock().await;
+        s.redacted_total += n as u64;
+        s.last_redacted_at = Some(chrono::Utc::now());
+        s.last_error = None;
+        Ok(n)
     }
 
     /// Redact the runtime-authored free-text columns of a `ui_events` row
@@ -438,8 +574,8 @@ impl Worker {
 
     /// Redact the per-frame `full_text` search surface and, in the SAME
     /// detection pass, propagate the result to that frame's DERIVED copies —
-    /// `accessibility_text`, `accessibility_tree_json` (issue #4116) and
-    /// `window_name`. They are all decompositions of `full_text`, so every
+    /// `accessibility_text`, `accessibility_tree_json` (issue #4116), `window_name` and
+    /// `browser_url`. They are all decompositions of `full_text`, so every
     /// PII value in them is in the detected map; applying it is pure string
     /// work (microseconds), the model runs ONCE for the whole frame instead
     /// of once per column.
@@ -512,7 +648,7 @@ impl Worker {
 
     /// Apply a frame's [`RedactionMap`] to each derived copy that still
     /// needs redaction (`*_redacted_at IS NULL`): `accessibility_text`,
-    /// `accessibility_tree_json` and `window_name`. Pure string application —
+    /// `accessibility_tree_json`, `window_name` and `browser_url`. Pure string application —
     /// NO model pass. The tree JSON is scrubbed field-wise (node text),
     /// preserving structure. A malformed JSON blob is logged and skipped (its
     /// watermark stays NULL); the row's `full_text` is still stamped, so the
@@ -563,6 +699,15 @@ impl Worker {
         if let Some(wn) = row.window_name.as_deref() {
             if !wn.is_empty() && row.window_name_redacted_at.is_none() {
                 tables::write_redacted_window_name(&self.pool, row.id, &map.apply(wn)).await?;
+                writes += 1;
+            }
+        }
+
+        // browser_url — also frames_fts; apply the map verbatim (scrubs
+        // on-screen PII in the path/query that's also in full_text).
+        if let Some(url) = row.browser_url.as_deref() {
+            if !url.is_empty() && row.browser_url_redacted_at.is_none() {
+                tables::write_redacted_browser_url(&self.pool, row.id, &map.apply(url)).await?;
                 writes += 1;
             }
         }
@@ -623,6 +768,14 @@ impl Worker {
             if !wn.is_empty() && row.window_name_redacted_at.is_none() {
                 let out = self.redactor.redact(wn).await?;
                 tables::write_redacted_window_name(&self.pool, row.id, &out.redacted).await?;
+                writes += 1;
+            }
+        }
+
+        if let Some(url) = row.browser_url.as_deref() {
+            if !url.is_empty() && row.browser_url_redacted_at.is_none() {
+                let out = self.redactor.redact(url).await?;
+                tables::write_redacted_browser_url(&self.pool, row.id, &out.redacted).await?;
                 writes += 1;
             }
         }

@@ -103,27 +103,35 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
     TargetTable::Elements,
 ];
 
-/// Columns on a `ui_events` row that the worker redacts together. The
-/// rule is RUNTIME-vs-BUILD-TIME authorship, not "is it text":
+/// Every free-text column on a `ui_events` row the worker redacts together.
 ///
-/// - **Redact (runtime-authored → carry user data):** `text_content`
-///   (typed/clipboard text), `element_value` (focused form-field
-///   contents — the key PII sink), and `window_title` (set by the app at
-///   runtime — routinely an email subject, document filename or
-///   account/page name, and indexed in `ui_events_fts`, so leaving it raw
-///   persists a searchable plaintext copy).
-/// - **Skip (build-time / developer-authored structural fields → never
-///   carry runtime user PII):** `element_name` and `element_description`
-///   are the accessibility name/description of a *control* ("Submit
-///   button", "Search field"), baked into the UI by its developer;
-///   `element_role` / `element_automation_id` are stable identifiers.
-///   Running the redactor over these every event is wasted CPU/GPU on
-///   props that never hold PII (per louis030195's review), so they're
-///   left untouched.
+/// Originally this was the runtime-only subset (text_content / element_value
+/// / window_title) on the theory that the accessibility name/description are
+/// always build-time control labels ("Submit button"). But that's not
+/// reliable: for many controls the AX *name* mirrors the field's content or
+/// label, and `element_name` is indexed in `ui_events_fts` — so a raw copy
+/// stays SEARCHABLE. A full-coverage audit (millions of populated rows) found
+/// real values there, so the rule is now simply "any captured free-text
+/// column gets scrubbed":
 ///
-/// `browser_url` is redacted on the frame's `full_text` surface and is
-/// structurally a URL, not prose, so it's out of scope here too.
-pub const UI_EVENT_TEXT_COLS: &[&str] = &["text_content", "element_value", "window_title"];
+/// - `text_content` — typed / keystroke / clipboard text.
+/// - `element_value` — focused control's contents (the key PII sink).
+/// - `window_title` — runtime window title (FTS-indexed).
+/// - `element_name` — AX name (FTS-indexed; can mirror field content).
+/// - `element_description` — AX description / help text.
+///
+/// The extra two are cheap: they ride the SAME per-row `redact_batch` the
+/// other columns already use (a few more strings, no extra round-trip).
+/// Structural identifiers (`element_role` / `element_automation_id` /
+/// `element_bounds`) are NOT free text and stay untouched. `browser_url` is
+/// redacted on the frame surface (`frames.browser_url`), not here.
+pub const UI_EVENT_TEXT_COLS: &[&str] = &[
+    "text_content",
+    "element_value",
+    "window_title",
+    "element_name",
+    "element_description",
+];
 
 /// One row to redact.
 #[derive(Debug)]
@@ -293,6 +301,14 @@ pub struct FrameTextRow {
     /// PII the frame also rendered on-screen is in `full_text` / the map).
     pub window_name: Option<String>,
     pub window_name_redacted_at: Option<i64>,
+    /// Browser URL — also a `frames_fts` column (so a raw copy stays
+    /// searchable), and the address bar is rendered on-screen so on-screen
+    /// PII in the path/query is in `full_text` / the map. Scrubbed via the
+    /// propagated map (best-effort, same as `window_name`). Structurally a
+    /// URL, so most edits are in path/query segments; bracket placeholders
+    /// are tolerable here (URLs in the timeline are for context, not fetch).
+    pub browser_url: Option<String>,
+    pub browser_url_redacted_at: Option<i64>,
 }
 
 /// Fetch up to `limit` frames whose `full_text` needs redaction
@@ -304,7 +320,8 @@ pub async fn fetch_unredacted_frames_fulltext(
 ) -> Result<Vec<FrameTextRow>, sqlx::Error> {
     let q = "SELECT id, full_text, accessibility_text, accessibility_redacted_at, \
                     accessibility_tree_json, accessibility_tree_redacted_at, \
-                    window_name, window_name_redacted_at \
+                    window_name, window_name_redacted_at, \
+                    browser_url, browser_url_redacted_at \
              FROM frames \
              WHERE full_text IS NOT NULL AND full_text != '' \
                AND full_text_redacted_at IS NULL \
@@ -331,6 +348,10 @@ pub async fn fetch_unredacted_frames_fulltext(
                 .get::<Option<Vec<u8>>, _>("window_name")
                 .map(|b| String::from_utf8_lossy(&b).into_owned()),
             window_name_redacted_at: r.get::<Option<i64>, _>("window_name_redacted_at"),
+            browser_url: r
+                .get::<Option<Vec<u8>>, _>("browser_url")
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            browser_url_redacted_at: r.get::<Option<i64>, _>("browser_url_redacted_at"),
         })
         .collect();
     Ok(out)
@@ -379,6 +400,116 @@ pub async fn write_redacted_window_name(
     .bind(id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Overwrite `frames.browser_url` with its redacted form and stamp
+/// `browser_url_redacted_at`. Like `window_name`, `browser_url` is a
+/// `frames_fts` column, so the `frames_au` trigger re-syncs the redacted
+/// value into the search index. Stamped even when unchanged so a clean URL
+/// is marked done and never re-fetched.
+pub async fn write_redacted_browser_url(
+    pool: &SqlitePool,
+    id: i64,
+    redacted: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE frames SET \
+            browser_url = ?, \
+            browser_url_redacted_at = strftime('%s', 'now') \
+         WHERE id = ?",
+    )
+    .bind(redacted)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One `elements` row to redact: the per-element `text` PLUS the
+/// `properties` JSON, which carries the accessibility `value` /
+/// `placeholder` / `help_text` / `role_description` of the control — the
+/// focused field's actual contents (incl. password-field values a11y
+/// exposes that OCR never sees). Both are scrubbed together from one
+/// detection batch and stamped via the single `elements.redacted_at`.
+#[derive(Debug)]
+pub struct ElementRow {
+    pub id: i64,
+    /// `elements.text` (NULL on container nodes).
+    pub text: Option<String>,
+    /// `elements.properties` raw JSON (the redactable a11y fields live here).
+    pub properties: Option<String>,
+}
+
+/// Fetch up to `limit` `elements` rows that still need redaction
+/// (`redacted_at IS NULL`) and carry at least one non-empty free-text
+/// surface — `text` OR a `properties` JSON that may hold redactable fields.
+/// Newest-first. Container nodes with neither are never fetched (nothing to
+/// scrub, and they'd just churn the watermark).
+pub async fn fetch_unredacted_elements(
+    pool: &SqlitePool,
+    limit: u32,
+) -> Result<Vec<ElementRow>, sqlx::Error> {
+    // `properties` is JSON; cheap LIKE pre-filters to rows that actually
+    // carry one of the redactable string fields, so structural-only nodes
+    // (is_enabled/role_description-less) never reach the model or even the
+    // fetch. The `redacted_at IS NULL` index predicate runs first.
+    let q = "SELECT id, text, properties \
+             FROM elements \
+             WHERE redacted_at IS NULL \
+               AND ( (text IS NOT NULL AND text != '') \
+                  OR (properties IS NOT NULL AND ( \
+                        properties LIKE '%\"value\"%' \
+                     OR properties LIKE '%\"placeholder\"%' \
+                     OR properties LIKE '%\"help_text\"%' \
+                     OR properties LIKE '%\"role_description\"%' \
+                     OR properties LIKE '%\"url\"%' )) ) \
+             ORDER BY id DESC \
+             LIMIT ?";
+    let rows = sqlx::query(q).bind(limit as i64).fetch_all(pool).await?;
+    let out = rows
+        .into_iter()
+        .map(|r| ElementRow {
+            id: r.get::<i64, _>("id"),
+            // Lossy UTF-8 decode (issue #4139) — never panic the worker.
+            text: r
+                .get::<Option<Vec<u8>>, _>("text")
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            properties: r
+                .get::<Option<Vec<u8>>, _>("properties")
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Overwrite an `elements` row's redacted columns and stamp `redacted_at`.
+/// `text` / `properties` are written only when `Some` (changed); the
+/// watermark is stamped regardless so a row with no PII is marked done and
+/// never re-fetched. The `elements_au` trigger re-syncs `elements_fts`.
+pub async fn write_redacted_element(
+    pool: &SqlitePool,
+    id: i64,
+    text: Option<&str>,
+    properties: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let mut set_clauses: Vec<&str> = Vec::new();
+    if text.is_some() {
+        set_clauses.push("text = ?");
+    }
+    if properties.is_some() {
+        set_clauses.push("properties = ?");
+    }
+    set_clauses.push("redacted_at = strftime('%s', 'now')");
+    let q = format!("UPDATE elements SET {} WHERE id = ?", set_clauses.join(", "));
+    let mut query = sqlx::query(&q);
+    if let Some(t) = text {
+        query = query.bind(t);
+    }
+    if let Some(p) = properties {
+        query = query.bind(p);
+    }
+    query.bind(id).execute(pool).await?;
     Ok(())
 }
 
@@ -548,7 +679,9 @@ mod tests {
                 accessibility_tree_json TEXT,
                 accessibility_tree_redacted_at INTEGER,
                 window_name TEXT,
-                window_name_redacted_at INTEGER
+                window_name_redacted_at INTEGER,
+                browser_url TEXT,
+                browser_url_redacted_at INTEGER
             );
             CREATE TABLE ui_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -561,11 +694,12 @@ mod tests {
                 redacted_at INTEGER
             );
             -- Per-element OCR/accessibility rows; `text` is NULL on
-            -- container nodes. Watermark column added by the
-            -- 20260613 migration (issue #3993).
+            -- container nodes. `properties` holds the a11y value /
+            -- placeholder / help_text JSON (issue #3993 + coverage audit).
             CREATE TABLE elements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT,
+                properties TEXT,
                 redacted_at INTEGER
             );
             "#,
@@ -691,48 +825,44 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        // A row whose ONLY populated text is the out-of-scope build-time
-        // fields (element_name / element_description). With the trimmed
-        // set these are never redacted, so this row has no in-scope content
-        // and must NOT be fetched — proves the fetch predicate dropped them.
+        // A row whose ONLY populated text is element_name / element_description.
+        // These are now IN scope (FTS-indexed, can mirror field content), so
+        // this row MUST be fetched — the coverage-audit change.
         sqlx::query(
             "INSERT INTO ui_events (event_type, element_name, element_description) \
-             VALUES ('click', 'Submit button', 'Submits the form')",
+             VALUES ('click', 'frank@example.com', 'note for henry@example.com')",
         )
         .execute(&pool)
         .await
         .unwrap();
 
         let rows = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
-        // The click (id 1), the keyboard (id 2), the clipboard (id 3) —
-        // but NOT the empty move (id 4) and NOT the structural-only row
-        // (id 5, whose only text lives in the now-out-of-scope columns).
-        assert_eq!(rows.len(), 3);
+        // The click (1), keyboard (2), clipboard (3), and the name/desc row
+        // (5) — but NOT the empty move (4).
+        assert_eq!(rows.len(), 4);
         assert!(
-            rows.iter().all(|r| r.id != 5),
-            "a row with PII only in element_name/element_description must \
-             no longer be fetched (those columns are out of scope)"
+            rows.iter().any(|r| r.id == 5),
+            "a row with PII only in element_name/element_description must now \
+             be fetched (those columns are in scope)"
         );
+        assert!(rows.iter().all(|r| r.id != 4), "the empty move must be skipped");
 
-        // Newest-first: clipboard (id 3), keyboard (id 2), click (id 1).
         let click = rows.iter().find(|r| r.id == 1).unwrap();
         assert_eq!(
             click.cols[col_idx("element_value")].as_deref(),
             Some("SSN 123-45-6789"),
             "in-scope element_value must be carried for redaction"
         );
+        assert_eq!(
+            click.cols[col_idx("element_name")].as_deref(),
+            Some("Tax ID field"),
+            "element_name must now be carried for redaction"
+        );
         // No text_content on the click row.
         assert!(click.cols[col_idx("text_content")].is_none());
-        // element_name is out of scope, so it's not even a column the
-        // fetch carries — col_idx would panic if it were still in the set.
-        assert!(
-            !UI_EVENT_TEXT_COLS.contains(&"element_name"),
-            "element_name must be dropped from the redacted column set"
-        );
-        assert!(
-            !UI_EVENT_TEXT_COLS.contains(&"element_description"),
-            "element_description must be dropped from the redacted column set"
-        );
+        // Both AX text fields are now in the redacted column set.
+        assert!(UI_EVENT_TEXT_COLS.contains(&"element_name"));
+        assert!(UI_EVENT_TEXT_COLS.contains(&"element_description"));
     }
 
     /// Already-redacted rows (watermark set) must not be re-fetched.
@@ -1022,5 +1152,86 @@ mod tests {
         assert!(row.get::<Option<i64>, _>(3).is_some());
         // The derived writers must not touch full_text's watermark.
         assert!(row.get::<Option<i64>, _>(4).is_none());
+    }
+
+    /// `fetch_unredacted_elements` LIKE-prefilter: fetch rows with `text` OR
+    /// a redactable `properties` field; skip structural-only rows entirely so
+    /// the model never touches them.
+    #[tokio::test]
+    async fn fetch_elements_covers_text_and_value_skips_structural() {
+        let pool = setup().await;
+        // 1: text only.
+        sqlx::query("INSERT INTO elements (text) VALUES ('a@b.co')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 2: properties.value only (the focused-field / password case).
+        sqlx::query(
+            "INSERT INTO elements (text, properties) VALUES (NULL, '{\"value\":\"c@d.co\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 3: structural-only properties (no redactable field) → must be skipped.
+        sqlx::query(
+            "INSERT INTO elements (text, properties) VALUES (NULL, '{\"is_enabled\":true,\"automation_id\":\"x\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 4: NULL/NULL container → skipped.
+        sqlx::query("INSERT INTO elements (text) VALUES (NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 5: already redacted → skipped.
+        sqlx::query(
+            "INSERT INTO elements (text, redacted_at) VALUES ('[EMAIL]', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = fetch_unredacted_elements(&pool, 10).await.unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 1], "only text(1) + value(2), newest-first");
+    }
+
+    /// `write_redacted_element` overwrites only the columns passed, always
+    /// stamps `redacted_at`, and leaves untouched columns intact.
+    #[tokio::test]
+    async fn write_element_overwrites_present_cols_and_stamps() {
+        let pool = setup().await;
+        sqlx::query(
+            "INSERT INTO elements (text, properties) VALUES ('a@b.co', '{\"value\":\"a@b.co\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Only properties changed (text left as-is → None).
+        write_redacted_element(&pool, 1, None, Some("{\"value\":\"[EMAIL]\"}"))
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT text, properties, redacted_at FROM elements WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>(0), "a@b.co", "untouched text preserved");
+        assert_eq!(row.get::<String, _>(1), "{\"value\":\"[EMAIL]\"}");
+        assert!(row.get::<Option<i64>, _>(2).is_some(), "redacted_at stamped");
+    }
+
+    /// A clean row (nothing to change) is still stamped so it's never
+    /// re-fetched.
+    #[tokio::test]
+    async fn write_element_clean_row_still_stamps() {
+        let pool = setup().await;
+        sqlx::query("INSERT INTO elements (text) VALUES ('plain text')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        write_redacted_element(&pool, 1, None, None).await.unwrap();
+        let pending = fetch_unredacted_elements(&pool, 10).await.unwrap();
+        assert!(pending.is_empty(), "clean row must be marked done");
     }
 }

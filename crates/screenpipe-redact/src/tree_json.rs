@@ -255,10 +255,16 @@ pub async fn redact_tree_json_with_redactor(
     ))
 }
 
-/// Walk the tree collecting every allowlisted node text string (the same
+/// Walk the tree collecting every allowlisted text string (the same
 /// allowlist [`redact_value_with`] mutates), in document order, so the
 /// redactor batch and the write-back walk line up index-for-index.
-fn collect_redactable(value: &Value, out: &mut Vec<String>) {
+///
+/// `pub(crate)` so the per-element worker can reuse this exact walker on the
+/// `elements.properties` JSON (which carries the same `value` / `placeholder`
+/// / `help_text` / `role_description` fields as a tree node) — issue #4115
+/// follow-up: a focused control's accessibility *value* (the typed contents,
+/// incl. password-field values a11y exposes that OCR never sees) lives there.
+pub(crate) fn collect_redactable(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::Object(obj) => {
             for (key, child) in obj.iter() {
@@ -278,6 +284,29 @@ fn collect_redactable(value: &Value, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Write `redacted` (parallel, in [`collect_redactable`] document order)
+/// back into the allowlisted string fields of `value`, returning whether
+/// anything changed. The caller is responsible for producing `redacted` by
+/// running its redactor over the strings `collect_redactable` yielded for
+/// the SAME `value` — same length, same order. Used by the per-element
+/// worker to scrub `elements.properties` after one shared detection batch.
+pub(crate) fn apply_redacted_strings(value: &mut Value, redacted: &[String]) -> bool {
+    let mut idx = 0usize;
+    let mut changed = false;
+    redact_value_with(value, &mut changed, &mut |s| {
+        // Defensive: if the caller under-supplied (shouldn't happen — it
+        // collected from this same value), leave the field untouched.
+        let out = redacted.get(idx)?;
+        idx += 1;
+        if out == s {
+            None
+        } else {
+            Some(out.clone())
+        }
+    });
+    changed
 }
 
 /// Error from [`redact_tree_json_with_redactor`]: malformed JSON or a
