@@ -25,6 +25,15 @@ fn sinc_params() -> SincInterpolationParameters {
 /// continuous stream — use [`StreamResampler`] there.
 pub fn resample(input: &[f32], from_sample_rate: u32, to_sample_rate: u32) -> Result<Vec<f32>> {
     debug!("Resampling audio");
+    // A zero sample rate makes the ratio 0 (to=0) or non-finite (from=0). The
+    // latter panics with a capacity overflow deep in rubato when it sizes the
+    // output buffer — same degenerate-size failure class as the spectral
+    // window underflow. Fail cleanly instead of crashing.
+    if from_sample_rate == 0 || to_sample_rate == 0 {
+        anyhow::bail!(
+            "invalid sample rate for resample: from={from_sample_rate} to={to_sample_rate} (must be > 0)"
+        );
+    }
     let mut resampler = SincFixedIn::<f32>::new(
         to_sample_rate as f64 / from_sample_rate as f64,
         2.0,
@@ -55,6 +64,13 @@ pub struct StreamResampler {
 
 impl StreamResampler {
     pub fn new(from_sample_rate: u32, to_sample_rate: u32) -> Result<Self> {
+        // See `resample`: a zero rate yields a 0/non-finite ratio that panics
+        // rubato. Reject it up front so the stream path never crashes either.
+        if from_sample_rate == 0 || to_sample_rate == 0 {
+            anyhow::bail!(
+                "invalid sample rate for resampler: from={from_sample_rate} to={to_sample_rate} (must be > 0)"
+            );
+        }
         let chunk_size = (from_sample_rate as usize / 100).max(64);
         let resampler = SincFixedIn::<f32>::new(
             to_sample_rate as f64 / from_sample_rate as f64,

@@ -4,14 +4,17 @@
 
 //! Battle-test the core audio DSP utilities against pathological-but-reachable
 //! inputs that real capture produces: digital silence (muted mic / gaps),
-//! clipping (loud sources), NaN/Inf (corrupted device buffers / driver
-//! glitches), empty and single-sample buffers (device hiccups), odd-length
-//! interleaved frames, and extreme sample-rate ratios (8 kHz telephone →
-//! 16 kHz, 48 kHz system audio → 16 kHz).
+//! clipping (loud sources), empty and single-sample buffers (device hiccups),
+//! odd-length interleaved frames, extreme sample-rate ratios (8 kHz telephone
+//! → 16 kHz, 48 kHz system audio → 16 kHz), and degenerate device parameters
+//! (0 channels / 0 sample rate from a misreporting virtual device).
 //!
-//! The invariant under test is *robustness*: no panic, and finite output (no
-//! NaN/Inf leaking downstream into Whisper, where they produce hallucinations
-//! or hangs). These run in CI as cheap unit tests — no models, no devices.
+//! The invariant under test is *robustness*: finite inputs never panic and
+//! produce finite output, and degenerate parameters fail cleanly (empty / Err)
+//! rather than crashing. NaN/Inf *inputs* are deliberately out of scope —
+//! capture produces finite PCM, and these utilities pass NaN/Inf through
+//! unchanged, so that contract is enforced at the capture boundary, not here.
+//! These run in CI as cheap unit tests — no models, no devices.
 
 use screenpipe_audio::utils::audio::{
     audio_to_mono, filter_music_frames, normalize_v2, resample, spectral_subtraction,
@@ -65,6 +68,14 @@ fn mono_handles_empty_and_partial_frames() {
     let odd = audio_to_mono(&[1.0, -1.0, 0.4], 2);
     assert_eq!(odd.len(), 2);
     assert!(all_finite(&odd));
+}
+
+#[test]
+fn mono_zero_channels_returns_empty_not_panic() {
+    // A device misreporting 0 channels used to panic: `len / 0` on the capacity
+    // hint and `chunks(0)` both crash. Must degrade to empty, like empty input.
+    assert!(audio_to_mono(&[0.1, 0.2, 0.3, 0.4], 0).is_empty());
+    assert!(audio_to_mono(&[], 0).is_empty());
 }
 
 #[test]
@@ -141,6 +152,20 @@ fn resample_silence_and_noise_stay_finite() {
     let n = noise(44_100, 0.8);
     let out = resample(&n, 44_100, SR).expect("resample noise");
     assert!(all_finite(&out));
+}
+
+#[test]
+fn resample_zero_rate_errors_not_panics() {
+    // A 0 sample rate makes the ratio 0 or non-finite. `from = 0` used to panic
+    // with a capacity overflow deep in rubato (same degenerate-size class as the
+    // spectral-window underflow this PR fixes); `to = 0` already errored. Both
+    // must now return a clean Err rather than crash.
+    let input = sine(16_000, 440.0, SR, 0.5);
+    assert!(
+        resample(&input, 0, SR).is_err(),
+        "from=0 must be a clean Err"
+    );
+    assert!(resample(&input, SR, 0).is_err(), "to=0 must be a clean Err");
 }
 
 // ---------------------------------------------------------------------------
