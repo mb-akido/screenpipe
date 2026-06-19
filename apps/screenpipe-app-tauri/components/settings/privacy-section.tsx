@@ -9,7 +9,7 @@ import type { SettingsField } from "./settings-search";
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
   { label: "Blocklist", keywords: ["ignore", "exclude", "block"] },
-  { label: "PII masking", keywords: ["mask", "redact"] },
+  { label: "PII masking", keywords: ["mask", "redact", "columns", "url", "fields"] },
   { label: "Telemetry" },
 ];
 import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
@@ -570,6 +570,77 @@ export function PrivacySection() {
   const handlePseudonymsToggle = (checked: boolean) => {
     handleSettingsChange(
       { piiRedactionPseudonyms: checked } as Partial<Settings>,
+      true,
+    );
+  };
+
+  // WHICH captured columns get scrubbed (orthogonal to the categories
+  // above). Typed text / clipboard / transcripts / window titles /
+  // on-screen text are always redacted; these extra surfaces are opt-in.
+  // Stored as the full list of stable column keys in `piiRedactionColumns`
+  // (see `RedactColumns` in screenpipe-redact). The core keys are always
+  // persisted so this UI only toggles the extras.
+  const CORE_REDACTION_COLUMNS = [
+    "accessibility_text",
+    "accessibility_tree",
+    "window_name",
+    "audio_transcription",
+    "ui_text_content",
+    "ui_element_value",
+    "ui_window_title",
+    "element_text",
+  ];
+  const PII_COLUMN_OPTIONS: { value: string; label: string; desc: string }[] = [
+    {
+      value: "element_properties",
+      label: "Form field values (accessibility)",
+      desc: "the value of every captured control — catches password & form-field contents OCR can't see. Heaviest surface; off by default",
+    },
+    {
+      value: "browser_url",
+      label: "Page URLs",
+      desc: "the browser address bar — often non-PII, and redacting breaks links",
+    },
+    {
+      value: "ui_element_name",
+      label: "Control names",
+      desc: "accessibility name of clicked/focused controls — usually static labels",
+    },
+    {
+      value: "ui_element_description",
+      label: "Control descriptions",
+      desc: "accessibility help text of controls",
+    },
+    {
+      value: "a11y_url_field",
+      label: "URLs in accessibility data",
+      desc: "the url field inside captured accessibility nodes",
+    },
+  ];
+
+  const piiRedactionColumns = useMemo<string[]>(() => {
+    return (
+      (settings.piiRedactionColumns as string[] | undefined) ?? [
+        ...CORE_REDACTION_COLUMNS,
+      ]
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.piiRedactionColumns]);
+
+  const handlePiiColumnToggle = (value: string, checked: boolean) => {
+    const next = new Set(piiRedactionColumns);
+    if (checked) next.add(value);
+    else next.delete(value);
+    // Core surfaces are always redacted — never drop them.
+    CORE_REDACTION_COLUMNS.forEach((c) => next.add(c));
+    // Persist in canonical order (core first, then extras) for stable diffs.
+    const order = [
+      ...CORE_REDACTION_COLUMNS,
+      ...PII_COLUMN_OPTIONS.map((o) => o.value),
+    ];
+    const ordered = order.filter((v) => next.has(v));
+    handleSettingsChange(
+      { piiRedactionColumns: ordered } as Partial<Settings>,
       true,
     );
   };
@@ -1286,6 +1357,42 @@ export function PrivacySection() {
                 <p className="text-[11px] text-muted-foreground pt-0.5">
                   Unselected types stay visible so your timeline remains
                   searchable. Secrets are always removed in both modes.
+                </p>
+
+                <p className="text-xs font-medium text-foreground pt-3 mt-1.5 border-t border-border">
+                  Where to redact
+                </p>
+                {PII_COLUMN_OPTIONS.map((opt) => {
+                  const checked = piiRedactionColumns.includes(opt.value);
+                  return (
+                    <label
+                      key={opt.value}
+                      className="flex items-start gap-2 text-xs cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={checked}
+                        onChange={(e) =>
+                          handlePiiColumnToggle(opt.value, e.target.checked)
+                        }
+                      />
+                      <span>
+                        <span className="font-medium text-foreground">
+                          {opt.label}
+                        </span>
+                        <span className="text-muted-foreground">
+                          {" "}— {opt.desc}
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
+                <p className="text-[11px] text-muted-foreground pt-0.5">
+                  Typed text, clipboard, transcripts, window titles, and
+                  on-screen text are always redacted. These extra capture
+                  surfaces are off by default — enable any that matter for your
+                  threat model.
                 </p>
 
                 <label className="flex items-start gap-2 text-xs cursor-pointer pt-2 mt-1.5 border-t border-border">

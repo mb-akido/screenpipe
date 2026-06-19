@@ -210,6 +210,14 @@ export type Settings = SettingsStore & {
 	lockVaultShortcut?: string;
 	/** When true, audio devices follow system default and auto-switch on changes */
 	useSystemDefaultAudio?: boolean;
+	/**
+	 * WHICH captured columns the redaction worker scrubs (orthogonal to
+	 * `piiRedactionLabels`, which picks PII categories). Full list of stable
+	 * column keys; core surfaces are always on, the extras (browser_url,
+	 * ui_element_name/description, a11y_url_field, element_properties) are
+	 * opt-in. See `RedactColumns` in screenpipe-redact.
+	 */
+	piiRedactionColumns?: string[];
 	/** Enable AI workflow event detection (cloud, triggers event-based pipes) */
 	enableWorkflowEvents?: boolean;
 	/** Audio transcription scheduling: "realtime" (default) or "batch" (longer chunks for quality) */

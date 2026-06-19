@@ -423,10 +423,12 @@ pub struct RecordingSettings {
     /// WHICH captured columns the redaction worker scrubs (orthogonal to
     /// `pii_redaction_labels`, which picks the PII *categories*). The full
     /// list of columns to redact, by stable key (see `RedactColumns` in
-    /// screenpipe-redact). Default = every clear capture surface ON, with
-    /// the debatable / lossy ones OFF: `browser_url`, `ui_element_name`,
-    /// `ui_element_description`, and the a11y `url` JSON field. `full_text`
-    /// is always redacted (the detection source) regardless of this list.
+    /// screenpipe-redact). Default = the clear, lighter capture surfaces ON,
+    /// with the debatable / lossy / heavy ones OFF (opt-in): `browser_url`,
+    /// `ui_element_name`, `ui_element_description`, `a11y_url_field`, and
+    /// `element_properties` (per-element a11y value JSON — millions of rows;
+    /// the focused-field value is still caught via `accessibility_tree` /
+    /// `ui_element_value`). `full_text` is always redacted regardless.
     #[serde(
         rename = "piiRedactionColumns",
         default = "default_pii_redaction_columns"
@@ -722,7 +724,6 @@ fn default_pii_redaction_columns() -> Vec<String> {
         "ui_element_value",
         "ui_window_title",
         "element_text",
-        "element_properties",
     ]
     .iter()
     .map(|s| s.to_string())

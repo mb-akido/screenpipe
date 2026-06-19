@@ -80,17 +80,21 @@ pub struct RedactColumns {
 }
 
 impl Default for RedactColumns {
-    /// The default allow-list: every clear capture surface ON, the
-    /// debatable / lossy ones OFF.
+    /// The default allow-list: the clear, lighter capture surfaces ON, the
+    /// debatable / lossy / heavy ones OFF (opt-in).
     ///
-    /// OFF by default (opt-in): `browser_url` (URLs are structured, often
-    /// non-PII, and lossy to redact), `ui_element_name` /
-    /// `ui_element_description` (usually build-time control labels), and the
-    /// `a11y_url_field` (the `url` key inside the a11y JSON).
+    /// OFF by default: `browser_url` (URLs are structured, often non-PII,
+    /// lossy to redact), `ui_element_name` / `ui_element_description`
+    /// (usually build-time control labels), `a11y_url_field` (the `url` key
+    /// inside the a11y JSON), and `element_properties`.
     ///
-    /// `element_properties` stays ON: it holds focused-field / password
-    /// values that a11y exposes but OCR never sees — the one place a miss is
-    /// genuinely dangerous — so off-by-default would re-open that leak.
+    /// `element_properties` is off by deliberate choice: it's the per-element
+    /// accessibility value JSON (millions of rows — the heaviest surface).
+    /// The focused-field value is still caught on the lighter surfaces that
+    /// ARE on by default (`accessibility_tree` node `value`, and
+    /// `ui_element_value` on click/focus). Enable `element_properties` for
+    /// full per-element value coverage (incl. password-field values a11y
+    /// exposes that OCR never sees).
     fn default() -> Self {
         Self {
             accessibility_text: true,
@@ -104,7 +108,7 @@ impl Default for RedactColumns {
             ui_element_name: false,
             ui_element_description: false,
             element_text: true,
-            element_properties: true,
+            element_properties: false,
             a11y_url_field: false,
         }
     }
@@ -224,14 +228,15 @@ mod tests {
     #[test]
     fn default_has_clear_pii_on_debatable_off() {
         let d = RedactColumns::default();
-        // Clear capture PII — on.
+        // Clear, lighter capture surfaces — on.
         assert!(d.accessibility_text && d.accessibility_tree && d.window_name);
         assert!(d.audio_transcription && d.ui_text_content && d.ui_element_value);
-        assert!(d.ui_window_title && d.element_text && d.element_properties);
-        // Debatable / lossy — off.
+        assert!(d.ui_window_title && d.element_text);
+        // Debatable / lossy / heavy — off (opt-in).
         assert!(!d.browser_url);
         assert!(!d.ui_element_name && !d.ui_element_description);
         assert!(!d.a11y_url_field);
+        assert!(!d.element_properties);
     }
 
     #[test]
