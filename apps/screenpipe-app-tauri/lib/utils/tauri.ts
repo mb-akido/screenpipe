@@ -2798,6 +2798,15 @@ piiBackend?: string;
  */
 piiRedactionLabels?: string[];
 /**
+ * WHICH captured columns the redaction worker scrubs (orthogonal to
+ * `piiRedactionLabels`, which picks PII categories). Full list of stable
+ * column keys (see `RedactColumns` in screenpipe-redact); core surfaces
+ * are always on, the extras (browser_url, ui_element_name/description,
+ * a11y_url_field, element_properties) are opt-in. `full_text` is always
+ * redacted regardless of this list.
+ */
+piiRedactionColumns?: string[];
+/**
  * Render redacted PII as **consistent pseudonyms** instead of static
  * `[LABEL]` tags when `asyncPiiRedaction` is on. Same value → same
  * stable token (e.g. `[PERSON_1a2b3c4d5e6f]`), so the timeline stays
