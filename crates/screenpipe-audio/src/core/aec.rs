@@ -172,6 +172,36 @@ impl Aec {
         self.block_len
     }
 
+    /// Cancel echo across a whole buffer (in place), processing it as a run of
+    /// [`Aec::block_len`] frames. `far` and `near` must be the same length and
+    /// a multiple of `block_len`; both must already be resampled to
+    /// [`AEC_SAMPLE_RATE`] and time-aligned (the far-end sample at index `i` is
+    /// what the speakers played when the mic captured `near[i]`). Intended for
+    /// the batch transcription path (a 30 s chunk is an exact multiple of 160).
+    pub fn process_buffer(&mut self, far: &[f32], near: &mut [f32]) {
+        assert_eq!(
+            far.len(),
+            near.len(),
+            "far and near must be the same length"
+        );
+        assert_eq!(
+            near.len() % self.block_len,
+            0,
+            "buffer length must be a multiple of block_len ({})",
+            self.block_len
+        );
+        let l = self.block_len;
+        let mut off = 0;
+        while off < near.len() {
+            let end = off + l;
+            // SAFETY-free split: copy the frame out, process, copy back.
+            let mut frame = near[off..end].to_vec();
+            self.process_frame(&far[off..end], &mut frame);
+            near[off..end].copy_from_slice(&frame);
+            off = end;
+        }
+    }
+
     /// Enable or disable cancellation. When disabled, [`Aec::process_frame`]
     /// is a pass-through (near-end returned untouched).
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -318,28 +348,37 @@ mod aec_tests {
         (*seed as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 
-    /// Band-limited, amplitude-modulated noise — a stand-in for far-end speech
-    /// that excites the adaptive filter broadbandly so it can converge.
+    /// Broadband, amplitude-modulated noise — a stand-in for real far-end
+    /// (system audio = speech/music), which excites the adaptive filter across
+    /// the whole band so every bin of the echo path can be identified. A light
+    /// low-pass adds spectral color (real far-end isn't perfectly white) while
+    /// keeping energy across the band; the slow envelope mimics speech dynamics.
     fn farend(n: usize, seed: u32) -> Vec<f32> {
         let mut s = seed | 1;
         let mut lp = 0.0f32;
         (0..n)
             .map(|i| {
                 let white = rng(&mut s);
-                lp = 0.6 * lp + 0.4 * white; // gentle low-pass → speech-ish spectrum
-                let env = 0.5 + 0.5 * (2.0 * PI * 3.0 * i as f32 / 16_000.0).sin();
+                lp = 0.2 * lp + 0.8 * white; // broadband with slight color
+                let env = 0.6 + 0.4 * (2.0 * PI * 3.0 * i as f32 / 16_000.0).sin();
                 lp * env * 0.5
             })
             .collect()
     }
 
-    /// A simple decaying room impulse response (bulk delay + reverb tail).
+    /// A plausible loudspeaker→mic room impulse response: a bulk delay then an
+    /// exponentially decaying tail of reflections. The reflection taps are
+    /// low-pass smoothed because a real acoustic path (speaker roll-off + air
+    /// absorption) is broadly low-pass — a full-band white IR is unphysical and
+    /// would alias pathologically through any rate conversion.
     fn echo_path(delay: usize, taps: usize) -> Vec<f32> {
         let mut h = vec![0.0f32; delay + taps];
         let mut s = 0x9e3779b9u32;
+        let mut lp = 0.0f32;
         for (i, v) in h.iter_mut().enumerate().skip(delay) {
             let t = (i - delay) as f32;
-            *v = rng(&mut s) * (-t / (taps as f32 / 3.0)).exp();
+            lp = 0.85 * lp + 0.15 * rng(&mut s); // low-pass the reflection taps
+            *v = lp * (-t / (taps as f32 / 3.0)).exp();
         }
         // Normalize, then attenuate so the echo is a realistic fraction of far-end.
         let norm: f32 = h.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
@@ -407,6 +446,29 @@ mod aec_tests {
         assert!(
             erle > 20.0,
             "expected >20 dB echo cancellation, got {erle:.1} dB"
+        );
+    }
+
+    #[test]
+    fn cancels_echo_with_large_inter_lane_bulk_delay() {
+        // The mic and system-audio lanes are buffered independently, so the
+        // far-end reference reaches the canceller offset from the mic by some
+        // bulk delay. The PBFDAF must absorb that into its tap range. Model a
+        // typical 20 ms offset (320 samples @ 16 kHz) on top of the room tail;
+        // the 160 ms filter span covers far larger offsets than this.
+        let n = 6 * AEC_SAMPLE_RATE as usize;
+        let far = farend(n, 0x1357_9bdf);
+        let h = echo_path(320, 256); // 20 ms bulk delay + ~16 ms tail
+        let near = convolve(&far, &h);
+
+        let mut aec = Aec::new();
+        let cleaned = run(&mut aec, &far, &near);
+
+        let from = n - AEC_SAMPLE_RATE as usize * 3 / 2;
+        let erle = tail_erle(&near, &cleaned, from);
+        assert!(
+            erle > 20.0,
+            "expected >20 dB cancellation with a 20 ms inter-lane delay, got {erle:.1} dB"
         );
     }
 
