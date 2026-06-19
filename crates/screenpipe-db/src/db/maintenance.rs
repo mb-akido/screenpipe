@@ -1353,4 +1353,19 @@ impl DatabaseManager {
             .await?;
         Ok(())
     }
+
+    /// Rebuild the database with a full `VACUUM` to return freed pages to the
+    /// OS. The retention loop's `incremental_vacuum` is a no-op while the DB is
+    /// `auto_vacuum=NONE` (how it ships) — it only recycles pages internally.
+    /// A full `VACUUM` always shrinks the file, but takes a brief exclusive
+    /// lock (writes block until it finishes) and needs free disk roughly equal
+    /// to the live data size, so this is an explicit user action, never part of
+    /// the background loop. Checkpoints the WAL first so the rewrite is clean.
+    pub async fn compact(&self) -> Result<(), sqlx::Error> {
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+        Ok(())
+    }
 }

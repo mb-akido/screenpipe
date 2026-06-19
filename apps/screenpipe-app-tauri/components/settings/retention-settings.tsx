@@ -22,6 +22,7 @@ import {
   Clock,
   Film,
   FileText,
+  Minimize2,
 } from "lucide-react";
 import {
   AlertDialog,
@@ -95,6 +96,8 @@ export function RetentionSettings() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [pendingRecent, setPendingRecent] = useState<number | null>(null);
   const [deletingRecent, setDeletingRecent] = useState(false);
+  const [pendingCompact, setPendingCompact] = useState(false);
+  const [compacting, setCompacting] = useState(false);
 
   const enabled = settings.localRetentionEnabled ?? false;
   const retentionDays = settings.localRetentionDays ?? 14;
@@ -272,6 +275,35 @@ export function RetentionSettings() {
       });
     } finally {
       setDeletingRecent(false);
+    }
+  };
+
+  const confirmCompact = async () => {
+    setPendingCompact(false);
+    setCompacting(true);
+    try {
+      const res = await localFetch("/data/compact", { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `request failed (${res.status})`);
+      }
+      const r = await res.json();
+      const reclaimed = r.bytes_reclaimed || 0;
+      toast({
+        title: "database compacted",
+        description:
+          reclaimed > 0
+            ? `reclaimed ${formatBytes(reclaimed)} of disk space.`
+            : "already compact — nothing to reclaim right now.",
+      });
+    } catch (e: any) {
+      toast({
+        title: "failed to compact database",
+        description: e.message,
+        variant: "destructive",
+      });
+    } finally {
+      setCompacting(false);
     }
   };
 
@@ -455,8 +487,62 @@ export function RetentionSettings() {
               )}
             </div>
           )}
+
+          {/* Compact — physically shrink db.sqlite by rebuilding it (full
+              VACUUM). Cleanup/lean stop the DB growing and reuse freed pages,
+              but the file only returns space to the drive when compacted. */}
+          <div className="flex flex-wrap items-center gap-3 pl-6 border-t border-border pt-3">
+            <div className="flex-1 min-w-[180px]">
+              <p className="text-sm font-medium">reclaim disk space</p>
+              <p className="text-xs text-muted-foreground">
+                rebuild the database file so freed space goes back to your
+                drive. cleanup keeps the database from growing; compacting is
+                what actually shrinks the file.
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 text-xs"
+              onClick={() => setPendingCompact(true)}
+              disabled={compacting}
+            >
+              {compacting ? (
+                <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+              ) : (
+                <Minimize2 className="h-3 w-3 mr-1.5" />
+              )}
+              compact database
+            </Button>
+          </div>
         </div>
       </div>
+
+      {/* Compact confirmation */}
+      <AlertDialog
+        open={pendingCompact}
+        onOpenChange={(open) => {
+          if (!open) setPendingCompact(false);
+        }}
+      >
+        <AlertDialogContent data-testid="retention-compact-dialog">
+          <AlertDialogHeader>
+            <AlertDialogTitle>compact the database?</AlertDialogTitle>
+            <AlertDialogDescription>
+              screenpipe will rebuild db.sqlite to return freed space to your
+              drive. recording briefly pauses while it runs, and it needs free
+              disk space roughly equal to the current database size. larger
+              databases take longer.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmCompact}>
+              compact now
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Recent-delete confirmation */}
       <AlertDialog

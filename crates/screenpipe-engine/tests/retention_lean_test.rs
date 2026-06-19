@@ -270,3 +270,56 @@ async fn database_auto_vacuum_is_none_so_file_does_not_self_shrink() {
          file only shrinks on a full VACUUM — keep the UI copy honest about this"
     );
 }
+
+/// `compact()` (the `POST /data/compact` action) must actually return freed
+/// pages to the OS via a full VACUUM — the reclaim that the no-op
+/// incremental_vacuum can't do under auto_vacuum=NONE. Uses a file-backed DB
+/// (not :memory:) so freelist behavior matches production. Asserts on
+/// freelist_count (deterministic) rather than raw file bytes (page-rounded).
+#[tokio::test]
+async fn compact_returns_free_pages_to_the_os_after_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let db = DatabaseManager::new(path.to_str().unwrap(), Default::default())
+        .await
+        .unwrap();
+
+    // Grow the file with sizable rows, then checkpoint into the main file.
+    let ts = (Utc::now() - Duration::days(30)).to_rfc3339();
+    for _ in 0..500 {
+        sqlx::query("INSERT INTO frames (timestamp, full_text) VALUES (?1, ?2)")
+            .bind(&ts)
+            .bind("x".repeat(2000))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Delete everything → pages go on the free list (auto_vacuum=NONE).
+    sqlx::query("DELETE FROM frames")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let freelist_before = count(&db, "PRAGMA freelist_count").await;
+    assert!(
+        freelist_before > 0,
+        "deletion should leave free pages with auto_vacuum=NONE (got {freelist_before})"
+    );
+
+    db.compact().await.unwrap();
+
+    let freelist_after = count(&db, "PRAGMA freelist_count").await;
+    assert_eq!(
+        freelist_after, 0,
+        "VACUUM must return every free page to the OS (got {freelist_after})"
+    );
+}
