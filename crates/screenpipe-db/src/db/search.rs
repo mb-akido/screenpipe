@@ -625,6 +625,13 @@ impl DatabaseManager {
         )?;
 
         background_results.append(&mut live_results);
+        // During a meeting the live transcript is persisted into BOTH
+        // `meeting_transcript_segments` (canonical, just appended as
+        // `live_results`) AND `audio_transcriptions` with engine "live", so the
+        // merge surfaces each utterance twice. Drop the bare audio mirror,
+        // keep the richer meeting segment (#4256, mechanism 2). Done before
+        // sort/paginate so the offset/limit window applies to deduped rows.
+        let mut background_results = dedup_live_meeting_mirror(background_results);
         background_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(background_results
             .into_iter()
@@ -1747,5 +1754,248 @@ impl DatabaseManager {
                 .await?;
 
         Ok((latest_frame.map(|f| f.0), latest_audio.map(|a| a.0), None))
+    }
+}
+
+/// Drop `audio_transcriptions` rows that merely mirror a live meeting transcript
+/// already present (from `meeting_transcript_segments`).
+///
+/// During a meeting the live (screenpipe-cloud) transcript is persisted into
+/// BOTH `meeting_transcript_segments` — the canonical copy, carrying
+/// `meeting_id`, speaker, and `meeting`/`live` tags — AND `audio_transcriptions`
+/// with `transcription_engine = "live"`. `search_audio` merges both sources, so
+/// every utterance surfaces twice (#4256, mechanism 2). Keep the richer meeting
+/// segment, drop the bare audio mirror.
+///
+/// Conservative by construction:
+/// - The canonical segments are the only rows with `meeting_id.is_some()`
+///   (background audio always has `meeting_id = None`).
+/// - A row is removed only when it is a background (`meeting_id.is_none()`)
+///   `"live"`-engine row whose (trimmed text, timestamp, device direction)
+///   exactly matches a segment. Batch audio and realtime-only `"live"` audio
+///   with no meeting twin are left untouched.
+///
+/// This does NOT collapse the separate acoustic-loopback duplication (the same
+/// utterance captured on both mic and system-audio devices, #4256 mechanism 1):
+/// those carry different timestamps and device directions and are a capture-time
+/// concern, not a storage mirror.
+fn dedup_live_meeting_mirror(results: Vec<AudioResult>) -> Vec<AudioResult> {
+    use std::collections::HashSet;
+
+    let segment_keys: HashSet<(String, DateTime<Utc>, DeviceType)> = results
+        .iter()
+        .filter(|r| r.meeting_id.is_some())
+        .map(|r| {
+            (
+                r.transcription.trim().to_string(),
+                r.timestamp,
+                r.device_type.clone(),
+            )
+        })
+        .collect();
+
+    if segment_keys.is_empty() {
+        return results;
+    }
+
+    results
+        .into_iter()
+        .filter(|r| {
+            let is_mirror =
+                r.meeting_id.is_none() && r.transcription_engine.eq_ignore_ascii_case("live");
+            if !is_mirror {
+                return true;
+            }
+            let key = (
+                r.transcription.trim().to_string(),
+                r.timestamp,
+                r.device_type.clone(),
+            );
+            !segment_keys.contains(&key)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod dedup_live_meeting_mirror_tests {
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// `meeting_id = Some` ⇒ canonical meeting segment; `None` ⇒ background audio.
+    fn row(
+        text: &str,
+        at: &str,
+        engine: &str,
+        device_type: DeviceType,
+        meeting_id: Option<i64>,
+    ) -> AudioResult {
+        AudioResult {
+            audio_chunk_id: if meeting_id.is_some() { -1 } else { 1 },
+            transcription: text.to_string(),
+            timestamp: ts(at),
+            file_path: String::new(),
+            offset_index: 0,
+            transcription_engine: engine.to_string(),
+            tags: Vec::new(),
+            device_name: "dev".to_string(),
+            device_type,
+            speaker: None,
+            speaker_label: None,
+            speaker_source: None,
+            speaker_confidence: None,
+            speaker_provisional: false,
+            start_time: None,
+            end_time: None,
+            source: Some(
+                if meeting_id.is_some() {
+                    "live"
+                } else {
+                    "background"
+                }
+                .to_string(),
+            ),
+            meeting_id,
+            provider: None,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn drops_audio_live_mirror_keeps_meeting_segment() {
+        let out = dedup_live_meeting_mirror(vec![
+            row(
+                "hello there",
+                "2026-06-18T15:57:35.034Z",
+                "nova-3",
+                DeviceType::Output,
+                Some(7),
+            ),
+            row(
+                "hello there",
+                "2026-06-18T15:57:35.034Z",
+                "live",
+                DeviceType::Output,
+                None,
+            ),
+        ]);
+        assert_eq!(out.len(), 1, "the audio mirror should be removed");
+        assert!(
+            out[0].meeting_id.is_some(),
+            "the canonical meeting segment is kept"
+        );
+    }
+
+    #[test]
+    fn both_device_directions_keep_their_canonical_segment() {
+        // Acoustic loopback (mechanism 1): same text on mic + system audio with
+        // distinct timestamps. Each has a meeting-segment twin + an audio mirror.
+        // mechanism-2 dedup removes the two mirrors and keeps both segments — it
+        // does NOT collapse the two directions into one.
+        let out = dedup_live_meeting_mirror(vec![
+            row(
+                "same skiing",
+                "2026-06-18T15:57:35.034Z",
+                "nova-3",
+                DeviceType::Output,
+                Some(7),
+            ),
+            row(
+                "same skiing",
+                "2026-06-18T15:57:35.808Z",
+                "nova-3",
+                DeviceType::Input,
+                Some(7),
+            ),
+            row(
+                "same skiing",
+                "2026-06-18T15:57:35.034Z",
+                "live",
+                DeviceType::Output,
+                None,
+            ),
+            row(
+                "same skiing",
+                "2026-06-18T15:57:35.808Z",
+                "live",
+                DeviceType::Input,
+                None,
+            ),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|r| r.meeting_id.is_some()));
+    }
+
+    #[test]
+    fn realtime_live_audio_without_a_meeting_twin_is_preserved() {
+        // No segment rows at all → nothing to dedup against.
+        let out = dedup_live_meeting_mirror(vec![row(
+            "realtime line",
+            "2026-06-18T10:00:00Z",
+            "live",
+            DeviceType::Input,
+            None,
+        )]);
+        assert_eq!(out.len(), 1);
+
+        // Segment present but the live audio row's timestamp differs → preserved.
+        let out = dedup_live_meeting_mirror(vec![
+            row(
+                "a line",
+                "2026-06-18T10:00:00Z",
+                "nova-3",
+                DeviceType::Input,
+                Some(3),
+            ),
+            row(
+                "a line",
+                "2026-06-18T10:00:01Z",
+                "live",
+                DeviceType::Input,
+                None,
+            ),
+        ]);
+        assert_eq!(out.len(), 2, "a non-matching timestamp must not be deduped");
+    }
+
+    #[test]
+    fn batch_audio_is_never_dropped_even_if_it_matches_a_segment() {
+        // Only engine == "live" rows are mirrors; a real batch transcription that
+        // happens to share text+timestamp must survive.
+        let out = dedup_live_meeting_mirror(vec![
+            row(
+                "overlap",
+                "2026-06-18T12:00:00Z",
+                "nova-3",
+                DeviceType::Output,
+                Some(9),
+            ),
+            row(
+                "overlap",
+                "2026-06-18T12:00:00Z",
+                "nova-3",
+                DeviceType::Output,
+                None,
+            ),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn no_meeting_segments_is_a_noop() {
+        let input = vec![
+            row("x", "2026-06-18T12:00:00Z", "live", DeviceType::Input, None),
+            row(
+                "y",
+                "2026-06-18T12:00:01Z",
+                "nova-3",
+                DeviceType::Output,
+                None,
+            ),
+        ];
+        let out = dedup_live_meeting_mirror(input);
+        assert_eq!(out.len(), 2);
     }
 }
