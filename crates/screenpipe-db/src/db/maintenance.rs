@@ -553,6 +553,136 @@ impl DatabaseManager {
         })
     }
 
+    /// Lean retention: strip the heavy *text* a frame carries while keeping the
+    /// frame row, its searchable `full_text`, transcripts, and memories alive.
+    ///
+    /// Drops the three biggest db.sqlite text contributors for [start, end]:
+    ///   - `elements` rows (the per-node OCR + accessibility tree)
+    ///   - `frames.accessibility_tree_json` (the raw AX tree JSON blob)
+    ///   - `ui_events` (the keystroke/click/scroll stream)
+    ///
+    /// Search/timeline keep working because `frames.full_text` (indexed by
+    /// `frames_fts`) and `audio_transcriptions` are untouched. FTS stays in
+    /// sync automatically: `elements_ad`/`ui_events` delete triggers issue the
+    /// FTS5 'delete' command, and nulling `accessibility_tree_json` fires no
+    /// trigger (`frames_au` only watches full_text/app_name/window_name/url).
+    ///
+    /// Anchor handling mirrors `delete_time_range_batch`: elements owned by an
+    /// in-range frame but referenced by a still-kept out-of-range frame are
+    /// migrated to that referrer first, so recent frames don't lose elements.
+    pub async fn strip_heavy_text_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<StripTextResult, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+
+        let start_str = start.to_rfc3339();
+        let end_str = end.to_rfc3339();
+
+        // Migrate elements off in-range anchor frames that are referenced by
+        // out-of-range (kept) frames, so those kept frames retain their
+        // elements once we delete the in-range owners below.
+        let anchor_ids: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT DISTINCT f.id FROM frames f
+               WHERE f.timestamp BETWEEN ?1 AND ?2
+               AND EXISTS (
+                   SELECT 1 FROM frames ref
+                   WHERE ref.elements_ref_frame_id = f.id
+                   AND ref.timestamp NOT BETWEEN ?1 AND ?2
+               )"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        for anchor_id in &anchor_ids {
+            let new_anchor_id: Option<i64> = sqlx::query_scalar(
+                r#"SELECT MIN(id) FROM frames
+                   WHERE elements_ref_frame_id = ?1
+                   AND timestamp NOT BETWEEN ?2 AND ?3"#,
+            )
+            .bind(anchor_id)
+            .bind(&start_str)
+            .bind(&end_str)
+            .fetch_optional(&mut **tx.conn())
+            .await?
+            .flatten();
+
+            if let Some(new_id) = new_anchor_id {
+                sqlx::query("UPDATE elements SET frame_id = ?1 WHERE frame_id = ?2")
+                    .bind(new_id)
+                    .bind(anchor_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+                sqlx::query(
+                    "UPDATE frames SET elements_ref_frame_id = ?1 WHERE elements_ref_frame_id = ?2",
+                )
+                .bind(new_id)
+                .bind(anchor_id)
+                .execute(&mut **tx.conn())
+                .await?;
+                sqlx::query("UPDATE frames SET elements_ref_frame_id = NULL WHERE id = ?1")
+                    .bind(new_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+            }
+        }
+
+        // Delete elements for in-range frames (elements_ad keeps elements_fts in sync)
+        let elements_result = sqlx::query(
+            "DELETE FROM elements WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+        let elements_deleted = elements_result.rows_affected();
+
+        // Null the raw accessibility tree JSON blob. Not FTS-indexed and not a
+        // column watched by frames_au, so no trigger fires — full_text (the
+        // search source) is deliberately left intact.
+        let frames_result = sqlx::query(
+            r#"UPDATE frames SET accessibility_tree_json = NULL
+               WHERE timestamp BETWEEN ?1 AND ?2
+               AND accessibility_tree_json IS NOT NULL"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+        let frames_stripped = frames_result.rows_affected();
+
+        // Delete the UI event stream (its delete trigger keeps ui_events_fts in sync)
+        let ui_events_result =
+            sqlx::query("DELETE FROM ui_events WHERE timestamp BETWEEN ?1 AND ?2")
+                .bind(&start_str)
+                .bind(&end_str)
+                .execute(&mut **tx.conn())
+                .await?;
+        let ui_events_deleted = ui_events_result.rows_affected();
+
+        tx.commit().await.map_err(|e| {
+            error!(
+                "failed to commit strip_heavy_text_in_range transaction: {}",
+                e
+            );
+            e
+        })?;
+
+        debug!(
+            "strip_heavy_text_in_range committed: elements={}, frames_stripped={}, ui_events={}",
+            elements_deleted, frames_stripped, ui_events_deleted
+        );
+
+        Ok(StripTextResult {
+            elements_deleted,
+            frames_stripped,
+            ui_events_deleted,
+        })
+    }
+
     /// Estimate disk reclaimable by `evict_media_in_range` for [start, end].
     /// Returns (file count, total bytes). Reads file sizes from disk via
     /// `tokio::fs::metadata`, so cost is O(N) syscalls — keep ranges

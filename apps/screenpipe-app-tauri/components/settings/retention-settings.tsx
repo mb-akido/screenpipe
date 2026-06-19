@@ -21,6 +21,7 @@ import {
   AlertTriangle,
   Clock,
   Film,
+  FileText,
 } from "lucide-react";
 import {
   AlertDialog,
@@ -34,7 +35,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { localFetch } from "@/lib/api";
 
-type RetentionMode = "media" | "all";
+type RetentionMode = "media" | "lean" | "all";
 type EffectiveMode = "off" | RetentionMode;
 
 interface RetentionStatus {
@@ -205,7 +206,9 @@ export function RetentionSettings() {
         title:
           nextMode === "media"
             ? `media eviction enabled (${retentionDays}d)`
-            : `auto-delete enabled (${retentionDays}d)`,
+            : nextMode === "lean"
+              ? `lean cleanup enabled (${retentionDays}d)`
+              : `auto-delete enabled (${retentionDays}d)`,
       });
       fetchStatus();
     } catch (e: any) {
@@ -343,7 +346,9 @@ export function RetentionSettings() {
               ? "currently: keeping everything forever."
               : effective === "media"
                 ? `currently: dropping video + audio older than ${retentionDays} days, text stays searchable.`
-                : `currently: deleting everything older than ${retentionDays} days.`}
+                : effective === "lean"
+                  ? `currently: dropping video + audio and the bulky ui detail older than ${retentionDays} days, text + memories stay searchable.`
+                  : `currently: deleting everything older than ${retentionDays} days.`}
           </p>
 
           <div className="space-y-2 pl-6">
@@ -364,6 +369,14 @@ export function RetentionSettings() {
               onClick={() => handleSelectMode("media")}
             />
             <ModeRow
+              testId="retention-mode-lean"
+              checked={effective === "lean"}
+              icon={<FileText className="h-4 w-4" />}
+              title="shrink the database, keep text + memories"
+              body="everything media mode does, plus drops the bulky accessibility/ui detail (the biggest part of the database) older than the cutoff. text search, transcripts, timeline, and memories still work. best if the database file itself is getting large."
+              onClick={() => handleSelectMode("lean")}
+            />
+            <ModeRow
               testId="retention-mode-all"
               checked={effective === "all"}
               icon={<Trash2 className="h-4 w-4" />}
@@ -380,7 +393,9 @@ export function RetentionSettings() {
                 ? "cutoff (applies once a policy is on)"
                 : effective === "media"
                   ? "evict media older than"
-                  : "delete data older than"}
+                  : effective === "lean"
+                    ? "clean up data older than"
+                    : "delete data older than"}
             </span>
             <Select
               value={retentionDays.toString()}
@@ -423,8 +438,13 @@ export function RetentionSettings() {
               )}
               {status.total_deleted > 0 && (
                 <p>
-                  total {effective === "media" ? "files evicted" : "records deleted"}:{" "}
-                  {status.total_deleted.toLocaleString()}
+                  total{" "}
+                  {effective === "media"
+                    ? "files evicted"
+                    : effective === "lean"
+                      ? "items cleaned"
+                      : "records deleted"}
+                  : {status.total_deleted.toLocaleString()}
                 </p>
               )}
               {status.last_error && (
@@ -480,7 +500,9 @@ export function RetentionSettings() {
             <AlertDialogTitle>
               {pendingMode === "media"
                 ? "enable media eviction?"
-                : "delete everything past the cutoff?"}
+                : pendingMode === "lean"
+                  ? "enable lean cleanup?"
+                  : "delete everything past the cutoff?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {pendingMode === "media" ? (
@@ -488,6 +510,14 @@ export function RetentionSettings() {
                   every day, screenpipe will delete video and audio files older
                   than {retentionDays} days. transcripts, ocr text, and your
                   app/window timeline stay searchable.
+                </>
+              ) : pendingMode === "lean" ? (
+                <>
+                  every day, screenpipe will reclaim video and audio files and
+                  drop the bulky accessibility/ui detail older than{" "}
+                  {retentionDays} days — the part that makes the database file
+                  grow. your text search, transcripts, timeline, and memories
+                  stay intact. clip replay past the cutoff won't be available.
                 </>
               ) : (
                 <>
@@ -519,7 +549,9 @@ export function RetentionSettings() {
             <span className="text-sm text-muted-foreground">
               {pendingMode === "media"
                 ? "evict media older than"
-                : "delete data older than"}
+                : pendingMode === "lean"
+                  ? "clean up data older than"
+                  : "delete data older than"}
             </span>
             <Select
               value={retentionDays.toString()}
@@ -548,7 +580,11 @@ export function RetentionSettings() {
                   : undefined
               }
             >
-              {pendingMode === "media" ? "enable eviction" : "enable deletion"}
+              {pendingMode === "media"
+                ? "enable eviction"
+                : pendingMode === "lean"
+                  ? "enable cleanup"
+                  : "enable deletion"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

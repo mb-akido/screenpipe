@@ -1598,6 +1598,9 @@ async fn main() -> anyhow::Result<()> {
                 screenpipe_engine::retention::RetentionMode::Media => {
                     "media-only (keep transcripts)".to_string()
                 }
+                screenpipe_engine::retention::RetentionMode::Lean => {
+                    "lean (keep text+memories)".to_string()
+                }
                 screenpipe_engine::retention::RetentionMode::All => "all (full delete)".to_string(),
             }
         }

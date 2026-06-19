@@ -53,9 +53,15 @@ struct RetentionRuntime {
     run_now: Arc<tokio::sync::Notify>,
 }
 
-/// What old data gets cleaned up. `Media` (default) keeps DB rows (search,
-/// timeline, transcripts) and only reclaims mp4/wav/jpeg files; `All` is the
-/// legacy behavior that wipes everything past the cutoff.
+/// What old data gets cleaned up.
+/// - `Media` (default): keeps every DB row (search, timeline, transcripts) and
+///   only reclaims mp4/wav/jpeg files on disk.
+/// - `Lean`: also reclaims media AND strips the heavy text a frame carries —
+///   the per-node accessibility/OCR `elements`, the raw accessibility tree
+///   JSON, and the `ui_events` stream — while keeping `full_text`, transcripts,
+///   and memories searchable. Shrinks db.sqlite itself (the element tree is the
+///   biggest contributor), unlike `Media` which only frees disk files.
+/// - `All`: the legacy behavior that wipes everything past the cutoff.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, OaSchema, ValueEnum, Default,
 )]
@@ -64,6 +70,7 @@ struct RetentionRuntime {
 pub enum RetentionMode {
     #[default]
     Media,
+    Lean,
     All,
 }
 
@@ -448,6 +455,59 @@ async fn do_local_cleanup(
                     );
                 }
             },
+            RetentionMode::Lean => {
+                // 1. Reclaim media files on disk (same as Media mode).
+                match db.evict_media_in_range(batch_start, batch_end).await {
+                    Ok(result) => {
+                        let evicted = result.video_chunks_evicted
+                            + result.audio_chunks_evicted
+                            + result.snapshots_evicted;
+                        if evicted > 0 {
+                            any_deleted = true;
+                        }
+                        total += evicted;
+
+                        for path in result
+                            .video_files
+                            .iter()
+                            .chain(result.audio_files.iter())
+                            .chain(result.snapshot_files.iter())
+                        {
+                            if let Err(e) = tokio::fs::remove_file(path).await {
+                                warn!("retention: failed to evict file {}: {}", path, e);
+                            }
+                        }
+                    }
+                    Err(e) => warn!(
+                        "retention: lean media evict failed for range {} to {}: {}",
+                        batch_start, batch_end, e
+                    ),
+                }
+
+                // 2. Strip the heavy text rows (elements tree, AX JSON,
+                //    ui_events). full_text/transcripts/memories stay searchable.
+                match db.strip_heavy_text_in_range(batch_start, batch_end).await {
+                    Ok(result) => {
+                        let stripped = result.elements_deleted
+                            + result.frames_stripped
+                            + result.ui_events_deleted;
+                        if stripped > 0 {
+                            any_deleted = true;
+                            info!(
+                                "retention: lean stripped elements={} frames_ax_json={} ui_events={}",
+                                result.elements_deleted,
+                                result.frames_stripped,
+                                result.ui_events_deleted,
+                            );
+                        }
+                        total += stripped;
+                    }
+                    Err(e) => warn!(
+                        "retention: lean text strip failed for range {} to {}: {}",
+                        batch_start, batch_end, e
+                    ),
+                }
+            }
         }
 
         batch_start = batch_end;
@@ -456,13 +516,21 @@ async fn do_local_cleanup(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    if any_deleted && matches!(mode, RetentionMode::All) {
-        if let Err(e) = db.cleanup_orphaned_chunks().await {
-            warn!("retention: orphan chunk cleanup failed: {}", e);
+    if any_deleted {
+        // Only `All` deletes frames/transcriptions, which can orphan chunk
+        // rows. `Lean` keeps them (it evicts files + strips text), so the
+        // expensive orphan scan isn't needed.
+        if matches!(mode, RetentionMode::All) {
+            if let Err(e) = db.cleanup_orphaned_chunks().await {
+                warn!("retention: orphan chunk cleanup failed: {}", e);
+            }
         }
-        info!("retention: running incremental vacuum to reclaim disk space");
-        if let Err(e) = db.execute_raw_sql("PRAGMA incremental_vacuum(1000)").await {
-            warn!("retention: incremental vacuum failed: {}", e);
+        // Both `All` and `Lean` free pages in db.sqlite, so reclaim them.
+        if matches!(mode, RetentionMode::All | RetentionMode::Lean) {
+            info!("retention: running incremental vacuum to reclaim disk space");
+            if let Err(e) = db.execute_raw_sql("PRAGMA incremental_vacuum(1000)").await {
+                warn!("retention: incremental vacuum failed: {}", e);
+            }
         }
     }
 
