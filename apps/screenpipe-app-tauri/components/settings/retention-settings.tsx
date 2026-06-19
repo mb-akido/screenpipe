@@ -379,7 +379,7 @@ export function RetentionSettings() {
               : effective === "media"
                 ? `currently: dropping video + audio older than ${retentionDays} days, text stays searchable.`
                 : effective === "lean"
-                  ? `currently: dropping video + audio and the bulky ui detail older than ${retentionDays} days, text + memories stay searchable.`
+                  ? `currently: dropping video + audio and the bulky ocr/accessibility detail older than ${retentionDays} days, text + memories stay searchable.`
                   : `currently: deleting everything older than ${retentionDays} days.`}
           </p>
 
@@ -405,7 +405,7 @@ export function RetentionSettings() {
               checked={effective === "lean"}
               icon={<FileText className="h-4 w-4" />}
               title="trim heavy ui data, keep text + memories"
-              body="everything media mode does, plus drops the bulky accessibility/ui detail (the biggest part of the database) older than the cutoff. text search, transcripts, timeline, and memories still work. stops the database from ballooning and frees that space for reuse."
+              body="everything media mode does, plus drops the bulky per-element ocr + accessibility detail (the biggest part of the database) older than the cutoff. text search, transcripts, timeline, and memories still work — only the on-screen element geometry is dropped. stops the database from ballooning and frees that space for reuse."
               onClick={() => handleSelectMode("lean")}
             />
             <ModeRow
@@ -600,8 +600,8 @@ export function RetentionSettings() {
               ) : pendingMode === "lean" ? (
                 <>
                   every day, screenpipe will reclaim video and audio files and
-                  drop the bulky accessibility/ui detail older than{" "}
-                  {retentionDays} days — the part that makes the database file
+                  drop the bulky per-element ocr + accessibility detail older
+                  than {retentionDays} days — the part that makes the database
                   grow. your text search, transcripts, timeline, and memories
                   stay intact. clip replay past the cutoff won't be available.
                 </>

@@ -27,16 +27,18 @@ async fn strip_heavy_text_keeps_recent_and_text_drops_old_blobs() {
     let recent_ts = Utc::now().to_rfc3339();
 
     // Two frames: an old one (id 1) and a recent one (id 2). Both carry a
-    // full_text (search source) and an accessibility_tree_json blob.
+    // full_text (search source), an accessibility_tree_json blob (AX detail),
+    // and a text_json blob (per-word OCR bounding boxes).
     for (id, ts) in [(1_i64, &old_ts), (2_i64, &recent_ts)] {
         sqlx::query(
-            r#"INSERT INTO frames (id, timestamp, full_text, accessibility_tree_json, app_name)
-               VALUES (?1, ?2, ?3, ?4, 'TestApp')"#,
+            r#"INSERT INTO frames (id, timestamp, full_text, accessibility_tree_json, text_json, app_name)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'TestApp')"#,
         )
         .bind(id)
         .bind(ts)
         .bind(format!("frame {id} searchable text"))
         .bind(r#"{"role":"AXWindow","children":[{"role":"AXButton"}]}"#)
+        .bind(r#"[{"text":"ocrword","left":0.1,"top":0.2,"width":0.1,"height":0.02}]"#)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -78,6 +80,15 @@ async fn strip_heavy_text_keeps_recent_and_text_drops_old_blobs() {
         .await,
         2
     );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM frames WHERE text_json IS NOT NULL"
+        )
+        .await,
+        2,
+        "both frames start with OCR text_json"
+    );
 
     // Strip a window that brackets the old frame but excludes the recent one.
     let start = Utc::now() - Duration::days(31);
@@ -110,6 +121,15 @@ async fn strip_heavy_text_keeps_recent_and_text_drops_old_blobs() {
         .await,
         1,
         "old frame AX tree json must be nulled"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM frames WHERE id = 1 AND text_json IS NULL"
+        )
+        .await,
+        1,
+        "old frame OCR text_json must be nulled too (symmetric with AX json)"
     );
 
     // Old element gone from both the table and the FTS index.
@@ -148,6 +168,15 @@ async fn strip_heavy_text_keeps_recent_and_text_drops_old_blobs() {
         )
         .await,
         1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM frames WHERE id = 2 AND text_json IS NOT NULL"
+        )
+        .await,
+        1,
+        "recent frame keeps its OCR text_json"
     );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM ui_events").await,

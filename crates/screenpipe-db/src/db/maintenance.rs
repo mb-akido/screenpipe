@@ -556,16 +556,21 @@ impl DatabaseManager {
     /// Lean retention: strip the heavy *text* a frame carries while keeping the
     /// frame row, its searchable `full_text`, transcripts, and memories alive.
     ///
-    /// Drops the three biggest db.sqlite text contributors for [start, end]:
-    ///   - `elements` rows (the per-node OCR + accessibility tree)
+    /// Drops the biggest db.sqlite text contributors for [start, end]:
+    ///   - `elements` rows (the per-node OCR *and* accessibility tree)
     ///   - `frames.accessibility_tree_json` (the raw AX tree JSON blob)
+    ///   - `frames.text_json` (the per-word OCR bounding-box blob) — dropped
+    ///     symmetrically with the AX blob so OCR detail isn't left behind
     ///   - `ui_events` (the keystroke/click/scroll stream)
     ///
-    /// Search/timeline keep working because `frames.full_text` (indexed by
-    /// `frames_fts`) and `audio_transcriptions` are untouched. FTS stays in
-    /// sync automatically: `elements_ad`/`ui_events` delete triggers issue the
-    /// FTS5 'delete' command, and nulling `accessibility_tree_json` fires no
-    /// trigger (`frames_au` only watches full_text/app_name/window_name/url).
+    /// What is KEPT so search/timeline/memories keep working: `frames.full_text`
+    /// (the single searchable OCR+a11y text, indexed by `frames_fts`),
+    /// `audio_transcriptions`, and `memories`. So OCR *text* survives — only the
+    /// OCR/AX *geometry detail* (bounds, tree) is dropped. FTS stays in sync
+    /// automatically: `elements_ad`/`ui_events_ad` delete triggers issue the
+    /// FTS5 'delete' command, and nulling `text_json`/`accessibility_tree_json`
+    /// fires no trigger (`frames_au` only watches
+    /// full_text/app_name/window_name/browser_url).
     ///
     /// Anchor handling mirrors `delete_time_range_batch`: elements owned by an
     /// in-range frame but referenced by a still-kept out-of-range frame are
@@ -640,13 +645,14 @@ impl DatabaseManager {
         .await?;
         let elements_deleted = elements_result.rows_affected();
 
-        // Null the raw accessibility tree JSON blob. Not FTS-indexed and not a
-        // column watched by frames_au, so no trigger fires — full_text (the
-        // search source) is deliberately left intact.
+        // Null the heavy per-frame geometry blobs: the raw accessibility tree
+        // JSON and the per-word OCR bounding boxes (text_json). Neither is
+        // FTS-indexed nor watched by frames_au, so no trigger fires — full_text
+        // (the searchable OCR+a11y text) is deliberately left intact.
         let frames_result = sqlx::query(
-            r#"UPDATE frames SET accessibility_tree_json = NULL
+            r#"UPDATE frames SET accessibility_tree_json = NULL, text_json = NULL
                WHERE timestamp BETWEEN ?1 AND ?2
-               AND accessibility_tree_json IS NOT NULL"#,
+               AND (accessibility_tree_json IS NOT NULL OR text_json IS NOT NULL)"#,
         )
         .bind(&start_str)
         .bind(&end_str)
