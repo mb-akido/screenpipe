@@ -335,6 +335,131 @@ impl Default for Aec {
     }
 }
 
+/// Time-aligned far-end (system-audio) reference for [`Aec`].
+///
+/// The mic and system-audio lanes are captured by independent tasks, so they
+/// reach the canceller as separate streams. This buffers the far-end lane as a
+/// contiguous run of [`AEC_SAMPLE_RATE`] mono samples anchored to a capture
+/// timestamp, and lets the mic path pull the far-end window aligned to a mic
+/// frame's own timestamp. Spans with no reference are zero-filled — there was
+/// no loudspeaker output then, so there is no echo to cancel.
+///
+/// Timestamps are epoch milliseconds (what `now_epoch_millis()` stamps on the
+/// meeting-audio frames). ms→sample is exact at 16 kHz (16 samples/ms). The
+/// adaptive filter's 160 ms span absorbs the residual sub-ms misalignment, and
+/// because the canceller only subtracts the far-correlated component, any
+/// leftover offset reduces echo removed without distorting near-end speech.
+pub struct FarEndRef {
+    buf: VecDeque<f32>,
+    /// epoch-ms timestamp of `buf.front()`, once anything has been pushed.
+    start_ms: Option<i64>,
+    capacity: usize,
+}
+
+impl FarEndRef {
+    /// Samples per millisecond at the canceller's rate (16 at 16 kHz).
+    const SAMPLES_PER_MS: i64 = AEC_SAMPLE_RATE as i64 / 1000;
+    /// A timestamp discontinuity larger than this resets the timeline rather
+    /// than zero-filling a huge gap (e.g. capture paused/restarted).
+    const RESET_GAP_MS: i64 = 2000;
+
+    /// Retain at most `capacity` samples (older far-end is dropped).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(capacity),
+            start_ms: None,
+            capacity,
+        }
+    }
+
+    /// Sample index within `buf` for epoch-ms `ts` (may be negative or beyond
+    /// the buffer; callers clamp).
+    fn index_of(&self, ts_ms: i64) -> i64 {
+        match self.start_ms {
+            Some(s) => (ts_ms - s) * Self::SAMPLES_PER_MS,
+            None => 0,
+        }
+    }
+
+    /// Append far-end `samples` captured at `ts_ms`. Reconciles against the
+    /// expected next position: a forward gap is zero-filled, a small overlap is
+    /// trimmed, and a large jump resets the timeline.
+    pub fn push(&mut self, ts_ms: i64, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let Some(start) = self.start_ms else {
+            self.start_ms = Some(ts_ms);
+            self.buf.extend(samples.iter().copied());
+            self.trim();
+            return;
+        };
+
+        let idx = (ts_ms - start) * Self::SAMPLES_PER_MS;
+        let len = self.buf.len() as i64;
+        let gap = idx - len;
+
+        if gap.abs() * 1000 / Self::SAMPLES_PER_MS > Self::RESET_GAP_MS {
+            // Discontinuity — restart the timeline at this frame.
+            self.buf.clear();
+            self.start_ms = Some(ts_ms);
+            self.buf.extend(samples.iter().copied());
+        } else if gap > 0 {
+            // Forward gap: zero-fill the silent span, then append.
+            self.buf
+                .extend(std::iter::repeat(0.0f32).take(gap as usize));
+            self.buf.extend(samples.iter().copied());
+        } else if gap == 0 {
+            self.buf.extend(samples.iter().copied());
+        } else {
+            // Overlap: drop the overlapping head of `samples`, append the rest.
+            let drop = (-gap) as usize;
+            if drop < samples.len() {
+                self.buf.extend(samples[drop..].iter().copied());
+            }
+        }
+        self.trim();
+    }
+
+    /// Drop from the front so at most `capacity` samples are retained, keeping
+    /// `start_ms` consistent with the new front.
+    fn trim(&mut self) {
+        if self.buf.len() > self.capacity {
+            let drop = self.buf.len() - self.capacity;
+            self.buf.drain(..drop);
+            if let Some(s) = self.start_ms {
+                self.start_ms = Some(s + drop as i64 / Self::SAMPLES_PER_MS);
+                // exact: drop is a multiple-friendly count; sub-ms rounding is
+                // absorbed by the adaptive filter.
+            }
+        }
+    }
+
+    /// Return `n` far-end samples aligned to a mic frame starting at `ts_ms`.
+    /// Positions with no stored reference are zero (so the result is always
+    /// length `n`, ready to pair with an `n`-sample mic frame).
+    pub fn take_aligned(&self, ts_ms: i64, n: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; n];
+        if self.start_ms.is_none() {
+            return out;
+        }
+        let base = self.index_of(ts_ms);
+        let len = self.buf.len() as i64;
+        for (i, o) in out.iter_mut().enumerate() {
+            let pos = base + i as i64;
+            if pos >= 0 && pos < len {
+                *o = self.buf[pos as usize];
+            }
+        }
+        out
+    }
+
+    /// Whether any reference has been captured yet.
+    pub fn is_primed(&self) -> bool {
+        self.start_ms.is_some()
+    }
+}
+
 #[cfg(test)]
 mod aec_tests {
     use super::*;
@@ -532,5 +657,77 @@ mod aec_tests {
         let before = near.clone();
         aec.process_frame(&far, &mut near);
         assert_eq!(before, near);
+    }
+
+    // ── FarEndRef alignment buffer ──────────────────────────────────────────
+
+    /// 10 ms of ramp data starting at value `v0` (distinct per frame so tests
+    /// can tell which frame a sample came from). 160 samples at 16 kHz.
+    fn ramp(v0: f32) -> Vec<f32> {
+        (0..AEC_BLOCK_LEN).map(|i| v0 + i as f32).collect()
+    }
+
+    #[test]
+    fn far_end_ref_aligns_contiguous_pushes() {
+        let mut r = FarEndRef::new(16_000);
+        r.push(0, &ramp(1000.0)); // [0,10)ms
+        r.push(10, &ramp(2000.0)); // [10,20)ms
+        assert!(r.is_primed());
+        assert_eq!(r.take_aligned(0, AEC_BLOCK_LEN), ramp(1000.0));
+        assert_eq!(r.take_aligned(10, AEC_BLOCK_LEN), ramp(2000.0));
+        // A 5 ms-offset window straddles the two frames: 80 samples of frame 1's
+        // tail then 80 of frame 2's head.
+        let mid = r.take_aligned(5, AEC_BLOCK_LEN);
+        assert_eq!(mid[0], 1000.0 + 80.0);
+        assert_eq!(mid[80], 2000.0);
+    }
+
+    #[test]
+    fn far_end_ref_zero_fills_out_of_range() {
+        let mut r = FarEndRef::new(16_000);
+        r.push(100, &ramp(1.0)); // [100,110)ms
+                                 // Before the buffer starts → zeros.
+        assert_eq!(r.take_aligned(0, AEC_BLOCK_LEN), vec![0.0; AEC_BLOCK_LEN]);
+        // After it ends → zeros.
+        assert_eq!(r.take_aligned(200, AEC_BLOCK_LEN), vec![0.0; AEC_BLOCK_LEN]);
+        // Empty buffer → zeros, never panics.
+        let empty = FarEndRef::new(16_000);
+        assert_eq!(
+            empty.take_aligned(0, AEC_BLOCK_LEN),
+            vec![0.0; AEC_BLOCK_LEN]
+        );
+    }
+
+    #[test]
+    fn far_end_ref_zero_fills_a_forward_gap() {
+        let mut r = FarEndRef::new(16_000);
+        r.push(0, &ramp(1.0)); // [0,10)ms
+        r.push(30, &ramp(9.0)); // 20 ms gap, then [30,40)ms
+                                // The silent gap reads as zeros…
+        assert_eq!(r.take_aligned(15, AEC_BLOCK_LEN), vec![0.0; AEC_BLOCK_LEN]);
+        // …and the post-gap frame is still correctly aligned.
+        assert_eq!(r.take_aligned(30, AEC_BLOCK_LEN), ramp(9.0));
+    }
+
+    #[test]
+    fn far_end_ref_resets_on_large_discontinuity() {
+        let mut r = FarEndRef::new(16_000);
+        r.push(0, &ramp(1.0));
+        r.push(10_000, &ramp(5.0)); // 10 s jump (> RESET_GAP_MS) → restart
+                                    // Old timeline is gone; the new frame anchors the buffer.
+        assert_eq!(r.take_aligned(0, AEC_BLOCK_LEN), vec![0.0; AEC_BLOCK_LEN]);
+        assert_eq!(r.take_aligned(10_000, AEC_BLOCK_LEN), ramp(5.0));
+    }
+
+    #[test]
+    fn far_end_ref_respects_capacity() {
+        // Capacity for 2 frames; push 3 → the oldest is dropped.
+        let mut r = FarEndRef::new(2 * AEC_BLOCK_LEN);
+        r.push(0, &ramp(1.0));
+        r.push(10, &ramp(2.0));
+        r.push(20, &ramp(3.0));
+        assert_eq!(r.take_aligned(0, AEC_BLOCK_LEN), vec![0.0; AEC_BLOCK_LEN]); // evicted
+        assert_eq!(r.take_aligned(10, AEC_BLOCK_LEN), ramp(2.0));
+        assert_eq!(r.take_aligned(20, AEC_BLOCK_LEN), ramp(3.0));
     }
 }
