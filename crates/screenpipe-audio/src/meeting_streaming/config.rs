@@ -62,6 +62,13 @@ pub struct MeetingStreamingConfig {
     /// streaming analog of the batch path's keyterms. Empty = no biasing.
     #[serde(default)]
     pub keyterms: Vec<String>,
+    /// Run the input (mic) lane through the software echo canceller, using the
+    /// output (system-audio) lane as the far-end reference, before live
+    /// transcription. Off by default; opt-in via the mic echo-cancellation
+    /// setting (#3938). Removes the loudspeaker echo so the remote talker stops
+    /// being transcribed on both the "me" and "speaker" lanes.
+    #[serde(default)]
+    pub aec_enabled: bool,
 }
 
 impl Default for MeetingStreamingConfig {
@@ -109,6 +116,10 @@ impl Default for MeetingStreamingConfig {
             local_speaker_name: env_non_empty("SCREENPIPE_MEETING_LOCAL_SPEAKER_NAME"),
             persist_finals: true,
             keyterms: Vec::new(),
+            aec_enabled: env::var("SCREENPIPE_MEETING_AEC")
+                .ok()
+                .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false),
         }
     }
 }
@@ -146,6 +157,13 @@ impl MeetingStreamingConfig {
     /// `with_provider` preserves it.
     pub fn with_keyterms(mut self, keyterms: Vec<String>) -> Self {
         self.keyterms = keyterms;
+        self
+    }
+
+    /// Enable/disable the input-lane echo canceller (preserved across provider
+    /// re-resolution, like keyterms).
+    pub fn with_aec_enabled(mut self, enabled: bool) -> Self {
+        self.aec_enabled = enabled;
         self
     }
 

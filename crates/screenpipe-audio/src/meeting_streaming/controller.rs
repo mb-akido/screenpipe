@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 use crate::{core::engine::AudioTranscriptionEngine, transcription::engine::TranscriptionEngine};
 
 use super::{
+    aec_stage::MeetingAecStage,
     deepgram_live,
     events::{
         MeetingAudioFrame, MeetingAudioTap, MeetingLifecycleEvent, MeetingStreamingError,
@@ -65,6 +66,10 @@ struct ActiveMeetingStream {
     notified_transcript_stall: bool,
     device_senders: HashMap<String, mpsc::Sender<MeetingAudioFrame>>,
     device_retry_after: HashMap<String, Instant>,
+    /// Per-meeting echo canceller: subtracts the output (system-audio) lane
+    /// from the input (mic) lane before live transcription. Reset each meeting
+    /// so the adaptive filter relearns the room. No-op unless `aec_enabled`.
+    aec_stage: MeetingAecStage,
 }
 
 /// Start the meeting-streaming lifecycle coordinator.
@@ -230,12 +235,20 @@ pub fn start_meeting_streaming_loop(
                                     session.voiced_audio_seen = true;
                                 }
                                 if session.live_transcription_enabled {
-                                    route_frame_to_provider(
-                                        &audio_tap,
-                                        &transcription_engine,
-                                        session,
-                                        frame,
-                                    );
+                                    // Echo-cancel the mic lane against the
+                                    // system-audio lane before transcription
+                                    // (no-op when aec_enabled is false). The
+                                    // stage may buffer a sub-block remainder and
+                                    // return None, in which case there is
+                                    // nothing to route this frame.
+                                    if let Some(frame) = session.aec_stage.process(frame) {
+                                        route_frame_to_provider(
+                                            &audio_tap,
+                                            &transcription_engine,
+                                            session,
+                                            frame,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -342,6 +355,7 @@ async fn start_streaming_session(
         notified_transcript_stall: false,
         device_senders: HashMap::new(),
         device_retry_after: HashMap::new(),
+        aec_stage: MeetingAecStage::new(session_config.aec_enabled),
     });
 
     let started = MeetingStreamingSessionStarted {
@@ -907,6 +921,7 @@ mod tests {
             notified_transcript_stall: false,
             device_senders: HashMap::new(),
             device_retry_after: HashMap::new(),
+            aec_stage: MeetingAecStage::new(false),
         }
     }
 

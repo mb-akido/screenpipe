@@ -308,7 +308,16 @@ impl AudioManager {
         {
             let mut meeting_streaming_handle = self.meeting_streaming_handle.write().await;
             if meeting_streaming_handle.is_none() {
-                let config = self.options.read().await.meeting_streaming.clone();
+                // Drive the engine-side software echo canceller from the macOS
+                // "mic echo cancellation" toggle (the VPIO path is a 0 dB no-op,
+                // #3938). Not gated on the Windows flag: WASAPI AEC already
+                // cancels there (#3406), so a second pass would be redundant.
+                let opts = self.options.read().await;
+                let config = opts
+                    .meeting_streaming
+                    .clone()
+                    .with_aec_enabled(opts.macos_input_vpio_enabled);
+                drop(opts);
                 let audio_rx = self.meeting_audio_tap.subscribe();
                 *meeting_streaming_handle = Some(start_meeting_streaming_loop(
                     config,
