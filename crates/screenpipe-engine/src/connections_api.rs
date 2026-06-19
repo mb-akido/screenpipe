@@ -10,7 +10,7 @@ use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use screenpipe_connect::connections::ConnectionManager;
+use screenpipe_connect::connections::{bee, ConnectionManager};
 use screenpipe_connect::oauth::{self as oauth_store, PENDING_OAUTH};
 use screenpipe_connect::whatsapp::WhatsAppGateway;
 use screenpipe_secrets::SecretStore;
@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -3064,6 +3064,152 @@ async fn browser_run_eval(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bee one-click device-pairing
+// (protocol lives in screenpipe_connect::connections::bee)
+// ---------------------------------------------------------------------------
+
+/// Server-side state for an in-flight Bee pairing. The ephemeral secret key
+/// never leaves the engine — it's held here keyed by `request_id` until the
+/// poll route decrypts the sealed token or the session expires.
+struct BeePairingSession {
+    secret_key: [u8; 32],
+    public_key_b64: String,
+    created_at: Instant,
+}
+
+fn bee_pairing_sessions() -> &'static StdMutex<HashMap<String, BeePairingSession>> {
+    static SESSIONS: OnceLock<StdMutex<HashMap<String, BeePairingSession>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+const BEE_PAIRING_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Deserialize)]
+struct BeePairPollBody {
+    request_id: String,
+}
+
+/// POST /connections/bee/pair/start — begin a one-click Bee pairing.
+///
+/// Generates an ephemeral keypair, asks Bee for a pairing request, stashes the
+/// secret key keyed by `request_id`, and returns the URL the user opens to
+/// approve. The UI then polls `pair/poll` until completion.
+async fn bee_pair_start() -> (StatusCode, Json<Value>) {
+    let (secret_key, public_key_b64) = match bee::generate_pairing_keypair() {
+        Ok(kp) => kp,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        }
+    };
+    let client = reqwest::Client::new();
+    match bee::request_pairing(&client, &public_key_b64).await {
+        Ok(bee::PairingOutcome::Pending {
+            request_id,
+            expires_at,
+        }) => {
+            let pairing_url = bee::pairing_connect_url(&request_id);
+            {
+                let mut sessions = bee_pairing_sessions().lock().unwrap();
+                let now = Instant::now();
+                sessions.retain(|_, s| now.duration_since(s.created_at) < BEE_PAIRING_SESSION_TTL);
+                sessions.insert(
+                    request_id.clone(),
+                    BeePairingSession {
+                        secret_key,
+                        public_key_b64,
+                        created_at: now,
+                    },
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "request_id": request_id,
+                    "pairing_url": pairing_url,
+                    "expires_at": expires_at,
+                })),
+            )
+        }
+        Ok(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "unexpected pairing state from Bee" })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// POST /connections/bee/pair/poll {request_id} — poll a pending pairing.
+///
+/// Returns `{status: pending|completed|expired|unknown}`. On `completed` it
+/// decrypts the sealed token and stores it as the Bee `api_key` credential —
+/// the same slot the manual "Developer Token" field uses — so the proxy and
+/// `test()` paths need no changes.
+async fn bee_pair_poll(
+    State(state): State<ConnectionsState>,
+    Json(body): Json<BeePairPollBody>,
+) -> (StatusCode, Json<Value>) {
+    let (secret_key, public_key_b64) = {
+        let sessions = bee_pairing_sessions().lock().unwrap();
+        match sessions.get(&body.request_id) {
+            Some(s) => (s.secret_key, s.public_key_b64.clone()),
+            None => return (StatusCode::NOT_FOUND, Json(json!({ "status": "unknown" }))),
+        }
+    };
+
+    let client = reqwest::Client::new();
+    match bee::request_pairing(&client, &public_key_b64).await {
+        Ok(bee::PairingOutcome::Pending { .. }) => {
+            (StatusCode::OK, Json(json!({ "status": "pending" })))
+        }
+        Ok(bee::PairingOutcome::Completed { encrypted_token }) => {
+            let token = match bee::decrypt_pairing_token(&encrypted_token, &secret_key) {
+                Ok(t) => t,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({ "error": e.to_string() })),
+                    )
+                }
+            };
+            let mut creds = Map::new();
+            creds.insert("api_key".to_string(), Value::String(token));
+            let result = {
+                let mgr = state.cm.lock().await;
+                mgr.connect("bee", creds).await
+            };
+            bee_pairing_sessions()
+                .lock()
+                .unwrap()
+                .remove(&body.request_id);
+            match result {
+                Ok(()) => (StatusCode::OK, Json(json!({ "status": "completed" }))),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                ),
+            }
+        }
+        Ok(bee::PairingOutcome::Expired) => {
+            bee_pairing_sessions()
+                .lock()
+                .unwrap()
+                .remove(&body.request_id);
+            (StatusCode::OK, Json(json!({ "status": "expired" })))
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
 pub fn router<S>(
     cm: SharedConnectionManager,
     wa: SharedWhatsAppGateway,
@@ -3137,6 +3283,9 @@ where
         .route("/whatsapp/pair", post(whatsapp_pair))
         .route("/whatsapp/status", get(whatsapp_status))
         .route("/whatsapp/disconnect", post(whatsapp_disconnect))
+        // Bee one-click device-pairing (must be before /:id to avoid conflict)
+        .route("/bee/pair/start", post(bee_pair_start))
+        .route("/bee/pair/poll", post(bee_pair_poll))
         // Credential proxy — pipes call this instead of external APIs directly
         .route("/:id/proxy/*path", axum::routing::any(connection_proxy))
         .route("/:id/config", get(connection_config))

@@ -2906,6 +2906,102 @@ interface InstanceData {
   credentials: Record<string, string>;
 }
 
+/**
+ * One-click "connect with Bee" — drives the engine's device-pairing routes
+ * (POST /connections/bee/pair/{start,poll}). Bee has no redirect OAuth and no
+ * web token portal anymore, so we start a pairing, open the approve URL, and
+ * poll until the sealed token is decrypted + stored server-side.
+ */
+function BeePairPanel({ onConnected }: { onConnected: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const cancelledRef = useRef(false);
+
+  useEffect(() => {
+    return () => {
+      cancelledRef.current = true;
+    };
+  }, []);
+
+  const handleConnect = async () => {
+    setBusy(true);
+    setStatusMsg(null);
+    cancelledRef.current = false;
+    try {
+      const res = await localFetch("/connections/bee/pair/start", { method: "POST" });
+      const body = await res.json();
+      if (!res.ok) {
+        setStatusMsg(body?.error ?? `Couldn't start pairing (HTTP ${res.status})`);
+        setBusy(false);
+        return;
+      }
+      const requestId = body.request_id as string;
+      await openUrl(body.pairing_url as string);
+      setStatusMsg("approve the connection in your browser, then come back…");
+
+      const deadline = Date.now() + 5 * 60 * 1000;
+      const poll = async () => {
+        if (cancelledRef.current) return;
+        if (Date.now() > deadline) {
+          setStatusMsg("pairing timed out — try again");
+          setBusy(false);
+          return;
+        }
+        try {
+          const pr = await localFetch("/connections/bee/pair/poll", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ request_id: requestId }),
+          });
+          const pb = await pr.json();
+          if (pb?.status === "completed") {
+            setStatusMsg(null);
+            setBusy(false);
+            onConnected();
+            return;
+          }
+          if (pb?.status === "expired" || pb?.status === "unknown") {
+            setStatusMsg("pairing expired — try again");
+            setBusy(false);
+            return;
+          }
+        } catch {
+          // transient — keep polling until the deadline
+        }
+        setTimeout(poll, 2000);
+      };
+      setTimeout(poll, 2000);
+    } catch (e) {
+      setStatusMsg(`pairing failed: ${e instanceof Error ? e.message : String(e)}`);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <Button
+        onClick={handleConnect}
+        disabled={busy}
+        size="sm"
+        className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal whitespace-nowrap"
+      >
+        {busy ? (
+          <>
+            <Loader2 className="h-3 w-3 animate-spin" />
+            waiting for approval…
+          </>
+        ) : (
+          <>
+            <LogIn className="h-3 w-3" />
+            connect with Bee
+          </>
+        )}
+      </Button>
+      {statusMsg && <p className="text-[11px] text-muted-foreground">{statusMsg}</p>}
+    </div>
+  );
+}
+
 function ApiIntegrationPanel({ integration, onRefresh }: {
   integration: IntegrationInfo;
   onRefresh: () => void;
@@ -3918,6 +4014,33 @@ export function ConnectionsSection({
                     </div>
                   </details>
                 )}
+              </div>
+            );
+          }
+          // Bee has no redirect OAuth, but supports one-click device pairing.
+          // Show the pairing button, keeping the manual token field as an
+          // advanced fallback (e.g. a token pasted from the bee CLI).
+          if (selectedIntegration.id === "bee") {
+            return (
+              <div className="space-y-3">
+                <BeePairPanel
+                  onConnected={() => {
+                    refreshIntegrationConnection("bee", true);
+                    notifyConnectionsUpdated();
+                    fetchIntegrations();
+                  }}
+                />
+                <details>
+                  <summary className="text-[11px] text-muted-foreground cursor-pointer select-none hover:text-foreground">
+                    advanced: connect with a token instead
+                  </summary>
+                  <div className="pt-2">
+                    <ApiIntegrationPanel
+                      integration={selectedIntegration}
+                      onRefresh={fetchIntegrations}
+                    />
+                  </div>
+                </details>
               </div>
             );
           }
