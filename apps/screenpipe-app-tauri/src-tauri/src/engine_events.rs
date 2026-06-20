@@ -124,6 +124,7 @@ fn dispatch(app: &AppHandle, text: &str) {
         }
         "audio_device_fallback_engaged"
         | "audio_device_fallback_cleared"
+        | "audio_device_fallback_unavailable"
         | "audio_device_status_changed" => audio_device::handle(app, name, &data),
         "audio_capture_health_speaker_silent" | "audio_capture_health_recovered" => {
             audio_health::handle(app, name, &data)
