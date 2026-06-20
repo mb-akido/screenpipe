@@ -333,6 +333,146 @@ function RedactionExamplePreview({ labels }: { labels: string[] }) {
   );
 }
 
+// Hover-to-highlight preview for the "where we look" (surfaces) axis: a tiny
+// mock app window whose regions light up when you hover the matching row and
+// get a redaction bar when that surface is on. Pure illustration — fabricated
+// content, never real captured data. Grayscale per DESIGN.md.
+function RedactionWherePreview({
+  options,
+  selected,
+  onToggle,
+}: {
+  options: {
+    value: string;
+    label: string;
+    desc: string;
+    recommended?: boolean;
+  }[];
+  selected: string[];
+  onToggle: (value: string, checked: boolean) => void;
+}) {
+  const [hovered, setHovered] = useState<string | null>(null);
+  const on = (v: string) => selected.includes(v);
+
+  // A redactable region of the mock screen, tagged with the surface it maps
+  // to. Outlines on hover of that row; covered by a bar when the surface is
+  // on. Helper (not a nested component) so it keeps the parent's hover state.
+  const region = (r: string, content: React.ReactNode, mono?: boolean) => (
+    <span
+      className={cn(
+        "relative inline-block rounded-[3px] align-baseline",
+        hovered === r &&
+          "outline outline-2 outline-foreground outline-offset-2",
+      )}
+    >
+      <span className={cn(mono && "font-mono", on(r) && "invisible")}>
+        {content}
+      </span>
+      {on(r) && (
+        <span className="absolute inset-0 rounded-[3px] bg-foreground" />
+      )}
+    </span>
+  );
+
+  return (
+    <div className="mt-1">
+      <div className="space-y-1.5">
+        {options.map((opt) => (
+          <label
+            key={opt.value}
+            className="flex items-start gap-2 text-xs cursor-pointer"
+            onMouseEnter={() => setHovered(opt.value)}
+            onMouseLeave={() => setHovered(null)}
+          >
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={on(opt.value)}
+              onChange={(e) => onToggle(opt.value, e.target.checked)}
+            />
+            <span>
+              <span className="font-medium text-foreground">{opt.label}</span>
+              {opt.recommended && (
+                <span className="text-muted-foreground"> (recommended)</span>
+              )}
+              <span className="text-muted-foreground"> — {opt.desc}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      {/* Mock app window — hover a row above to see the matching area. */}
+      <div className="mt-2.5 overflow-hidden rounded-md border border-border bg-card">
+        <div className="flex items-center gap-1.5 border-b border-border px-2 py-1.5">
+          <span className="h-2 w-2 rounded-full bg-border" />
+          <span className="h-2 w-2 rounded-full bg-border" />
+          <span className="h-2 w-2 rounded-full bg-border" />
+          <span className="ml-1 min-w-0 flex-1 text-[10px]">
+            {region(
+              "browser_url",
+              <span className="block truncate rounded-full bg-muted px-2 py-0.5 text-muted-foreground">
+                app.example.com/account
+              </span>,
+              true,
+            )}
+          </span>
+        </div>
+        <div className="space-y-2 px-3 py-2.5 text-xs">
+          <div className="flex gap-3">
+            {region(
+              "ui_element_name",
+              <span className="font-medium text-foreground">dashboard</span>,
+            )}
+            {region(
+              "ui_element_name",
+              <span className="text-muted-foreground">settings</span>,
+            )}
+          </div>
+
+          <div>
+            <div className="mb-0.5 text-[10px] text-muted-foreground">email</div>
+            <div className="rounded border border-border px-1.5 py-1">
+              {region("element_properties", "jordan@example.com")}
+            </div>
+            <div className="mt-0.5 text-[10px]">
+              {region(
+                "ui_element_description",
+                <span className="text-muted-foreground">
+                  we&apos;ll never share your email
+                </span>,
+              )}
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-0.5 text-[10px] text-muted-foreground">
+              password
+            </div>
+            <div className="rounded border border-border px-1.5 py-1 font-mono">
+              {region("element_properties", "hunter2-s3cret", true)}
+            </div>
+          </div>
+
+          <div className="text-[10px]">
+            {region(
+              "a11y_url_field",
+              <span className="text-foreground underline">reset password</span>,
+            )}
+          </div>
+
+          <div className="space-y-1 pt-0.5">
+            <div className="h-1.5 w-full rounded bg-foreground" />
+            <div className="h-1.5 w-4/5 rounded bg-foreground" />
+            <div className="text-[9px] text-muted-foreground">
+              typed text, transcripts &amp; on-screen text — always hidden
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function PrivacySection() {
   const { settings, updateSettings } = useSettings();
   const isEnterprise = useIsEnterpriseBuild();
@@ -1514,42 +1654,14 @@ export function PrivacySection() {
                       <p className="text-[11px] text-muted-foreground">
                         We always scan what you type, your clipboard,
                         transcripts, window titles, and on-screen text. Turn on
-                        any of these extra places the same info can hide.
+                        any of these extra places the same info can hide —
+                        hover a row to see what it covers.
                       </p>
-                      {PII_COLUMN_OPTIONS.map((opt) => {
-                        const checked = piiRedactionColumns.includes(opt.value);
-                        return (
-                          <label
-                            key={opt.value}
-                            className="flex items-start gap-2 text-xs cursor-pointer"
-                          >
-                            <input
-                              type="checkbox"
-                              className="mt-0.5"
-                              checked={checked}
-                              onChange={(e) =>
-                                handlePiiColumnToggle(
-                                  opt.value,
-                                  e.target.checked,
-                                )
-                              }
-                            />
-                            <span>
-                              <span className="font-medium text-foreground">
-                                {opt.label}
-                              </span>
-                              {opt.recommended && (
-                                <span className="text-muted-foreground">
-                                  {" "}(recommended)
-                                </span>
-                              )}
-                              <span className="text-muted-foreground">
-                                {" "}— {opt.desc}
-                              </span>
-                            </span>
-                          </label>
-                        );
-                      })}
+                      <RedactionWherePreview
+                        options={PII_COLUMN_OPTIONS}
+                        selected={piiRedactionColumns}
+                        onToggle={handlePiiColumnToggle}
+                      />
                     </div>
                   </details>
                 )}
