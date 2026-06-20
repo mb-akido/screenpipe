@@ -2026,6 +2026,15 @@ pub struct RemoteSyncArgs {
     /// SSH port
     #[arg(long, default_value_t = 22)]
     pub port: u16,
+    /// Skip recordings: the `data/` + `exports/` dirs and media files
+    /// (mp4/wav/jpg/...). Syncs the searchable db + config only — the fast
+    /// way to put a huge ~/.screenpipe on a small remote.
+    #[arg(long, default_value_t = false)]
+    pub no_media: bool,
+    /// Exclude paths matching a glob (repeatable, `*` wildcards). Also reads
+    /// `<data-dir>/.screenpipeignore` (one glob per line, `#` comments).
+    #[arg(long = "exclude")]
+    pub exclude: Vec<String>,
 }
 
 // =============================================================================
