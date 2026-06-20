@@ -145,3 +145,172 @@ export function RetentionModePreview({
     </div>
   );
 }
+
+// ── shared: a 5-segment geometric meter ──────────────────────────────
+// Filled segments = level (0–5). Black-on-grey, sharp — brand house style.
+function SegMeter({ label, level }: { label: string; level: number }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-[5.5rem] shrink-0 text-[10px] text-muted-foreground">
+        {label}
+      </span>
+      <span className="flex flex-1 gap-[3px]">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <span
+            key={i}
+            className={cn(
+              "h-1.5 flex-1 rounded-[1px]",
+              i < level ? "bg-foreground" : "bg-foreground/15",
+            )}
+          />
+        ))}
+      </span>
+    </div>
+  );
+}
+
+// ── Power mode ───────────────────────────────────────────────────────
+// Three meters (cadence / quality / battery) that re-balance per profile,
+// so the tradeoff each mode makes is visible at a glance.
+const POWER_PROFILE: Record<
+  "auto" | "performance" | "battery_saver",
+  { meters: [number, number, number]; caption: string }
+> = {
+  performance: {
+    meters: [5, 5, 1],
+    caption: "full cadence & quality — ignores battery",
+  },
+  auto: {
+    meters: [3, 3, 3],
+    caption: "adapts to whether you're plugged in",
+  },
+  battery_saver: {
+    meters: [1, 2, 5],
+    caption: "slows capture & trims quality to stretch battery",
+  },
+};
+
+export function PowerModePreview({
+  mode,
+}: {
+  mode: "auto" | "performance" | "battery_saver";
+}) {
+  const p = POWER_PROFILE[mode] ?? POWER_PROFILE.auto;
+  return (
+    <div className="mt-3 space-y-1.5 rounded-md border border-border bg-muted/40 px-2.5 py-2">
+      <SegMeter label="capture cadence" level={p.meters[0]} />
+      <SegMeter label="capture quality" level={p.meters[1]} />
+      <SegMeter label="battery life" level={p.meters[2]} />
+      <p className="pt-0.5 text-[10px] text-muted-foreground">{p.caption}</p>
+    </div>
+  );
+}
+
+// ── Transcription engine ─────────────────────────────────────────────
+// Answers "does my audio leave the device?" with a tiny data-flow plus
+// privacy / speed / device-load meters. Engines are classified by id.
+type EngineClass = {
+  where: "device" | "enclave" | "provider";
+  target: string;
+  note: string;
+  privacy: number;
+  speed: number;
+  load: number;
+};
+
+function classifyEngine(engine: string): EngineClass | null {
+  if (engine === "disabled") return null;
+  if (engine === "screenpipe-cloud")
+    return {
+      where: "enclave",
+      target: "verified enclave",
+      note: "attested · zero-retention",
+      privacy: 4,
+      speed: 5,
+      load: 1,
+    };
+  if (engine === "deepgram")
+    return {
+      where: "provider",
+      target: "Deepgram",
+      note: "third party",
+      privacy: 2,
+      speed: 5,
+      load: 1,
+    };
+  if (engine === "openai-compatible")
+    return {
+      where: "provider",
+      target: "your provider",
+      note: "third party",
+      privacy: 2,
+      speed: 4,
+      load: 1,
+    };
+  // whisper-*, qwen3-asr, parakeet — runs locally
+  return {
+    where: "device",
+    target: "your device",
+    note: "never leaves",
+    privacy: 5,
+    speed: 3,
+    load: 4,
+  };
+}
+
+export function TranscriptionEnginePreview({ engine }: { engine: string }) {
+  const c = classifyEngine(engine);
+  if (!c) {
+    return (
+      <div className="mt-2.5 ml-[26px] rounded-md border border-border bg-muted/40 px-2.5 py-2">
+        <p className="text-[11px] text-muted-foreground">
+          audio is captured but not transcribed — no speech text, nothing sent
+          anywhere, lowest load.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2.5 ml-[26px] space-y-2 rounded-md border border-border bg-muted/40 px-2.5 py-2">
+      <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+        <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono">
+          audio
+        </span>
+        <span className="text-muted-foreground">→</span>
+        <span className="rounded border border-border bg-background px-1.5 py-0.5 text-foreground">
+          {c.target}
+        </span>
+        <span className="text-muted-foreground">{c.note}</span>
+      </div>
+      <SegMeter label="privacy" level={c.privacy} />
+      <SegMeter label="speed" level={c.speed} />
+      <SegMeter label="device load" level={c.load} />
+    </div>
+  );
+}
+
+// ── Notifications ────────────────────────────────────────────────────
+// A sample of the actual notification, so the toggles aren't abstract.
+export function NotificationSamplePreview() {
+  return (
+    <div className="mb-4 rounded-lg border border-border bg-card px-3 py-2.5">
+      <p className="mb-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+        what these look like
+      </p>
+      <div className="flex items-start gap-2.5 rounded-md border border-border bg-background px-2.5 py-2">
+        <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-[6px] bg-foreground">
+          <span className="h-2.5 w-2.5 rounded-[2px] bg-background" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-foreground">screenpipe</span>
+            <span className="text-[10px] text-muted-foreground">now</span>
+          </div>
+          <p className="truncate text-xs text-muted-foreground">
+            Audio capture recovered — recording is healthy again.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -8,7 +8,7 @@ const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
 import React, { useEffect, useState, useMemo, useCallback } from "react";
 import { useSettingsIndexDriftCheck, type SettingsField } from "./settings-search";
-import { CaptureFrequencyPreview, AudioCaptureModePreview } from "./setting-previews";
+import { CaptureFrequencyPreview, AudioCaptureModePreview, TranscriptionEnginePreview } from "./setting-previews";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
@@ -2701,6 +2701,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 </Select>
               </div>
             </div>
+            <TranscriptionEnginePreview engine={settings.audioTranscriptionEngine} />
             {audioEngineResolution.fallbackReason && (
               <Alert
                 data-testid="audio-engine-fallback-alert"
