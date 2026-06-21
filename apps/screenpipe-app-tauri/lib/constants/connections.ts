@@ -37,8 +37,7 @@ export const CONNECTION_CATEGORY_BY_ID: Record<string, string> = {
   "custom-mcp": "AI",
 
   // Agent — autonomous agents & skills
-  hermes: "Agent",
-  openclaw: "Agent",
+  "remote-agent": "Agent",
   skills: "Agent",
 
   // Automation — workflow automation platforms
@@ -169,8 +168,7 @@ export const CONNECTION_HARDCODED_DESCRIPTIONS: Record<string, string> = {
   "google-sheets": "Read and search your Google Sheets",
   "gmail": "Read and search your Gmail inbox",
   "ics-calendar": "Subscribe to any ICS calendar feed",
-  "openclaw": "Browse the web with OpenClaw agents",
-  "hermes": "AI-powered messaging assistant",
+  "remote-agent": "Run a 24/7 agent (OpenClaw, Hermes, Claude, Codex) on your VPS, wired to screenpipe",
   "whatsapp": "Search your WhatsApp conversations",
   "anythingllm": "Give AnythingLLM access to your screen",
   "ollama": "Connect local Ollama models to screenpipe",
