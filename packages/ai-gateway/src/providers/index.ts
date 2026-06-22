@@ -1,6 +1,6 @@
 import { OpenAIProvider } from './openai';
 import { AnthropicProvider } from './anthropic';
-import { VertexAIProvider } from './vertex';
+import { VertexAIProvider, buildWifConfig } from './vertex';
 import { GeminiProvider } from './gemini';
 import { OpenRouterProvider } from './openrouter';
 import { VertexMaasProvider, isVertexMaasModel } from './vertex-maas';
@@ -91,10 +91,12 @@ export function createProvider(model: string, env: Env): AIProvider {
 	if (model.toLowerCase().includes('gemini')) {
 		// Prefer Vertex AI for Gemini (shorter data retention, enterprise ToS)
 		if (env.VERTEX_SERVICE_ACCOUNT_JSON && env.VERTEX_PROJECT_ID) {
+			const wif = buildWifConfig(env);
 			return new GeminiProvider({
 				serviceAccountJson: env.VERTEX_SERVICE_ACCOUNT_JSON,
-				projectId: env.VERTEX_PROJECT_ID,
+				projectId: wif?.projectId || env.VERTEX_PROJECT_ID,
 				region: 'us-central1',
+				wif,
 			});
 		}
 		// Fallback to API key if Vertex credentials unavailable
@@ -104,7 +106,8 @@ export function createProvider(model: string, env: Env): AIProvider {
 	if (isVertexMaasModel(model)) {
 		const serviceAccountJson = requireSecret(env.VERTEX_SERVICE_ACCOUNT_JSON, 'Vertex AI credentials not configured');
 		const projectId = requireSecret(env.VERTEX_PROJECT_ID, 'Vertex AI credentials not configured');
-		return new VertexMaasProvider(serviceAccountJson, projectId);
+		const wif = buildWifConfig(env);
+		return new VertexMaasProvider(serviceAccountJson, wif?.projectId || projectId, wif);
 	}
 	// Tinfoil — confidential inference in secure enclaves (TEE)
 	if (isTinfoilModel(model)) {

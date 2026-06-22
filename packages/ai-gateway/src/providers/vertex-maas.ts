@@ -17,7 +17,7 @@
 
 import { AIProvider } from './base';
 import { Message, RequestBody, ResponseFormat, ToolCall } from '../types';
-import { VertexAIProvider } from './vertex';
+import { VertexAIProvider, WifConfig } from './vertex';
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
@@ -269,8 +269,8 @@ export class VertexMaasProvider implements AIProvider {
 	private vertexProvider: VertexAIProvider;
 	private projectId: string;
 
-	constructor(serviceAccountJson: string, projectId: string) {
-		this.vertexProvider = new VertexAIProvider(serviceAccountJson, projectId);
+	constructor(serviceAccountJson: string, projectId: string, wif?: WifConfig) {
+		this.vertexProvider = new VertexAIProvider(serviceAccountJson, projectId, undefined, wif);
 		this.projectId = projectId;
 	}
 

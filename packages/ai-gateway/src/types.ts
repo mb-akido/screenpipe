@@ -154,6 +154,17 @@ export interface Env {
 	VERTEX_SERVICE_ACCOUNT_JSON: string;
 	VERTEX_PROJECT_ID: string;
 	VERTEX_REGION: string;
+	// Vertex auth mode: "sakey" (default, SA-key JWT) or "wif" (keyless Workload
+	// Identity Federation → screenpipe-prod). See buildWifConfig in providers/vertex.ts.
+	VERTEX_AUTH_MODE?: string;
+	WIF_SIGNING_KEY?: string; // PKCS#8 PEM, the Worker's OIDC signing key (secret)
+	WIF_JWT_KID?: string;
+	WIF_JWT_ISSUER?: string;
+	WIF_JWT_AUDIENCE?: string;
+	WIF_JWT_SUBJECT?: string;
+	WIF_STS_AUDIENCE?: string;
+	WIF_SA_EMAIL?: string;
+	WIF_PROJECT_ID?: string; // GCP project WIF Vertex calls bill to (default screenpipe-prod)
 	// D1 database for usage tracking
 	DB: D1Database;
 	// Sentry error tracking
