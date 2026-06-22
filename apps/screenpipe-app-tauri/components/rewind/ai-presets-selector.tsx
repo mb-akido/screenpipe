@@ -190,7 +190,7 @@ export function AIProviderConfig({
   const { isEnterprise, policy: enterprisePolicy } = useEnterprisePolicy();
   const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
   const [piAvailable, setPiAvailable] = useState(false);
-  const [piModels, setPiModels] = useState<{ id: string; name: string; free?: boolean; cost_tier?: string; recommended_for?: string[]; warning?: string; health?: { status: string; error_rate_5m: number } }[]>([]);
+  const [piModels, setPiModels] = useState<{ id: string; name: string; free?: boolean; cost_tier?: string; recommended_for?: string[]; warning?: string; locked?: boolean; health?: { status: string; error_rate_5m: number } }[]>([]);
 
   // Fetch PI models from gateway (single source of truth)
   useEffect(() => {
@@ -211,6 +211,7 @@ export function AIProviderConfig({
             cost_tier: m.cost_tier,
             recommended_for: m.recommended_for,
             warning: m.warning,
+            locked: m.locked,
             health: m.health,
             }))
             .filter((m: { id: string }, idx: number, arr: { id: string }[]) => arr.findIndex((x) => x.id === m.id) === idx);
@@ -856,12 +857,13 @@ export function AIProviderConfig({
                 {piModels.map((m) => {
                   const costLabel = m.cost_tier === 'low' ? '$' : m.cost_tier === 'medium' ? '$$' : m.cost_tier === 'high' ? '$$$' : m.cost_tier === 'very_high' ? '$$$$' : '';
                   return (
-                  <SelectItem key={m.id} value={m.id}>
+                  <SelectItem key={m.id} value={m.id} disabled={m.locked} className={m.locked ? "opacity-60" : undefined}>
                     <span className="flex items-center gap-1.5">
                       {m.health?.status === 'down' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" title="overloaded" />}
                       {m.health?.status === 'degraded' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500" title="degraded" />}
                       {m.name}{m.free ? " (free)" : ""}
-                      {costLabel && <span className="text-[9px] font-medium text-muted-foreground">{costLabel}</span>}
+                      {m.locked && <span className="text-[9px] font-medium text-muted-foreground border rounded px-1">business</span>}
+                      {!m.locked && costLabel && <span className="text-[9px] font-medium text-muted-foreground">{costLabel}</span>}
                       {m.recommended_for?.includes('pipes') && <span className="text-[9px] text-muted-foreground bg-muted rounded px-1">pipes</span>}
                       {m.health?.status === 'down' && <span className="text-[9px] text-red-400 ml-1">overloaded</span>}
                     </span>

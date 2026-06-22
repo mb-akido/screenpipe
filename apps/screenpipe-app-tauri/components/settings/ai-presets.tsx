@@ -56,6 +56,7 @@ import {
   ChevronUp,
   GripVertical,
   Share2,
+  Lock,
 } from "lucide-react";
 import {
   DndContext,
@@ -200,6 +201,10 @@ export interface AIModel {
   /** How many daily-quota units one message on this model consumes.
    *  0 = free / doesn't count. Populated by the screenpipe worker. */
   query_weight?: number;
+  /** True when this model is above the user's plan (e.g. a marquee model for a
+   *  non-Business user). Shown greyed with a "Business" badge + one-click
+   *  upgrade instead of being selectable. Set by the screenpipe gateway. */
+  locked?: boolean;
 }
 
 export const AIProviderCard = ({
@@ -1094,6 +1099,7 @@ const AISection = ({
                 recommended_for: m.recommended_for,
                 warning: m.warning,
                 query_weight: m.query_weight,
+                locked: m.locked,
                 }))
                 .filter((m: AIModel, idx: number, arr: AIModel[]) => arr.findIndex((x) => x.id === m.id) === idx);
               if (piModels.length > 0) {
@@ -1503,15 +1509,18 @@ const AISection = ({
                           ))}
                         </CommandGroup>
                       )}
-                      <CommandGroup heading={models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
-                        {models?.filter((m) => !m.free).map((model) => {
+                      <CommandGroup heading={models?.some((m) => !m.free && m.locked) ? "More models" : models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
+                        {models?.filter((m) => !m.free).slice().sort((a, b) => (a.locked ? 1 : 0) - (b.locked ? 1 : 0)).map((model) => {
                           const costLabel = model.cost_tier === 'low' ? '$' : model.cost_tier === 'medium' ? '$$' : model.cost_tier === 'high' ? '$$$' : model.cost_tier === 'very_high' ? '$$$$' : '';
                           return (
                           <CommandItem
                             key={model.id}
                             value={model.id}
+                            className={model.locked ? "opacity-60" : undefined}
                             onSelect={async () => {
-                              if (model.id === "claude-opus-4-8" && !settings.user?.cloud_subscribed) {
+                              // Locked = above the user's plan. One click -> Business
+                              // checkout (or sign-in first) instead of selecting it.
+                              if (model.locked) {
                                 if (!settings.user?.token) {
                                   await commands.openLoginWindow();
                                 } else {
@@ -1537,8 +1546,14 @@ const AISection = ({
                               <div className="flex items-center justify-between">
                                 <span className="font-medium">{model.name}</span>
                                 <div className="flex items-center gap-1 ml-2">
-                                  {costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
-                                  {model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
+                                  {model.locked && (
+                                    <Badge variant="outline" className="text-[10px] gap-0.5 border-foreground/40 text-foreground/80">
+                                      <Lock className="h-2.5 w-2.5" />
+                                      Business
+                                    </Badge>
+                                  )}
+                                  {!model.locked && costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
+                                  {!model.locked && model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
                                   {/* Low-quota warning — only renders when the user is within
                                       ~30% of exhausting their daily cap for this specific model.
                                       Silent otherwise (normal state = no extra clutter). */}

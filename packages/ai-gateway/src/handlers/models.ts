@@ -32,6 +32,13 @@ interface ModelEntry {
   /** Live health status from rolling 5-minute error rate */
   health?: ModelHealthStatus;
   /**
+   * True when this model is above the caller's tier (e.g. a marquee model for a
+   * non-Business user). The app shows it greyed with a "Business" badge + a
+   * one-click upgrade instead of hiding it. Usage is still blocked request-side
+   * (index.ts -> 403 model_not_allowed), so this is presentation-only.
+   */
+  locked?: boolean;
+  /**
    * How many "daily query" units one message on this model consumes.
    * 0 = doesn't count against the user's daily cap (free-tier Vertex,
    * auto, gemini-3-flash, etc.). Higher = fewer messages before cap.
@@ -594,16 +601,12 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
     // provider secret is not configured in the Worker environment yet.
     models = models.filter(model => !model.requires_env || hasConfiguredSecret(env[model.requires_env]));
 
-    // Filter models based on tier allowlist
-    if (tier !== 'subscribed') {
-      const allowedModels = getTierConfig(env)[tier].allowedModels;
-      models = models.filter(model =>
-        allowedModels.some(allowed =>
-          model.id.toLowerCase().includes(allowed.toLowerCase()) ||
-          allowed.toLowerCase().includes(model.id.toLowerCase())
-        )
-      );
-    }
+    // Non-Business tiers used to have above-tier models filtered OUT of the
+    // list entirely. Instead we now keep them and tag `locked` on the response
+    // copy below, so the app can show them greyed with a one-click upgrade.
+    // (Computed per-request in the map() so we never mutate shared catalog
+    // objects across requests — a subscribed request must not inherit a lock.)
+    const lockAllowlist = tier === 'subscribed' ? null : getTierConfig(env)[tier].allowedModels;
 
     // Attach live health status from rolling 5-minute error rates
     const health = await getModelHealth(env);
@@ -618,7 +621,14 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
       model.query_weight = getModelWeight(model.id);
     }
 
-    const responseModels = models.map(({ requires_env, ...model }) => model);
+    const responseModels = models.map(({ requires_env, ...model }) => {
+      if (!lockAllowlist) return model;
+      const allowed = lockAllowlist.some(allowed =>
+        model.id.toLowerCase().includes(allowed.toLowerCase()) ||
+        allowed.toLowerCase().includes(model.id.toLowerCase())
+      );
+      return allowed ? model : { ...model, locked: true };
+    });
 
     return addCorsHeaders(createSuccessResponse({
       object: 'list',

@@ -205,26 +205,31 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
       'meta-llama/llama-4-scout',
     ],
   },
+  // logged_in = signed in but NOT on Business. NB: the gateway has no separate
+  // "Basic" tier — Free and Basic both resolve here (recording is gated by
+  // app_entitled elsewhere). This is the Free/Basic -> Business upgrade gate:
+  // the marquee models (Sonnet, Opus, GPT-5.x, Fable, *-pro, 397b) are
+  // Business-only, while everyone keeps `auto` + the free/fast models. Free
+  // models carry query_weight 0 so they never count against dailyQueries —
+  // the free experience stays effectively unlimited; dailyQueries caps only
+  // PAID-model messages and is tunable live via LIMIT_LOGGED_IN_DAILY (CF env,
+  // no redeploy).
   logged_in: {
-    dailyQueries: 50,
+    dailyQueries: 30,
     rpm: 25,
     allowedModels: [
       'auto',
       'claude-haiku-4-5',
-      'claude-sonnet-4-5',
       'gemini-2.5-flash',
       'gemini-3-flash',
       'gemini-3.1-flash-lite',
       'gemini-3.5-flash',
-      'gemini-3-pro',
-      'gemini-3.1-pro',
       'glm-4.7',
       'glm-5',
       'kimi-k2.5',
       'deepseek/deepseek-chat',
       'deepseek/deepseek-v3.2-speciale',
       'qwen/qwen3.5-flash',
-      'qwen/qwen3.5-397b',
       'meta-llama/llama-4-scout',
       'meta-llama/llama-4-maverick',
       'gemma4-31b',
