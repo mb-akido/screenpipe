@@ -21,7 +21,7 @@ pub enum ServiceCommand {
         /// Args appended to `screenpipe record`. Default is serve-only (no
         /// capture) — right for a headless box that just serves synced/cloud
         /// data to an agent. Pass `--record-args ""` to capture instead.
-        #[arg(long, default_value = "--disable-vision --disable-audio")]
+        #[arg(long, allow_hyphen_values = true, default_value = "--disable-vision --disable-audio")]
         record_args: String,
     },
     /// Stop + remove the service.
@@ -109,6 +109,17 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort pre-step (e.g. unload-before-load, disable-if-present) where
+/// failure is expected and the tool's own error output would just be noise.
+#[allow(dead_code)] // used on linux + macos paths
+fn run_quiet(cmd: &str, args: &[&str]) {
+    let _ = std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 #[cfg(target_os = "linux")]
 fn install(record_args: &str) -> Result<()> {
     let home = dirs::home_dir().context("could not resolve home dir")?;
@@ -129,7 +140,7 @@ fn install(record_args: &str) -> Result<()> {
     // Linger = the user manager (and our unit) starts at BOOT, before/without
     // an interactive login. Essential for a headless VPS.
     if let Ok(user) = std::env::var("USER") {
-        let _ = run("loginctl", &["enable-linger", &user]);
+        run_quiet("loginctl", &["enable-linger", &user]);
     }
     run("systemctl", &["--user", "daemon-reload"])?;
     run("systemctl", &["--user", "enable", "--now", &format!("{SERVICE_NAME}.service")])?;
@@ -153,7 +164,7 @@ fn install(record_args: &str) -> Result<()> {
     println!("  ✓ wrote {}", plist_path.display());
 
     let p = plist_path.to_string_lossy().into_owned();
-    let _ = run("launchctl", &["unload", &p]);
+    run_quiet("launchctl", &["unload", &p]);
     run("launchctl", &["load", &p])?;
     println!("  ✓ screenpipe launch agent loaded — runs at login, restarts on crash");
     Ok(())
@@ -167,7 +178,7 @@ fn install(_record_args: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn uninstall() -> Result<()> {
     let svc = format!("{SERVICE_NAME}.service");
-    let _ = run("systemctl", &["--user", "disable", "--now", &svc]);
+    run_quiet("systemctl", &["--user", "disable", "--now", &svc]);
     if let Some(home) = dirs::home_dir() {
         let unit_path = home.join(".config/systemd/user").join(&svc);
         let _ = std::fs::remove_file(&unit_path);
@@ -184,7 +195,7 @@ fn uninstall() -> Result<()> {
         let plist_path = home
             .join("Library/LaunchAgents")
             .join(format!("{LAUNCHD_LABEL}.plist"));
-        let _ = run("launchctl", &["unload", &plist_path.to_string_lossy()]);
+        run_quiet("launchctl", &["unload", &plist_path.to_string_lossy()]);
         let _ = std::fs::remove_file(&plist_path);
         println!("  ✓ removed {}", plist_path.display());
     }
