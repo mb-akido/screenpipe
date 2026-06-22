@@ -57,6 +57,27 @@ export function HermesCard() {
         defaultRemotePath: "~/screenpipe-data",
         storageKeyPrefix: "hermes",
       }}
+      connect={{
+        integrationId: "hermes",
+        fields: [
+          {
+            key: "endpoint",
+            label: "API Server URL",
+            secret: false,
+            placeholder: "http://127.0.0.1:8642",
+            helpUrl:
+              "https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server",
+          },
+          {
+            key: "token",
+            label: "API Server Key",
+            secret: true,
+            placeholder: "API_SERVER_KEY (optional)",
+            helpUrl:
+              "https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server",
+          },
+        ],
+      }}
     />
   );
 }
