@@ -48,6 +48,7 @@ import {
 } from "lucide-react";
 import { useRunningPipes } from "@/lib/hooks/use-running-pipes";
 import { useUpcomingPipes, type UpcomingPipe } from "@/lib/hooks/use-upcoming-pipes";
+import { usePlatform } from "@/lib/hooks/use-platform";
 import { localFetch } from "@/lib/api";
 import { emit, listen } from "@tauri-apps/api/event";
 import { cn } from "@/lib/utils";
@@ -223,6 +224,13 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
   const actions = useChatActions();
   const queueDepths = useQueueDepths();
   const [openConversationMenuId, setOpenConversationMenuId] = useState<string | null>(null);
+  // macOS (WKWebView) auto-hides styled overlay scrollbars, so the minimal
+  // scrollbar only flashes while actually scrolling. Windows/Linux (WebView2
+  // / Chromium) render styled scrollbars as persistent, space-reserving
+  // classic scrollbars — so expanding a pipe section (which grows the sidebar
+  // past the viewport) makes a scrollbar pop in. Hide it off macOS to match,
+  // mirroring the html/body `scrollbar-hide` convention in globals.css.
+  const { isMac } = usePlatform();
 
   // Sync currentId from standalone-chat. Whenever the chat panel switches
   // its piSessionIdRef (new chat, prefill auto-send, history click in the
@@ -776,7 +784,8 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     // (Timeline / Memories / ...) and look misaligned.
     <div
       className={cn(
-        "flex flex-col min-h-0 text-sm px-2 overflow-y-auto overflow-x-hidden scrollbar-minimal",
+        "flex flex-col min-h-0 text-sm px-2 overflow-y-auto overflow-x-hidden",
+        isMac ? "scrollbar-minimal" : "scrollbar-hide",
         className
       )}
       data-testid="chat-sidebar"
