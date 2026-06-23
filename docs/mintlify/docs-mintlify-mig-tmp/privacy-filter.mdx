@@ -13,6 +13,16 @@ the privacy filter removes personal info from your screen data before the AI you
 
 for the full local/cloud data-flow model, see [privacy data flow](/privacy-data-flow).
 
+## redaction is on by default
+
+you don't have to switch anything on: screenpipe redacts the values you type into form fields — passwords, card numbers, secrets — locally, before they're ever stored or sent. each redaction is labeled in plain language so you can see what was scrubbed.
+
+<Frame caption="form-field values are scrubbed on-device, by default">
+  <img src="/public/app-screenshots/np21-privacy.gif" alt="before and after on-device redaction of a form" />
+</Frame>
+
+want to see exactly what screenpipe reads? hover a capture setting and it highlights the regions of the screen it looks at.
+
 ## choose a privacy mode
 
 | mode | best for | what happens |
