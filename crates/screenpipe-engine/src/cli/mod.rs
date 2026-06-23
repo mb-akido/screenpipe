@@ -19,7 +19,7 @@ pub mod profile;
 pub mod search;
 pub mod service;
 pub mod status;
-mod store_file;
+pub(crate) mod store_file;
 pub mod survey;
 pub mod sync;
 pub mod team;
