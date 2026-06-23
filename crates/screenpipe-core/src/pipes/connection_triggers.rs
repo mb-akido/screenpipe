@@ -411,15 +411,37 @@ async fn fetch_notion(
     since: &str,
 ) -> Option<Vec<DetectedItem>> {
     let id = connection_id("notion", src.instance.as_deref());
-    let url = format!("{}/connections/{}/proxy/v1/search", ctx.api_base, id);
+    // Optional database scope: watch one database's pages instead of the whole
+    // workspace. The UI sets filter.database to the database id.
+    let database = src
+        .filter
+        .get("database")
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty());
+    let url = match database {
+        Some(db) => format!(
+            "{}/connections/{}/proxy/v1/databases/{}/query",
+            ctx.api_base, id, db
+        ),
+        None => format!("{}/connections/{}/proxy/v1/search", ctx.api_base, id),
+    };
 
     let mut all: Vec<DetectedItem> = Vec::new();
     let mut start_cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let mut body = serde_json::json!({
-            "sort": { "direction": "descending", "timestamp": "last_edited_time" },
-            "page_size": NOTION_PAGE_SIZE
-        });
+        // Database query uses `sorts` (array); workspace search uses `sort`
+        // (object) plus an object=page filter so we don't fire on databases.
+        let mut body = match database {
+            Some(_) => serde_json::json!({
+                "sorts": [ { "timestamp": "last_edited_time", "direction": "descending" } ],
+                "page_size": NOTION_PAGE_SIZE
+            }),
+            None => serde_json::json!({
+                "sort": { "direction": "descending", "timestamp": "last_edited_time" },
+                "filter": { "value": "page", "property": "object" },
+                "page_size": NOTION_PAGE_SIZE
+            }),
+        };
         if let Some(c) = &start_cursor {
             body["start_cursor"] = serde_json::json!(c);
         }

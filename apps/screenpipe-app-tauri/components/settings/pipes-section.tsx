@@ -2892,10 +2892,16 @@ export function PipesSection() {
                         <PipeTriggerPicker
                           pipeName={pipe.config.name}
                           trigger={pipe.config.trigger}
-                          apiBase={apiBase}
+                          schedule={pipe.config.schedule}
                           otherPipes={pipes
                             .filter((p) => p.config.name !== pipe.config.name && p.config.enabled)
                             .map((p) => ({ name: p.config.name }))}
+                          availableConnections={availableConnections}
+                          refreshConnections={async () => {
+                            const next = await fetchAvailablePipeConnections(apiBase, availableConnections);
+                            setAvailableConnections(next);
+                            return next;
+                          }}
                           fetchPipes={fetchPipes}
                           applyOptimistic={(t) =>
                             setPipes((prev) =>
@@ -2906,6 +2912,20 @@ export function PipesSection() {
                               )
                             )
                           }
+                          applySchedule={(s) => {
+                            setPipes((prev) =>
+                              prev.map((p) =>
+                                p.config.name === pipe.config.name
+                                  ? { ...p, config: { ...p.config, schedule: s } }
+                                  : p
+                              )
+                            );
+                            localFetch(`/pipes/${pipe.config.name}/config`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ schedule: s }),
+                            }).then(() => fetchPipes());
+                          }}
                         />
 
                         {/* Notifications toggle */}
