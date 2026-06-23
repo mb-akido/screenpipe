@@ -584,8 +584,121 @@ fn parse_devices_from_health(health_result: &Result<HealthCheckResponse>) -> Vec
 /// At 1-second polling, 90 = 90 seconds of sustained failure.
 const CAPTURE_STALL_THRESHOLD: u32 = 90;
 
-/// Suppress re-notification for this long after showing one.
+/// Suppress re-notification for this long after showing one. Also doubles as
+/// the post-restart warm-up grace: stall detection is paused for this long
+/// after any restart (manual, settings-triggered, or our own auto-restart) so a
+/// freshly-spawned pipeline gets time to load models and produce its first
+/// frame/DB write before we judge it stalled.
 const NOTIFICATION_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Maximum number of automatic in-place capture restarts to attempt within a
+/// single stall episode before giving up and notifying the user. Each attempt
+/// is followed by the `NOTIFICATION_COOLDOWN` warm-up grace, so there are
+/// roughly `CAPTURE_STALL_THRESHOLD + NOTIFICATION_COOLDOWN` seconds (~6.5 min)
+/// between attempts — three attempts ≈ 20 min of self-healing before we stop.
+const MAX_AUTO_RESTARTS_PER_STALL: u32 = 3;
+
+/// Action the stall watchdog should take on a given health tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallAction {
+    /// Capture healthy (or excused) — nothing to do.
+    None,
+    /// Capture just recovered after a stall episode of N sustained stale checks.
+    Recovered(u32),
+    /// Sustained stall with auto-restart budget remaining — restart capture.
+    AutoRestart,
+    /// Auto-restart budget exhausted and still stalled — alert the user once.
+    Notify,
+}
+
+/// Tracks one capture kind's (vision or audio) stall episode and decides when to
+/// auto-restart vs. give up. Pure state machine: `observe` is called once per
+/// health tick with whether capture currently looks bad. Keeping the decision
+/// logic free of clocks/IO makes every edge case exhaustively unit-testable.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StallTracker {
+    /// Sustained-bad ticks since the last action. Drives the threshold edge;
+    /// reset to 0 after each auto-restart so the edge re-arms for the next one.
+    since_action: u32,
+    /// Total sustained-bad ticks this episode (for the "recovered after N" log);
+    /// reset only when capture actually recovers, not on auto-restart.
+    episode_ticks: u32,
+    /// Auto-restarts already attempted this episode.
+    auto_restarts: u32,
+    /// Whether the give-up notification has already fired this episode.
+    gave_up: bool,
+}
+
+impl StallTracker {
+    /// Advance the state machine by one health tick.
+    ///
+    /// `bad` is true when capture is stale/not-started or its DB writes have
+    /// stalled AND the condition is not excused (DRM pause, transcription pause,
+    /// meeting). `threshold` is the number of consecutive bad ticks (≈ seconds
+    /// at 1 Hz polling) that triggers an action. Returns exactly one action.
+    fn observe(&mut self, bad: bool, threshold: u32, max_auto_restarts: u32) -> StallAction {
+        if !bad {
+            let recovered_ticks = self.episode_ticks;
+            let was_stalled = self.episode_ticks >= threshold;
+            *self = StallTracker::default();
+            return if was_stalled {
+                StallAction::Recovered(recovered_ticks)
+            } else {
+                StallAction::None
+            };
+        }
+
+        self.since_action = self.since_action.saturating_add(1);
+        self.episode_ticks = self.episode_ticks.saturating_add(1);
+
+        // Edge-trigger exactly at the threshold so one tick maps to one action.
+        // Past-threshold ticks do nothing until we either re-arm (auto-restart
+        // resets `since_action`) or recover.
+        if self.since_action != threshold {
+            return StallAction::None;
+        }
+
+        if self.auto_restarts < max_auto_restarts {
+            self.auto_restarts = self.auto_restarts.saturating_add(1);
+            self.since_action = 0; // re-arm for the next attempt after the grace
+            StallAction::AutoRestart
+        } else if !self.gave_up {
+            self.gave_up = true;
+            StallAction::Notify
+        } else {
+            StallAction::None
+        }
+    }
+}
+
+/// Whether screen capture currently looks stalled. Stale/not-started frames or a
+/// stalled DB-write path both count; DRM playback intentionally pauses vision
+/// capture, so it is never treated as a stall.
+fn vision_capture_bad(health: &HealthCheckResponse) -> bool {
+    let status_bad = matches!(
+        health.frame_status.as_deref(),
+        Some("stale") | Some("not_started")
+    );
+    (status_bad || health.vision_db_write_stalled) && !health.drm_content_paused
+}
+
+/// Whether audio capture currently looks stalled. Stale/not-started capture or a
+/// stalled DB-write path both count; an intentionally-paused transcription or an
+/// in-progress meeting (silence is expected) is excused.
+fn audio_capture_bad(health: &HealthCheckResponse) -> bool {
+    let status_bad = matches!(
+        health.audio_status.as_deref(),
+        Some("stale") | Some("not_started")
+    );
+    let excused = health
+        .audio_pipeline
+        .as_ref()
+        .map(|ap| {
+            ap.transcription_paused.unwrap_or(false) || ap.meeting_detected.unwrap_or(false)
+        })
+        .unwrap_or(false);
+    (status_bad || health.audio_db_write_stalled) && !excused
+}
 
 /// Starts a background task that periodically checks the health of the sidecar
 /// and updates the tray icon accordingly.
@@ -599,11 +712,9 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
     let mut consecutive_failures: u32 = 0;
     let mut consecutive_unhealthy: u32 = 0;
 
-    // Capture stall detection state
-    let mut consecutive_audio_stall: u32 = 0;
-    let mut consecutive_vision_stall: u32 = 0;
-    let mut last_audio_notification: Option<Instant> = None;
-    let mut last_vision_notification: Option<Instant> = None;
+    // Capture stall detection + auto-recovery state (one tracker per kind).
+    let mut vision_stall = StallTracker::default();
+    let mut audio_stall = StallTracker::default();
     let mut wake_reset_done = false;
     // Grace period after ANY restart (manual, notification-triggered, or
     // settings-triggered): suppress stall detection for 120s, giving the
@@ -901,8 +1012,8 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                         info!("detected restart (spawn epoch {} → {}), activating {}s stall detection grace",
                             last_known_spawn_epoch, current_epoch, NOTIFICATION_COOLDOWN.as_secs());
                         last_restart_triggered = Some(Instant::now());
-                        consecutive_audio_stall = 0;
-                        consecutive_vision_stall = 0;
+                        vision_stall = StallTracker::default();
+                        audio_stall = StallTracker::default();
                     }
                     last_known_spawn_epoch = current_epoch;
                 }
@@ -913,136 +1024,128 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // it stops/restarts VisionManager + AudioManager without killing the server.
             // The health endpoint still reports drm_content_paused for UI purposes.
 
-            // ── Capture stall detection ──
-            // Only check when the server is responding (status == Recording),
-            // we're past the startup grace period, and not in a post-restart
-            // grace period. Grace matches NOTIFICATION_COOLDOWN so a restart
-            // never triggers a second notification before the cooldown expires.
+            // ── Capture stall detection + auto-recovery ──
+            // When screen (or audio) capture silently freezes — macOS
+            // ScreenCaptureKit stops delivering frames, Windows WGC stalls, or
+            // the capture loop is alive but DB writes are blocked — the engine
+            // stays up and keeps reporting "recording", yet no new frames/audio
+            // land. The user sees a green tray and a frozen timeline. On
+            // sustained staleness we AUTOMATICALLY restart the capture session in
+            // place (the HTTP server stays up); only after several auto-restarts
+            // fail to help do we fall back to alerting the user.
+            //
+            // Only acts when the server is responding (status == Recording) and
+            // we're past the startup grace period. The post-restart grace
+            // (in_restart_grace) pauses detection — but does NOT reset the
+            // trackers — so the auto-restart budget survives a restart's warm-up
+            // window and we can still give up after enough failed attempts.
             let in_restart_grace = last_restart_triggered
                 .map(|t| t.elapsed() < NOTIFICATION_COOLDOWN)
                 .unwrap_or(false);
             if status == RecordingStatus::Recording
                 && start_time.elapsed() > NOTIFICATION_COOLDOWN
-                && !in_restart_grace
             {
-                if let Ok(ref health) = health_result {
-                    let audio_bad = matches!(
-                        health.audio_status.as_deref(),
-                        Some("stale") | Some("not_started")
-                    );
-                    let vision_bad = matches!(
-                        health.frame_status.as_deref(),
-                        Some("stale") | Some("not_started")
-                    );
-
-                    // Skip stall detection if transcription is intentionally paused or in a meeting
-                    let audio_excused = health
-                        .audio_pipeline
-                        .as_ref()
-                        .map(|ap| {
-                            ap.transcription_paused.unwrap_or(false)
-                                || ap.meeting_detected.unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-
-                    // Audio stall tracking:
-                    // - audio_bad (capture stale/not_started): always counts
-                    // - audio_db_write_stalled: only counts as a stall signal.
-                    //   Change #1 (engine side) ensures this flag only fires after
-                    //   at least one successful DB write, so silent environments
-                    //   (last_db_write_ts == 0) won't trigger false positives.
-                    let audio_db_stalled = health.audio_db_write_stalled;
-                    if (audio_bad || audio_db_stalled) && !audio_excused {
-                        consecutive_audio_stall = consecutive_audio_stall.saturating_add(1);
-                    } else {
-                        if consecutive_audio_stall >= CAPTURE_STALL_THRESHOLD {
-                            info!(
-                                "audio capture recovered after {} stale checks",
-                                consecutive_audio_stall
-                            );
+                if !in_restart_grace {
+                    if let Ok(ref health) = health_result {
+                        // After wake from sleep, reset the trackers once: the
+                        // capture streams are freshly reconfigured, so don't let a
+                        // pre-sleep stall episode trip an instant auto-restart
+                        // before the first post-wake frame/sample arrives.
+                        let woke = screenpipe_engine::sleep_monitor::recently_woke_from_sleep();
+                        if woke && !wake_reset_done {
+                            wake_reset_done = true;
+                            vision_stall = StallTracker::default();
+                            audio_stall = StallTracker::default();
                         }
-                        consecutive_audio_stall = 0;
-                    }
-
-                    // Vision stall tracking — also trigger on DB write stalls
-                    // (capture loop alive but pool exhaustion blocking writes)
-                    let vision_db_stalled = health.vision_db_write_stalled;
-                    if vision_bad || vision_db_stalled {
-                        consecutive_vision_stall = consecutive_vision_stall.saturating_add(1);
-                    } else {
-                        if consecutive_vision_stall >= CAPTURE_STALL_THRESHOLD {
-                            info!(
-                                "vision capture recovered after {} stale checks",
-                                consecutive_vision_stall
-                            );
+                        if !woke {
+                            wake_reset_done = false;
                         }
-                        consecutive_vision_stall = 0;
-                    }
 
-                    // After wake from sleep, reset stall counters and notification
-                    // cooldowns once so degraded recording is re-detected from scratch.
-                    // Only reset once per wake event to avoid suppressing the counter
-                    // for the entire 30s wake window.
-                    let woke = screenpipe_engine::sleep_monitor::recently_woke_from_sleep();
-                    if woke && !wake_reset_done {
-                        wake_reset_done = true;
-                        consecutive_audio_stall = 0;
-                        consecutive_vision_stall = 0;
-                        last_audio_notification = None;
-                        last_vision_notification = None;
-                    }
-                    if !woke {
-                        wake_reset_done = false;
-                    }
+                        let vision_bad = vision_capture_bad(health);
+                        let audio_bad = audio_capture_bad(health);
+                        let vision_action = vision_stall.observe(
+                            vision_bad,
+                            CAPTURE_STALL_THRESHOLD,
+                            MAX_AUTO_RESTARTS_PER_STALL,
+                        );
+                        let audio_action = audio_stall.observe(
+                            audio_bad,
+                            CAPTURE_STALL_THRESHOLD,
+                            MAX_AUTO_RESTARTS_PER_STALL,
+                        );
 
-                    // Show notification if threshold hit, cooldown expired, and not disabled
-                    let notifications_enabled = crate::store::SettingsStore::get(&app)
-                        .ok()
-                        .flatten()
-                        .map(|s| s.show_restart_notifications)
-                        .unwrap_or(false);
-                    let now_instant = Instant::now();
+                        let notifications_enabled = crate::store::SettingsStore::get(&app)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.show_restart_notifications)
+                            .unwrap_or(false);
 
-                    if consecutive_audio_stall == CAPTURE_STALL_THRESHOLD && notifications_enabled {
-                        let cooldown_ok = last_audio_notification
-                            .map(|t| now_instant.duration_since(t) >= NOTIFICATION_COOLDOWN)
-                            .unwrap_or(true);
-                        if cooldown_ok {
+                        // Recovery + give-up handling per kind (logging / alerts).
+                        for (action, label) in
+                            [(vision_action, "screen"), (audio_action, "audio")]
+                        {
+                            match action {
+                                StallAction::Recovered(ticks) => {
+                                    info!(
+                                        "{} capture recovered after {} stale checks",
+                                        label, ticks
+                                    );
+                                }
+                                StallAction::Notify => {
+                                    warn!(
+                                        "{} capture still stalled after {} auto-restarts — \
+                                         giving up auto-recovery, alerting user",
+                                        label, MAX_AUTO_RESTARTS_PER_STALL
+                                    );
+                                    if notifications_enabled {
+                                        let _ =
+                                            show_capture_stall_notification(&app, label).await;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // A single capture restart re-creates BOTH the vision and
+                        // audio managers, so if either kind asks for one we do
+                        // exactly one restart and let the shared post-restart grace
+                        // cover the other.
+                        let restart_reason = if matches!(vision_action, StallAction::AutoRestart) {
+                            Some("screen")
+                        } else if matches!(audio_action, StallAction::AutoRestart) {
+                            Some("audio")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = restart_reason {
                             warn!(
-                                "audio capture stalled for {}s, showing restart notification",
-                                CAPTURE_STALL_THRESHOLD
+                                "{} capture stalled ~{}s — auto-restarting capture session \
+                                 (attempt {}/{})",
+                                reason,
+                                CAPTURE_STALL_THRESHOLD,
+                                vision_stall.auto_restarts.max(audio_stall.auto_restarts),
+                                MAX_AUTO_RESTARTS_PER_STALL
                             );
-                            last_audio_notification = Some(now_instant);
-                            last_restart_triggered = Some(now_instant);
-                            let _ = show_capture_stall_notification(&app, "audio").await;
-                        }
-                    }
-
-                    if consecutive_vision_stall == CAPTURE_STALL_THRESHOLD && notifications_enabled
-                    {
-                        let cooldown_ok = last_vision_notification
-                            .map(|t| now_instant.duration_since(t) >= NOTIFICATION_COOLDOWN)
-                            .unwrap_or(true);
-                        if cooldown_ok {
-                            let reason = if vision_db_stalled {
-                                "db write stall"
-                            } else {
-                                "capture stall"
-                            };
-                            warn!(
-                                "vision {} for {}s, showing restart notification",
-                                reason, CAPTURE_STALL_THRESHOLD
-                            );
-                            last_vision_notification = Some(now_instant);
-                            last_restart_triggered = Some(now_instant);
-                            let _ = show_capture_stall_notification(&app, "screen").await;
+                            // Open the shared warm-up grace immediately so the next
+                            // ticks don't keep counting while the restart runs.
+                            last_restart_triggered = Some(Instant::now());
+                            let app_for_restart = app.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    crate::recording::auto_restart_capture(app_for_restart).await
+                                {
+                                    warn!("auto_restart_capture failed: {}", e);
+                                }
+                            });
                         }
                     }
                 }
             } else {
-                // Reset stall counters when server is not in Recording state
-                consecutive_audio_stall = 0;
-                consecutive_vision_stall = 0;
+                // Server not in a Recording state (stopped, manually paused,
+                // scheduled pause, or still in startup): no stall episode is
+                // meaningful — reset both trackers.
+                vision_stall = StallTracker::default();
+                audio_stall = StallTracker::default();
             }
         }
     });
@@ -1851,5 +1954,213 @@ mod tests {
         assert!(!clamp_start_in_progress(true, &mut since, Duration::ZERO));
         // Timer must NOT reset while raw stays true — the episode is one pin.
         assert!(since.is_some());
+    }
+
+    // ==================== capture-bad classification tests ====================
+
+    fn base_health() -> HealthCheckResponse {
+        HealthCheckResponse {
+            status: "healthy".to_string(),
+            status_code: Some(200),
+            last_frame_timestamp: None,
+            last_audio_timestamp: None,
+            last_ui_timestamp: None,
+            frame_status: Some("ok".to_string()),
+            audio_status: Some("ok".to_string()),
+            ui_status: None,
+            message: None,
+            verbose_instructions: None,
+            device_status_details: None,
+            monitors: None,
+            audio_pipeline: None,
+            vision_db_write_stalled: false,
+            audio_db_write_stalled: false,
+            drm_content_paused: false,
+            schedule_paused: false,
+        }
+    }
+
+    fn pipeline(transcription_paused: bool, meeting_detected: bool) -> AudioPipelineInfo {
+        AudioPipelineInfo {
+            uptime_secs: 1.0,
+            chunks_sent: 1,
+            transcription_paused: Some(transcription_paused),
+            meeting_detected: Some(meeting_detected),
+        }
+    }
+
+    #[test]
+    fn vision_bad_on_stale_and_not_started_only() {
+        let mut h = base_health();
+        assert!(!vision_capture_bad(&h), "ok frame_status is healthy");
+        h.frame_status = None;
+        assert!(!vision_capture_bad(&h), "absent frame_status is not a stall");
+        h.frame_status = Some("stale".to_string());
+        assert!(vision_capture_bad(&h));
+        h.frame_status = Some("not_started".to_string());
+        assert!(vision_capture_bad(&h));
+    }
+
+    #[test]
+    fn vision_bad_on_db_write_stall_even_when_frames_ok() {
+        // Capture loop alive (frames "ok") but DB writes blocked (pool/FD
+        // exhaustion) is still a stall — frames captured aren't being persisted.
+        let mut h = base_health();
+        h.vision_db_write_stalled = true;
+        assert!(vision_capture_bad(&h));
+    }
+
+    #[test]
+    fn vision_not_bad_while_drm_paused() {
+        // DRM playback intentionally pauses vision capture — never auto-restart.
+        let mut h = base_health();
+        h.frame_status = Some("stale".to_string());
+        h.drm_content_paused = true;
+        assert!(!vision_capture_bad(&h), "DRM pause excuses a stale frame status");
+        h.frame_status = Some("ok".to_string());
+        h.vision_db_write_stalled = true;
+        assert!(!vision_capture_bad(&h), "DRM pause excuses a db-write stall too");
+    }
+
+    #[test]
+    fn audio_bad_on_stale_or_db_stall() {
+        let mut h = base_health();
+        assert!(!audio_capture_bad(&h));
+        h.audio_status = Some("stale".to_string());
+        assert!(audio_capture_bad(&h));
+        h.audio_status = Some("ok".to_string());
+        h.audio_db_write_stalled = true;
+        assert!(audio_capture_bad(&h));
+    }
+
+    #[test]
+    fn audio_not_bad_while_paused_or_in_meeting() {
+        let mut h = base_health();
+        h.audio_status = Some("stale".to_string());
+        // Transcription intentionally paused → expected silence, not a stall.
+        h.audio_pipeline = Some(pipeline(true, false));
+        assert!(!audio_capture_bad(&h));
+        // In a meeting → silence is expected, not a stall.
+        h.audio_pipeline = Some(pipeline(false, true));
+        assert!(!audio_capture_bad(&h));
+        // Pipeline present but neither excuse set → still a stall.
+        h.audio_pipeline = Some(pipeline(false, false));
+        assert!(audio_capture_bad(&h));
+    }
+
+    // ==================== StallTracker tests ====================
+
+    // Drive `ticks` consecutive bad observations and collect the actions.
+    fn run_bad(t: &mut StallTracker, threshold: u32, max: u32, ticks: u32) -> Vec<StallAction> {
+        (0..ticks).map(|_| t.observe(true, threshold, max)).collect()
+    }
+
+    #[test]
+    fn tracker_no_action_below_threshold() {
+        let mut t = StallTracker::default();
+        let actions = run_bad(&mut t, 3, 3, 2);
+        assert_eq!(actions, vec![StallAction::None, StallAction::None]);
+    }
+
+    #[test]
+    fn tracker_auto_restarts_exactly_at_threshold() {
+        let mut t = StallTracker::default();
+        let actions = run_bad(&mut t, 3, 3, 3);
+        assert_eq!(
+            actions,
+            vec![StallAction::None, StallAction::None, StallAction::AutoRestart]
+        );
+        assert_eq!(t.auto_restarts, 1);
+        assert_eq!(t.since_action, 0, "edge re-armed after restart");
+    }
+
+    #[test]
+    fn tracker_rearms_for_repeated_restarts_then_gives_up_and_notifies_once() {
+        let threshold = 3;
+        let max = 2;
+        let mut t = StallTracker::default();
+        // 1st episode segment → AutoRestart #1
+        assert_eq!(*run_bad(&mut t, threshold, max, 3).last().unwrap(), StallAction::AutoRestart);
+        // still stalled after the restart's grace → AutoRestart #2
+        assert_eq!(*run_bad(&mut t, threshold, max, 3).last().unwrap(), StallAction::AutoRestart);
+        assert_eq!(t.auto_restarts, 2);
+        // budget exhausted → Notify exactly once
+        assert_eq!(*run_bad(&mut t, threshold, max, 3).last().unwrap(), StallAction::Notify);
+        assert!(t.gave_up);
+        // …and nothing further while it stays stalled (no notification spam, no
+        // pointless restarts).
+        let after = run_bad(&mut t, threshold, max, 6);
+        assert!(after.iter().all(|a| *a == StallAction::None), "silent after give-up: {after:?}");
+    }
+
+    #[test]
+    fn tracker_reports_recovered_with_total_episode_ticks() {
+        let threshold = 3;
+        let mut t = StallTracker::default();
+        // 3 bad → AutoRestart, then 2 more bad (episode_ticks = 5 total)
+        run_bad(&mut t, threshold, 3, 3);
+        run_bad(&mut t, threshold, 3, 2);
+        // capture recovers
+        assert_eq!(t.observe(false, threshold, 3), StallAction::Recovered(5));
+        // tracker fully reset
+        assert_eq!(t, StallTracker::default());
+    }
+
+    #[test]
+    fn tracker_sub_threshold_blip_is_not_a_recovery() {
+        let threshold = 3;
+        let mut t = StallTracker::default();
+        run_bad(&mut t, threshold, 3, 2); // 2 bad ticks, never hit threshold
+        assert_eq!(
+            t.observe(false, threshold, 3),
+            StallAction::None,
+            "a brief blip must not log a spurious recovery"
+        );
+    }
+
+    #[test]
+    fn tracker_recovery_restores_auto_restart_budget() {
+        let threshold = 3;
+        let max = 1;
+        let mut t = StallTracker::default();
+        // Exhaust the single restart, give up.
+        assert_eq!(*run_bad(&mut t, threshold, max, 3).last().unwrap(), StallAction::AutoRestart);
+        assert_eq!(*run_bad(&mut t, threshold, max, 3).last().unwrap(), StallAction::Notify);
+        // Recover.
+        assert!(matches!(t.observe(false, threshold, max), StallAction::Recovered(_)));
+        // A brand-new episode gets the full budget again (auto-restart, not an
+        // instant give-up).
+        assert_eq!(*run_bad(&mut t, threshold, max, 3).last().unwrap(), StallAction::AutoRestart);
+    }
+
+    #[test]
+    fn tracker_zero_budget_notifies_immediately_at_threshold() {
+        // Defensive: with no auto-restart budget the very first threshold hit
+        // goes straight to notifying (never silently does nothing).
+        let threshold = 2;
+        let mut t = StallTracker::default();
+        assert_eq!(
+            run_bad(&mut t, threshold, 0, 2),
+            vec![StallAction::None, StallAction::Notify]
+        );
+    }
+
+    #[test]
+    fn tracker_wired_to_real_constants() {
+        // Guard the production wiring: first action lands at exactly
+        // CAPTURE_STALL_THRESHOLD and is an auto-restart (budget > 0).
+        let mut t = StallTracker::default();
+        let actions = run_bad(
+            &mut t,
+            CAPTURE_STALL_THRESHOLD,
+            MAX_AUTO_RESTARTS_PER_STALL,
+            CAPTURE_STALL_THRESHOLD,
+        );
+        assert!(MAX_AUTO_RESTARTS_PER_STALL > 0);
+        assert_eq!(actions[(CAPTURE_STALL_THRESHOLD - 2) as usize], StallAction::None);
+        assert_eq!(
+            actions[(CAPTURE_STALL_THRESHOLD - 1) as usize],
+            StallAction::AutoRestart
+        );
     }
 }
