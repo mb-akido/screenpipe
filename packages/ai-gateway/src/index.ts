@@ -7,7 +7,7 @@ import { Env, RequestBody, AuthResult } from './types';
 import { handleOptions, createSuccessResponse, createErrorResponse, addCorsHeaders } from './utils/cors';
 import { validateAuth } from './utils/auth';
 import { RateLimiter, checkRateLimit } from './utils/rate-limiter';
-import { trackUsage, getUsageStatus, isModelAllowed, getTierConfig, getCreditBalance } from './services/usage-tracker';
+import { trackUsage, getUsageStatus, isModelAllowed, resolveModelGate, getTierConfig, getCreditBalance } from './services/usage-tracker';
 import { handleChatCompletions } from './handlers/chat';
 import { handleModelListing } from './handlers/models';
 import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
@@ -113,26 +113,23 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				})));
 			}
 
-			// Check if model is allowed for this tier
-			if (!isModelAllowed(body.model, authResult.tier, env)) {
-				// Background/automation traffic (pipes, daily summaries) must never
-				// hard-fail on the model gate — a scheduled pipe pinned to a now-gated
-				// model would silently break every run. Downgrade to 'auto' (always
-				// allowed, routes to a free model) so the automation keeps running.
-				// Interactive requests still get the visible 403 so the app can surface
-				// the upgrade UI. Mirrors the frontier-model downgrade in chat.ts.
-				if (body.model !== 'auto' && isBackgroundRequest(request)) {
-					console.log(`background request for disallowed model "${body.model}" (${authResult.tier}) -> downgraded to auto`);
-					body.model = 'auto';
-				} else {
-					const allowedModels = getTierConfig(env)[authResult.tier].allowedModels;
-					return addCorsHeaders(createErrorResponse(403, JSON.stringify({
-						error: 'model_not_allowed',
-						message: `Model "${body.model}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
-						tier: authResult.tier,
-						allowed_models: allowedModels,
-					})));
-				}
+			// Gate the model for this tier. Background/automation traffic (pipes,
+			// daily summaries) must never hard-fail — a scheduled pipe pinned to a
+			// now-gated model would silently break every run — so it downgrades to
+			// 'auto' (free, always allowed) and keeps running. Interactive requests
+			// still get the visible 403 so the app can surface the upgrade UI.
+			const gate = resolveModelGate(body.model, authResult.tier, env, isBackgroundRequest(request));
+			if (gate === 'downgrade') {
+				console.log(`background request for disallowed model "${body.model}" (${authResult.tier}) -> downgraded to auto`);
+				body.model = 'auto';
+			} else if (gate === 'reject') {
+				const allowedModels = getTierConfig(env)[authResult.tier].allowedModels;
+				return addCorsHeaders(createErrorResponse(403, JSON.stringify({
+					error: 'model_not_allowed',
+					message: `Model "${body.model}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
+					tier: authResult.tier,
+					allowed_models: allowedModels,
+				})));
 			}
 
 			// Per-user daily cost cap (account-wide $ ceiling, credit-extended).

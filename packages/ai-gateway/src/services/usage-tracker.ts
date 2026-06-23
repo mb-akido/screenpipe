@@ -511,6 +511,31 @@ export function isModelGatingEnabled(env?: Env): boolean {
   return String(raw ?? 'true').toLowerCase() !== 'false';
 }
 
+export type ModelGateDecision = 'allow' | 'downgrade' | 'reject';
+
+/**
+ * Decide what the gateway should do with a requested model for a tier:
+ *  - 'allow'     — the tier may use it (or gating is off)
+ *  - 'downgrade' — the tier can't use it, but this is background/automation
+ *                  traffic (a pipe): swap to 'auto' so the automation keeps
+ *                  running on a free model instead of silently 403'ing
+ *  - 'reject'    — the tier can't use it on interactive traffic: return 403 so
+ *                  the app can show the upgrade UI
+ *
+ * This is the single source of truth for the background-downgrade behavior in
+ * index.ts; kept pure so it's directly testable.
+ */
+export function resolveModelGate(
+  model: string,
+  tier: UserTier,
+  env: Env | undefined,
+  isBackground: boolean,
+): ModelGateDecision {
+  if (isModelAllowed(model, tier, env)) return 'allow';
+  if (model !== 'auto' && isBackground) return 'downgrade';
+  return 'reject';
+}
+
 /**
  * Check if a model is allowed for a given tier
  */

@@ -10,6 +10,7 @@ import { localFetch } from "@/lib/api";
 import { parsePipeError, isActionablePipeError } from "@/lib/pipe-errors";
 import { useAdvisoryStore } from "@/lib/advisories";
 import { useSettings } from "@/lib/hooks/use-settings";
+import { isPrimaryWindow } from "@/lib/utils/is-primary-window";
 import { commands } from "@/lib/utils/tauri";
 
 /**
@@ -38,7 +39,10 @@ export function PipeAdvisoryWatcher() {
   const reconcile = useAdvisoryStore((s) => s.reconcile);
   const { settings } = useSettings();
   const flag = useFeatureFlagEnabled("pipe_advisories");
-  const enabled = flag !== false; // default ON; set the flag false in PostHog to kill it
+  // Only the primary window polls — the overlay is mounted in every window, but
+  // N windows each hitting /pipes every 60s is wasteful. Default ON; killable
+  // via the PostHog `pipe_advisories` flag.
+  const enabled = flag !== false && isPrimaryWindow();
   const subscribed = settings.user?.cloud_subscribed === true;
   const token = settings.user?.token;
   const userId = settings.user?.id;
