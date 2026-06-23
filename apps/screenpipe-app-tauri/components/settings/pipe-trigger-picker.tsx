@@ -9,20 +9,9 @@ import { localFetch } from "@/lib/api";
 import { commands } from "@/lib/utils/tauri";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { notifyConnectionsUpdated } from "@/lib/connections-events";
+import { IntegrationIcon } from "@/components/settings/connections-section";
 import type { AvailableConnection } from "@/lib/pipe-connections";
-import {
-  Plus,
-  Search,
-  Clock,
-  CalendarClock,
-  MessageSquare,
-  FileText,
-  FolderOpen,
-  Workflow,
-  Loader2,
-  Check,
-  ExternalLink,
-} from "lucide-react";
+import { Plus, Search, Clock, CalendarClock, Workflow, Loader2, Check } from "lucide-react";
 
 export interface TriggerSource {
   app: string;
@@ -43,45 +32,50 @@ interface PickerProps {
   schedule?: string;
   otherPipes: { name: string }[];
   availableConnections: AvailableConnection[];
-  /** Re-fetch connections after a connect; returns the fresh list. */
   refreshConnections: () => Promise<AvailableConnection[]>;
   fetchPipes: () => void;
   applyOptimistic: (trigger: Trigger | undefined) => void;
   applySchedule: (schedule: string) => void;
 }
 
+// ── shared brand-aligned classes (DESIGN.md: sharp corners, grayscale only) ───
+
+const INPUT = "w-full h-9 text-xs font-mono bg-background border rounded-none px-2 outline-none focus:border-foreground transition-colors";
+const BTN_PRIMARY =
+  "h-9 px-4 text-[11px] font-medium uppercase tracking-wide border border-foreground bg-foreground text-background hover:bg-background hover:text-foreground disabled:opacity-40 disabled:hover:bg-foreground disabled:hover:text-background rounded-none transition-colors";
+const BTN_SECONDARY =
+  "h-9 px-3 text-[11px] font-medium uppercase tracking-wide border border-foreground bg-background text-foreground hover:bg-foreground hover:text-background rounded-none transition-colors inline-flex items-center gap-1.5";
+const LABEL = "text-[10px] uppercase tracking-wide text-muted-foreground font-medium";
+
 // ── left-rail catalog ────────────────────────────────────────────────────────
 
-type OptionId =
-  | "schedule"
-  | "meeting_started"
-  | "meeting_ended"
-  | "slack"
-  | "notion"
-  | "obsidian"
-  | "pipe";
+type OptionId = "schedule" | "meeting_started" | "meeting_ended" | "slack" | "notion" | "obsidian" | "pipe";
 
 interface Option {
   id: OptionId;
   group: string;
   label: string;
   sub: string;
-  icon: React.ReactNode;
-  /** connection id this option needs, if any */
   app?: "slack" | "notion" | "obsidian";
 }
 
 const OPTIONS: Option[] = [
-  { id: "schedule", group: "recurring", label: "on a schedule", sub: "every N minutes, daily, cron…", icon: <Clock className="h-4 w-4" /> },
-  { id: "meeting_started", group: "meetings", label: "meeting starts", sub: "a call is detected", icon: <CalendarClock className="h-4 w-4" /> },
-  { id: "meeting_ended", group: "meetings", label: "meeting ends", sub: "a call wraps up", icon: <CalendarClock className="h-4 w-4" /> },
-  { id: "slack", group: "slack", label: "new message", sub: "in a channel you pick", icon: <MessageSquare className="h-4 w-4" />, app: "slack" },
-  { id: "notion", group: "notion", label: "page created or edited", sub: "workspace or a database", icon: <FileText className="h-4 w-4" />, app: "notion" },
-  { id: "obsidian", group: "obsidian", label: "new note", sub: "in a vault folder", icon: <FolderOpen className="h-4 w-4" />, app: "obsidian" },
-  { id: "pipe", group: "pipes", label: "after a pipe finishes", sub: "chain off another pipe", icon: <Workflow className="h-4 w-4" /> },
+  { id: "schedule", group: "recurring", label: "on a schedule", sub: "every N minutes, daily, cron" },
+  { id: "meeting_started", group: "meetings", label: "meeting starts", sub: "a call is detected" },
+  { id: "meeting_ended", group: "meetings", label: "meeting ends", sub: "a call wraps up" },
+  { id: "slack", group: "slack", label: "new message", sub: "in a channel you pick", app: "slack" },
+  { id: "notion", group: "notion", label: "page created or edited", sub: "workspace or a database", app: "notion" },
+  { id: "obsidian", group: "obsidian", label: "new note", sub: "in a vault folder", app: "obsidian" },
+  { id: "pipe", group: "pipes", label: "after a pipe finishes", sub: "chain off another pipe" },
 ];
-
 const GROUP_ORDER = ["recurring", "meetings", "slack", "notion", "obsidian", "pipes"];
+
+function optionIcon(o: Option) {
+  if (o.app) return <IntegrationIcon icon={o.app} className="w-4 h-4 flex items-center justify-center" fallbackClassName="h-4 w-4 text-muted-foreground" />;
+  if (o.id === "schedule") return <Clock className="h-4 w-4 text-muted-foreground" />;
+  if (o.id === "pipe") return <Workflow className="h-4 w-4 text-muted-foreground" />;
+  return <CalendarClock className="h-4 w-4 text-muted-foreground" />;
+}
 
 // ── chip labels ──────────────────────────────────────────────────────────────
 
@@ -92,8 +86,9 @@ function eventLabel(e: string): string {
   return e.replace(/_/g, " ");
 }
 function sourceLabel(s: TriggerSource): string {
-  if (s.app === "slack") return `slack · ${s.filter?.channel_name || s.filter?.channel || "a channel"}`;
-  if (s.app === "notion") return `notion · ${s.filter?.database_name || "any page edited"}`;
+  const acct = s.instance ? ` (${s.instance})` : "";
+  if (s.app === "slack") return `slack${acct} · ${s.filter?.channel_name || s.filter?.channel || "a channel"}`;
+  if (s.app === "notion") return `notion${acct} · ${s.filter?.database_name || "any page edited"}`;
   if (s.app === "obsidian") return `obsidian · ${s.path || "vault"}`;
   return `${s.app} · ${s.kind || "new item"}`;
 }
@@ -124,9 +119,8 @@ export function PipeTriggerPicker(props: PickerProps) {
   const remove = (kind: "events" | "custom" | "sources", i: number) =>
     persistTrigger({ ...trigger, [kind]: (trigger?.[kind] ?? []).filter((_, j) => j !== i) });
 
-  const chip = "text-xs bg-muted/50 border px-3 py-1.5 flex-1 font-mono truncate";
-  const xBtn =
-    "text-muted-foreground/0 group-hover/item:text-muted-foreground hover:!text-destructive transition-all text-sm leading-none px-1";
+  const chip = "text-xs bg-muted/50 border rounded-none px-3 py-1.5 flex-1 font-mono truncate";
+  const xBtn = "text-muted-foreground/0 group-hover/item:text-muted-foreground hover:!text-foreground transition-all text-sm leading-none px-1";
 
   return (
     <div>
@@ -155,14 +149,14 @@ export function PipeTriggerPicker(props: PickerProps) {
         ))}
         <button
           onClick={() => setOpen(true)}
-          className="w-full h-8 text-xs border rounded px-2 flex items-center gap-1.5 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+          className="w-full h-8 text-[11px] uppercase tracking-wide border rounded-none px-2 flex items-center gap-1.5 text-muted-foreground hover:bg-foreground hover:text-background hover:border-foreground transition-colors"
         >
           <Plus className="h-3.5 w-3.5" /> add trigger
         </button>
       </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-3xl p-0 overflow-hidden gap-0">
+        <DialogContent className="max-w-3xl p-0 overflow-hidden gap-0 rounded-none">
           <TriggerModal
             {...props}
             onClose={() => setOpen(false)}
@@ -216,7 +210,7 @@ function TriggerModal({
       {/* left rail */}
       <div className="w-[270px] border-r flex flex-col">
         <div className="p-3 pb-2">
-          <div className="text-sm font-medium mb-2">add trigger</div>
+          <div className="text-sm font-medium mb-2 lowercase">add trigger</div>
           <div className="relative">
             <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
             <input
@@ -224,7 +218,7 @@ function TriggerModal({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="search triggers…"
-              className="w-full h-8 text-xs bg-muted/40 border rounded pl-8 pr-2 outline-none focus:ring-1 focus:ring-ring"
+              className="w-full h-8 text-xs font-mono bg-muted/40 border rounded-none pl-8 pr-2 outline-none focus:border-foreground transition-colors"
             />
           </div>
         </div>
@@ -239,11 +233,11 @@ function TriggerModal({
                   <button
                     key={o.id}
                     onClick={() => setSelected(o.id)}
-                    className={`w-full flex items-center gap-2.5 px-2 py-1.5 rounded text-left transition-colors ${
+                    className={`w-full flex items-center gap-2.5 px-2 py-1.5 rounded-none text-left transition-colors ${
                       selected === o.id ? "bg-accent" : "hover:bg-accent/60"
                     }`}
                   >
-                    <span className="text-muted-foreground shrink-0">{o.icon}</span>
+                    <span className="shrink-0">{optionIcon(o)}</span>
                     <span className="flex-1 min-w-0">
                       <span className="block text-xs font-medium truncate">{o.label}</span>
                       <span className="block text-[10px] text-muted-foreground truncate">{o.sub}</span>
@@ -302,7 +296,7 @@ function Detail({
   return (
     <div className="h-full flex flex-col">
       <div className="px-5 py-4 flex items-center gap-2 border-b">
-        <span className="text-muted-foreground">{option.icon}</span>
+        <span className="shrink-0">{optionIcon(option)}</span>
         <span className="text-sm font-medium">{detailTitle(option.id)}</span>
       </div>
       <div className="flex-1 overflow-y-auto px-5 py-4">
@@ -342,13 +336,7 @@ function detailTitle(id: OptionId): string {
 function PrimaryAdd({ disabled, onClick, label = "add trigger" }: { disabled?: boolean; onClick: () => void; label?: string }) {
   return (
     <div className="mt-5 flex justify-end">
-      <button
-        disabled={disabled}
-        onClick={onClick}
-        className="h-9 px-4 text-xs font-medium rounded bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-40 transition-opacity"
-      >
-        {label}
-      </button>
+      <button disabled={disabled} onClick={onClick} className={BTN_PRIMARY}>{label}</button>
     </div>
   );
 }
@@ -378,19 +366,14 @@ function ScheduleDetail({ schedule, onSave }: { schedule?: string; onSave: (s: s
           <button
             key={p.v}
             onClick={() => setVal(p.v)}
-            className={`text-xs border rounded px-3 py-2 text-left transition-colors ${val === p.v ? "border-primary bg-accent" : "hover:bg-accent/60"}`}
+            className={`text-xs border rounded-none px-3 py-2 text-left transition-colors ${val === p.v ? "border-foreground bg-accent" : "hover:bg-accent/60"}`}
           >
             {p.l}
           </button>
         ))}
       </div>
-      <label className="text-[10px] uppercase tracking-wide text-muted-foreground">custom (interval or cron)</label>
-      <input
-        value={val}
-        onChange={(e) => setVal(e.target.value)}
-        placeholder="every 15m  ·  0 9 * * 1-5"
-        className="w-full h-8 text-xs font-mono bg-background border rounded px-2 mt-1"
-      />
+      <label className={LABEL}>custom (interval or cron)</label>
+      <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="every 15m  ·  0 9 * * 1-5" className={`${INPUT} mt-1`} />
       <PrimaryAdd disabled={!val.trim()} onClick={() => onSave(val.trim())} label="set schedule" />
     </div>
   );
@@ -402,7 +385,7 @@ function PipeDetail({ pipes, onAdd }: { pipes: { name: string }[]; onAdd: (name:
   return (
     <div>
       <p className="text-xs text-muted-foreground mb-3">Run this pipe right after another finishes (chaining).</p>
-      <select value={name} onChange={(e) => setName(e.target.value)} className="w-full h-9 text-xs bg-background border rounded px-2">
+      <select value={name} onChange={(e) => setName(e.target.value)} className={INPUT}>
         <option value="">choose a pipe…</option>
         {pipes.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
       </select>
@@ -411,10 +394,20 @@ function PipeDetail({ pipes, onAdd }: { pipes: { name: string }[]; onAdd: (name:
   );
 }
 
-// ── connection-aware source detail (the important part) ──────────────────────
+// ── connection-aware source detail ───────────────────────────────────────────
 
 interface SlackChannel { id: string; name: string; is_private?: boolean }
 interface NotionDb { id: string; name: string }
+
+/** Accounts for an app: [] = single/default, else one per connected workspace. */
+function accountsFor(conns: AvailableConnection[], app: string): { value: string; label: string }[] {
+  const c = conns.find((x) => x.id === app);
+  if (!c?.instances || c.instances.length < 2) return [];
+  return c.instances.map((i) => ({
+    value: i.instanceKey.includes(":") ? i.instanceKey.split(":").slice(1).join(":") : "",
+    label: i.instanceLabel,
+  }));
+}
 
 function SourceDetail({
   app,
@@ -430,6 +423,8 @@ function SourceDetail({
   const [conns, setConns] = useState(availableConnections);
   const connected = !!conns.find((c) => c.id === app)?.connected;
   const [connecting, setConnecting] = useState(false);
+  const accounts = accountsFor(conns, app);
+  const [instance, setInstance] = useState<string>(accounts[0]?.value ?? "");
 
   useEffect(() => setConns(availableConnections), [availableConnections]);
 
@@ -457,12 +452,24 @@ function SourceDetail({
     }
   }
 
-  if (!connected) {
-    return <ConnectCard app={app} connecting={connecting} onConnect={doConnect} />;
-  }
-  if (app === "slack") return <SlackPicker onAdd={onAdd} />;
-  if (app === "notion") return <NotionPicker onAdd={onAdd} />;
-  return <ObsidianPicker onAdd={onAdd} />;
+  if (!connected) return <ConnectCard app={app} connecting={connecting} onConnect={doConnect} />;
+
+  const inst = instance || undefined;
+  return (
+    <div>
+      {accounts.length > 1 && (
+        <div className="mb-3">
+          <label className={LABEL}>account</label>
+          <select value={instance} onChange={(e) => setInstance(e.target.value)} className={`${INPUT} mt-1`}>
+            {accounts.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+          </select>
+        </div>
+      )}
+      {app === "slack" && <SlackPicker key={inst ?? ""} instance={inst} onAdd={onAdd} />}
+      {app === "notion" && <NotionPicker key={inst ?? ""} instance={inst} onAdd={onAdd} />}
+      {app === "obsidian" && <ObsidianPicker onAdd={onAdd} />}
+    </div>
+  );
 }
 
 const APP_META: Record<string, { name: string; blurb: string; examples: string[] }> = {
@@ -474,34 +481,33 @@ const APP_META: Record<string, { name: string; blurb: string; examples: string[]
 function ConnectCard({ app, connecting, onConnect }: { app: string; connecting: boolean; onConnect: () => void }) {
   const m = APP_META[app];
   return (
-    <div className="rounded-lg border bg-muted/30 p-4">
+    <div className="border rounded-none p-4">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
-          <div className="text-sm font-medium">Connect {m.name}</div>
-          <p className="text-xs text-muted-foreground mt-1">{m.blurb}</p>
-          <button
-            onClick={onConnect}
-            disabled={connecting}
-            className="mt-3 h-8 px-3 text-xs font-medium rounded bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 inline-flex items-center gap-1.5"
-          >
-            {connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
-            {app === "obsidian" ? "Choose vault folder" : `Connect ${m.name}`}
+          <div className="flex items-center gap-2">
+            <IntegrationIcon icon={app} className="w-5 h-5 flex items-center justify-center" fallbackClassName="h-5 w-5 text-muted-foreground" />
+            <div className="text-sm font-medium">connect {m.name}</div>
+          </div>
+          <p className="text-xs text-muted-foreground mt-2">{m.blurb}</p>
+          <button onClick={onConnect} disabled={connecting} className={`mt-3 ${BTN_SECONDARY}`}>
+            {connecting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {app === "obsidian" ? "choose vault folder" : `connect ${m.name}`}
           </button>
         </div>
         {m.examples.length > 0 && (
           <div className="flex flex-col items-end gap-1.5 shrink-0">
             {m.examples.map((e) => (
-              <span key={e} className="text-[11px] border rounded-full px-2.5 py-1 text-muted-foreground bg-background/60">{e}</span>
+              <span key={e} className="text-[11px] border rounded-none px-2.5 py-1 text-muted-foreground font-mono">{e}</span>
             ))}
           </div>
         )}
       </div>
-      <p className="text-[10px] text-muted-foreground mt-3">You can change what this pipe can access at any time.</p>
+      <p className="text-[10px] text-muted-foreground mt-3">you can change what this pipe can access at any time.</p>
     </div>
   );
 }
 
-function SlackPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
+function SlackPicker({ instance, onAdd }: { instance?: string; onAdd: (s: TriggerSource) => void }) {
   const [channels, setChannels] = useState<SlackChannel[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [q, setQ] = useState("");
@@ -510,7 +516,9 @@ function SlackPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
   useEffect(() => {
     (async () => {
       try {
-        const r = await localFetch("/connections/slack/conversations?limit=200");
+        // Up to 200 channels; the search box narrows within the fetched set.
+        const inst = instance ? `&instance=${encodeURIComponent(instance)}` : "";
+        const r = await localFetch(`/connections/slack/conversations?limit=200${inst}`);
         const j = await r.json();
         const list: SlackChannel[] = (j?.channels ?? [])
           .filter((c: SlackChannel) => c.name)
@@ -522,14 +530,14 @@ function SlackPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
         setChannels([]);
       }
     })();
-  }, []);
+  }, [instance]);
 
   const shown = (channels ?? []).filter((c) => !q || c.name.toLowerCase().includes(q.toLowerCase()));
   return (
     <div>
-      <label className="text-[10px] uppercase tracking-wide text-muted-foreground">select a channel</label>
-      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search channels…" className="w-full h-8 text-xs bg-background border rounded px-2 mt-1 mb-2" />
-      <div className="border rounded max-h-[220px] overflow-y-auto">
+      <label className={LABEL}>select a channel</label>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search channels…" className={`${INPUT} mt-1 mb-2`} />
+      <div className="border rounded-none max-h-[220px] overflow-y-auto">
         {channels === null ? (
           <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> loading channels…</div>
         ) : err ? (
@@ -543,22 +551,22 @@ function SlackPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
               onClick={() => setPicked(c)}
               className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors ${picked?.id === c.id ? "bg-accent" : "hover:bg-accent/60"}`}
             >
-              <span className="text-muted-foreground">{c.is_private ? "🔒" : "#"}</span>
-              <span className="flex-1 truncate">{c.name}</span>
-              {picked?.id === c.id && <Check className="h-3.5 w-3.5 text-primary" />}
+              <span className="text-muted-foreground font-mono">{c.is_private ? "🔒" : "#"}</span>
+              <span className="flex-1 truncate font-mono">{c.name}</span>
+              {picked?.id === c.id && <Check className="h-3.5 w-3.5" />}
             </button>
           ))
         )}
       </div>
       <PrimaryAdd
         disabled={!picked}
-        onClick={() => picked && onAdd({ app: "slack", kind: "message", filter: { channel: picked.id, channel_name: `#${picked.name}` } })}
+        onClick={() => picked && onAdd({ app: "slack", kind: "message", instance, filter: { channel: picked.id, channel_name: `#${picked.name}` } })}
       />
     </div>
   );
 }
 
-function NotionPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
+function NotionPicker({ instance, onAdd }: { instance?: string; onAdd: (s: TriggerSource) => void }) {
   const [dbs, setDbs] = useState<NotionDb[] | null>(null);
   const [q, setQ] = useState("");
   const [picked, setPicked] = useState<NotionDb | null>(null); // null = any page
@@ -566,7 +574,8 @@ function NotionPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
   useEffect(() => {
     (async () => {
       try {
-        const r = await localFetch("/connections/notion/proxy/v1/search", {
+        const cid = instance ? `notion:${instance}` : "notion";
+        const r = await localFetch(`/connections/${cid}/proxy/v1/search`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ filter: { value: "database", property: "object" }, page_size: 100 }),
@@ -581,34 +590,28 @@ function NotionPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
         setDbs([]);
       }
     })();
-  }, []);
+  }, [instance]);
 
   const shown = (dbs ?? []).filter((d) => !q || d.name.toLowerCase().includes(q.toLowerCase()));
+  const row = "w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors";
   return (
     <div>
-      <label className="text-[10px] uppercase tracking-wide text-muted-foreground">select a data source</label>
-      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search databases…" className="w-full h-8 text-xs bg-background border rounded px-2 mt-1 mb-2" />
-      <div className="border rounded max-h-[220px] overflow-y-auto">
-        <button
-          onClick={() => setPicked(null)}
-          className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs border-b transition-colors ${picked === null ? "bg-accent" : "hover:bg-accent/60"}`}
-        >
-          <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+      <label className={LABEL}>select a data source</label>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search databases…" className={`${INPUT} mt-1 mb-2`} />
+      <div className="border rounded-none max-h-[220px] overflow-y-auto">
+        <button onClick={() => setPicked(null)} className={`${row} border-b ${picked === null ? "bg-accent" : "hover:bg-accent/60"}`}>
+          <IntegrationIcon icon="notion" className="w-3.5 h-3.5 flex items-center justify-center" fallbackClassName="h-3.5 w-3.5 text-muted-foreground" />
           <span className="flex-1">any page in your workspace</span>
-          {picked === null && <Check className="h-3.5 w-3.5 text-primary" />}
+          {picked === null && <Check className="h-3.5 w-3.5" />}
         </button>
         {dbs === null ? (
           <div className="flex items-center gap-2 text-xs text-muted-foreground px-3 py-4"><Loader2 className="h-3.5 w-3.5 animate-spin" /> loading databases…</div>
         ) : (
           shown.map((d) => (
-            <button
-              key={d.id}
-              onClick={() => setPicked(d)}
-              className={`w-full flex items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors ${picked?.id === d.id ? "bg-accent" : "hover:bg-accent/60"}`}
-            >
-              <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+            <button key={d.id} onClick={() => setPicked(d)} className={`${row} ${picked?.id === d.id ? "bg-accent" : "hover:bg-accent/60"}`}>
+              <IntegrationIcon icon="notion" className="w-3.5 h-3.5 flex items-center justify-center" fallbackClassName="h-3.5 w-3.5 text-muted-foreground" />
               <span className="flex-1 truncate">{d.name}</span>
-              {picked?.id === d.id && <Check className="h-3.5 w-3.5 text-primary" />}
+              {picked?.id === d.id && <Check className="h-3.5 w-3.5" />}
             </button>
           ))
         )}
@@ -617,8 +620,8 @@ function NotionPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
         onClick={() =>
           onAdd(
             picked
-              ? { app: "notion", kind: "page", filter: { database: picked.id, database_name: picked.name } }
-              : { app: "notion", kind: "page" }
+              ? { app: "notion", kind: "page", instance, filter: { database: picked.id, database_name: picked.name } }
+              : { app: "notion", kind: "page", instance }
           )
         }
       />
@@ -652,19 +655,12 @@ function ObsidianPicker({ onAdd }: { onAdd: (s: TriggerSource) => void }) {
   return (
     <div>
       <p className="text-xs text-muted-foreground mb-3">Fires when a new note appears in the folder you watch.</p>
-      <label className="text-[10px] uppercase tracking-wide text-muted-foreground">folder to watch</label>
+      <label className={LABEL}>folder to watch</label>
       <div className="flex items-center gap-2 mt-1">
-        <input
-          value={folder}
-          onChange={(e) => setFolder(e.target.value)}
-          placeholder={vault || "/path/to/vault/folder"}
-          className="flex-1 h-8 text-xs font-mono bg-background border rounded px-2"
-        />
-        <button onClick={choose} className="h-8 px-3 text-xs border rounded hover:bg-accent inline-flex items-center gap-1.5">
-          <FolderOpen className="h-3.5 w-3.5" /> browse
-        </button>
+        <input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder={vault || "/path/to/vault/folder"} className={INPUT} />
+        <button onClick={choose} className={BTN_SECONDARY}>browse</button>
       </div>
-      <p className="text-[10px] text-muted-foreground mt-1.5">Tip: point at a subfolder (e.g. meetings/) for less noise.</p>
+      <p className="text-[10px] text-muted-foreground mt-1.5">tip: point at a subfolder (e.g. meetings/) for less noise.</p>
       <PrimaryAdd disabled={!folder.trim()} onClick={() => onAdd({ app: "obsidian", kind: "note", path: folder.trim() })} />
     </div>
   );
