@@ -93,9 +93,7 @@ export function PipeScheduleBuilder({
     };
   }, [cfg, manual, weeklyNoDays, apiBase]);
 
-  const summary = manual
-    ? "won't run on a schedule"
-    : preview?.summary || describeScheduleConfig(cfg);
+  const summary = preview?.summary || describeScheduleConfig(cfg);
   const nextRun = !manual && preview?.next?.[0]
     ? new Date(preview.next[0]).toLocaleString([], {
         weekday: "short",
@@ -290,11 +288,19 @@ export function PipeScheduleBuilder({
 
       {/* Summary / next run */}
       <div className="rounded border border-border bg-muted/30 px-2 py-1.5">
-        <p className="text-[11px]">
-          runs <span className="text-foreground">{summary}</span>
-        </p>
-        {nextRun && (
-          <p className="text-[11px] text-muted-foreground">next occurrence: {nextRun}</p>
+        {manual ? (
+          <p className="text-[11px]">
+            moves to <span className="text-foreground">manual</span> — runs only when you trigger it
+          </p>
+        ) : (
+          <>
+            <p className="text-[11px]">
+              runs <span className="text-foreground">{summary}</span>
+            </p>
+            {nextRun && (
+              <p className="text-[11px] text-muted-foreground">next occurrence: {nextRun}</p>
+            )}
+          </>
         )}
       </div>
 
