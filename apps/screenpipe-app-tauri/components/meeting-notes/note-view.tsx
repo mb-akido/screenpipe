@@ -103,6 +103,18 @@ import { listenTyped, TAURI_EVENTS } from "@/lib/events/tauri-events";
 import { writeBrowserLogNow } from "@/lib/logging/browser-log";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
+const SAVE_BEFORE_STOP_TIMEOUT_MS = 1500;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error("save timed out")), ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
 
 interface NoteViewProps {
   meeting: MeetingRecord;
@@ -698,21 +710,40 @@ export function NoteView({
   const handleStopClick = async () => {
     if (savingBeforeStop) return;
     setSavingBeforeStop(true);
+    let noteSaveFailed = false;
     try {
       const current = { title, attendees, note };
       if (!sameMeetingNoteDraft(current, lastSavedRef.current)) {
-        await save(current, { throwOnError: true });
+        await withTimeout(
+          save(current, { throwOnError: true }),
+          SAVE_BEFORE_STOP_TIMEOUT_MS,
+        );
       }
+    } catch (err) {
+      noteSaveFailed = true;
+      console.warn("meeting note save before stop failed; stopping anyway", err);
+    }
+
+    try {
       await onStop();
     } catch (err) {
-      console.error("failed to save meeting note before stop", err);
+      console.error("failed to stop meeting", err);
       toast({
-        title: "couldn't save notes",
-        description: "try again before stopping the meeting.",
+        title: "couldn't stop meeting",
+        description: "try again from the meeting menu.",
         variant: "destructive",
       });
+      return;
     } finally {
       setSavingBeforeStop(false);
+    }
+
+    if (noteSaveFailed) {
+      toast({
+        title: "meeting stopped",
+        description: "notes did not save before stopping. edit them and try saving again.",
+        variant: "destructive",
+      });
     }
   };
 

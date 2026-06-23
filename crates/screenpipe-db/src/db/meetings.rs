@@ -195,6 +195,11 @@ impl DatabaseManager {
             return Ok(());
         }
 
+        self.append_meeting_context(id).await
+    }
+
+    /// Append auto-collected context to an already-ended meeting note.
+    pub async fn append_meeting_context(&self, id: i64) -> Result<(), SqlxError> {
         // Build the auto-injected suffix from the available signals. Each
         // signal is independently optional — a meeting where the user only
         // edited files but typed nothing still gets the files block, and

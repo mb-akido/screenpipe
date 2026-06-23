@@ -65,8 +65,8 @@ pub struct StartMeetingRequest {
 pub struct StopMeetingRequest {
     pub id: Option<i64>,
     /// When false, skip auto-appending the user's typed text (and edited
-    /// files) to the meeting note. Defaults to true to preserve historical
-    /// behavior.
+    /// files) to the meeting note. Defaults to true; the append runs after
+    /// the meeting is stopped so cleanup cannot block the stop action.
     #[serde(default = "default_append_typed_text")]
     pub append_typed_text: bool,
 }
@@ -710,12 +710,7 @@ pub(crate) async fn stop_meeting_handler(
 
     state
         .db
-        .end_meeting_with_typed_text(
-            id,
-            &now,
-            body.append_typed_text,
-            Some(MEETING_END_REASON_EXPLICIT_STOP),
-        )
+        .end_meeting(id, &now, Some(MEETING_END_REASON_EXPLICIT_STOP))
         .await
         .map_err(|e| {
             (
@@ -769,6 +764,19 @@ pub(crate) async fn stop_meeting_handler(
             id,
             e
         );
+    }
+
+    if body.append_typed_text {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db.append_meeting_context(id).await {
+                tracing::warn!(
+                    "failed to append meeting context after explicit stop for meeting {}: {}",
+                    id,
+                    e
+                );
+            }
+        });
     }
 
     Ok(JsonResponse(meeting))

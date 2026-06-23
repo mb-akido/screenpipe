@@ -15,6 +15,7 @@ import {
   platform as osPlatform,
 } from "@tauri-apps/plugin-os";
 import { Textarea } from "./ui/textarea";
+import { ToastAction } from "./ui/toast";
 import {
   Tooltip,
   TooltipContent,
@@ -338,6 +339,7 @@ export const ShareLogsButton = ({
       const supportId = confirmPayload?.data?.id;
       const followUpChannel = confirmPayload?.data?.follow_up;
       const reference = supportId ? ` #${supportId}` : "";
+      const copyReference = supportId ? String(supportId) : identifier;
 
       toast({
         title: "feedback sent",
@@ -345,6 +347,18 @@ export const ShareLogsButton = ({
           followUpChannel === "email"
             ? `we emailed you a receipt${reference} and will reply there.`
             : `we posted it to support${reference}; mention that ID in Discord if you need an update.`,
+        action: (
+          <ToastAction
+            altText="copy feedback id"
+            onClick={() => {
+              void commands.copyTextToClipboard(copyReference).then(() => {
+                toast({ title: "feedback id copied" });
+              });
+            }}
+          >
+            copy id
+          </ToastAction>
+        ),
       });
       setFeedbackText("");
       setScreenshot(null);

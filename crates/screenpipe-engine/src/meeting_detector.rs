@@ -138,6 +138,10 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
             },
             call_signals: vec![
                 CallSignal::AutomationId("hangup-button"),
+                CallSignal::AutomationIdContains("hangup"),
+                CallSignal::AutomationIdContains("hang-up"),
+                CallSignal::AutomationIdContains("hang_up"),
+                CallSignal::AutomationIdContains("call-end"),
                 CallSignal::KeyboardShortcut("Ctrl+Shift+H"),
                 CallSignal::KeyboardShortcut("\u{2318}\u{21e7}H"), // Cmd+Shift+H
                 CallSignal::RoleWithName {
@@ -146,11 +150,21 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
                 CallSignal::RoleWithName {
                     role: "AXButton",
+                    name_contains: "leave call",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
                     name_contains: "leave",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "end call",
                 },
                 // Fallback: Teams on some Windows machines exposes "Leave" as a
                 // non-Button control type (Custom, Text, etc.). Match by name only.
                 CallSignal::NameContains("leave"),
+                CallSignal::NameContains("hang up"),
+                CallSignal::NameContains("end call"),
                 // Teams web (browser): mute is AXCheckBox with keyboard shortcut in name.
                 // "Mute mic (⇧ ⌘ M)" is only present during an active call.
                 CallSignal::RoleWithName {
@@ -2305,6 +2319,13 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
+fn macos_app_name_matches(app_name_lower: &str, candidates: &[&str]) -> bool {
+    candidates.iter().any(|candidate| {
+        app_name_lower == *candidate
+            || (candidate.contains(' ') && app_name_lower.contains(candidate))
+    })
+}
+
 /// Match a `browser_url_patterns` entry against a URL or window-title string at
 /// host-name boundaries.
 ///
@@ -2464,11 +2485,8 @@ pub fn find_running_meeting_apps(
 
             for (idx, profile) in profiles.iter().enumerate() {
                 // Check native app names
-                let matches_native = profile
-                    .app_identifiers
-                    .macos_app_names
-                    .iter()
-                    .any(|n| name_lower == *n);
+                let matches_native =
+                    macos_app_name_matches(&name_lower, profile.app_identifiers.macos_app_names);
 
                 if matches_native {
                     results.push(RunningMeetingApp {
@@ -4360,6 +4378,54 @@ mod tests {
                 .contains(&"msteams"),
             "MSTeams not added to macos_app_names"
         );
+    }
+
+    #[test]
+    fn test_macos_native_app_match_accepts_teams_qualified_name() {
+        let profiles = load_detection_profiles();
+        let teams = profiles
+            .iter()
+            .find(|p| {
+                p.app_identifiers
+                    .macos_app_names
+                    .contains(&"microsoft teams")
+            })
+            .expect("Teams profile not found");
+
+        assert!(macos_app_name_matches(
+            "microsoft teams (work or school)",
+            teams.app_identifiers.macos_app_names
+        ));
+        assert!(macos_app_name_matches(
+            "microsoft teams classic",
+            teams.app_identifiers.macos_app_names
+        ));
+        assert!(!macos_app_name_matches(
+            "teams helper",
+            teams.app_identifiers.macos_app_names
+        ));
+    }
+
+    #[test]
+    fn test_teams_profile_has_modern_hangup_signals() {
+        let profiles = load_detection_profiles();
+        let teams = profiles
+            .iter()
+            .find(|p| {
+                p.app_identifiers
+                    .macos_app_names
+                    .contains(&"microsoft teams")
+            })
+            .expect("Teams profile not found");
+
+        assert!(teams
+            .call_signals
+            .iter()
+            .any(|s| matches!(s, CallSignal::AutomationIdContains(id) if *id == "hangup")));
+        assert!(teams
+            .call_signals
+            .iter()
+            .any(|s| matches!(s, CallSignal::NameContains(name) if *name == "end call")));
     }
 
     #[test]
