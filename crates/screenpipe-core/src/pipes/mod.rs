@@ -4696,9 +4696,18 @@ impl PipeManager {
         let pipes_dir = self.pipes_dir.clone();
         let generation_ref = self.scheduler_generation.clone();
         let generation = generation_ref.load(std::sync::atomic::Ordering::SeqCst);
+        let api_base = format!("http://127.0.0.1:{}", self.api_port);
+        let api_key = self.local_api_key.clone();
 
         tokio::spawn(async move {
             let mut state = connection_triggers::WatcherState::load(&pipes_dir);
+            // Shared client with a short timeout so a hung connection proxy call
+            // can't stall the poll loop. API-poll sources (Slack/Notion) hit the
+            // local proxy on api_base; the file source (Obsidian) ignores it.
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
             info!(
                 "connection-trigger watcher started (generation {})",
                 generation
@@ -4717,7 +4726,12 @@ impl PipeManager {
                         .map(|(n, (c, _, _))| (n.clone(), c.clone()))
                         .collect()
                 };
-                connection_triggers::poll_once(&pipes_dir, &snapshot, &mut state);
+                let ctx = connection_triggers::SourceCtx {
+                    http: &http,
+                    api_base: &api_base,
+                    api_key: api_key.as_deref(),
+                };
+                connection_triggers::poll_once(&pipes_dir, &snapshot, &mut state, &ctx).await;
 
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(
