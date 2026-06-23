@@ -4708,6 +4708,11 @@ impl PipeManager {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default();
+            // Learn when fired pipe runs finish so we can commit (or retry) the
+            // cursor — this is what makes delivery at-least-once. pipe_completed:*
+            // events are named per pipe, so subscribe to all and prefix-filter.
+            use futures::{FutureExt, StreamExt};
+            let mut completed_rx = screenpipe_events::subscribe_to_all_events();
             info!(
                 "connection-trigger watcher started (generation {})",
                 generation
@@ -4734,12 +4739,38 @@ impl PipeManager {
                         .map(|(n, (c, _, _))| (n.clone(), c.clone()))
                         .collect()
                 };
+                // Drain pipe_completed:* events since the last tick.
+                let mut completions: Vec<(String, bool)> = Vec::new();
+                while let Some(e) = completed_rx.next().now_or_never().flatten() {
+                    if e.name.starts_with("pipe_completed:") {
+                        let pipe = e
+                            .data
+                            .get("pipe_name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        let success = e
+                            .data
+                            .get("success")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if let Some(pipe) = pipe {
+                            completions.push((pipe, success));
+                        }
+                    }
+                }
                 let ctx = connection_triggers::SourceCtx {
                     http: &http,
                     api_base: &api_base,
                     api_key: api_key.as_deref(),
                 };
-                connection_triggers::poll_once(&pipes_dir, &snapshot, &mut state, &ctx).await;
+                connection_triggers::poll_once(
+                    &pipes_dir,
+                    &snapshot,
+                    &mut state,
+                    &ctx,
+                    &completions,
+                )
+                .await;
 
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(

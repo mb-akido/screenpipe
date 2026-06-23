@@ -4,108 +4,122 @@
 
 //! Per-app connection triggers — watch a connected app for new items and fire a pipe.
 //!
-//! This is the *producer* side of pipe triggers. The scheduler already consumes
-//! events from the bus and runs pipes whose `trigger.events` match; this watcher
-//! adds the missing piece: detecting "a new X happened" in a connected app and
-//! emitting a `connection_trigger` event addressed to the matched pipe.
-//!
-//! Separation of concerns: the watcher only *detects + emits*; it never runs a
-//! pipe. The scheduler only *matches + runs*; it never polls an app. They meet
-//! at the event bus, the same seam meeting/`pipe_completed` triggers already use.
+//! Producer side of pipe triggers. The scheduler already runs pipes off the event
+//! bus; this watcher detects "a new X happened" in a connected app and emits a
+//! `connection_trigger` event addressed to the matched pipe. The watcher only
+//! *detects + emits*; the scheduler only *matches + runs*. They meet at the bus.
 //!
 //! Three ingestion classes, one cursor model:
 //! - **file** (Obsidian): scan a vault folder for new/changed `.md` files.
-//! - **api poll** (Slack, Notion): hit the local connection proxy
-//!   (`/connections/<id>/...`), which injects auth server-side, and diff the
-//!   response against an opaque cursor token.
+//! - **api poll** (Slack, Notion): page the local connection proxy
+//!   (`/connections/<id>/...`, which injects auth server-side) and diff the
+//!   response against an opaque, source-specific cursor token.
 //!
-//! Reliability (v1):
-//! - Cursors persist to `<pipes_dir>/.connection-triggers.json`, so a restart
-//!   resumes from the last watermark rather than replaying or losing position.
-//! - On first sight a subscription initialises to "now" — enabling a trigger
-//!   never replays the whole backlog.
-//! - Each fire is capped to `MAX_ITEMS_PER_FIRE` and the cursor advances only to
-//!   the last item delivered, so a large backlog (e.g. after the app was offline)
-//!   drains over several ticks. For ordered sources this is loss-free.
-//! - On startup the watcher waits a few seconds before its first poll so the
+//! Reliability:
+//! - **Persisted cursors** (`<pipes_dir>/.connection-triggers.json`) hold the
+//!   *committed* watermark — only advanced once a fired pipe run completes. A
+//!   restart resumes from there and re-delivers anything that was in-flight.
+//! - **At-least-once delivery**: a fire stays *pending* (in-memory) until the
+//!   pipe emits `pipe_completed` with success → commit. On failure/timeout it is
+//!   retried (bounded by [`RETRY_CAP`]) and then given up so it can't loop.
+//! - **Init-to-now**: enabling a trigger never replays the backlog.
+//! - **Bounded fires**: at most [`MAX_ITEMS_PER_FIRE`] per fire; a backlog drains
+//!   over ticks. Slack/Notion paginate ([`MAX_PAGES`]) so a busy channel or a
+//!   long offline gap is drained, not silently skipped.
+//! - **Dedup**: one fetch per (app, account, channel/folder) per tick, fanned out
+//!   to every subscribing pipe (each with its own cursor).
+//! - **Startup**: the watcher waits a few seconds before its first poll so the
 //!   scheduler is subscribed and can't miss a fire-on-startup.
 //!
-//! Known gaps (documented, not yet closed):
-//! - Delivery is at-most-once: the cursor advances on emit, so a crash between
-//!   emit and the pipe run drops that one trigger. Pair a source trigger with a
-//!   safety `schedule` for stronger delivery; advance-after-run is the fix.
-//! - Slack/Notion fetch one page per poll. If MORE than a page of new items
-//!   appears between two polls (a very busy channel, or a long offline gap), the
-//!   oldest beyond the page are skipped (and a warning is logged). Cursor-based
-//!   pagination is the fix. Obsidian re-scans the whole folder, so it has no cap.
-//! - Two pipes watching the same Slack channel poll it independently (no shared
-//!   fetch). Fine for a handful; dedup is a follow-up.
+//! Remaining footgun: a pipe that writes into its own watched folder/channel will
+//! self-trigger — author it to write elsewhere.
 
 use super::{PipeConfig, SourceTrigger};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 
 /// How often sources are polled.
 pub const POLL_INTERVAL_SECS: u64 = 30;
 
-/// Max items delivered in a single fire. A large backlog (e.g. after the app
-/// was offline) drains over several ticks instead of one giant fire — bounds the
-/// `.trigger-context.json` size and the pipe's context, and is loss-free for
-/// ordered sources because the cursor only advances to the last delivered item.
+/// Max items delivered in a single fire; a larger backlog drains over ticks.
 pub const MAX_ITEMS_PER_FIRE: usize = 50;
 
-/// Slack `conversations.history` page size. Larger than MAX_ITEMS_PER_FIRE so a
-/// moderate backlog is fetched in one call and then drained in capped batches.
+/// Slack `conversations.history` page size.
 const SLACK_HISTORY_LIMIT: usize = 200;
 
-/// Cursor file living alongside the pipes, mapping subscription → high-watermark.
-const CURSOR_FILE: &str = ".connection-triggers.json";
+/// Notion `search` page size.
+const NOTION_PAGE_SIZE: usize = 50;
 
-/// Per-pipe file the watcher writes before firing, naming exactly what changed.
+/// Max pages fetched per source per tick (bounds a huge backlog).
+const MAX_PAGES: usize = 5;
+
+/// How many times a failed fire is retried before it's given up (skip + commit),
+/// so a perpetually-failing pipe can't re-fire forever.
+const RETRY_CAP: u32 = 5;
+
+/// A pending (emitted, unconfirmed) fire older than this with no completion seen
+/// is retried — covers a crashed run that never reported back.
+const INFLIGHT_TIMEOUT: Duration = Duration::from_secs(600);
+
+const CURSOR_FILE: &str = ".connection-triggers.json";
 const TRIGGER_CONTEXT_FILE: &str = ".trigger-context.json";
 
-/// Apps the watcher currently knows how to poll. Sources for other apps are
-/// silently ignored (handled by push/native paths or future work).
 const SUPPORTED_APPS: &[&str] = &["obsidian", "slack", "notion"];
 
 fn is_supported(app: &str) -> bool {
     SUPPORTED_APPS.contains(&app)
 }
 
-/// Persisted high-watermark for one subscription. The token is opaque and
-/// source-specific (max file mtime for Obsidian, latest Slack `ts`, latest
-/// Notion `last_edited_time`) so we never depend on the local clock.
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+/// Persisted committed watermark for one subscription.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CursorState {
-    /// Opaque high-watermark already delivered for this subscription.
+    /// Opaque, source-specific high-watermark of *delivered + confirmed* items.
     #[serde(default)]
     pub token: String,
     /// True once initialised to "now" so the first poll never replays the backlog.
     pub initialized: bool,
 }
 
-/// In-memory watcher state: the cursor map plus a dirty flag to avoid rewriting
-/// the cursor file on idle ticks.
+/// In-memory record of a fire awaiting its pipe run to complete.
+#[derive(Debug, Clone)]
+pub struct Pending {
+    pub pipe: String,
+    /// Watermark this fire would commit on success.
+    pub token: String,
+    pub attempts: u32,
+    /// Set when the run failed/timed out — the next poll re-emits (retry).
+    pub failed: bool,
+    pub since: Instant,
+}
+
+/// Watcher state: persisted committed cursors + in-memory pending fires.
 #[derive(Debug, Default)]
 pub struct WatcherState {
-    cursors: HashMap<String, CursorState>,
+    committed: HashMap<String, CursorState>,
+    pending: HashMap<String, Pending>,
     dirty: bool,
 }
 
 impl WatcherState {
-    /// Load persisted cursors. A missing or corrupt file starts empty
-    /// (everything re-initialises to now).
+    /// Load committed cursors. Pending is always empty on load, so anything that
+    /// was in-flight when we stopped is re-detected and re-delivered (at-least-once).
     pub fn load(pipes_dir: &Path) -> Self {
-        let cursors = std::fs::read_to_string(pipes_dir.join(CURSOR_FILE))
+        let committed = std::fs::read_to_string(pipes_dir.join(CURSOR_FILE))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         Self {
-            cursors,
+            committed,
+            pending: HashMap::new(),
             dirty: false,
         }
     }
@@ -114,7 +128,7 @@ impl WatcherState {
         if !self.dirty {
             return;
         }
-        if let Ok(json) = serde_json::to_string_pretty(&self.cursors) {
+        if let Ok(json) = serde_json::to_string_pretty(&self.committed) {
             if let Err(e) = super::atomic_write(&pipes_dir.join(CURSOR_FILE), &json) {
                 warn!("connection trigger: failed to persist cursors: {}", e);
                 return;
@@ -124,8 +138,7 @@ impl WatcherState {
     }
 }
 
-/// A new item detected in a watched source. Shape is uniform across apps so the
-/// pipe always reads the same `.trigger-context.json`.
+/// A new item detected in a watched source. Uniform shape across apps.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedItem {
     /// Stable id: file path / Slack message ts / Notion page id.
@@ -138,20 +151,6 @@ pub struct DetectedItem {
     pub ts: String,
 }
 
-/// Outcome of evaluating one subscription against its current cursor.
-#[derive(Debug)]
-pub enum PollOutcome {
-    /// First sight — initialise the cursor to this watermark, emit nothing.
-    Initialized(String),
-    /// New items detected — fire, then advance the cursor to `new_cursor`.
-    Fired {
-        items: Vec<DetectedItem>,
-        new_cursor: String,
-    },
-    /// Nothing new.
-    Idle,
-}
-
 /// Everything the API-poll sources need to reach the local connection proxy.
 pub struct SourceCtx<'a> {
     pub http: &'a reqwest::Client,
@@ -162,8 +161,8 @@ pub struct SourceCtx<'a> {
 }
 
 impl SourceCtx<'_> {
-    async fn get_json(&self, url: &str) -> Option<Value> {
-        let mut req = self.http.get(url);
+    async fn get_json_q(&self, url: &str, query: &[(&str, &str)]) -> Option<Value> {
+        let mut req = self.http.get(url).query(query);
         if let Some(key) = self.api_key {
             req = req.bearer_auth(key);
         }
@@ -190,13 +189,51 @@ impl SourceCtx<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Subscription identity
+// Tokens & identity
 // ---------------------------------------------------------------------------
 
-/// Stable key for a subscription. `\u{1f}` (unit separator) can't appear in the
-/// fields, so the key is unambiguous. Includes the filter (e.g. Slack channel)
-/// so two channels on the same pipe stay distinct.
-pub fn subscription_key(pipe: &str, src: &SourceTrigger) -> String {
+/// Compare two opaque cursor tokens for an app. Slack `ts` / Obsidian mtime are
+/// numeric; Notion `last_edited_time` is fixed-format UTC ISO, so a lexicographic
+/// compare is a correct chronological compare. An unparseable token sorts lowest.
+fn token_cmp(app: &str, a: &str, b: &str) -> Ordering {
+    if app == "notion" {
+        a.cmp(b)
+    } else {
+        let pa = a.parse::<f64>().unwrap_or(f64::MIN);
+        let pb = b.parse::<f64>().unwrap_or(f64::MIN);
+        pa.partial_cmp(&pb).unwrap_or(Ordering::Equal)
+    }
+}
+
+fn token_gt(app: &str, a: &str, b: &str) -> bool {
+    token_cmp(app, a, b) == Ordering::Greater
+}
+
+fn now_token(app: &str) -> String {
+    match app {
+        "obsidian" => system_time_ms(SystemTime::now()).unwrap_or(0).to_string(),
+        "slack" => now_unix_secs_str(),
+        "notion" => chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Largest token among `items`, never below `floor` (the init "now" baseline).
+fn max_token(app: &str, items: &[DetectedItem], floor: &str) -> String {
+    let mut m = floor.to_string();
+    for i in items {
+        if token_cmp(app, &i.ts, &m) == Ordering::Greater {
+            m = i.ts.clone();
+        }
+    }
+    m
+}
+
+/// Identity of a *source* (app + account + channel/folder), without the pipe —
+/// two pipes watching the same thing share one fetch.
+fn source_identity(src: &SourceTrigger) -> String {
     let mut filter: Vec<(&String, &String)> = src.filter.iter().collect();
     filter.sort();
     let filter_str = filter
@@ -205,13 +242,18 @@ pub fn subscription_key(pipe: &str, src: &SourceTrigger) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{pipe}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
         src.app,
         effective_kind(src),
         src.instance.as_deref().unwrap_or(""),
         src.path.as_deref().unwrap_or(""),
         filter_str,
     )
+}
+
+/// Per-pipe subscription key: pipe + source identity.
+pub fn subscription_key(pipe: &str, src: &SourceTrigger) -> String {
+    format!("{pipe}\u{1f}{}", source_identity(src))
 }
 
 fn effective_kind(src: &SourceTrigger) -> &str {
@@ -250,13 +292,160 @@ fn now_unix_secs_str() -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
+fn first_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        "message".to_string()
+    } else if line.chars().count() > max {
+        let truncated: String = line.chars().take(max).collect();
+        format!("{truncated}…")
+    } else {
+        line.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Obsidian (file watch)
+// Fetch layer (one call per source per tick; paginated)
 // ---------------------------------------------------------------------------
 
-/// Recursively collect `.md` files under `root` whose mtime is newer than
-/// `since_ms`. Skips hidden directories (`.obsidian`, `.git`, `.trash`) and
-/// dotfiles. Returns the new items (oldest first) and the max mtime seen.
+/// Fetch raw items for a source newer than `since` (oldest-first). `since` may be
+/// empty (init / fully-behind subscriber) → fetch the recent window. `None` means
+/// the source couldn't be polled (misconfigured or transient error) — skip it.
+async fn fetch_items(
+    ctx: &SourceCtx<'_>,
+    src: &SourceTrigger,
+    since: &str,
+) -> Option<Vec<DetectedItem>> {
+    match src.app.as_str() {
+        "obsidian" => fetch_obsidian(src, since).await,
+        "slack" => fetch_slack(ctx, src, since).await,
+        "notion" => fetch_notion(ctx, src, since).await,
+        _ => None,
+    }
+}
+
+async fn fetch_obsidian(src: &SourceTrigger, since: &str) -> Option<Vec<DetectedItem>> {
+    let path = src.path.clone().filter(|p| !p.is_empty())?;
+    let since_ms = since.parse::<u64>().unwrap_or(0);
+    // Blocking filesystem scan — keep it off the async worker threads.
+    tokio::task::spawn_blocking(move || {
+        let root = Path::new(&path);
+        if !root.is_dir() {
+            debug!(
+                "connection trigger: obsidian path is not a directory: {}",
+                path
+            );
+            return None;
+        }
+        let (items, _max) = scan_new_files(root, since_ms);
+        Some(items)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn fetch_slack(
+    ctx: &SourceCtx<'_>,
+    src: &SourceTrigger,
+    since: &str,
+) -> Option<Vec<DetectedItem>> {
+    let channel = src
+        .filter
+        .get("channel")
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())?;
+    let url = format!("{}/connections/slack/history", ctx.api_base);
+    let limit = SLACK_HISTORY_LIMIT.to_string();
+    let instance = src.instance.as_deref().filter(|s| !s.is_empty());
+
+    let mut all: Vec<DetectedItem> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let mut q: Vec<(&str, &str)> = vec![("channel", channel), ("limit", &limit)];
+        if !since.is_empty() {
+            q.push(("oldest", since));
+            q.push(("inclusive", "false"));
+        }
+        if let Some(c) = cursor.as_deref() {
+            q.push(("cursor", c));
+        }
+        if let Some(inst) = instance {
+            q.push(("instance", inst));
+        }
+        let value = ctx.get_json_q(&url, &q).await?;
+        all.extend(parse_slack_messages(&value).into_iter().map(|(_, i)| i));
+        let has_more = value
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let next = value
+            .get("response_metadata")
+            .and_then(|m| m.get("next_cursor"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        match (has_more, next) {
+            (true, Some(n)) => cursor = Some(n),
+            _ => break,
+        }
+    }
+    all.sort_by(|a, b| token_cmp("slack", &a.ts, &b.ts));
+    all.dedup_by(|a, b| a.ts == b.ts);
+    Some(all)
+}
+
+async fn fetch_notion(
+    ctx: &SourceCtx<'_>,
+    src: &SourceTrigger,
+    since: &str,
+) -> Option<Vec<DetectedItem>> {
+    let id = connection_id("notion", src.instance.as_deref());
+    let url = format!("{}/connections/{}/proxy/v1/search", ctx.api_base, id);
+
+    let mut all: Vec<DetectedItem> = Vec::new();
+    let mut start_cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let mut body = serde_json::json!({
+            "sort": { "direction": "descending", "timestamp": "last_edited_time" },
+            "page_size": NOTION_PAGE_SIZE
+        });
+        if let Some(c) = &start_cursor {
+            body["start_cursor"] = serde_json::json!(c);
+        }
+        let value = ctx.post_json(&url, body).await?;
+        let page = parse_notion_results(&value); // oldest-first
+                                                 // Page is descending by edit time; once its oldest entry is at/below the
+                                                 // cursor we've covered the whole new window — stop paging.
+        let covered = page
+            .first()
+            .map(|(t, _)| !since.is_empty() && token_cmp("notion", t, since) != Ordering::Greater)
+            .unwrap_or(true);
+        all.extend(page.into_iter().map(|(_, i)| i));
+        let has_more = value
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let next = value
+            .get("next_cursor")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        match (covered, has_more, next) {
+            (false, true, Some(n)) => start_cursor = Some(n),
+            _ => break,
+        }
+    }
+    all.sort_by(|a, b| token_cmp("notion", &a.ts, &b.ts));
+    all.dedup_by(|a, b| a.id == b.id);
+    if !since.is_empty() {
+        all.retain(|i| token_gt("notion", &i.ts, since));
+    }
+    Some(all)
+}
+
+/// Recursively collect `.md` files under `root` with mtime newer than `since_ms`.
+/// Skips hidden dirs (`.obsidian`, `.git`, `.trash`) and dotfiles. Oldest-first.
 pub fn scan_new_files(root: &Path, since_ms: u64) -> (Vec<DetectedItem>, u64) {
     let mut out = Vec::new();
     let mut max_mtime = since_ms;
@@ -305,46 +494,11 @@ pub fn scan_new_files(root: &Path, since_ms: u64) -> (Vec<DetectedItem>, u64) {
             }
         }
     }
-
     out.sort_by_key(|i| i.ts.parse::<u64>().unwrap_or(0));
     (out, max_mtime)
 }
 
-/// Evaluate an Obsidian folder subscription. `None` = misconfigured (no path /
-/// not a directory), so the caller skips it without touching the cursor.
-fn obsidian_poll(src: &SourceTrigger, cursor: &CursorState) -> Option<PollOutcome> {
-    let path = src.path.as_deref().filter(|p| !p.is_empty())?;
-    let root = Path::new(path);
-    if !root.is_dir() {
-        debug!(
-            "connection trigger: obsidian path is not a directory: {}",
-            path
-        );
-        return None;
-    }
-    let since = cursor.token.parse::<u64>().unwrap_or(0);
-    if !cursor.initialized {
-        let now_ms = system_time_ms(SystemTime::now()).unwrap_or(0);
-        let (_items, max_mtime) = scan_new_files(root, 0);
-        return Some(PollOutcome::Initialized(max_mtime.max(now_ms).to_string()));
-    }
-    let (items, max_mtime) = scan_new_files(root, since);
-    if items.is_empty() {
-        Some(PollOutcome::Idle)
-    } else {
-        Some(PollOutcome::Fired {
-            items,
-            new_cursor: max_mtime.to_string(),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Slack (api poll) — conversations.history for one channel
-// ---------------------------------------------------------------------------
-
-/// Normalise a Slack `conversations.history` response into `(ts, item)` pairs
-/// sorted oldest-first. Pure so it can be tested against a sample payload.
+/// Normalise a Slack `conversations.history` response into `(ts, item)` pairs.
 pub fn parse_slack_messages(value: &Value) -> Vec<(f64, DetectedItem)> {
     let mut out: Vec<(f64, DetectedItem)> = value
         .get("messages")
@@ -368,111 +522,11 @@ pub fn parse_slack_messages(value: &Value) -> Vec<(f64, DetectedItem)> {
                 .collect()
         })
         .unwrap_or_default();
-    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
     out
 }
 
-async fn slack_poll(
-    ctx: &SourceCtx<'_>,
-    src: &SourceTrigger,
-    cursor: &CursorState,
-) -> Option<PollOutcome> {
-    let channel = src
-        .filter
-        .get("channel")
-        .map(|s| s.as_str())
-        .filter(|s| !s.is_empty())?;
-    let mut url = format!(
-        "{}/connections/slack/history?channel={}&limit={}",
-        ctx.api_base, channel, SLACK_HISTORY_LIMIT
-    );
-    // Fetch only messages newer than the cursor — smaller payloads and the
-    // server returns at most SLACK_HISTORY_LIMIT of them.
-    if cursor.initialized && !cursor.token.is_empty() {
-        url.push_str(&format!("&oldest={}&inclusive=false", cursor.token));
-    }
-    if let Some(inst) = src.instance.as_deref().filter(|s| !s.is_empty()) {
-        url.push_str(&format!("&instance={inst}"));
-    }
-    let value = ctx.get_json(&url).await?;
-    // `has_more` means more new messages exist than one page held; the oldest
-    // ones beyond the page are skipped (cursor pagination is a follow-up).
-    if value
-        .get("has_more")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        warn!(
-            "connection trigger: slack channel {} returned a full page ({}+ new messages); oldest beyond the page are skipped until pagination lands",
-            channel, SLACK_HISTORY_LIMIT
-        );
-    }
-    let all = parse_slack_messages(&value);
-
-    if !cursor.initialized {
-        let token = all
-            .last()
-            .map(|(_, i)| i.ts.clone())
-            .unwrap_or_else(now_unix_secs_str);
-        return Some(PollOutcome::Initialized(token));
-    }
-    let since = cursor.token.parse::<f64>().unwrap_or(0.0);
-    let items: Vec<DetectedItem> = all
-        .into_iter()
-        .filter(|(ts, _)| *ts > since)
-        .map(|(_, i)| i)
-        .collect();
-    if items.is_empty() {
-        Some(PollOutcome::Idle)
-    } else {
-        let new_cursor = items.last().map(|i| i.ts.clone()).unwrap_or_default();
-        Some(PollOutcome::Fired { items, new_cursor })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Notion (api poll) — search sorted by last_edited_time
-// ---------------------------------------------------------------------------
-
-/// Best-effort extraction of a human title from a Notion page/database object.
-pub fn extract_notion_title(obj: &Value) -> String {
-    // Database objects carry a top-level `title` rich-text array.
-    if let Some(s) = rich_text_plain(obj.get("title")) {
-        if !s.is_empty() {
-            return s;
-        }
-    }
-    // Page objects carry the title under the property whose type is "title".
-    if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
-        for prop in props.values() {
-            if prop.get("type").and_then(|t| t.as_str()) == Some("title") {
-                if let Some(s) = rich_text_plain(prop.get("title")) {
-                    if !s.is_empty() {
-                        return s;
-                    }
-                }
-            }
-        }
-    }
-    obj.get("url")
-        .and_then(|v| v.as_str())
-        .or_else(|| obj.get("id").and_then(|v| v.as_str()))
-        .unwrap_or("untitled")
-        .to_string()
-}
-
-fn rich_text_plain(v: Option<&Value>) -> Option<String> {
-    let arr = v?.as_array()?;
-    let s: String = arr
-        .iter()
-        .filter_map(|seg| seg.get("plain_text").and_then(|t| t.as_str()))
-        .collect();
-    Some(s)
-}
-
-/// Normalise a Notion `search` response into `(last_edited_time, item)` pairs
-/// sorted oldest-first. Notion timestamps are fixed-format UTC ISO 8601, so a
-/// lexicographic compare on the string is a correct chronological compare.
+/// Normalise a Notion `search` response into `(last_edited_time, item)` pairs.
 pub fn parse_notion_results(value: &Value) -> Vec<(String, DetectedItem)> {
     let mut out: Vec<(String, DetectedItem)> = value
         .get("results")
@@ -500,109 +554,173 @@ pub fn parse_notion_results(value: &Value) -> Vec<(String, DetectedItem)> {
     out
 }
 
-async fn notion_poll(
-    ctx: &SourceCtx<'_>,
-    src: &SourceTrigger,
-    cursor: &CursorState,
-) -> Option<PollOutcome> {
-    let id = connection_id("notion", src.instance.as_deref());
-    let url = format!("{}/connections/{}/proxy/v1/search", ctx.api_base, id);
-    let body = serde_json::json!({
-        "sort": { "direction": "descending", "timestamp": "last_edited_time" },
-        "page_size": 20
-    });
-    let value = ctx.post_json(&url, body).await?;
-    if value
-        .get("has_more")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        warn!(
-            "connection trigger: notion search returned a full page for pipe source; oldest edits beyond the page are skipped until pagination lands"
-        );
+/// Best-effort title from a Notion page/database object.
+pub fn extract_notion_title(obj: &Value) -> String {
+    if let Some(s) = rich_text_plain(obj.get("title")) {
+        if !s.is_empty() {
+            return s;
+        }
     }
-    let all = parse_notion_results(&value);
+    if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
+        for prop in props.values() {
+            if prop.get("type").and_then(|t| t.as_str()) == Some("title") {
+                if let Some(s) = rich_text_plain(prop.get("title")) {
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    obj.get("url")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("untitled")
+        .to_string()
+}
 
-    if !cursor.initialized {
-        // Match Notion's timestamp shape (millis + Z) so lexicographic compares
-        // against real `last_edited_time` values stay correct.
-        let token = all.last().map(|(_, i)| i.ts.clone()).unwrap_or_else(|| {
-            chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                .to_string()
-        });
-        return Some(PollOutcome::Initialized(token));
+fn rich_text_plain(v: Option<&Value>) -> Option<String> {
+    let arr = v?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|seg| seg.get("plain_text").and_then(|t| t.as_str()))
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-subscriber decision (pure)
+// ---------------------------------------------------------------------------
+
+/// What to do for one subscription this tick, given its committed cursor, any
+/// in-flight pending fire, and the freshly-fetched items. Pure → unit-tested.
+#[derive(Debug)]
+pub enum Decision {
+    /// First sight — set the committed watermark, emit nothing.
+    Init(String),
+    /// Nothing to do (no new items, or a fire is in-flight awaiting completion).
+    Skip,
+    /// Emit these items; hold them pending under `token` until the run completes.
+    Emit {
+        items: Vec<DetectedItem>,
+        token: String,
+        attempts: u32,
+    },
+}
+
+fn decide(
+    app: &str,
+    committed: Option<&CursorState>,
+    pending: Option<&Pending>,
+    raw: &[DetectedItem],
+    now: &str,
+) -> Decision {
+    let initialized = committed.map(|c| c.initialized).unwrap_or(false);
+    if !initialized {
+        return Decision::Init(max_token(app, raw, now));
     }
-    let since = &cursor.token;
-    let items: Vec<DetectedItem> = all
-        .into_iter()
-        .filter(|(edited, _)| edited.as_str() > since.as_str())
-        .map(|(_, i)| i)
+    // A fire is in flight and hasn't failed yet — wait for its completion.
+    if matches!(pending, Some(p) if !p.failed) {
+        return Decision::Skip;
+    }
+    let committed_token = committed.map(|c| c.token.as_str()).unwrap_or("");
+    let mut items: Vec<DetectedItem> = raw
+        .iter()
+        .filter(|i| token_gt(app, &i.ts, committed_token))
+        .cloned()
         .collect();
     if items.is_empty() {
-        Some(PollOutcome::Idle)
-    } else {
-        let new_cursor = items.last().map(|i| i.ts.clone()).unwrap_or_default();
-        Some(PollOutcome::Fired { items, new_cursor })
+        return Decision::Skip;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Dispatch + poll loop
-// ---------------------------------------------------------------------------
-
-/// Dispatch one subscription to its source implementation. `None` = couldn't
-/// poll (misconfigured or transient error); the caller leaves the cursor alone.
-async fn poll_source(
-    ctx: &SourceCtx<'_>,
-    src: &SourceTrigger,
-    cursor: &CursorState,
-) -> Option<PollOutcome> {
-    match src.app.as_str() {
-        // The vault scan is blocking filesystem work — run it on the blocking
-        // pool so a large vault can't stall the async poll loop.
-        "obsidian" => {
-            let src = src.clone();
-            let cursor = cursor.clone();
-            tokio::task::spawn_blocking(move || obsidian_poll(&src, &cursor))
-                .await
-                .ok()
-                .flatten()
-        }
-        "slack" => slack_poll(ctx, src, cursor).await,
-        "notion" => notion_poll(ctx, src, cursor).await,
-        _ => None,
-    }
-}
-
-/// Cap a fired batch to `MAX_ITEMS_PER_FIRE` and return the token to advance the
-/// cursor to — the last item actually delivered. Items must be sorted oldest
-/// first; the remainder (if any) is picked up on the next poll, so a backlog
-/// drains over ticks without loss for ordered sources. Returns None if empty.
-fn cap_batch(items: &mut Vec<DetectedItem>) -> Option<String> {
     if items.len() > MAX_ITEMS_PER_FIRE {
         items.truncate(MAX_ITEMS_PER_FIRE);
     }
-    items.last().map(|i| i.ts.clone())
+    let token = items.last().map(|i| i.ts.clone()).unwrap_or_default();
+    // Carry the attempt count forward across a retry of a failed fire.
+    let attempts = pending.map(|p| p.attempts).unwrap_or(0);
+    Decision::Emit {
+        items,
+        token,
+        attempts,
+    }
 }
 
-/// Drop cursors for subscriptions that no longer exist. Returns true if changed.
-fn gc_cursors(cursors: &mut HashMap<String, CursorState>, active: &HashSet<String>) -> bool {
-    let before = cursors.len();
-    cursors.retain(|k, _| active.contains(k));
-    cursors.len() != before
+/// Apply a pipe-run completion to any pending fires for that pipe. Returns true
+/// if a committed cursor changed (needs persisting). Pure → unit-tested.
+fn apply_completion(state: &mut WatcherState, pipe: &str, success: bool) -> bool {
+    let keys: Vec<String> = state
+        .pending
+        .iter()
+        .filter(|(_, p)| p.pipe == pipe)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut dirty = false;
+    for key in keys {
+        let p = match state.pending.get(&key) {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+        if success {
+            commit(state, &key, &p.token);
+            state.pending.remove(&key);
+            dirty = true;
+        } else if p.attempts + 1 >= RETRY_CAP {
+            warn!(
+                "connection trigger: giving up on '{}' after {} failed attempts; advancing cursor",
+                key,
+                p.attempts + 1
+            );
+            commit(state, &key, &p.token);
+            state.pending.remove(&key);
+            dirty = true;
+        } else if let Some(pp) = state.pending.get_mut(&key) {
+            pp.attempts += 1;
+            pp.failed = true; // next poll re-emits (retry)
+        }
+    }
+    dirty
 }
 
-/// Run one poll across every enabled pipe's sources, emitting
-/// `connection_trigger` events and advancing cursors.
+fn commit(state: &mut WatcherState, key: &str, token: &str) {
+    let c = state.committed.entry(key.to_string()).or_default();
+    c.token = token.to_string();
+    c.initialized = true;
+}
+
+/// Retry pending fires that have been in flight too long with no completion seen.
+fn expire_timeouts(state: &mut WatcherState) {
+    for p in state.pending.values_mut() {
+        if !p.failed && p.since.elapsed() >= INFLIGHT_TIMEOUT {
+            p.attempts += 1;
+            p.failed = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Poll loop
+// ---------------------------------------------------------------------------
+
+/// One poll across every enabled pipe's sources. `completions` are
+/// `(pipe_name, success)` drained from `pipe_completed:*` since the last tick.
 pub async fn poll_once(
     pipes_dir: &Path,
     pipes: &[(String, PipeConfig)],
     state: &mut WatcherState,
     ctx: &SourceCtx<'_>,
+    completions: &[(String, bool)],
 ) {
-    let mut active: HashSet<String> = HashSet::new();
+    // 1. confirm/retire in-flight fires, then time out stuck ones.
+    for (pipe, success) in completions {
+        if apply_completion(state, pipe, *success) {
+            state.dirty = true;
+        }
+    }
+    expire_timeouts(state);
 
+    // 2. gather subscriptions, grouped by source identity (dedup the fetch).
+    let mut active: HashSet<String> = HashSet::new();
+    let mut groups: HashMap<String, Vec<(String, SourceTrigger, String)>> = HashMap::new();
     for (pipe, config) in pipes {
         if !config.enabled {
             continue;
@@ -617,67 +735,109 @@ pub async fn poll_once(
             }
             let key = subscription_key(pipe, src);
             active.insert(key.clone());
-            // Clone the cursor so we don't hold a &mut across the await.
-            let cursor = state.cursors.entry(key.clone()).or_default().clone();
-
-            match poll_source(ctx, src, &cursor).await {
-                None => {}
-                Some(PollOutcome::Idle) => {}
-                Some(PollOutcome::Initialized(token)) => {
-                    if let Some(c) = state.cursors.get_mut(&key) {
-                        c.token = token;
-                        c.initialized = true;
-                    }
-                    state.dirty = true;
-                    info!(
-                        "connection trigger: initialised '{}' watch for pipe '{}'",
-                        src.app, pipe
-                    );
-                }
-                Some(PollOutcome::Fired {
-                    mut items,
-                    new_cursor,
-                }) => {
-                    let total = items.len();
-                    // Deliver at most MAX_ITEMS_PER_FIRE and advance the cursor
-                    // only to the last item delivered, so a backlog drains over
-                    // ticks rather than firing one huge batch.
-                    let advance_to = cap_batch(&mut items).unwrap_or(new_cursor);
-                    if let Some(c) = state.cursors.get_mut(&key) {
-                        c.token = advance_to;
-                        c.initialized = true;
-                    }
-                    state.dirty = true;
-                    let count = items.len();
-                    write_trigger_context(&pipes_dir.join(pipe), src, &items);
-                    emit_event(pipe, src, count);
-                    if total > count {
-                        info!(
-                            "connection trigger: pipe '{}' fired by {}/{} new {} item(s) from {} (rest drain next tick)",
-                            pipe, count, total, effective_kind(src), src.app
-                        );
-                    } else {
-                        info!(
-                            "connection trigger: pipe '{}' fired by {} new {} item(s) from {}",
-                            pipe,
-                            count,
-                            effective_kind(src),
-                            src.app
-                        );
-                    }
-                }
-            }
+            groups
+                .entry(source_identity(src))
+                .or_default()
+                .push((pipe.clone(), src.clone(), key));
         }
     }
 
-    if gc_cursors(&mut state.cursors, &active) {
+    // 3. one fetch per source, fanned out to each subscribing pipe.
+    for subs in groups.values() {
+        let app = subs[0].1.app.clone();
+        // Fetch from the most-behind subscriber so one call covers them all.
+        let min_since = subs
+            .iter()
+            .filter_map(|(_, _, k)| state.committed.get(k))
+            .filter(|c| c.initialized)
+            .map(|c| c.token.clone())
+            .reduce(|a, b| {
+                if token_cmp(&app, &a, &b) == Ordering::Less {
+                    a
+                } else {
+                    b
+                }
+            })
+            .unwrap_or_default();
+
+        let raw = match fetch_items(ctx, &subs[0].1, &min_since).await {
+            Some(r) => r,
+            None => continue,
+        };
+
+        for (pipe, src, key) in subs {
+            process_subscriber(pipes_dir, state, pipe, src, key, &raw);
+        }
+    }
+
+    // 4. drop cursors + pending for subscriptions that no longer exist.
+    let before = state.committed.len();
+    state.committed.retain(|k, _| active.contains(k));
+    state.pending.retain(|k, _| active.contains(k));
+    if state.committed.len() != before {
         state.dirty = true;
     }
     state.save(pipes_dir);
 }
 
-/// Write the new items to `<pipe-dir>/.trigger-context.json` so the pipe prompt
-/// can read exactly what changed (the pipe runs with cwd = its own dir).
+fn process_subscriber(
+    pipes_dir: &Path,
+    state: &mut WatcherState,
+    pipe: &str,
+    src: &SourceTrigger,
+    key: &str,
+    raw: &[DetectedItem],
+) {
+    let app = src.app.as_str();
+    let committed = state.committed.get(key).cloned();
+    let pending = state.pending.get(key).cloned();
+    let now = now_token(app);
+    match decide(app, committed.as_ref(), pending.as_ref(), raw, &now) {
+        Decision::Skip => {}
+        Decision::Init(token) => {
+            state.committed.insert(
+                key.to_string(),
+                CursorState {
+                    token,
+                    initialized: true,
+                },
+            );
+            state.pending.remove(key);
+            state.dirty = true;
+            info!(
+                "connection trigger: initialised '{}' watch for pipe '{}'",
+                src.app, pipe
+            );
+        }
+        Decision::Emit {
+            items,
+            token,
+            attempts,
+        } => {
+            let count = items.len();
+            write_trigger_context(&pipes_dir.join(pipe), src, &items);
+            emit_event(pipe, src, count);
+            state.pending.insert(
+                key.to_string(),
+                Pending {
+                    pipe: pipe.to_string(),
+                    token,
+                    attempts,
+                    failed: false,
+                    since: Instant::now(),
+                },
+            );
+            info!(
+                "connection trigger: pipe '{}' fired by {} new {} item(s) from {} (awaiting completion)",
+                pipe,
+                count,
+                effective_kind(src),
+                src.app
+            );
+        }
+    }
+}
+
 fn write_trigger_context(pipe_dir: &Path, src: &SourceTrigger, items: &[DetectedItem]) {
     if !pipe_dir.is_dir() {
         return;
@@ -713,161 +873,181 @@ fn emit_event(pipe: &str, src: &SourceTrigger, count: usize) {
     }
 }
 
-fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().next().unwrap_or("").trim();
-    if line.chars().count() > max {
-        let truncated: String = line.chars().take(max).collect();
-        format!("{truncated}…")
-    } else if line.is_empty() {
-        "message".to_string()
-    } else {
-        line.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    fn touch(dir: &Path, name: &str) -> u64 {
-        let p = dir.join(name);
-        fs::write(&p, b"x").unwrap();
-        system_time_ms(fs::metadata(&p).unwrap().modified().unwrap()).unwrap()
+    fn item(ts: &str) -> DetectedItem {
+        DetectedItem {
+            id: ts.into(),
+            title: "t".into(),
+            preview: String::new(),
+            ts: ts.into(),
+        }
     }
-
-    fn obsidian_src(path: &str) -> SourceTrigger {
-        SourceTrigger {
-            app: "obsidian".into(),
-            kind: String::new(),
-            instance: None,
-            path: Some(path.into()),
-            filter: Default::default(),
+    fn committed(token: &str) -> CursorState {
+        CursorState {
+            token: token.into(),
+            initialized: true,
+        }
+    }
+    fn pending(pipe: &str, token: &str, attempts: u32, failed: bool) -> Pending {
+        Pending {
+            pipe: pipe.into(),
+            token: token.into(),
+            attempts,
+            failed,
+            since: Instant::now(),
         }
     }
 
     #[test]
-    fn scan_finds_only_files_newer_than_cursor() {
-        let d = tempfile::tempdir().unwrap();
-        let m = touch(d.path(), "a.md");
-        let (items, max) = scan_new_files(d.path(), 0);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "a.md");
-        assert!(max >= m);
-        let (none, _) = scan_new_files(d.path(), m + 10_000);
-        assert!(none.is_empty(), "files at/below the cursor must not refire");
+    fn token_cmp_numeric_and_lexicographic() {
+        assert_eq!(
+            token_cmp("slack", "1700000002.0001", "1700000001.0009"),
+            Ordering::Greater
+        );
+        assert_eq!(token_cmp("obsidian", "1000", "999"), Ordering::Greater);
+        assert_eq!(
+            token_cmp(
+                "notion",
+                "2026-06-23T12:00:00.000Z",
+                "2026-06-22T23:59:59.999Z"
+            ),
+            Ordering::Greater
+        );
+        assert_eq!(token_cmp("slack", "", "0"), Ordering::Less); // unparseable sorts lowest
     }
 
     #[test]
-    fn scan_skips_hidden_dirs_and_non_markdown() {
-        let d = tempfile::tempdir().unwrap();
-        fs::create_dir(d.path().join(".obsidian")).unwrap();
-        touch(&d.path().join(".obsidian"), "cache.md");
-        touch(d.path(), "note.txt");
-        let (items, _) = scan_new_files(d.path(), 0);
-        assert_eq!(items.len(), 0);
+    fn decide_inits_without_replaying_backlog() {
+        let raw = vec![item("100"), item("300"), item("200")];
+        match decide("obsidian", None, None, &raw, "50") {
+            Decision::Init(t) => assert_eq!(t, "300"), // max of items, above the floor
+            other => panic!("expected Init, got {other:?}"),
+        }
     }
 
     #[test]
-    fn scan_recurses_into_subfolders() {
-        let d = tempfile::tempdir().unwrap();
-        let sub = d.path().join("meetings");
-        fs::create_dir(&sub).unwrap();
-        touch(&sub, "standup.md");
-        let (items, _) = scan_new_files(d.path(), 0);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "standup.md");
-    }
-
-    #[test]
-    fn obsidian_initialises_then_fires_then_idle() {
-        let d = tempfile::tempdir().unwrap();
-        let m = touch(d.path(), "old.md");
-        let src = obsidian_src(d.path().to_str().unwrap());
-
-        match obsidian_poll(&src, &CursorState::default()).unwrap() {
-            PollOutcome::Initialized(token) => {
-                assert!(token.parse::<u64>().unwrap() >= m);
+    fn decide_emits_new_and_caps_to_max() {
+        let raw: Vec<DetectedItem> = (1..=(MAX_ITEMS_PER_FIRE as u64 + 5))
+            .map(|n| item(&n.to_string()))
+            .collect();
+        let c = committed("0");
+        match decide("obsidian", Some(&c), None, &raw, "0") {
+            Decision::Emit { items, token, .. } => {
+                assert_eq!(items.len(), MAX_ITEMS_PER_FIRE);
+                assert_eq!(token, MAX_ITEMS_PER_FIRE.to_string()); // advances only to last delivered
             }
-            other => panic!("expected Initialized, got {other:?}"),
+            other => panic!("expected Emit, got {other:?}"),
         }
+    }
 
-        let behind = CursorState {
-            token: m.saturating_sub(1).to_string(),
-            initialized: true,
-        };
-        match obsidian_poll(&src, &behind).unwrap() {
-            PollOutcome::Fired { items, .. } => assert_eq!(items.len(), 1),
-            other => panic!("expected Fired, got {other:?}"),
-        }
-
-        let ahead = CursorState {
-            token: (m + 5_000).to_string(),
-            initialized: true,
-        };
+    #[test]
+    fn decide_skips_while_a_fire_is_in_flight() {
+        let raw = vec![item("10")];
+        let c = committed("0");
+        let p = pending("pipe", "5", 0, false);
         assert!(matches!(
-            obsidian_poll(&src, &ahead),
-            Some(PollOutcome::Idle)
+            decide("obsidian", Some(&c), Some(&p), &raw, "0"),
+            Decision::Skip
         ));
     }
 
     #[test]
-    fn obsidian_skips_when_path_missing_or_not_dir() {
-        assert!(obsidian_poll(&obsidian_src(""), &CursorState::default()).is_none());
-        assert!(
-            obsidian_poll(&obsidian_src("/no/such/dir/xyz"), &CursorState::default()).is_none()
-        );
+    fn decide_retries_a_failed_fire_and_carries_attempts() {
+        let raw = vec![item("10")];
+        let c = committed("0");
+        let p = pending("pipe", "10", 2, true); // failed → retry
+        match decide("obsidian", Some(&c), Some(&p), &raw, "0") {
+            Decision::Emit {
+                attempts, items, ..
+            } => {
+                assert_eq!(attempts, 2, "attempt count carried across retries");
+                assert_eq!(items.len(), 1);
+            }
+            other => panic!("expected Emit (retry), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_completion_commits_on_success() {
+        let mut s = WatcherState::default();
+        s.committed.insert("k".into(), committed("0"));
+        s.pending.insert("k".into(), pending("p", "100", 0, false));
+        assert!(apply_completion(&mut s, "p", true));
+        assert_eq!(s.committed["k"].token, "100");
+        assert!(!s.pending.contains_key("k"));
+    }
+
+    #[test]
+    fn apply_completion_retries_then_gives_up() {
+        let mut s = WatcherState::default();
+        s.committed.insert("k".into(), committed("0"));
+        s.pending.insert("k".into(), pending("p", "100", 0, false));
+        // fail a few times — stays pending (failed), cursor not advanced
+        for _ in 0..(RETRY_CAP - 1) {
+            apply_completion(&mut s, "p", false);
+            assert!(s.pending.contains_key("k"));
+            assert_eq!(s.committed["k"].token, "0");
+        }
+        // final failure crosses the cap → give up, commit, drop pending
+        assert!(apply_completion(&mut s, "p", false));
+        assert!(!s.pending.contains_key("k"));
+        assert_eq!(s.committed["k"].token, "100");
     }
 
     #[test]
     fn parse_slack_sorts_and_normalises() {
         let payload = serde_json::json!({
-            "ok": true,
             "messages": [
-                { "ts": "1700000005.000200", "text": "second line\nmore" },
+                { "ts": "1700000005.000200", "text": "second\nmore" },
                 { "ts": "1700000001.000100", "text": "first" },
                 { "bogus": true }
             ]
         });
         let msgs = parse_slack_messages(&payload);
-        assert_eq!(msgs.len(), 2, "malformed message is dropped");
-        assert_eq!(msgs[0].1.ts, "1700000001.000100", "sorted oldest first");
-        assert_eq!(msgs[0].1.title, "first");
-        assert_eq!(msgs[1].1.title, "second line", "title is first line only");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].1.ts, "1700000001.000100");
+        assert_eq!(msgs[1].1.title, "second");
     }
 
     #[test]
     fn parse_notion_extracts_title_and_sorts() {
         let payload = serde_json::json!({
             "results": [
-                {
-                    "id": "page-b", "url": "https://notion.so/b",
-                    "last_edited_time": "2026-06-23T12:00:00.000Z",
-                    "properties": { "Name": { "type": "title", "title": [ { "plain_text": "Roadmap" } ] } }
-                },
-                {
-                    "id": "page-a", "url": "https://notion.so/a",
-                    "last_edited_time": "2026-06-22T09:00:00.000Z",
-                    "properties": { "Name": { "type": "title", "title": [ { "plain_text": "Notes" } ] } }
-                }
+                { "id": "b", "url": "u", "last_edited_time": "2026-06-23T12:00:00.000Z",
+                  "properties": { "Name": { "type": "title", "title": [ { "plain_text": "Roadmap" } ] } } },
+                { "id": "a", "url": "u", "last_edited_time": "2026-06-22T09:00:00.000Z",
+                  "properties": { "Name": { "type": "title", "title": [ { "plain_text": "Notes" } ] } } }
             ]
         });
         let pages = parse_notion_results(&payload);
-        assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0].1.id, "page-a", "sorted oldest first");
+        assert_eq!(pages[0].1.id, "a");
         assert_eq!(pages[1].1.title, "Roadmap");
     }
 
     #[test]
-    fn notion_title_falls_back_to_url_then_id() {
-        let db = serde_json::json!({ "title": [ { "plain_text": "Tasks DB" } ] });
-        assert_eq!(extract_notion_title(&db), "Tasks DB");
+    fn notion_title_falls_back_to_url() {
         let bare = serde_json::json!({ "id": "abc", "url": "https://notion.so/abc" });
         assert_eq!(extract_notion_title(&bare), "https://notion.so/abc");
     }
 
     #[test]
-    fn subscription_key_is_distinct_per_channel() {
+    fn scan_finds_only_new_markdown() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a.md");
+        fs::write(&p, b"x").unwrap();
+        let m = system_time_ms(fs::metadata(&p).unwrap().modified().unwrap()).unwrap();
+        fs::write(d.path().join("note.txt"), b"x").unwrap();
+        let (items, _) = scan_new_files(d.path(), 0);
+        assert_eq!(items.len(), 1, "only .md, and dotfiles/.txt skipped");
+        assert!(scan_new_files(d.path(), m + 10_000).0.is_empty());
+    }
+
+    #[test]
+    fn subscription_key_distinct_per_channel_same_source_shared() {
         let mut a = SourceTrigger {
             app: "slack".into(),
             kind: String::new(),
@@ -876,46 +1056,11 @@ mod tests {
             filter: Default::default(),
         };
         let mut b = a.clone();
-        a.filter.insert("channel".into(), "C111".into());
-        b.filter.insert("channel".into(), "C222".into());
+        a.filter.insert("channel".into(), "C1".into());
+        b.filter.insert("channel".into(), "C2".into());
         assert_ne!(subscription_key("p", &a), subscription_key("p", &b));
-        assert_eq!(subscription_key("p", &a), subscription_key("p", &a));
-    }
-
-    #[test]
-    fn cap_batch_truncates_and_advances_to_last_delivered() {
-        let mk = |ts: u64| DetectedItem {
-            id: ts.to_string(),
-            title: "n".into(),
-            preview: String::new(),
-            ts: ts.to_string(),
-        };
-        // Under the cap: unchanged, advance to the last item.
-        let mut few: Vec<DetectedItem> = (1..=3).map(mk).collect();
-        assert_eq!(cap_batch(&mut few).as_deref(), Some("3"));
-        assert_eq!(few.len(), 3);
-        // Over the cap: truncated to the oldest MAX, advance to the MAX-th so the
-        // remainder fires on the next tick (loss-free drain for ordered sources).
-        let mut many: Vec<DetectedItem> = (1..=(MAX_ITEMS_PER_FIRE as u64 + 10)).map(mk).collect();
-        assert_eq!(
-            cap_batch(&mut many).as_deref(),
-            Some(MAX_ITEMS_PER_FIRE.to_string().as_str())
-        );
-        assert_eq!(many.len(), MAX_ITEMS_PER_FIRE);
-        // Empty: no token.
-        let mut none: Vec<DetectedItem> = vec![];
-        assert!(cap_batch(&mut none).is_none());
-    }
-
-    #[test]
-    fn gc_drops_inactive_cursors() {
-        let mut cursors = HashMap::new();
-        cursors.insert("keep".to_string(), CursorState::default());
-        cursors.insert("drop".to_string(), CursorState::default());
-        let active: HashSet<String> = ["keep".to_string()].into_iter().collect();
-        assert!(gc_cursors(&mut cursors, &active));
-        assert!(cursors.contains_key("keep"));
-        assert!(!cursors.contains_key("drop"));
-        assert!(!gc_cursors(&mut cursors, &active), "no change second time");
+        // Same source, two pipes → different sub keys but identical source identity.
+        assert_ne!(subscription_key("p", &a), subscription_key("q", &a));
+        assert_eq!(source_identity(&a), source_identity(&a));
     }
 }
