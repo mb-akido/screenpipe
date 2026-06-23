@@ -69,8 +69,11 @@ export function PipeScheduleBuilder({
   const showTime = cfg.frequency === "days" || cfg.frequency === "weeks" || cfg.frequency === "months";
   const showTimezone = showTime;
   const weeklyNoDays = !manual && cfg.frequency === "weeks" && cfg.days_of_week.length === 0;
-  const endMode: "never" | "on" | "after" =
-    cfg.max_occurrences != null ? "after" : cfg.ending ? "on" : "never";
+  // Explicit so "on date" stays selected before a date is picked (deriving it
+  // from cfg.ending would snap back to "never" while the input is empty).
+  const [endMode, setEndMode] = useState<"never" | "on" | "after">(() =>
+    cfg.max_occurrences != null ? "after" : cfg.ending ? "on" : "never"
+  );
 
   const update = (patch: Partial<ScheduleConfig>) => setCfg((c) => ({ ...c, ...patch }));
 
@@ -282,6 +285,7 @@ export function PipeScheduleBuilder({
             <Select
               value={endMode}
               onValueChange={(v) => {
+                setEndMode(v as "never" | "on" | "after");
                 if (v === "never") update({ ending: null, max_occurrences: null });
                 else if (v === "on") update({ max_occurrences: null });
                 else update({ ending: null, max_occurrences: cfg.max_occurrences ?? 5 });
