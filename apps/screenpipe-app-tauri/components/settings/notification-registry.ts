@@ -169,6 +169,100 @@ export const NOTIFICATION_CATEGORIES: NotificationCategory[] = [
 /** Master switch key — silences every notification at the `/notify` choke point. */
 export const MASTER_NOTIFICATIONS_KEY = "notificationsEnabled" as const;
 
+// ── do not disturb ───────────────────────────────────────────────────
+// Snooze (pause until a timestamp) and quiet hours (a recurring daily window)
+// both evaluate at the same Rust gate as the master switch. Critical
+// recording-stopped alerts ignore all of them.
+
+export interface QuietHoursPref {
+  enabled: boolean;
+  /** "HH:MM" 24h local */
+  start: string;
+  /** "HH:MM" 24h local; may be earlier than start to wrap past midnight */
+  end: string;
+}
+
+export const DEFAULT_QUIET_HOURS: QuietHoursPref = {
+  enabled: false,
+  start: "22:00",
+  end: "08:00",
+};
+
+export interface SnoozePreset {
+  label: string;
+  /** minutes from now, or a marker resolved by `snoozeUntilMs` */
+  kind: "minutes" | "untilTomorrow";
+  minutes?: number;
+}
+
+export const SNOOZE_PRESETS: SnoozePreset[] = [
+  { label: "30 min", kind: "minutes", minutes: 30 },
+  { label: "1 hour", kind: "minutes", minutes: 60 },
+  { label: "2 hours", kind: "minutes", minutes: 120 },
+  { label: "until tomorrow", kind: "untilTomorrow" },
+];
+
+/** Resolve a snooze preset to an absolute epoch-ms expiry (local clock). */
+export function snoozeUntilMs(preset: SnoozePreset, now = new Date()): number {
+  if (preset.kind === "untilTomorrow") {
+    const t = new Date(now);
+    t.setDate(t.getDate() + 1);
+    t.setHours(8, 0, 0, 0); // 8am tomorrow, local
+    return t.getTime();
+  }
+  return now.getTime() + (preset.minutes ?? 0) * 60_000;
+}
+
+/** Parse "HH:MM" (24h) → minutes since midnight, or null. Mirrors the Rust `parse_hhmm`. */
+export function parseHHMM(s: string): number | null {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s.trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/** Is `now` inside the (wrap-aware) quiet window? Mirrors the Rust `within_quiet`. */
+export function isQuietActive(
+  qh: QuietHoursPref | undefined,
+  now = new Date()
+): boolean {
+  if (!qh?.enabled) return false;
+  const start = parseHHMM(qh.start);
+  const end = parseHHMM(qh.end);
+  if (start == null || end == null || start === end) return false;
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  return start < end
+    ? nowMin >= start && nowMin < end
+    : nowMin >= start || nowMin < end;
+}
+
+/** Human label for an active snooze, e.g. "until 3:40 PM" / "until Tue 8:00 AM". */
+export function formatSnoozeUntil(untilMs: number, now = new Date()): string {
+  const until = new Date(untilMs);
+  const sameDay = until.toDateString() === now.toDateString();
+  const time = until.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (sameDay) return `until ${time}`;
+  const day = until.toLocaleDateString([], { weekday: "short" });
+  return `until ${day} ${time}`;
+}
+
+// ── presets (bulk set) ───────────────────────────────────────────────
+export type CategoryPreset = "recommended" | "all" | "none";
+
+/** Per-category boolean values for a one-click preset. */
+export function categoryValuesForPreset(
+  kind: CategoryPreset
+): Record<string, boolean> {
+  return Object.fromEntries(
+    NOTIFICATION_CATEGORIES.map((c) => [
+      c.id,
+      kind === "all" ? true : kind === "none" ? false : c.default,
+    ])
+  );
+}
+
 /** Quick lookup by id. */
 export const NOTIFICATION_CATEGORY_BY_ID: Record<string, NotificationCategory> =
   Object.fromEntries(NOTIFICATION_CATEGORIES.map((c) => [c.id, c]));
@@ -186,10 +280,12 @@ export function categoriesForGroup(
  * muted-pipe list starts empty. Spread this — never hand-maintain a parallel
  * defaults object.
  */
-export const DEFAULT_NOTIFICATION_PREFS: Record<string, boolean | string[]> = {
+export const DEFAULT_NOTIFICATION_PREFS: Record<string, unknown> = {
   [MASTER_NOTIFICATIONS_KEY]: true,
   ...Object.fromEntries(NOTIFICATION_CATEGORIES.map((c) => [c.id, c.default])),
   mutedPipes: [] as string[],
+  snoozeUntil: 0,
+  quietHours: DEFAULT_QUIET_HOURS,
 };
 
 /** Resolve a category's current value, falling back to its registry default. */
@@ -199,4 +295,16 @@ export function categoryEnabled(
 ): boolean {
   const v = prefs?.[category.id];
   return typeof v === "boolean" ? v : category.default;
+}
+
+/** Aggregate on/off state of a group, for the group-header bulk toggle. */
+export function groupState(
+  prefs: Record<string, unknown> | undefined,
+  group: NotificationGroupId
+): "all" | "some" | "none" {
+  const cats = categoriesForGroup(group);
+  const on = cats.filter((c) => categoryEnabled(prefs, c)).length;
+  if (on === 0) return "none";
+  if (on === cats.length) return "all";
+  return "some";
 }

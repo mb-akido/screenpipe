@@ -334,6 +334,12 @@ export type Settings = SettingsStore & {
 		/** Master switch. When false the `/notify` handler drops every panel
 		 *  (pipe, system, power, transcript-stall, …). Default true. */
 		notificationsEnabled?: boolean;
+		/** Snooze expiry as epoch ms. While `> Date.now()` all non-critical
+		 *  notifications are paused. 0 / unset = not snoozed. */
+		snoozeUntil?: number;
+		/** Recurring daily quiet window (local wall-clock). When `enabled`,
+		 *  non-critical notifications are paused inside the window. */
+		quietHours?: { enabled: boolean; start: string; end: string };
 		captureStalls: boolean;
 		appUpdates: boolean;
 		pipeSuggestions: boolean;

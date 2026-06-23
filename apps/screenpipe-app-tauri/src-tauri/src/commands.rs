@@ -2925,17 +2925,15 @@ pub async fn show_notification_panel(
 
     info!("show_notification_panel called");
 
-    // Master switch ("All notifications" off) — the single choke point that
-    // catches both `/notify` and the direct callers (pipe suggestions, audio
-    // device/health toasts, capture-stall). The critical `capture_stall`
-    // recording-stopped alert is exempt so we never silently hide it.
+    // Delivery gate — the single choke point that catches both `/notify` and
+    // the direct callers (pipe suggestions, audio device/health toasts,
+    // capture-stall). Honors master-off, snooze, and quiet hours. The critical
+    // `capture_stall` recording-stopped alert is exempt so we never silently
+    // hide it.
     let notification_type = crate::notifications::gate::notification_type_from_payload(&payload);
-    if crate::notifications::gate::suppressed_by_master(
-        crate::notifications::gate::master_enabled(&app_handle),
-        notification_type.as_deref(),
-    ) {
+    if crate::notifications::gate::suppressed_now(&app_handle, notification_type.as_deref()) {
         info!(
-            "show_notification_panel: suppressed by master switch (type={:?})",
+            "show_notification_panel: suppressed (master/snooze/quiet, type={:?})",
             notification_type
         );
         return Ok(());

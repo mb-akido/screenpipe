@@ -117,20 +117,17 @@ pub async fn send_notification(
         .unwrap_or_else(|| "pipe".to_string());
     let source = resolve_notification_source_metadata(&payload, &headers, &panel_id);
 
-    // Master switch: when the user turns off "All notifications", drop the
-    // alert here so it never writes history either. Announcements returned
-    // above are first-party product comms and exempt; `capture_stall` is the
-    // critical recording-stopped alert and also exempt (see `gate`).
+    // Delivery gate (master-off / snooze / quiet hours): drop the alert here so
+    // it never writes history either. Announcements returned above are
+    // first-party product comms and exempt; `capture_stall` is the critical
+    // recording-stopped alert and also exempt (see `gate`).
     // `show_notification_panel` enforces the same gate for the direct callers
     // that skip this route.
-    if super::gate::suppressed_by_master(
-        super::gate::master_enabled(&state.app_handle),
-        Some(resolved_type.as_str()),
-    ) {
-        debug!("notify: skipped (all notifications disabled)");
+    if super::gate::suppressed_now(&state.app_handle, Some(resolved_type.as_str())) {
+        debug!("notify: skipped (notifications paused — master/snooze/quiet)");
         return Ok(Json(ApiResponse {
             success: true,
-            message: "notifications disabled".to_string(),
+            message: "notifications paused".to_string(),
         }));
     }
 

@@ -23,11 +23,23 @@ import {
   NOTIFICATION_CATEGORIES,
   MASTER_NOTIFICATIONS_KEY,
   DEFAULT_NOTIFICATION_PREFS,
+  DEFAULT_QUIET_HOURS,
   categoriesForGroup,
   categoryEnabled,
+  groupState,
+  categoryValuesForPreset,
+  type CategoryPreset,
   type NotificationCategory,
+  type QuietHoursPref,
 } from "./notification-registry";
 import { NotificationPipeControls } from "./notification-pipe-controls";
+import { NotificationPauseControl } from "./notification-pause-control";
+
+const PRESETS: { kind: CategoryPreset; label: string }[] = [
+  { kind: "recommended", label: "recommended" },
+  { kind: "all", label: "everything" },
+  { kind: "none", label: "nothing" },
+];
 
 /**
  * Settings search index — derived from the registry so it can never drift from
@@ -36,8 +48,16 @@ import { NotificationPipeControls } from "./notification-pipe-controls";
  */
 export const searchIndex: SettingsField[] = [
   {
-    label: "All notifications",
-    keywords: ["mute all", "do not disturb", "dnd", "silence", "master"],
+    label: "Notifications",
+    keywords: ["mute all", "do not disturb", "dnd", "silence", "pause", "snooze"],
+  },
+  {
+    label: "Quiet hours",
+    keywords: ["schedule", "night", "sleep", "focus", "dnd", "do not disturb"],
+  },
+  {
+    label: "Reset to defaults",
+    keywords: ["presets", "recommended", "everything", "nothing", "reset"],
   },
   ...NOTIFICATION_CATEGORIES.map((c) => ({
     label: c.label,
@@ -80,11 +100,59 @@ export function NotificationsSettings() {
 
   const masterOn = prefs[MASTER_NOTIFICATIONS_KEY] !== false;
   const mutedPipes = Array.isArray(prefs.mutedPipes) ? prefs.mutedPipes : [];
+  const snoozeUntil =
+    typeof prefs.snoozeUntil === "number" ? prefs.snoozeUntil : 0;
+  const quietHours =
+    (prefs.quietHours as QuietHoursPref | undefined) ?? DEFAULT_QUIET_HOURS;
 
   const writePrefs = (patch: Record<string, unknown>) => {
     updateSettings({
       notificationPrefs: { ...prefs, ...patch },
     } as unknown as Partial<Settings>);
+  };
+
+  // Write a batch of category booleans, keeping the two categories that drive
+  // extra state in sync: `captureStalls` mirrors `showRestartNotifications`,
+  // and `pipeSuggestions` mirrors the scheduler flag `pipeSuggestionsEnabled`
+  // (and pings the scheduler). So group toggles / presets stay consistent.
+  const writeCategoryPatch = (patch: Record<string, boolean>) => {
+    const extra: Record<string, unknown> = {};
+    if ("captureStalls" in patch) {
+      extra.showRestartNotifications = patch.captureStalls;
+    }
+    if ("pipeSuggestions" in patch) {
+      extra.pipeSuggestionsEnabled = patch.pipeSuggestions;
+      commands
+        .pipeSuggestionsUpdateSettings(
+          patch.pipeSuggestions,
+          settings.pipeSuggestionFrequencyHours ?? 24
+        )
+        .catch(() => {});
+    }
+    updateSettings({
+      notificationPrefs: { ...prefs, ...patch },
+      ...extra,
+    } as unknown as Partial<Settings>);
+  };
+
+  const applyPreset = (kind: CategoryPreset) =>
+    writeCategoryPatch(categoryValuesForPreset(kind));
+
+  const resetToDefaults = () => {
+    const suggestionsDefault =
+      DEFAULT_NOTIFICATION_PREFS.pipeSuggestions as boolean;
+    updateSettings({
+      notificationPrefs: { ...DEFAULT_NOTIFICATION_PREFS },
+      showRestartNotifications:
+        DEFAULT_NOTIFICATION_PREFS.captureStalls as boolean,
+      pipeSuggestionsEnabled: suggestionsDefault,
+    } as unknown as Partial<Settings>);
+    commands
+      .pipeSuggestionsUpdateSettings(
+        suggestionsDefault,
+        settings.pipeSuggestionFrequencyHours ?? 24
+      )
+      .catch(() => {});
   };
 
   const q = query.trim().toLowerCase();
@@ -95,20 +163,56 @@ export function NotificationsSettings() {
     categories: categoriesForGroup(group.id).filter((c) => matchesQuery(c, q)),
   })).filter((g) => g.categories.length > 0);
 
-  const masterMatches =
-    !q ||
-    "all notifications mute all do not disturb dnd silence".includes(q);
-
   return (
     <div className="space-y-6">
       <div>
         <p className="text-sm text-muted-foreground">
-          Control which notifications screenpipe sends you. Turn whole groups
-          off, or fine-tune a single pipe.
+          Control which notifications screenpipe sends you. Pause on a whim,
+          set quiet hours, turn whole groups off, or fine-tune a single pipe.
         </p>
       </div>
 
       <NotificationSamplePreview />
+
+      {/* Do Not Disturb — pause (snooze / off) + quiet hours. Critical
+          recording-stopped alerts always fire regardless. */}
+      <NotificationPauseControl
+        masterOn={masterOn}
+        snoozeUntil={snoozeUntil}
+        quietHours={quietHours}
+        onSnooze={(untilMs) => writePrefs({ snoozeUntil: untilMs })}
+        onResume={() =>
+          writePrefs({ snoozeUntil: 0, [MASTER_NOTIFICATIONS_KEY]: true })
+        }
+        onTurnOff={() =>
+          writePrefs({ [MASTER_NOTIFICATIONS_KEY]: false, snoozeUntil: 0 })
+        }
+        onQuietChange={(qh) => writePrefs({ quietHours: qh })}
+      />
+
+      {/* Quick presets + reset, then the in-section filter */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[11px] text-muted-foreground">quick set:</span>
+        {PRESETS.map((p) => (
+          <button
+            key={p.kind}
+            type="button"
+            data-testid={`notification-preset-${p.kind}`}
+            onClick={() => applyPreset(p.kind)}
+            className="border border-border px-2.5 py-1 text-[11px] transition-colors hover:border-foreground hover:bg-foreground hover:text-background"
+          >
+            {p.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          data-testid="notification-reset"
+          onClick={resetToDefaults}
+          className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        >
+          reset to defaults
+        </button>
+      </div>
 
       {/* In-section filter — keeps the page usable as categories grow */}
       <div className="relative">
@@ -123,47 +227,39 @@ export function NotificationsSettings() {
         />
       </div>
 
-      {/* Master switch — the single choke point. Off = silence everything. */}
-      {masterMatches && (
-        <div
-          className={cn(
-            "flex items-center justify-between gap-3 border border-border bg-card px-4 py-3.5",
-            !masterOn && "border-foreground/40"
-          )}
-        >
-          <div>
-            <p className="text-sm font-medium">All notifications</p>
-            <p className="text-xs text-muted-foreground">
-              {masterOn
-                ? "Master switch. Turn off to silence every notification below."
-                : "Everything is muted. Critical recording-stopped alerts still fire."}
-            </p>
-          </div>
-          <Switch
-            data-testid="notification-pref-master"
-            checked={masterOn}
-            onCheckedChange={(v) =>
-              writePrefs({ [MASTER_NOTIFICATIONS_KEY]: v })
-            }
-          />
-        </div>
-      )}
-
-      {/* Grouped categories, rendered from the registry */}
-      <div className={cn("space-y-6", !masterOn && "opacity-50")}>
-        {visibleGroups.map(({ group, categories }) => (
+      {/* Grouped categories, rendered from the registry. Each group header
+          carries a bulk toggle (all on / all off). */}
+      <div className="space-y-6">
+        {visibleGroups.map(({ group, categories }) => {
+          const gstate = groupState(prefs, group.id);
+          return (
           <div key={group.id} className="space-y-1">
-            <div className="mb-1">
+            <div className="mb-1 flex items-center justify-between gap-3">
               <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                 {group.label}
               </p>
+              {/* Bulk toggle only makes sense for the full (unfiltered) group */}
+              {!q && (
+                <Switch
+                  data-testid={`notification-group-${group.id}`}
+                  aria-label={`toggle all ${group.label}`}
+                  checked={gstate === "all"}
+                  onCheckedChange={(v) =>
+                    writeCategoryPatch(
+                      Object.fromEntries(
+                        categoriesForGroup(group.id).map((c) => [c.id, v])
+                      )
+                    )
+                  }
+                />
+              )}
             </div>
             {categories.map((category) => (
               <CategoryRow
                 key={category.id}
                 category={category}
                 checked={categoryEnabled(prefs, category)}
-                disabled={!masterOn}
+                disabled={false}
                 settings={settings}
                 updateSettings={updateSettings}
                 onToggle={(v) => {
@@ -198,7 +294,6 @@ export function NotificationsSettings() {
                   <div className="mt-1">
                     <button
                       type="button"
-                      disabled={!masterOn}
                       onClick={() => setPipesExpanded((e) => !e)}
                       className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:pointer-events-none"
                     >
@@ -219,10 +314,7 @@ export function NotificationsSettings() {
                       <div className="mt-2.5 pl-1">
                         <NotificationPipeControls
                           mutedPipes={mutedPipes}
-                          disabled={
-                            !masterOn ||
-                            categoryEnabled(prefs, category) === false
-                          }
+                          disabled={categoryEnabled(prefs, category) === false}
                           onChange={(next) => writePrefs({ mutedPipes: next })}
                         />
                       </div>
@@ -232,7 +324,8 @@ export function NotificationsSettings() {
               </CategoryRow>
             ))}
           </div>
-        ))}
+          );
+        })}
 
         {visibleGroups.length === 0 && (
           <p className="py-6 text-center text-xs text-muted-foreground">

@@ -11,6 +11,12 @@ import {
   MASTER_NOTIFICATIONS_KEY,
   categoriesForGroup,
   categoryEnabled,
+  groupState,
+  categoryValuesForPreset,
+  parseHHMM,
+  isQuietActive,
+  snoozeUntilMs,
+  SNOOZE_PRESETS,
 } from "../notification-registry";
 
 describe("notification registry", () => {
@@ -61,5 +67,56 @@ describe("notification registry", () => {
       1
     );
     expect(NOTIFICATION_CATEGORIES.filter((c) => c.hasPerPipe)).toHaveLength(1);
+  });
+
+  it("preset values: all=true, none=false, recommended=defaults", () => {
+    const all = categoryValuesForPreset("all");
+    const none = categoryValuesForPreset("none");
+    const rec = categoryValuesForPreset("recommended");
+    for (const c of NOTIFICATION_CATEGORIES) {
+      expect(all[c.id]).toBe(true);
+      expect(none[c.id]).toBe(false);
+      expect(rec[c.id]).toBe(c.default);
+    }
+  });
+
+  it("groupState reflects all / some / none", () => {
+    const g = "meetings" as const;
+    const cats = categoriesForGroup(g);
+    const allOn = Object.fromEntries(cats.map((c) => [c.id, true]));
+    const allOff = Object.fromEntries(cats.map((c) => [c.id, false]));
+    expect(groupState(allOn, g)).toBe("all");
+    expect(groupState(allOff, g)).toBe("none");
+    expect(groupState({ ...allOff, [cats[0].id]: true }, g)).toBe("some");
+  });
+});
+
+describe("do not disturb helpers", () => {
+  it("parseHHMM parses and rejects garbage", () => {
+    expect(parseHHMM("00:00")).toBe(0);
+    expect(parseHHMM("08:30")).toBe(510);
+    expect(parseHHMM("23:59")).toBe(1439);
+    expect(parseHHMM("24:00")).toBeNull();
+    expect(parseHHMM("9:99")).toBeNull();
+    expect(parseHHMM("nope")).toBeNull();
+  });
+
+  it("isQuietActive respects enabled + wrap-around window", () => {
+    const qh = { enabled: true, start: "22:00", end: "08:00" };
+    expect(isQuietActive(qh, new Date("2026-01-01T23:30:00"))).toBe(true);
+    expect(isQuietActive(qh, new Date("2026-01-01T03:00:00"))).toBe(true);
+    expect(isQuietActive(qh, new Date("2026-01-01T12:00:00"))).toBe(false);
+    expect(isQuietActive({ ...qh, enabled: false }, new Date("2026-01-01T23:30:00"))).toBe(false);
+  });
+
+  it("snoozeUntilMs adds minutes and resolves 'until tomorrow' to 8am next day", () => {
+    const now = new Date("2026-01-01T10:00:00");
+    const min = SNOOZE_PRESETS.find((p) => p.kind === "minutes" && p.minutes === 60)!;
+    expect(snoozeUntilMs(min, now)).toBe(now.getTime() + 60 * 60_000);
+    const tmr = SNOOZE_PRESETS.find((p) => p.kind === "untilTomorrow")!;
+    const got = new Date(snoozeUntilMs(tmr, now));
+    expect(got.getDate()).toBe(2);
+    expect(got.getHours()).toBe(8);
+    expect(got.getMinutes()).toBe(0);
   });
 });
