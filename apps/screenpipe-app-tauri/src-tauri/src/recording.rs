@@ -326,6 +326,22 @@ pub struct RecordingState {
     pub db_wedge_breaker: DbWedgeBreaker,
 }
 
+impl RecordingState {
+    /// Single source of truth for `wants_recording`. Call from every capture
+    /// on/off path so the health watchdog can tell a crash from a deliberate
+    /// stop: `start_capture` / `spawn_screenpipe` set it on; `stop_capture` /
+    /// `stop_screenpipe` clear it. (Capture has two on-paths and two off-paths;
+    /// missing any one is how a tray-stopped capture got resurrected.)
+    pub fn set_capture_intent(&self, on: bool) {
+        self.wants_recording.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether capture is currently intended to be running.
+    pub fn capture_intended(&self) -> bool {
+        self.wants_recording.load(Ordering::SeqCst)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Device listing (unchanged)
 // ---------------------------------------------------------------------------
@@ -444,7 +460,7 @@ pub async fn stop_capture(
     // The tray/shortcut "stop recording" lands here (server stays up, capture
     // off). Clear the intent so a later engine crash doesn't get auto-respawned
     // — which would resurrect capture the user deliberately stopped.
-    state.wants_recording.store(false, Ordering::SeqCst);
+    state.set_capture_intent(false);
 
     remember_active_meeting_for_capture_restart(&state).await;
 
@@ -563,7 +579,7 @@ pub async fn start_capture(
     // Capture is now intended to run (tray/shortcut start, mic-grant reinit, …)
     // — record it so the health watchdog will respawn a crashed engine instead
     // of treating the absence of capture as a deliberate stop.
-    state.wants_recording.store(true, Ordering::SeqCst);
+    state.set_capture_intent(true);
 
     // Race guard: short-circuit duplicate invocations.
     //
@@ -661,7 +677,7 @@ pub async fn stop_screenpipe(
 
     // Deliberate stop → clear the intent so the health watchdog leaves the
     // server down instead of auto-respawning it.
-    state.wants_recording.store(false, Ordering::SeqCst);
+    state.set_capture_intent(false);
 
     // Stop capture first
     {
@@ -708,7 +724,7 @@ pub async fn spawn_screenpipe(
     // Mark recording as intended-ON up front (even if the start below fails or
     // is deferred by cooldown) so the health watchdog will keep trying to bring
     // a crashed/failed server back instead of treating it as a user stop.
-    state.wants_recording.store(true, Ordering::SeqCst);
+    state.set_capture_intent(true);
 
     // --- Cooldown enforcement ---
     let now_epoch = std::time::SystemTime::now()
