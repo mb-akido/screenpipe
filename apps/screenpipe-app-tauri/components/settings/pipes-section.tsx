@@ -967,7 +967,7 @@ export function PipesSection() {
   const [sharingPublic, setSharingPublic] = useState<string | null>(null);
   const [publishPipeName, setPublishPipeName] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [pipeTypeFilter, setPipeTypeFilter] = useState<"scheduled" | "triggered" | "manual" | "cloud">("scheduled");
+  const [pipeTypeFilter, setPipeTypeFilter] = useState<"automated" | "manual" | "cloud">("automated");
   // "cloud" (the org's cloud runner) is an enterprise-build-only surface
   const isEnterpriseBuild = useIsEnterpriseBuild();
   // Favorites — per-machine preference persisted via /pipes/favorites.
@@ -994,6 +994,10 @@ export function PipesSection() {
     !!p.config.schedule && p.config.schedule !== "manual" && !isTriggeredPipe(p);
   const isManualPipe = (p: PipeStatus) =>
     (!p.config.schedule || p.config.schedule === "manual") && !isTriggeredPipe(p);
+  // "Automated" groups scheduled + event/connection-triggered pipes — anything
+  // that runs on its own. Manual (run-on-demand) stands apart.
+  const isAutomatedPipe = (p: PipeStatus) =>
+    isScheduledPipe(p) || isTriggeredPipe(p);
 
   // Single create-pipe entry point shared by the create box and the example
   // chips. Marks the generation attempt (so standalone-chat can fire
@@ -1045,8 +1049,7 @@ export function PipesSection() {
             if (!p.config.name.toLowerCase().includes(q)) return false;
           }
 
-          if (pipeTypeFilter === "scheduled" && !isScheduledPipe(p)) return false;
-          if (pipeTypeFilter === "triggered" && !isTriggeredPipe(p)) return false;
+          if (pipeTypeFilter === "automated" && !isAutomatedPipe(p)) return false;
           if (pipeTypeFilter === "manual" && !isManualPipe(p)) return false;
 
           // Favorites filter — only applied when the user has toggled the star chip on.
@@ -1078,8 +1081,7 @@ export function PipesSection() {
   // Counts for sub-tab badges — memoized so the filter doesn't re-run on every render
   const tabCounts = React.useMemo(() => {
     return {
-      scheduled: pipes.filter(isScheduledPipe).length,
-      triggered: pipes.filter(isTriggeredPipe).length,
+      automated: pipes.filter(isAutomatedPipe).length,
       manual: pipes.filter(isManualPipe).length,
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1088,9 +1090,8 @@ export function PipesSection() {
   const starredEmptyTitle = React.useMemo(() => {
     if (!pipeFavorites.showOnly) return null;
 
-    if (pipeTypeFilter === "triggered") return "no starred triggered pipes";
     if (pipeTypeFilter === "manual") return "no starred manual pipes";
-    return "no starred scheduled pipes";
+    return "no starred automated pipes";
   }, [pipeFavorites.showOnly, pipeTypeFilter]);
 
   const sharePipePublic = async (pipe: PipeStatus) => {
@@ -1914,8 +1915,7 @@ export function PipesSection() {
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
             {([
-              "scheduled",
-              "triggered",
+              "automated",
               "manual",
               ...(isEnterpriseBuild ? (["cloud"] as const) : []),
             ] as const).map((tab) => (
@@ -2019,17 +2019,6 @@ export function PipesSection() {
                   </Button>
                 </div>
               </div>
-            ) : pipeTypeFilter === "triggered" ? (
-              <>
-                <p>no triggered pipes installed</p>
-                <p className="text-sm mt-2">
-                  triggered pipes use{" "}
-                  <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                    trigger.events
-                  </code>
-                  {" "}in their frontmatter (e.g. meeting_started, meeting_ended)
-                </p>
-              </>
             ) : pipeTypeFilter === "manual" ? (
               <>
                 <p>no manual pipes installed</p>
