@@ -2735,7 +2735,9 @@ export function PipesSection() {
                         <PipeTriggerPicker
                           pipeName={pipe.config.name}
                           trigger={pipe.config.trigger}
-                          schedule={pipe.config.schedule}
+                          apiBase={apiBase}
+                          scheduleConfig={pipe.config.schedule_config ?? null}
+                          scheduleString={pipe.config.schedule || "manual"}
                           otherPipes={pipes
                             .filter((p) => p.config.name !== pipe.config.name && p.config.enabled)
                             .map((p) => ({ name: p.config.name }))}
@@ -2755,18 +2757,18 @@ export function PipesSection() {
                               )
                             )
                           }
-                          applySchedule={(s) => {
+                          onSaveSchedule={(cfg) => {
                             setPipes((prev) =>
                               prev.map((p) =>
                                 p.config.name === pipe.config.name
-                                  ? { ...p, config: { ...p.config, schedule: s } }
+                                  ? { ...p, config: { ...p.config, schedule_config: cfg, schedule: "manual" } }
                                   : p
                               )
                             );
                             localFetch(`/pipes/${pipe.config.name}/config`, {
                               method: "POST",
                               headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ schedule: s }),
+                              body: JSON.stringify({ schedule_config: cfg }),
                             }).then(() => fetchPipes());
                           }}
                         />
