@@ -122,6 +122,15 @@ fn has_matching_ffprobe(ffmpeg_path: &std::path::Path) -> bool {
     which(probe_name).is_ok()
 }
 
+/// Directory a macOS auto-install drops ffmpeg into (`~/.local/bin`), as a pure
+/// path with NO side effects — unlike `get_ffmpeg_install_dir`, which creates the
+/// dir and edits shell rc files. Used by the resolver so a previously installed
+/// ffmpeg is found even when `~/.local/bin` isn't on this process's PATH.
+#[cfg(target_os = "macos")]
+fn macos_ffmpeg_install_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".local").join("bin"))
+}
+
 fn find_ffmpeg_path_internal() -> Option<PathBuf> {
     debug!("Starting search for ffmpeg executable");
 
@@ -145,6 +154,24 @@ fn find_ffmpeg_path_internal() -> Option<PathBuf> {
                     debug!("Found bundled ffmpeg in Resources: {:?}", in_resources);
                     return Some(in_resources);
                 }
+            }
+        }
+    }
+
+    // macOS: a prior auto-install lands ffmpeg in ~/.local/bin
+    // (get_ffmpeg_install_dir). That dir is appended to shell rc files for
+    // future shells but is NOT on this process's PATH, so the `which` check
+    // below can't see it. Without this explicit lookup we re-install on every
+    // launch — and the install's PATH-based version probe then fails with
+    // "No such file or directory (os error 2)" even though the binary unpacked
+    // fine (SCREENPIPE-CLI-W3, macOS).
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(dir) = macos_ffmpeg_install_dir() {
+            let candidate = dir.join(EXECUTABLE_NAME);
+            if candidate.exists() && has_matching_ffprobe(&candidate) {
+                debug!("Found auto-installed ffmpeg in {:?}", candidate);
+                return Some(candidate);
             }
         }
     }
@@ -282,6 +309,21 @@ fn find_ffmpeg_path_internal() -> Option<PathBuf> {
         return Some(path);
     }
 
+    // macOS installs to ~/.local/bin, which `which` can't see in-process.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(dir) = macos_ffmpeg_install_dir() {
+            let candidate = dir.join(EXECUTABLE_NAME);
+            if candidate.is_file() {
+                debug!(
+                    "found ffmpeg in install dir after installation: {:?}",
+                    candidate
+                );
+                return Some(candidate);
+            }
+        }
+    }
+
     let installation_dir = sidecar_dir().map_err(|e| e.to_string()).unwrap();
     let ffmpeg_in_installation = installation_dir.join(EXECUTABLE_NAME);
     if ffmpeg_in_installation.is_file() {
@@ -315,9 +357,26 @@ fn handle_ffmpeg_installation() -> Result<(), anyhow::Error> {
     debug!("extracting...");
     unpack_ffmpeg(&archive_path, &destination)?;
 
-    let version = ffmpeg_version()?;
-
-    info!("done! installed ffmpeg version {}", version);
+    // Validate the install by the unpacked binary ON DISK, not via
+    // ffmpeg_version() — that resolves ffmpeg through PATH/sidecar_dir, which on
+    // macOS does NOT include our install dir (~/.local/bin) within this process,
+    // so it returns a false "No such file or directory (os error 2)" even though
+    // the binary unpacked fine. That false failure is what makes us re-install
+    // every launch (SCREENPIPE-CLI-W3). Trust the file if it's on disk.
+    let installed = destination.join(EXECUTABLE_NAME);
+    if !installed.is_file() {
+        return Err(anyhow::anyhow!(
+            "ffmpeg missing after unpack at {}",
+            installed.display()
+        ));
+    }
+    match ffmpeg_version() {
+        Ok(version) => info!("done! installed ffmpeg version {}", version),
+        Err(e) => debug!(
+            "installed ffmpeg at {} (PATH version probe failed, expected on macOS: {e})",
+            installed.display()
+        ),
+    }
     Ok(())
 }
 
@@ -400,5 +459,36 @@ mod tests {
         #[cfg(not(windows))]
         let missing = PathBuf::from("/screenpipe-does-not-exist/nope-7f3a/ffmpeg");
         assert!(!ffmpeg_path_is_usable(&missing));
+    }
+
+    // SCREENPIPE-CLI-W3: the macOS auto-install lands ffmpeg in ~/.local/bin and
+    // the resolver now looks there. Pin the install-dir path is stable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_install_dir_is_local_bin() {
+        let d = macos_ffmpeg_install_dir().expect("home dir");
+        assert!(d.ends_with("bin"));
+        assert!(d.to_string_lossy().contains(".local"));
+    }
+
+    // The macOS install-dir lookup only accepts ffmpeg when a sibling ffprobe is
+    // present (frame extraction needs both); cover that pairing directly.
+    #[test]
+    fn ffprobe_sibling_is_detected() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("sp_ffmpeg_probe_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        #[cfg(windows)]
+        let (ff, fp) = ("ffmpeg.exe", "ffprobe.exe");
+        #[cfg(not(windows))]
+        let (ff, fp) = ("ffmpeg", "ffprobe");
+        let ffmpeg = dir.join(ff);
+        fs::write(&ffmpeg, b"x").unwrap();
+        fs::write(dir.join(fp), b"x").unwrap();
+        assert!(
+            has_matching_ffprobe(&ffmpeg),
+            "a sibling ffprobe must be detected next to ffmpeg"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
