@@ -1485,10 +1485,54 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 /// rolling-minute rate-limit window. No-op when nothing is waiting.
 const SCHEDULED_RUN_SPACING_SECS: u64 = 5;
 
-/// Set up permissions for a Pi pipe: install extension, filtered skills,
-/// write the permissions JSON file, and register the token with the server.
+/// Register server-side pipe permissions and write the permissions file.
 /// Returns the generated token (if any) so the caller can clean it up later.
-async fn setup_pipe_permissions(
+async fn register_pipe_permissions(
+    pipe_dir: &Path,
+    config: &PipeConfig,
+    token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
+) -> Option<String> {
+    let mut perms = permissions::PipePermissions::from_config(config);
+    perms.pipe_dir = Some(pipe_dir.to_string_lossy().to_string());
+
+    // Always write permissions JSON when filesystem sandbox is active.
+    let force_write = perms.pipe_dir.is_some();
+
+    if perms.has_any_restrictions() || force_write {
+        // Generate a unique pipe token for server-side enforcement.
+        let suffix: u64 = rand::random();
+        let t = format!("sp_pipe_{:016x}", suffix);
+        perms.pipe_token = Some(t.clone());
+
+        // Register with server middleware before the agent starts to avoid a
+        // race where the first API call arrives before the token is registered.
+        if let Some(registry) = token_registry {
+            registry.register_token(t.clone(), perms.clone()).await;
+        }
+
+        // Write permissions JSON for Pi's extension and for troubleshooting
+        // non-Pi agents that rely only on the server-side token.
+        let perms_path = pipe_dir.join(".screenpipe-permissions.json");
+        match serde_json::to_string(&perms) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&perms_path, &json) {
+                    warn!("failed to write permissions file: {}", e);
+                }
+            }
+            Err(e) => warn!("failed to serialize permissions: {}", e),
+        }
+
+        Some(t)
+    } else {
+        // No restrictions — clean up any stale permissions file
+        let _ = std::fs::remove_file(pipe_dir.join(".screenpipe-permissions.json"));
+        None
+    }
+}
+
+/// Set up Pi-specific pipe extensions/skills, then register shared server-side
+/// permissions. Non-Pi agents use only [`register_pipe_permissions`].
+async fn setup_pi_pipe_permissions(
     pipe_dir: &Path,
     config: &PipeConfig,
     token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
@@ -1512,42 +1556,7 @@ async fn setup_pipe_permissions(
         warn!("failed to install filtered skills: {}", e);
     }
 
-    let mut perms = permissions::PipePermissions::from_config(config);
-    perms.pipe_dir = Some(pipe_dir.to_string_lossy().to_string());
-
-    // Always write permissions JSON when filesystem sandbox is active.
-    let force_write = perms.pipe_dir.is_some();
-
-    if perms.has_any_restrictions() || force_write {
-        // Generate a unique pipe token for server-side enforcement
-        use rand::Rng;
-        let suffix: u64 = rand::thread_rng().gen();
-        let t = format!("sp_pipe_{:016x}", suffix);
-        perms.pipe_token = Some(t.clone());
-
-        // Register with server middleware — must complete before Pi starts
-        // to avoid race where Pi's first API call arrives before token is registered
-        if let Some(registry) = token_registry {
-            registry.register_token(t.clone(), perms.clone()).await;
-        }
-
-        // Write permissions JSON for the extension to read
-        let perms_path = pipe_dir.join(".screenpipe-permissions.json");
-        match serde_json::to_string(&perms) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&perms_path, &json) {
-                    warn!("failed to write permissions file: {}", e);
-                }
-            }
-            Err(e) => warn!("failed to serialize permissions: {}", e),
-        }
-
-        Some(t)
-    } else {
-        // No restrictions — clean up any stale permissions file
-        let _ = std::fs::remove_file(pipe_dir.join(".screenpipe-permissions.json"));
-        None
-    }
+    register_pipe_permissions(pipe_dir, config, token_registry).await
 }
 
 /// Remove a pipe token from the server registry.
@@ -2376,12 +2385,19 @@ impl PipeManager {
 
         let pipe_dir = self.pipes_dir.clone().join(name);
 
+        let pipe_token = if config.agent == "pi" {
+            setup_pi_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await
+        } else {
+            register_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await
+        };
+
         let pipe_system_prompt = render_pipe_system_prompt(
             &body,
             self.api_port,
             preset_prompt.as_deref(),
             self.connections_context.as_deref(),
             self.local_api_key.as_deref(),
+            pipe_token.as_deref(),
         );
         let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
         let pipe_name = name.to_string();
@@ -2403,7 +2419,6 @@ impl PipeManager {
         );
 
         // Pre-configure pi
-        let mut pipe_token: Option<String> = None;
         if config.agent == "pi" {
             let cloud_token = executor.user_token();
             if let Err(e) = PiExecutor::ensure_pi_config(
@@ -2417,9 +2432,6 @@ impl PipeManager {
             {
                 warn!("failed to pre-configure pi provider: {}", e);
             }
-
-            pipe_token =
-                setup_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await;
         }
         let token_registry_ref = self.token_registry.clone();
 
@@ -2913,6 +2925,12 @@ impl PipeManager {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let pipe_token = if config.agent == "pi" {
+                setup_pi_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await
+            } else {
+                register_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await
+            };
+
             // Build prompt with context header
             let pipe_system_prompt = render_pipe_system_prompt(
                 &body,
@@ -2920,6 +2938,7 @@ impl PipeManager {
                 preset_prompt.as_deref(),
                 self.connections_context.as_deref(),
                 self.local_api_key.as_deref(),
+                pipe_token.as_deref(),
             );
             let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
 
@@ -2941,7 +2960,6 @@ impl PipeManager {
 
             // Pre-configure pi with the pipe's provider so models.json has the
             // right entry before the agent subprocess starts.
-            let mut pipe_token: Option<String> = None;
             if config.agent == "pi" {
                 if let Err(e) = PiExecutor::ensure_pi_config(
                     None,
@@ -2954,13 +2972,6 @@ impl PipeManager {
                 {
                     warn!("failed to pre-configure pi provider: {}", e);
                 }
-
-                pipe_token = setup_pipe_permissions(
-                    &self.pipes_dir.join(name),
-                    &config,
-                    self.token_registry.as_ref(),
-                )
-                .await;
             }
 
             // Run with timeout + streaming
@@ -4126,9 +4137,10 @@ impl PipeManager {
                         }
                     };
 
+                    let pipe_dir = pipes_dir.join(name);
+
                     // Pre-configure pi with the pipe's provider
-                    let mut pipe_token: Option<String> = None;
-                    if config.agent == "pi" {
+                    let pipe_token = if config.agent == "pi" {
                         let cloud_token = executor.user_token();
                         if let Err(e) = PiExecutor::ensure_pi_config(
                             cloud_token.as_deref(),
@@ -4142,13 +4154,10 @@ impl PipeManager {
                             warn!("scheduler: failed to pre-configure pi provider: {}", e);
                         }
 
-                        pipe_token = setup_pipe_permissions(
-                            &pipes_dir.join(name),
-                            config,
-                            token_registry.as_ref(),
-                        )
-                        .await;
-                    }
+                        setup_pi_pipe_permissions(&pipe_dir, config, token_registry.as_ref()).await
+                    } else {
+                        register_pipe_permissions(&pipe_dir, config, token_registry.as_ref()).await
+                    };
 
                     // Check if history/session continuation is enabled
                     let history_enabled = config
@@ -4157,14 +4166,13 @@ impl PipeManager {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
 
-                    let pipe_dir = pipes_dir.join(name);
-
                     let pipe_system_prompt = render_pipe_system_prompt(
                         body,
                         api_port,
                         preset_prompt.as_deref(),
                         connections_context.as_deref(),
                         local_api_key.as_deref(),
+                        pipe_token.as_deref(),
                     );
                     let prompt = render_prompt_with_port(
                         config,
@@ -4886,6 +4894,7 @@ fn render_pipe_system_prompt(
     system_prompt: Option<&str>,
     connections_context: Option<&str>,
     local_api_key: Option<&str>,
+    pipe_token: Option<&str>,
 ) -> String {
     let os = std::env::consts::OS;
     let mut sys = String::new();
@@ -4899,10 +4908,14 @@ fn render_pipe_system_prompt(
     // Pass the key explicitly instead of reading the parent's process env —
     // the parent env is only populated via the `set_local_api_key` side-effect
     // and may be empty when api_auth_key was resolved late or never set.
-    let api_auth_note = if local_api_key.is_some() {
-        "\nAPI Authentication: REQUIRED. Add `-H \"Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY\"` to ALL curl requests to the Screenpipe API. The env var is already set in your environment.\n"
+    let api_auth_note = if let Some(token) = pipe_token {
+        format!(
+            "\nAPI Authentication: REQUIRED. Add `-H \"Authorization: Bearer {token}\"` to ALL curl requests to the Screenpipe API. This pipe-specific token is required for server-side permission enforcement.\n"
+        )
+    } else if local_api_key.is_some() {
+        "\nAPI Authentication: REQUIRED. Add `-H \"Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY\"` to ALL curl requests to the Screenpipe API. The env var is already set in your environment.\n".to_string()
     } else {
-        ""
+        String::new()
     };
 
     sys.push_str(&format!(
@@ -6532,7 +6545,7 @@ mod tests {
         assert!(prompt.contains("Time range:"));
         assert!(prompt.contains("Do the work described above now."));
         // Port / body go into system prompt, not user prompt
-        let sys = render_pipe_system_prompt("body text", 3031, None, None, None);
+        let sys = render_pipe_system_prompt("body text", 3031, None, None, None, None);
         assert!(sys.contains("http://localhost:3031"));
         assert!(!sys.contains("http://localhost:3030"));
         assert!(sys.contains("body text"));
@@ -6560,7 +6573,7 @@ mod tests {
             artifacts: vec![],
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("hello", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("hello", 3030, None, None, None, None);
         assert!(sys.contains("http://localhost:3030"));
     }
 
@@ -6592,6 +6605,7 @@ mod tests {
             Some("You are a helpful assistant"),
             None,
             None,
+            None,
         );
         assert!(sys.starts_with("You are a helpful assistant\n\n"));
         assert!(sys.contains("body text"));
@@ -6620,14 +6634,14 @@ mod tests {
             artifacts: vec![],
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("body text", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("body text", 3030, None, None, None, None);
         assert!(!sys.contains("System prompt:"));
         assert!(sys.contains("body text"));
     }
 
     #[test]
     fn test_system_prompt_contains_anti_recursion_warning() {
-        let sys = render_pipe_system_prompt("task body", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("task body", 3030, None, None, None, None);
         assert!(sys.contains("NEVER run `screenpipe pipe run`"));
         assert!(sys.contains("You ARE this pipe"));
     }
@@ -6637,7 +6651,8 @@ mod tests {
         // Pass the key explicitly — the renderer must not depend on parent
         // process env (which is empty in tests and was the root cause of the
         // 403 reported by the security-requests-grc pipe in prod).
-        let sys = render_pipe_system_prompt("task body", 3030, None, None, Some("sp-test-key"));
+        let sys =
+            render_pipe_system_prompt("task body", 3030, None, None, Some("sp-test-key"), None);
         assert!(
             sys.contains("API Authentication: REQUIRED"),
             "auth note must be emitted when local_api_key is Some"
@@ -6646,8 +6661,26 @@ mod tests {
     }
 
     #[test]
+    fn test_system_prompt_prefers_pipe_token_for_permission_enforcement() {
+        let sys = render_pipe_system_prompt(
+            "task body",
+            3030,
+            None,
+            None,
+            Some("sp-local-api-key"),
+            Some("sp_pipe_abc123"),
+        );
+        assert!(sys.contains("Bearer sp_pipe_abc123"));
+        assert!(
+            !sys.contains("SCREENPIPE_LOCAL_API_KEY"),
+            "permissioned pipe prompts should prefer the pipe token over the global API key"
+        );
+        assert!(sys.contains("server-side permission enforcement"));
+    }
+
+    #[test]
     fn test_system_prompt_omits_auth_note_when_no_key() {
-        let sys = render_pipe_system_prompt("task body", 3030, None, None, None);
+        let sys = render_pipe_system_prompt("task body", 3030, None, None, None, None);
         assert!(
             !sys.contains("API Authentication: REQUIRED"),
             "auth note must not be emitted when local_api_key is None"
