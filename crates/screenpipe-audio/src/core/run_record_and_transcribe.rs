@@ -80,6 +80,43 @@ const INPUT_SILENT_BUFFER_TIMEOUT_SECS: u64 = 30;
 const SILENT_BUFFER_PEAK_THRESHOLD: f32 = 1e-6;
 const RECORDER_OUTPUT_CHANNELS: u16 = 1;
 
+/// Why a recording session's OS audio stream stopped delivering usable data.
+///
+/// Carried as the `anyhow` cause (not just a message) so higher layers — e.g.
+/// the per-device VPIO runtime-fallback policy in `DeviceManager` — can react to
+/// the *kind* of death by `downcast_ref` instead of matching message text. The
+/// `Display` output is byte-for-byte the previous string so logs and any
+/// existing log-greps are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDeath {
+    /// No data callbacks at all for `secs` — the OS stream is dead. Covers a
+    /// CoreAudio/VPIO stall and a VPIO stream that was created ("AEC
+    /// initialized") but never delivered a single sample.
+    ReceiveTimeout { secs: u64 },
+    /// Callbacks kept firing but delivered only exact-zero buffers for `secs` —
+    /// suspected hijack by another process holding the device. NOT a VPIO fault
+    /// (HAL would be zero-filled too), so it must not trigger VPIO fallback.
+    ZeroFill { device: String, secs: u64 },
+}
+
+impl std::fmt::Display for StreamDeath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamDeath::ReceiveTimeout { secs } => write!(
+                f,
+                "Audio stream timeout - no data received for {secs}s (stream dead)"
+            ),
+            StreamDeath::ZeroFill { device, secs } => write!(
+                f,
+                "Audio stream zero-fill — no usable data from {device} for {secs}s \
+                 (suspected device hijack by another process)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StreamDeath {}
+
 #[inline]
 fn is_silent_buffer(chunk: &[f32]) -> bool {
     !chunk.is_empty() && chunk.iter().all(|s| s.abs() < SILENT_BUFFER_PEAK_THRESHOLD)
@@ -371,12 +408,10 @@ async fn recv_audio_chunk(
                     );
                     metrics.record_stream_timeout();
                     audio_stream.is_disconnected.store(true, Ordering::Relaxed);
-                    return Err(anyhow!(
-                        "Audio stream zero-fill — no usable data from {} for {}s \
-                         (suspected device hijack by another process)",
-                        device_name,
-                        INPUT_SILENT_BUFFER_TIMEOUT_SECS
-                    ));
+                    return Err(anyhow!(StreamDeath::ZeroFill {
+                        device: device_name.to_string(),
+                        secs: INPUT_SILENT_BUFFER_TIMEOUT_SECS,
+                    }));
                 }
             }
 
@@ -441,10 +476,9 @@ async fn recv_audio_chunk(
             );
             metrics.record_stream_timeout();
             audio_stream.is_disconnected.store(true, Ordering::Relaxed);
-            Err(anyhow!(
-                "Audio stream timeout - no data received for {}s (stream dead)",
-                AUDIO_RECEIVE_TIMEOUT_SECS
-            ))
+            Err(anyhow!(StreamDeath::ReceiveTimeout {
+                secs: AUDIO_RECEIVE_TIMEOUT_SECS,
+            }))
         }
     }
 }
@@ -540,6 +574,45 @@ mod tests {
         assert_eq!(frame.channels, 1);
         assert_eq!(frame.sample_rate, 48_000);
         assert_eq!(frame.samples.as_ref(), &samples);
+    }
+
+    #[test]
+    fn stream_death_display_is_byte_for_byte_backcompat() {
+        // These exact strings appear in logs and may be grepped; the typed
+        // error must reproduce them verbatim.
+        assert_eq!(
+            StreamDeath::ReceiveTimeout {
+                secs: AUDIO_RECEIVE_TIMEOUT_SECS
+            }
+            .to_string(),
+            "Audio stream timeout - no data received for 8s (stream dead)"
+        );
+        assert_eq!(
+            StreamDeath::ZeroFill {
+                device: "MacBook Pro Microphone (input)".to_string(),
+                secs: INPUT_SILENT_BUFFER_TIMEOUT_SECS,
+            }
+            .to_string(),
+            "Audio stream zero-fill — no usable data from MacBook Pro Microphone (input) \
+             for 30s (suspected device hijack by another process)"
+        );
+    }
+
+    #[test]
+    fn stream_death_survives_downcast_through_anyhow_context() {
+        // The VPIO-fallback classifier in the manager downcasts through the
+        // cause chain; prove the typed cause survives a `.context()` wrap.
+        let err = anyhow!(StreamDeath::ReceiveTimeout { secs: 8 }).context("rebuilding device");
+        let found = err.chain().any(|c| {
+            matches!(
+                c.downcast_ref::<StreamDeath>(),
+                Some(StreamDeath::ReceiveTimeout { .. })
+            )
+        });
+        assert!(
+            found,
+            "ReceiveTimeout must remain downcastable after context wrapping"
+        );
     }
 
     #[test]

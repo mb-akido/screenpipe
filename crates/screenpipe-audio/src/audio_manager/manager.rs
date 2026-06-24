@@ -24,6 +24,22 @@ use whisper_rs::WhisperContext;
 
 use screenpipe_db::DatabaseManager;
 
+/// True if `e` is the VPIO-relevant kind of stream death: a receive-timeout
+/// (the stream was created but delivered no data). A zero-fill hijack
+/// (`StreamDeath::ZeroFill`) is deliberately excluded — that is another process
+/// seizing the device, not a VPIO fault, and the HAL path would be hijacked too.
+/// Walks the `anyhow` cause chain so it stays correct even if a caller later
+/// wraps the error with `.context(...)`.
+#[cfg(target_os = "macos")]
+fn is_vpio_relevant_stream_death(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::core::StreamDeath>(),
+            Some(crate::core::StreamDeath::ReceiveTimeout { .. })
+        )
+    })
+}
+
 use super::{
     start_device_monitor, stop_device_monitor, AudioCaptureMode, AudioManagerOptions,
     TranscriptionMode,
@@ -695,7 +711,7 @@ impl AudioManager {
                 // rapid failures (no-op when VPIO is off / already demoted).
                 #[cfg(target_os = "macos")]
                 if device_clone.device_type == crate::core::device::DeviceType::Input
-                    && e.to_string().contains("stream dead")
+                    && is_vpio_relevant_stream_death(e)
                 {
                     device_manager.note_vpio_runtime_failure(&device_clone);
                 }
@@ -1684,6 +1700,30 @@ mod tests {
         assert!(!result.transcription_restarted);
         assert!(result.recording_error.is_none());
         assert!(result.transcription_error.is_none());
+    }
+
+    /// The VPIO-fallback classifier must fire only on a receive-timeout death —
+    /// not a zero-fill hijack (not VPIO's fault) and not unrelated errors.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vpio_relevant_death_matches_only_receive_timeout() {
+        use crate::core::StreamDeath;
+
+        assert!(is_vpio_relevant_stream_death(&anyhow!(
+            StreamDeath::ReceiveTimeout { secs: 8 }
+        )));
+        assert!(is_vpio_relevant_stream_death(
+            &anyhow!(StreamDeath::ReceiveTimeout { secs: 8 }).context("rebuilding device")
+        ));
+        assert!(!is_vpio_relevant_stream_death(&anyhow!(
+            StreamDeath::ZeroFill {
+                device: "Mic (input)".to_string(),
+                secs: 30
+            }
+        )));
+        assert!(!is_vpio_relevant_stream_death(&anyhow!(
+            "device disconnected"
+        )));
     }
 
     // ── DRM stopped devices tracking tests ─────────────────────
