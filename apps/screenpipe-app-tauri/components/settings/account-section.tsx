@@ -33,6 +33,7 @@ import { toast } from "@/components/ui/use-toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { commands } from "@/lib/utils/tauri";
 import { planDisplayName, isSignedInCloudSubscriber } from "@/lib/app-entitlement";
+import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 import { Card } from "../ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
@@ -223,6 +224,10 @@ export function AccountSection() {
 
   const subscriptionPlan = settings.user?.subscription_plan ?? null;
   const hasNamedPlan = !!subscriptionPlan && subscriptionPlan !== "none";
+  // Consumer build collapses org/license-derived team/enterprise → "Business";
+  // only the enterprise build shows the real org label. Mirrors plan_display_name
+  // in src-tauri/src/tray.rs.
+  const isEnterpriseBuild = useIsEnterpriseBuild();
 
   return (
     <div className="space-y-6">
@@ -286,7 +291,7 @@ export function AccountSection() {
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Sparkles className="h-5 w-5 text-primary" />
-              <h3 className="text-lg font-semibold">Screenpipe {hasNamedPlan ? planDisplayName(subscriptionPlan) : "Business"}</h3>
+              <h3 className="text-lg font-semibold">Screenpipe {hasNamedPlan ? planDisplayName(subscriptionPlan, isEnterpriseBuild) : "Business"}</h3>
               <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">active</span>
             </div>
           </div>
@@ -617,7 +622,7 @@ export function AccountSection() {
               <div className="flex items-center gap-2">
                 <Sparkles className="h-5 w-5 text-primary" />
                 <h3 className="text-lg font-semibold">
-                  Screenpipe {planDisplayName(subscriptionPlan)}
+                  Screenpipe {planDisplayName(subscriptionPlan, isEnterpriseBuild)}
                 </h3>
                 <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">
                   active

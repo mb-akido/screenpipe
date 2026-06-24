@@ -147,12 +147,31 @@ fn prefetch_tray_menu_data(app: &AppHandle) -> TrayMenuData {
 /// The pricing page renames the tiers: standard→"Basic", pro→"Business",
 /// enterprise→"Enterprise". Keep in sync with `planDisplayName` in
 /// lib/app-entitlement.ts.
+///
+/// `team`/`enterprise` are org/license-derived: the consumer build has no
+/// self-serve Team/Enterprise product, so an account entitled via an enterprise
+/// org (e.g. an admin or member of an active license) — which still gets
+/// Business-equivalent features here — is shown as "Business" rather than
+/// "Enterprise". Only the enterprise build surfaces the real org label.
 fn plan_display_name(plan: Option<&str>) -> &'static str {
+    let enterprise_build = cfg!(feature = "enterprise-build");
     match plan.unwrap_or("none").to_ascii_lowercase().as_str() {
         "standard" => "Basic",
         "pro" => "Business",
-        "team" => "Team",
-        "enterprise" => "Enterprise",
+        "team" => {
+            if enterprise_build {
+                "Team"
+            } else {
+                "Business"
+            }
+        }
+        "enterprise" => {
+            if enterprise_build {
+                "Enterprise"
+            } else {
+                "Business"
+            }
+        }
         "lifetime" => "Lifetime",
         _ => "Free",
     }

@@ -11,6 +11,7 @@ import {
   isTokenHydrationPending,
   needsAppEntitlementRefresh,
   normalizeAppUser,
+  planDisplayName,
 } from "@/lib/app-entitlement";
 
 const NOW = new Date("2026-06-05T12:00:00.000Z");
@@ -219,5 +220,27 @@ describe("hasPersistedEntitlementEvidence", () => {
       ),
     ).toBe(false);
     expect(hasPersistedEntitlementEvidence(null)).toBe(false);
+  });
+});
+
+describe("planDisplayName", () => {
+  it("maps the self-serve tiers the same on every build", () => {
+    expect(planDisplayName("standard")).toBe("Basic");
+    expect(planDisplayName("pro")).toBe("Business");
+    expect(planDisplayName("lifetime")).toBe("Lifetime");
+    expect(planDisplayName("none")).toBe("Free");
+    expect(planDisplayName(null)).toBe("Free");
+  });
+
+  it("collapses org/license-derived team/enterprise to Business on the consumer build", () => {
+    // Default (consumer build): an account entitled via an enterprise org gets
+    // Business-equivalent features, so it should never read "Enterprise"/"Team".
+    expect(planDisplayName("team")).toBe("Business");
+    expect(planDisplayName("enterprise")).toBe("Business");
+  });
+
+  it("surfaces the real org label on the enterprise build", () => {
+    expect(planDisplayName("team", true)).toBe("Team");
+    expect(planDisplayName("enterprise", true)).toBe("Enterprise");
   });
 });
