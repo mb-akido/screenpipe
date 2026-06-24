@@ -6,9 +6,9 @@ and layer declared in the manifest, weighted by confidence and criticality.
 
 - Manifest: `e2e/coverage-map.json`
 - Specs directory: `e2e/specs`
-- Mapped specs: 57
-- Declared test blocks: 189
-- Weighted coverage points: 147.2
+- Mapped specs: 58
+- Declared test blocks: 191
+- Weighted coverage points: 148.9
 
 Confidence weights: strong=1.0, partial=0.7, conditional=0.4, smoke=0.3.
 Criticality weights: high=1.0, medium=0.7, low=0.4.
@@ -19,9 +19,9 @@ can execute more runtime cases than this number shows.
 
 | Platform | Specs | Declared tests | Weighted points | Layers | Features | Critical score |
 | --- | --- | --- | --- | --- | --- | --- |
-| windows | 49 | 177 | 142.8 | 15 | 54 | 92% |
-| macos | 54 | 155 | 119.8 | 17 | 56 | 89% |
-| linux | 42 | 142 | 115.2 | 13 | 51 | 86% |
+| windows | 50 | 179 | 144.5 | 15 | 54 | 92% |
+| macos | 55 | 157 | 121.5 | 17 | 56 | 89% |
+| linux | 43 | 144 | 116.9 | 13 | 51 | 86% |
 
 ## Runtime Results
 
@@ -37,15 +37,15 @@ pass/fail/skip counts.
 | auth | - | 1 specs / 1 tests / 1.0 pts | - |
 | billing | 2 specs / 2 tests / 1.7 pts | 2 specs / 2 tests / 1.7 pts | 2 specs / 2 tests / 1.7 pts |
 | capture-ocr | 2 specs / 14 tests / 5.6 pts | 2 specs / 4 tests / 1.6 pts | 1 specs / 3 tests / 1.2 pts |
-| chat-ai | 10 specs / 17 tests / 11.2 pts | 12 specs / 20 tests / 12.1 pts | 10 specs / 17 tests / 11.2 pts |
+| chat-ai | 10 specs / 18 tests / 11.9 pts | 12 specs / 21 tests / 12.8 pts | 10 specs / 18 tests / 11.9 pts |
 | entitlement | - | 1 specs / 1 tests / 1.0 pts | - |
-| local-api | 14 specs / 89 tests / 74.5 pts | 13 specs / 64 tests / 55.5 pts | 11 specs / 63 tests / 55.1 pts |
+| local-api | 15 specs / 90 tests / 75.5 pts | 14 specs / 65 tests / 56.5 pts | 12 specs / 64 tests / 56.1 pts |
 | notifications | 2 specs / 11 tests / 10.1 pts | 2 specs / 4 tests / 2.4 pts | 1 specs / 3 tests / 2.1 pts |
 | onboarding | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts |
 | os-integration | 4 specs / 16 tests / 15.1 pts | 4 specs / 3 tests / 0.9 pts | - |
 | performance | 2 specs / 43 tests / 43.0 pts | 4 specs / 33 tests / 29.5 pts | 1 specs / 28 tests / 28.0 pts |
-| pipes | 2 specs / 11 tests / 11.0 pts | 2 specs / 11 tests / 11.0 pts | 2 specs / 11 tests / 11.0 pts |
-| real-ui-e2e | 29 specs / 101 tests / 81.1 pts | 30 specs / 88 tests / 70.6 pts | 26 specs / 82 tests / 68.7 pts |
+| pipes | 3 specs / 12 tests / 12.0 pts | 3 specs / 12 tests / 12.0 pts | 3 specs / 12 tests / 12.0 pts |
+| real-ui-e2e | 29 specs / 102 tests / 81.8 pts | 30 specs / 89 tests / 71.3 pts | 26 specs / 83 tests / 69.4 pts |
 | settings | 10 specs / 27 tests / 24.9 pts | 11 specs / 21 tests / 18.2 pts | 9 specs / 19 tests / 16.9 pts |
 | storage-privacy | 6 specs / 20 tests / 19.1 pts | 5 specs / 12 tests / 11.1 pts | 4 specs / 12 tests / 11.1 pts |
 | tauri-command | 8 specs / 17 tests / 10.3 pts | 9 specs / 19 tests / 10.8 pts | 8 specs / 17 tests / 10.3 pts |
@@ -104,7 +104,7 @@ pass/fail/skip counts.
 | chat-parallel-jobs-duplicate.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Parallel auto-send prefill dedupe regression. |
 | chat-prefill-duplicate.spec.ts | windows, macos, linux | chat-ai | chat, chat-prefill | medium | partial | synthetic | 1 | Cross-window prefill duplicate regression. |
 | chat-settings-background-stream.spec.ts | windows, macos, linux | chat-ai, settings, real-ui-e2e | chat, chat-streaming, settings | high | strong | real-user-flow | 1 | Opening the standalone Settings route mid-stream must not abort the chat: a long synthetic stream keeps running while the user round-trips to Settings, remains live in Recents, and restores the full response (early + final tokens) after the row is clicked. |
-| chat-sidebar-groups.spec.ts | windows, macos, linux | chat-ai, real-ui-e2e | chat, chat-sidebar-groups | medium | strong | real-user-flow | 8 | Pipe auto-grouping (collapse, badge, expand/collapse, localStorage persistence) and manual sidebar groups (move-to-group, section headers, remove-from-group cleanup). 8 tests. |
+| chat-sidebar-groups.spec.ts | windows, macos, linux | chat-ai, real-ui-e2e | chat, chat-sidebar-groups | medium | strong | real-user-flow | 9 | Pipe auto-grouping (collapse, badge, expand/collapse, localStorage persistence) and manual sidebar groups (move-to-group, section headers, remove-from-group cleanup). 8 tests. |
 | chat-sidebar-stub-dedup.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Listener-order regression for metadata-only sidebar stubs gaining dedup keys. |
 | chat-source-file-preview.spec.ts | windows, macos, linux | chat-ai, real-ui-e2e | chat | medium | strong | real-user-flow | 1 | Clicking a chat file source opens it in the preview sidebar with rendered markdown + syntax-highlighted code. |
 | chat-streaming-performance.spec.ts | macos | chat-ai, performance | chat, chat-streaming | medium | conditional | performance | 2 | macOS-only chat streaming responsiveness. |
@@ -114,6 +114,7 @@ pass/fail/skip counts.
 | focus-server.spec.ts | windows, macos, linux | local-api, window-lifecycle, tauri-command | window-lifecycle, focus-server, deeplink | medium | partial | api | 2 | Focus server opens windows and forwards deeplink args. |
 | hd-recording-pipeline.spec.ts | macos | capture-ocr, local-api, performance | capture-ocr, hd-recording, timeline | high | conditional | api | 1 | Opt-in macOS HD capture and OCR indexing. |
 | help-discord-link.spec.ts | windows, macos, linux | real-ui-e2e | help | low | smoke | real-user-flow | 1 | Help section Discord invite link. |
+| hermes-pipe.spec.ts | windows, macos, linux | pipes, local-api | pipes | high | strong | api | 1 | Installs an agent: hermes pipe, runs it through the app local API, and verifies the Hermes command receives the prompt, session owner, and pipe-scoped permission token. |
 | home-window.spec.ts | windows, macos, linux | real-ui-e2e, window-lifecycle | app-launch, home-navigation, timeline, settings-recording, pipes | high | strong | real-user-flow | 1 | Clicks through Home, Pipes, Timeline, Help, and Settings. |
 | html-artifact-render.spec.ts | windows, macos, linux | real-ui-e2e | brain, artifacts, html-sandbox | high | strong | real-user-flow | 1 | Registers an HTML artifact, opens it in Brain, and asserts it renders inside a sandboxed allow-scripts iframe (CSP default-src 'none') whose global <style> never leaks into the host app DOM (regression: rehype-raw repainting the whole window). |
 | macos-ui-performance.spec.ts | macos | performance, real-ui-e2e | timeline, audio-device-health | medium | conditional | performance | 2 | macOS-only timeline/audio UI performance guards. |

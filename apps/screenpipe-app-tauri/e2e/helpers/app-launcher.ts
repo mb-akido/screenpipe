@@ -5,7 +5,7 @@
 import { spawn, execSync } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -51,7 +51,13 @@ function killPort(port: number): void {
 // e2e/helpers/ → ../.. = app root (Bun runs from source, no dist)
 const APP_ROOT = resolve(__dirname, '../..');
 export const E2E_DATA_DIR = resolve(APP_ROOT, '.e2e');
+export const HERMES_E2E_CAPTURE_DIR = resolve(E2E_DATA_DIR, 'hermes-capture');
 const APP_PID_FILE = resolve(E2E_DATA_DIR, 'app.pid');
+const HERMES_E2E_SCRIPT = resolve(E2E_DATA_DIR, 'fake-hermes.mjs');
+const HERMES_E2E_COMMAND = resolve(
+  E2E_DATA_DIR,
+  process.platform === 'win32' ? 'fake-hermes.cmd' : 'fake-hermes',
+);
 
 // `onboarding` marks the onboarding store complete so the app drops straight
 // into the home window. `no-recording` disables vision + audio so the server
@@ -93,6 +99,56 @@ async function waitForServer(port: number, timeoutMs = 30000): Promise<void> {
 
 let appProcess: ReturnType<typeof spawn> | null = null;
 
+function ensureHermesE2ECommand(): string {
+  mkdirSync(HERMES_E2E_CAPTURE_DIR, { recursive: true });
+  writeFileSync(
+    HERMES_E2E_SCRIPT,
+    `#!/usr/bin/env node
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const captureDir = process.env.SCREENPIPE_HERMES_CAPTURE;
+if (!captureDir) {
+  console.error('SCREENPIPE_HERMES_CAPTURE is required');
+  process.exit(2);
+}
+
+mkdirSync(captureDir, { recursive: true });
+const id = \`\${Date.now()}-\${process.pid}-\${Math.random().toString(36).slice(2)}\`;
+const args = process.argv.slice(2);
+const qIndex = args.indexOf('-q');
+const prompt = qIndex >= 0 ? (args[qIndex + 1] ?? '') : '';
+
+writeFileSync(join(captureDir, \`args-\${id}.txt\`), args.join('\\n') + '\\n', 'utf8');
+writeFileSync(join(captureDir, \`prompt-\${id}.txt\`), prompt, 'utf8');
+writeFileSync(
+  join(captureDir, \`env-\${id}.txt\`),
+  Object.entries(process.env)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => \`\${key}=\${value ?? ''}\`)
+    .join('\\n') + '\\n',
+  'utf8',
+);
+
+process.stdout.write('fake hermes completed\\n');
+`,
+    'utf8',
+  );
+
+  if (process.platform === 'win32') {
+    writeFileSync(HERMES_E2E_COMMAND, `@echo off\r\nnode "${HERMES_E2E_SCRIPT}" %*\r\n`, 'utf8');
+  } else {
+    writeFileSync(
+      HERMES_E2E_COMMAND,
+      `#!/usr/bin/env sh\nexec node "${HERMES_E2E_SCRIPT}" "$@"\n`,
+      'utf8',
+    );
+    chmodSync(HERMES_E2E_COMMAND, 0o755);
+  }
+
+  return HERMES_E2E_COMMAND;
+}
+
 export function getAppPid(): number | null {
   const pid = appProcess?.pid;
   if (pid) return pid;
@@ -118,6 +174,7 @@ export async function startApp(port = WEBDRIVER_PORT): Promise<ReturnType<typeof
 
   rmSync(E2E_DATA_DIR, { recursive: true, force: true });
   mkdirSync(E2E_DATA_DIR, { recursive: true });
+  const defaultHermesCommand = ensureHermesE2ECommand();
 
   appProcess = spawn(appPath, [], {
     env: {
@@ -125,6 +182,8 @@ export async function startApp(port = WEBDRIVER_PORT): Promise<ReturnType<typeof
       SCREENPIPE_DATA_DIR: E2E_DATA_DIR,
       SCREENPIPE_E2E_SEED: E2E_SEED_FLAGS,
       SCREENPIPE_FOCUS_PORT: String(FOCUS_PORT),
+      SCREENPIPE_HERMES_COMMAND: process.env.SCREENPIPE_HERMES_COMMAND ?? defaultHermesCommand,
+      SCREENPIPE_HERMES_CAPTURE: process.env.SCREENPIPE_HERMES_CAPTURE ?? HERMES_E2E_CAPTURE_DIR,
       TAURI_WEBDRIVER_PORT: String(port),
       // When the app panics under E2E (common during early platform bring-up),
       // a backtrace in CI logs is far more actionable than the default "run with

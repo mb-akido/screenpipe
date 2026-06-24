@@ -333,6 +333,16 @@
       "notes": "Help section Discord invite link."
     },
     {
+      "spec": "hermes-pipe.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["pipes", "local-api"],
+      "features": ["pipes"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "api",
+      "notes": "Installs an agent: hermes pipe, runs it through the app local API, and verifies the Hermes command receives the prompt, session owner, and pipe-scoped permission token."
+    },
+    {
       "spec": "home-window.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["real-ui-e2e", "window-lifecycle"],
