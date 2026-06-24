@@ -25,7 +25,9 @@ use crate::agents::{
 use crate::pipes::connections::parse_mcp_connection_id;
 use crate::pipes::mcp_access::McpSessionAccessRegistry;
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc,
+};
 use cron::Schedule as CronSchedule;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -259,9 +261,69 @@ pub struct PipeConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactDeclaration>,
 
+    /// Structured recurrence (the Notion-style schedule builder). When present
+    /// this is the source of truth and the legacy `schedule` string is ignored
+    /// by the scheduler; when absent the scheduler falls back to `schedule`.
+    /// Serialized as a nested YAML block in front-matter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_config: Option<ScheduleConfig>,
+
     /// Catches any extra fields from front-matter (backwards compat).
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, serde_json::Value>,
+}
+
+/// How often a structured schedule repeats. The unit of `ScheduleConfig.interval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Frequency {
+    Minutes,
+    Hours,
+    Days,
+    Weeks,
+    Months,
+}
+
+/// Structured recurrence produced by the schedule builder. Mirrors Notion's
+/// "On a schedule" panel. Unlike the legacy cron string this carries an
+/// explicit timezone plus start/end bounds, and can express every-N-weeks and
+/// monthly recurrences that cron can't. See `next_fire`/`should_run_config`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    /// Repeat unit.
+    pub frequency: Frequency,
+    /// "every N" — N>=1. Defaults to 1.
+    #[serde(default = "default_interval")]
+    pub interval: u32,
+    /// Weeks only: which weekdays fire. 0=Sun .. 6=Sat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days_of_week: Vec<u32>,
+    /// Months only: day-of-month (1..31), clamped to the month length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_of_month: Option<u32>,
+    /// Days/Weeks/Months: local wall-clock hour (0..23).
+    #[serde(default)]
+    pub at_hour: u32,
+    /// Days/Weeks/Months: local wall-clock minute (0..59).
+    #[serde(default)]
+    pub at_minute: u32,
+    /// IANA timezone (e.g. "America/New_York"). None → the machine's local zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Do not fire before this instant; also anchors every-N-weeks/months phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting: Option<DateTime<Utc>>,
+    /// Do not fire after this instant. None → repeats indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ending: Option<DateTime<Utc>>,
+    /// Stop after this many occurrences, counted from `starting`. None →
+    /// unlimited. Only enforced when `starting` is set (the UI defaults it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_occurrences: Option<u32>,
+}
+
+fn default_interval() -> u32 {
+    1
 }
 
 /// Deserialize `preset` field: accepts a single string or an array of strings.
@@ -3434,6 +3496,24 @@ impl PipeManager {
                         }
                     }
                 }
+                "schedule_config" => {
+                    if v.is_null() {
+                        // Clearing the structured schedule = manual.
+                        config.schedule_config = None;
+                        config.schedule = "manual".to_string();
+                    } else {
+                        match serde_json::from_value::<ScheduleConfig>(v.clone()) {
+                            Ok(sc) => {
+                                config.schedule_config = Some(sc);
+                                // The structured config is authoritative; park the
+                                // legacy string at "manual" so front-matter never
+                                // contradicts it (the scheduler ignores it anyway).
+                                config.schedule = "manual".to_string();
+                            }
+                            Err(e) => warn!("invalid schedule_config for '{}': {}", name, e),
+                        }
+                    }
+                }
                 _ => {
                     config.config.insert(k.clone(), v.clone());
                 }
@@ -3981,7 +4061,13 @@ impl PipeManager {
 
                     let triggered_by_event = event_triggered.contains(name);
                     let last = last_run.get(name).copied().unwrap_or(DateTime::UNIX_EPOCH);
-                    if !triggered_by_event && !should_run(&config.schedule, last) {
+                    // Structured `schedule_config` is authoritative when set;
+                    // otherwise fall back to the legacy `schedule` string.
+                    let due = match &config.schedule_config {
+                        Some(cfg) => should_run_config(cfg, last),
+                        None => should_run(&config.schedule, last),
+                    };
+                    if !triggered_by_event && !due {
                         continue;
                     }
 
@@ -5484,6 +5570,349 @@ fn should_run(schedule: &str, last_run: DateTime<Utc>) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structured schedule (ScheduleConfig) evaluation
+// ---------------------------------------------------------------------------
+
+/// A reference point for every-N-weeks/months phase when no `starting` is set.
+/// 1970-01-01 is a Thursday; any fixed anchor works since only the parity
+/// relative to it matters, and `starting` overrides it when present.
+fn schedule_anchor_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid anchor date")
+}
+
+/// Resolve a `ScheduleConfig.timezone` into something usable. Unknown/empty
+/// names fall back to the machine's local zone (same default as the legacy
+/// cron path), so a bad tz never silently stops a pipe.
+enum ResolvedTz {
+    Local,
+    Named(chrono_tz::Tz),
+}
+
+fn resolve_tz(name: Option<&str>) -> ResolvedTz {
+    match name {
+        Some(n) if !n.is_empty() => n
+            .parse::<chrono_tz::Tz>()
+            .map(ResolvedTz::Named)
+            .unwrap_or(ResolvedTz::Local),
+        _ => ResolvedTz::Local,
+    }
+}
+
+/// Build a UTC instant from a local wall-clock (date + h:m:0) in `tz`, picking
+/// the earliest valid instant across DST gaps/folds. Returns None only if the
+/// wall-clock is skipped entirely (spring-forward) with no nearby valid time.
+fn wall_clock_to_utc<Tz: TimeZone>(
+    tz: &Tz,
+    date: NaiveDate,
+    hour: u32,
+    minute: u32,
+) -> Option<DateTime<Utc>> {
+    let naive = date.and_hms_opt(hour.min(23), minute.min(59), 0)?;
+    let local = match tz.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(t) => t,
+        chrono::LocalResult::Ambiguous(t, _) => t,
+        // Spring-forward gap: this wall-clock doesn't exist. Nudge forward an
+        // hour so the occurrence still fires that day rather than vanishing.
+        chrono::LocalResult::None => {
+            let bumped = date.and_hms_opt((hour + 1).min(23), minute.min(59), 0)?;
+            tz.from_local_datetime(&bumped).single()?
+        }
+    };
+    Some(local.with_timezone(&Utc))
+}
+
+/// Does `date` satisfy the recurrence's day rule + interval phase?
+fn schedule_day_matches(cfg: &ScheduleConfig, date: NaiveDate) -> bool {
+    let anchor = cfg
+        .starting
+        .map(|s| {
+            // anchor in the schedule's own zone so phase aligns with wall-clock
+            match resolve_tz(cfg.timezone.as_deref()) {
+                ResolvedTz::Named(tz) => s.with_timezone(&tz).date_naive(),
+                ResolvedTz::Local => s.with_timezone(&Local).date_naive(),
+            }
+        })
+        .unwrap_or_else(schedule_anchor_date);
+    let interval = cfg.interval.max(1) as i64;
+
+    match cfg.frequency {
+        Frequency::Days => {
+            let delta = (date - anchor).num_days();
+            delta >= 0 && delta % interval == 0
+        }
+        Frequency::Weeks => {
+            if cfg.days_of_week.is_empty() {
+                return false;
+            }
+            let dow = date.weekday().num_days_from_sunday(); // 0=Sun..6=Sat
+            if !cfg.days_of_week.contains(&dow) {
+                return false;
+            }
+            // Week phase: compare ISO-week starts (Sunday-anchored).
+            let week_start = date - ChronoDuration::days(dow as i64);
+            let anchor_dow = anchor.weekday().num_days_from_sunday();
+            let anchor_week = anchor - ChronoDuration::days(anchor_dow as i64);
+            let weeks = (week_start - anchor_week).num_days() / 7;
+            weeks >= 0 && weeks % interval == 0
+        }
+        Frequency::Months => {
+            let dom = cfg.day_of_month.unwrap_or(1).clamp(1, 31);
+            let last_dom = days_in_month(date.year(), date.month());
+            let target = dom.min(last_dom);
+            if date.day() != target {
+                return false;
+            }
+            let months = (date.year() as i64 * 12 + date.month() as i64 - 1)
+                - (anchor.year() as i64 * 12 + anchor.month() as i64 - 1);
+            months >= 0 && months % interval == 0
+        }
+        // Minutes/Hours are interval-from-last-run, handled in next_fire_in_tz.
+        Frequency::Minutes | Frequency::Hours => true,
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_next = NaiveDate::from_ymd_opt(ny, nm, 1).expect("valid first-of-month");
+    (first_next - ChronoDuration::days(1)).day()
+}
+
+/// Next fire strictly after `after`, evaluated in `tz`. For Minutes/Hours this
+/// is a fixed interval from `after`; for Days/Weeks/Months it walks wall-clock
+/// dates forward to the next matching occurrence at `at_hour:at_minute`.
+fn next_fire_in_tz<Tz: TimeZone>(
+    cfg: &ScheduleConfig,
+    tz: &Tz,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let interval = cfg.interval.max(1) as i64;
+    match cfg.frequency {
+        Frequency::Minutes => Some(after + ChronoDuration::minutes(interval)),
+        Frequency::Hours => Some(after + ChronoDuration::hours(interval)),
+        Frequency::Days | Frequency::Weeks | Frequency::Months => {
+            let mut date = after.with_timezone(tz).date_naive();
+            // Walk forward up to ~14 months of days to find the next match.
+            for _ in 0..420 {
+                if schedule_day_matches(cfg, date) {
+                    if let Some(fire) = wall_clock_to_utc(tz, date, cfg.at_hour, cfg.at_minute) {
+                        if fire > after {
+                            return Some(fire);
+                        }
+                    }
+                }
+                date = date.succ_opt()?;
+            }
+            None
+        }
+    }
+}
+
+/// Next fire after `after`, resolving the config's timezone internally.
+fn next_fire(cfg: &ScheduleConfig, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match resolve_tz(cfg.timezone.as_deref()) {
+        ResolvedTz::Named(tz) => next_fire_in_tz(cfg, &tz, after),
+        ResolvedTz::Local => next_fire_in_tz(cfg, &Local, after),
+    }
+}
+
+/// The instant of the `max_occurrences`-th fire counted from `starting`, i.e.
+/// the last slot allowed by a "stop after N runs" rule. Only meaningful when
+/// both `starting` and `max_occurrences` are set; None otherwise (unlimited).
+fn occurrence_end(cfg: &ScheduleConfig) -> Option<DateTime<Utc>> {
+    let max = cfg.max_occurrences.filter(|n| *n > 0)? as usize;
+    let start = cfg.starting?;
+    let mut after = start - ChronoDuration::seconds(1);
+    let mut last = None;
+    for _ in 0..max {
+        match next_fire(cfg, after) {
+            Some(t) => {
+                last = Some(t);
+                after = t;
+            }
+            None => break,
+        }
+    }
+    last
+}
+
+/// The effective last-fire bound: the earlier of `ending` and the
+/// `max_occurrences` cutoff. None → no upper bound.
+fn effective_ending(cfg: &ScheduleConfig) -> Option<DateTime<Utc>> {
+    match (cfg.ending, occurrence_end(cfg)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The first `n` future occurrences (UTC), for the builder's preview. Stops
+/// early at the effective end (`ending` / `max_occurrences`) or if the
+/// recurrence can't produce more slots.
+pub fn next_occurrences(cfg: &ScheduleConfig, n: usize) -> Vec<DateTime<Utc>> {
+    let end = effective_ending(cfg);
+    let mut out = Vec::with_capacity(n);
+    let mut after = Utc::now();
+    if let Some(start) = cfg.starting {
+        if after < start {
+            after = start - ChronoDuration::seconds(1);
+        }
+    }
+    // Allow a few extra steps to skip occurrences that land just before
+    // `starting` at timezone extremes before giving up.
+    for _ in 0..(n + 16) {
+        match next_fire(cfg, after) {
+            Some(t) => {
+                after = t;
+                if cfg.starting.is_some_and(|s| t < s) {
+                    continue;
+                }
+                if end.is_some_and(|e| t > e) {
+                    break;
+                }
+                out.push(t);
+                if out.len() >= n {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Structured-schedule counterpart to `should_run`. Honors timezone +
+/// start/end bounds and reuses the same grace/catch-up windows as the cron path.
+fn should_run_config(cfg: &ScheduleConfig, last_run: DateTime<Utc>) -> bool {
+    let now = Utc::now();
+    if cfg.starting.is_some_and(|start| now < start) {
+        return false;
+    }
+    let end = effective_ending(cfg);
+    if end.is_some_and(|e| now > e) {
+        return false;
+    }
+    let mut search_from = if last_run == DateTime::<Utc>::UNIX_EPOCH {
+        now - CRON_GRACE_WINDOW
+    } else {
+        std::cmp::max(last_run, now - CRON_CATCHUP_WINDOW)
+    };
+    if let Some(start) = cfg.starting {
+        // Never produce a slot before the start boundary.
+        search_from = std::cmp::max(search_from, start - ChronoDuration::seconds(1));
+    }
+    match next_fire(cfg, search_from) {
+        // Don't fire a slot past the effective end (e.g. beyond the Nth run).
+        Some(next) => now >= next && end.map_or(true, |e| next <= e),
+        None => false,
+    }
+}
+
+fn format_time_12h(hour: u32, minute: u32) -> String {
+    let (h12, ampm) = match hour {
+        0 => (12, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        _ => (hour - 12, "PM"),
+    };
+    format!("{}:{:02} {}", h12, minute, ampm)
+}
+
+fn ordinal(n: u32) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{}{}", n, suffix)
+}
+
+/// Human-readable weekday set: "weekdays", "weekends", "every day", or a
+/// Monday-first short list ("Mon, Wed, Fri"). Mirrors the frontend humanizer.
+fn humanize_weekdays(days: &[u32]) -> String {
+    use std::collections::BTreeSet;
+    let set: BTreeSet<u32> = days.iter().copied().filter(|d| *d <= 6).collect();
+    if set.is_empty() {
+        return "—".to_string();
+    }
+    if set.len() == 7 {
+        return "every day".to_string();
+    }
+    let weekdays: BTreeSet<u32> = [1, 2, 3, 4, 5].into_iter().collect();
+    let weekend: BTreeSet<u32> = [0, 6].into_iter().collect();
+    if set == weekdays {
+        return "weekdays".to_string();
+    }
+    if set == weekend {
+        return "weekends".to_string();
+    }
+    let short = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let order = [1u32, 2, 3, 4, 5, 6, 0];
+    order
+        .iter()
+        .filter(|d| set.contains(d))
+        .map(|d| short[*d as usize])
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One-line summary of a structured schedule, e.g. "every weekday at 9:00 AM"
+/// or "every 2 weeks on Mon, Wed at 6:30 PM (America/New_York)".
+pub fn describe_schedule_config(cfg: &ScheduleConfig) -> String {
+    let n = cfg.interval.max(1);
+    let time = format_time_12h(cfg.at_hour, cfg.at_minute);
+    let mut base = match cfg.frequency {
+        Frequency::Minutes => {
+            if n == 1 {
+                "every minute".to_string()
+            } else {
+                format!("every {} minutes", n)
+            }
+        }
+        Frequency::Hours => {
+            if n == 1 {
+                "every hour".to_string()
+            } else {
+                format!("every {} hours", n)
+            }
+        }
+        Frequency::Days => {
+            if n == 1 {
+                format!("every day at {}", time)
+            } else {
+                format!("every {} days at {}", n, time)
+            }
+        }
+        Frequency::Weeks => {
+            let days = humanize_weekdays(&cfg.days_of_week);
+            if cfg.days_of_week.len() == 7 && n == 1 {
+                format!("every day at {}", time)
+            } else if n == 1 {
+                format!("weekly on {} at {}", days, time)
+            } else {
+                format!("every {} weeks on {} at {}", n, days, time)
+            }
+        }
+        Frequency::Months => {
+            let dom = ordinal(cfg.day_of_month.unwrap_or(1).clamp(1, 31));
+            if n == 1 {
+                format!("monthly on the {} at {}", dom, time)
+            } else {
+                format!("every {} months on the {} at {}", n, dom, time)
+            }
+        }
+    };
+    if let Some(tz) = cfg.timezone.as_deref().filter(|t| !t.is_empty()) {
+        base.push_str(&format!(" ({})", tz));
+    }
+    base
+}
+
 /// Parse strings like `"30m"`, `"2h"`, `"every 2h"`, `"15 min"` into Duration.
 fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
     let s = s.trim().to_lowercase();
@@ -6241,6 +6670,7 @@ mod tests {
             provider: None,
             preset: vec!["default".to_string()],
             permissions: PipePermissionsConfig::default(),
+            schedule_config: None,
             config: HashMap::new(),
             connections: vec![],
             timeout: None,
@@ -6582,6 +7012,307 @@ mod tests {
         assert!(parse_schedule("at ").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // Structured schedule (ScheduleConfig) evaluation
+    // -----------------------------------------------------------------------
+
+    fn cfg(frequency: Frequency) -> ScheduleConfig {
+        ScheduleConfig {
+            frequency,
+            interval: 1,
+            days_of_week: vec![],
+            day_of_month: None,
+            at_hour: 9,
+            at_minute: 0,
+            timezone: None,
+            starting: None,
+            ending: None,
+            max_occurrences: None,
+        }
+    }
+
+    fn utc_dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn schedule_config_helpers() {
+        assert_eq!(days_in_month(2024, 2), 29); // leap
+        assert_eq!(days_in_month(2025, 2), 28);
+        assert_eq!(days_in_month(2025, 4), 30);
+        assert_eq!(days_in_month(2025, 12), 31);
+        assert_eq!(ordinal(1), "1st");
+        assert_eq!(ordinal(2), "2nd");
+        assert_eq!(ordinal(3), "3rd");
+        assert_eq!(ordinal(4), "4th");
+        assert_eq!(ordinal(11), "11th");
+        assert_eq!(ordinal(21), "21st");
+        assert_eq!(humanize_weekdays(&[1, 2, 3, 4, 5]), "weekdays");
+        assert_eq!(humanize_weekdays(&[0, 6]), "weekends");
+        assert_eq!(humanize_weekdays(&[0, 1, 2, 3, 4, 5, 6]), "every day");
+        assert_eq!(humanize_weekdays(&[1, 3, 5]), "Mon, Wed, Fri");
+        assert_eq!(humanize_weekdays(&[0, 3]), "Wed, Sun"); // Monday-first
+    }
+
+    #[test]
+    fn describe_schedule_config_strings() {
+        let mut c = cfg(Frequency::Minutes);
+        c.interval = 30;
+        assert_eq!(describe_schedule_config(&c), "every 30 minutes");
+        c.interval = 1;
+        assert_eq!(describe_schedule_config(&c), "every minute");
+
+        let mut c = cfg(Frequency::Hours);
+        c.interval = 2;
+        assert_eq!(describe_schedule_config(&c), "every 2 hours");
+
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 9;
+        c.at_minute = 0;
+        assert_eq!(describe_schedule_config(&c), "every day at 9:00 AM");
+
+        let mut c = cfg(Frequency::Weeks);
+        c.days_of_week = vec![1, 2, 3, 4, 5];
+        c.at_hour = 9;
+        c.at_minute = 30;
+        assert_eq!(
+            describe_schedule_config(&c),
+            "weekly on weekdays at 9:30 AM"
+        );
+        c.interval = 2;
+        c.days_of_week = vec![1, 3];
+        assert_eq!(
+            describe_schedule_config(&c),
+            "every 2 weeks on Mon, Wed at 9:30 AM"
+        );
+
+        let mut c = cfg(Frequency::Months);
+        c.day_of_month = Some(1);
+        c.at_hour = 18;
+        c.at_minute = 0;
+        c.timezone = Some("America/New_York".to_string());
+        assert_eq!(
+            describe_schedule_config(&c),
+            "monthly on the 1st at 6:00 PM (America/New_York)"
+        );
+    }
+
+    #[test]
+    fn next_fire_interval_minutes_hours() {
+        let mut c = cfg(Frequency::Minutes);
+        c.interval = 30;
+        let after = utc_dt(2026, 6, 1, 12, 0);
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 6, 1, 12, 30))
+        );
+        let mut c = cfg(Frequency::Hours);
+        c.interval = 2;
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 6, 1, 14, 0))
+        );
+    }
+
+    #[test]
+    fn next_fire_daily_at_time() {
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 9;
+        // before 9am same day → fires today 9am
+        let after = utc_dt(2026, 6, 1, 7, 0);
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 6, 1, 9, 0))
+        );
+        // after 9am → fires next day
+        let after = utc_dt(2026, 6, 1, 10, 0);
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 6, 2, 9, 0))
+        );
+    }
+
+    #[test]
+    fn next_fire_weekly_multi_day() {
+        // Mon(1), Wed(3), Fri(5) at 9:00. 2026-06-01 is a Monday.
+        let mut c = cfg(Frequency::Weeks);
+        c.days_of_week = vec![1, 3, 5];
+        c.at_hour = 9;
+        // Monday 10am → next is Wednesday 9am
+        let after = utc_dt(2026, 6, 1, 10, 0);
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 6, 3, 9, 0))
+        );
+        // Saturday → next is following Monday
+        let after = utc_dt(2026, 6, 6, 0, 0);
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 6, 8, 9, 0))
+        );
+    }
+
+    #[test]
+    fn next_fire_every_two_weeks_anchored() {
+        // Every 2 weeks on Monday, anchored to 2026-06-01 (Mon).
+        let mut c = cfg(Frequency::Weeks);
+        c.interval = 2;
+        c.days_of_week = vec![1];
+        c.at_hour = 9;
+        c.starting = Some(utc_dt(2026, 6, 1, 0, 0));
+        // From just after the anchor Monday, the NEXT fire skips 2026-06-08
+        // (odd week) and lands on 2026-06-15.
+        let after = utc_dt(2026, 6, 1, 9, 1);
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 6, 15, 9, 0))
+        );
+    }
+
+    #[test]
+    fn next_fire_monthly_clamps_day() {
+        // Day 31 each month → clamps to last day of short months.
+        let mut c = cfg(Frequency::Months);
+        c.day_of_month = Some(31);
+        c.at_hour = 12;
+        let after = utc_dt(2026, 1, 31, 13, 0); // after Jan 31 noon
+                                                // Feb 2026 has 28 days → Feb 28.
+        assert_eq!(
+            next_fire_in_tz(&c, &chrono_tz::UTC, after),
+            Some(utc_dt(2026, 2, 28, 12, 0))
+        );
+    }
+
+    #[test]
+    fn next_fire_respects_timezone() {
+        // 9:00 in New York. On 2026-06-01 EDT is UTC-4 → 13:00 UTC.
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 9;
+        c.timezone = Some("America/New_York".to_string());
+        let tz: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let after = utc_dt(2026, 6, 1, 0, 0);
+        assert_eq!(
+            next_fire_in_tz(&c, &tz, after),
+            Some(utc_dt(2026, 6, 1, 13, 0))
+        );
+    }
+
+    #[test]
+    fn next_fire_dst_spring_forward_gap() {
+        // US spring-forward 2026-03-08: 2:00–2:59 local doesn't exist.
+        // A 2:30 daily schedule must still produce a valid instant that day.
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 2;
+        c.at_minute = 30;
+        c.timezone = Some("America/New_York".to_string());
+        let tz: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let after = utc_dt(2026, 3, 8, 0, 0);
+        let fire = next_fire_in_tz(&c, &tz, after).expect("should produce a slot");
+        // It lands on 2026-03-08 (bumped past the gap), not skipped to the 9th.
+        assert_eq!(fire.with_timezone(&tz).date_naive().day(), 8);
+    }
+
+    #[test]
+    fn next_occurrences_orders_and_bounds() {
+        // No bounds → exactly n future, strictly increasing occurrences.
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 9;
+        let occ = next_occurrences(&c, 5);
+        assert_eq!(occ.len(), 5);
+        assert!(occ.windows(2).all(|w| w[0] < w[1]));
+        assert!(occ[0] > Utc::now());
+
+        // `ending` caps the list. Far-future window so it's deterministic
+        // regardless of the machine clock/timezone.
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 12;
+        c.starting = Some(utc_dt(2099, 6, 1, 0, 0));
+        c.ending = Some(utc_dt(2099, 6, 3, 23, 0));
+        let occ = next_occurrences(&c, 10);
+        // Noon-local on Jun 1/2/3 always falls inside [00:00 Jun 1, 23:00 Jun 3] UTC.
+        assert_eq!(occ.len(), 3);
+        assert!(occ.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn max_occurrences_caps_runs_from_start() {
+        // Daily at noon, starting in the future, stop after 3 occurrences.
+        let mut c = cfg(Frequency::Days);
+        c.at_hour = 12;
+        c.timezone = Some("UTC".to_string());
+        c.starting = Some(utc_dt(2099, 6, 1, 0, 0));
+        c.max_occurrences = Some(3);
+        // Preview returns exactly the 3 allowed runs (Jun 1/2/3), not more.
+        assert_eq!(next_occurrences(&c, 10).len(), 3);
+        // The effective end is the 3rd fire; no `ending` set on its own.
+        let end = effective_ending(&c).expect("bounded by occurrence count");
+        assert_eq!(end, utc_dt(2099, 6, 3, 12, 0));
+        // max=0 / no starting → unbounded (ignored).
+        let mut c2 = cfg(Frequency::Days);
+        c2.max_occurrences = Some(0);
+        assert!(effective_ending(&c2).is_none());
+        let mut c3 = cfg(Frequency::Days);
+        c3.max_occurrences = Some(3); // no starting
+        assert!(effective_ending(&c3).is_none());
+    }
+
+    #[test]
+    fn should_run_config_start_end_gating() {
+        let mut c = cfg(Frequency::Minutes);
+        c.interval = 1;
+        // Starts in the future → never fires now.
+        c.starting = Some(Utc::now() + chrono::Duration::hours(1));
+        assert!(!should_run_config(&c, DateTime::UNIX_EPOCH));
+        // Ended in the past → never fires now.
+        let mut c = cfg(Frequency::Minutes);
+        c.ending = Some(Utc::now() - chrono::Duration::hours(1));
+        assert!(!should_run_config(&c, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn should_run_config_interval_fires_after_elapsed() {
+        let mut c = cfg(Frequency::Minutes);
+        c.interval = 30;
+        // last_run 31 min ago → due.
+        assert!(should_run_config(
+            &c,
+            Utc::now() - chrono::Duration::minutes(31)
+        ));
+        // last_run 5 min ago → not due.
+        assert!(!should_run_config(
+            &c,
+            Utc::now() - chrono::Duration::minutes(5)
+        ));
+    }
+
+    #[test]
+    fn schedule_config_serde_roundtrip_yaml() {
+        let mut c = cfg(Frequency::Weeks);
+        c.days_of_week = vec![1, 3, 5];
+        c.at_hour = 9;
+        c.at_minute = 30;
+        c.timezone = Some("Europe/London".to_string());
+        let yaml = serde_yaml::to_string(&c).unwrap();
+        let back: ScheduleConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(c, back);
+        // Frequency serializes lowercase.
+        assert!(yaml.contains("frequency: weeks"));
+    }
+
+    #[test]
+    fn pipe_config_schedule_config_optional_in_frontmatter() {
+        // Absent schedule_config deserializes to None (legacy pipes).
+        let yaml = "schedule: every 30m\nenabled: true\n";
+        let pc: PipeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(pc.schedule_config.is_none());
+        // Present nested block deserializes.
+        let yaml = "schedule: manual\nenabled: true\nschedule_config:\n  frequency: days\n  interval: 1\n  at_hour: 9\n  at_minute: 0\n";
+        let pc: PipeConfig = serde_yaml::from_str(yaml).unwrap();
+        let sc = pc.schedule_config.expect("parsed");
+        assert_eq!(sc.frequency, Frequency::Days);
+        assert_eq!(sc.at_hour, 9);
+    }
+
     #[test]
     fn test_should_run_once_in_past_unfired() {
         // Past timestamp within the freshness window (30m < ONE_OFF_STALE_THRESHOLD),
@@ -6692,6 +7423,7 @@ mod tests {
             provider: None,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
+            schedule_config: None,
             config: HashMap::new(),
             connections: vec![],
             timeout: None,
@@ -6725,6 +7457,7 @@ mod tests {
             provider: None,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
+            schedule_config: None,
             config: HashMap::new(),
             connections: vec![],
             timeout: None,
@@ -6751,6 +7484,7 @@ mod tests {
             provider: None,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
+            schedule_config: None,
             config: HashMap::new(),
             connections: vec![],
             timeout: None,
@@ -6785,6 +7519,7 @@ mod tests {
             provider: None,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
+            schedule_config: None,
             config: HashMap::new(),
             connections: vec![],
             timeout: None,
@@ -6888,6 +7623,7 @@ mod tests {
                 provider: None,
                 preset: vec![],
                 permissions: PipePermissionsConfig::default(),
+                schedule_config: None,
                 config: HashMap::new(),
                 connections: vec![],
                 timeout: None,
@@ -7253,6 +7989,41 @@ mod tests {
         let t = config2.trigger.unwrap();
         assert_eq!(t.events, vec!["new_event"]);
         assert_eq!(t.custom, vec!["when I open chrome"]);
+    }
+
+    #[test]
+    fn test_update_config_schedule_config_persists_and_roundtrips() {
+        // Mirrors the update_config "schedule_config" arm: a structured config
+        // survives serialize → re-parse, and the legacy string is parked at
+        // "manual" so the front-matter never contradicts it.
+        let content = "---\nschedule: every 1h\nenabled: true\n---\n\nTest";
+        let (mut config, body) = parse_frontmatter(content).unwrap();
+
+        let sc_json = serde_json::json!({
+            "frequency": "weeks",
+            "interval": 2,
+            "days_of_week": [1, 3],
+            "at_hour": 9,
+            "at_minute": 30,
+            "timezone": "Europe/London"
+        });
+        config.schedule_config = Some(serde_json::from_value::<ScheduleConfig>(sc_json).unwrap());
+        config.schedule = "manual".to_string();
+
+        // Not leaked into the extras catch-all.
+        assert!(!config.config.contains_key("schedule_config"));
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        let (config2, _) = parse_frontmatter(&serialized).unwrap();
+        let sc = config2
+            .schedule_config
+            .expect("schedule_config round-trips");
+        assert_eq!(sc.frequency, Frequency::Weeks);
+        assert_eq!(sc.interval, 2);
+        assert_eq!(sc.days_of_week, vec![1, 3]);
+        assert_eq!(sc.at_minute, 30);
+        assert_eq!(sc.timezone.as_deref(), Some("Europe/London"));
+        assert_eq!(config2.schedule, "manual");
     }
 
     #[test]

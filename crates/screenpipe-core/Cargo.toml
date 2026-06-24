@@ -60,6 +60,7 @@ cron = "0.13.0"
 
 serde_yaml = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = "0.10"
 tempfile = { workspace = true }
 
 [features]

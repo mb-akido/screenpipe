@@ -856,6 +856,33 @@ fn compute_next_timeout(
     min_ms.max(1) // avoid 0 (which means infinite in Win32)
 }
 
+/// Process names (lowercased, with extension) of apps whose in-process UI Automation
+/// providers crash the *host* process when an external client materializes their full
+/// subtree via a cached `TreeScope_Subtree` request.
+///
+/// Outlook Classic (`OUTLOOK.EXE`) is the documented case: users reported Outlook
+/// crashing whenever they opened the **Sent Items** folder while screenpipe was
+/// recording, and that ending the screenpipe process made the crash disappear. Its
+/// virtualized message-list provider re-enters and faults when we cache the whole grid
+/// in one cross-process call (Sent Items is worst — its recipient column resolves
+/// "person" objects). This mirrors long-standing Outlook quirks that screen readers
+/// (NVDA/JAWS) have had to special-case.
+///
+/// We skip only the a11y *tree* capture for these apps: input, app-switch, window-focus
+/// and clipboard events still flow, and OCR still captures the on-screen content, so the
+/// signal loss is minimal while the crash is eliminated.
+///
+/// This targets Outlook *Classic* only. The "new" Outlook (`olk.exe`) is a WebView2 app
+/// with a different provider and is unaffected.
+const FRAGILE_UIA_TREE_PROVIDERS: &[&str] = &["outlook.exe"];
+
+/// Returns true if `app_name` is a process whose UIA provider can crash when we capture
+/// its full accessibility tree. See [`FRAGILE_UIA_TREE_PROVIDERS`].
+fn is_fragile_uia_tree_provider(app_name: &str) -> bool {
+    let lower = app_name.to_ascii_lowercase();
+    FRAGILE_UIA_TREE_PROVIDERS.iter().any(|p| lower == *p)
+}
+
 /// Capture a window tree and send it through the channel if it changed.
 fn capture_and_send(
     uia: &UiaContext,
@@ -879,6 +906,18 @@ fn capture_and_send(
     // Check exclusions before making UIA tree calls. Some apps expose slow or
     // buggy providers, so the guard needs to happen before ElementFromHandle.
     if !config.should_capture_target(&app_name, window_title.as_deref()) {
+        return;
+    }
+
+    // Skip the full-subtree walk for apps with fragile UIA providers that crash their
+    // own host process when we materialize the tree (e.g. Outlook Classic on Sent
+    // Items — see is_fragile_uia_tree_provider). Other event capture and OCR are
+    // unaffected, so we lose only the a11y tree for these apps, not the crash.
+    if is_fragile_uia_tree_provider(&app_name) {
+        trace!(
+            "Skipping a11y tree capture for fragile UIA provider '{}' (crash-prone)",
+            app_name
+        );
         return;
     }
 
@@ -1056,6 +1095,23 @@ mod tests {
         assert_eq!(control_type_id_to_name(50020), "Text");
         assert_eq!(control_type_id_to_name(50032), "Window");
         assert_eq!(control_type_id_to_name(99999), "Unknown");
+    }
+
+    #[test]
+    fn test_fragile_uia_provider_detection() {
+        // Outlook Classic crashes its own process when we walk its tree (Sent Items).
+        // Match must be case-insensitive — szExeFile yields "OUTLOOK.EXE".
+        assert!(is_fragile_uia_tree_provider("OUTLOOK.EXE"));
+        assert!(is_fragile_uia_tree_provider("outlook.exe"));
+        assert!(is_fragile_uia_tree_provider("Outlook.exe"));
+
+        // Must NOT over-match: the "new" Outlook (olk.exe) is a WebView2 app with a
+        // different provider, and unrelated apps must keep their tree capture.
+        assert!(!is_fragile_uia_tree_provider("olk.exe"));
+        assert!(!is_fragile_uia_tree_provider("OUTLOOK")); // no extension → not our exact match
+        assert!(!is_fragile_uia_tree_provider("chrome.exe"));
+        assert!(!is_fragile_uia_tree_provider("notepad.exe"));
+        assert!(!is_fragile_uia_tree_provider(""));
     }
 
     #[test]

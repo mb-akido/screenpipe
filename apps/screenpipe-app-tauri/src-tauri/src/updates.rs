@@ -226,6 +226,17 @@ const AUTO_UPDATE_GATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// try again" than to block the click indefinitely.
 const BANNER_GATE_TIMEOUT_SECS: u64 = 60;
 
+/// Cooldown after an update *download/install* fails for a non-auth reason.
+/// The periodic check runs every 5 min; without this, a machine that can
+/// download the bundle but can't apply it (signature/Gatekeeper/permission
+/// issue) re-downloads the same version every cycle forever — one stuck
+/// machine produced ~1,400 re-downloads of a single version in 4 days and
+/// inflated the `app_downloaded` metric ~12x. While a version is in cooldown
+/// we still hit the cheap CHECK endpoint but skip the binary download until
+/// the window elapses, a newer version ships, or the user retries manually
+/// (which passes `force=true`). In-memory only — a restart re-attempts once.
+const UPDATE_FAILURE_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Wait for boot to reach "ready" or "error", with timeout. Logs the
 /// outcome with `label` so deferrals are searchable in support logs.
 pub async fn await_restart_gate(timeout: Duration, label: &str) -> RestartGate {
@@ -303,6 +314,19 @@ pub async fn restart_for_update(
     Ok("proceed".to_string())
 }
 
+/// Decide whether a detected update version is still inside the post-failure
+/// cooldown and should NOT be auto-re-downloaded. Pure (takes the elapsed
+/// duration rather than reading the clock) so it's unit-testable without an
+/// AppHandle. `last_failed` is `(version, time-since-failure)` for the most
+/// recent failed download, or `None` if nothing has failed.
+fn failed_version_in_cooldown(
+    last_failed: Option<(&str, Duration)>,
+    version: &str,
+    cooldown: Duration,
+) -> bool {
+    matches!(last_failed, Some((v, elapsed)) if v == version && elapsed < cooldown)
+}
+
 fn auto_update_enabled_from_settings(settings: Result<Option<SettingsStore>, String>) -> bool {
     settings
         .ok()
@@ -338,6 +362,10 @@ pub struct UpdatesManager {
     pending_update: Arc<Mutex<Option<PendingUpdateSnapshot>>>,
     /// Prevents concurrent check_for_updates calls (boot check + periodic race)
     is_checking: AtomicBool,
+    /// (version, when-it-failed) for the last update whose download/install
+    /// failed for a non-auth reason. Gates the periodic loop from re-downloading
+    /// the same broken version every 5 min — see `UPDATE_FAILURE_COOLDOWN`.
+    last_failed_update: Arc<Mutex<Option<(String, std::time::Instant)>>>,
 }
 
 impl UpdatesManager {
@@ -365,12 +393,17 @@ impl UpdatesManager {
             app: app.clone(),
             update_menu_item,
             is_checking: AtomicBool::new(false),
+            last_failed_update: Arc::new(Mutex::new(None)),
         })
     }
 
+    /// `force` = user-initiated check (tray/dock/Settings). Bypasses the
+    /// post-failure cooldown so "click to retry" always re-attempts the
+    /// download; periodic and boot checks pass `false`.
     pub async fn check_for_updates(
         &self,
         show_dialog: bool,
+        force: bool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         // Prevent concurrent update checks (boot check + periodic/manual race)
         if self
@@ -473,6 +506,38 @@ impl UpdatesManager {
             }
         }
         if let Ok(Some(update)) = check_result {
+            // Cooldown gate: if this exact version recently failed to
+            // download/install, don't auto-re-download it every 5 min. A
+            // user-initiated check (`force`) always bypasses this so "click to
+            // retry" works. We intentionally leave `update_available` false so
+            // the periodic loop keeps polling the cheap CHECK endpoint and
+            // resumes downloading once the window elapses or a newer version
+            // ships — but we skip the expensive binary fetch (and the
+            // `app_downloaded` event it triggers) until then.
+            if !force {
+                let in_cooldown = {
+                    let guard = self.last_failed_update.lock().await;
+                    failed_version_in_cooldown(
+                        guard.as_ref().map(|(v, at)| (v.as_str(), at.elapsed())),
+                        &update.version,
+                        UPDATE_FAILURE_COOLDOWN,
+                    )
+                };
+                if in_cooldown {
+                    info!(
+                        "update v{} recently failed to install; skipping auto-download \
+                         (cooldown {}h) — click 'check for updates' to retry",
+                        update.version,
+                        UPDATE_FAILURE_COOLDOWN.as_secs() / 3600
+                    );
+                    if let Some(ref item) = self.update_menu_item {
+                        item.set_enabled(true)?;
+                        item.set_text("Update failed — click to retry")?;
+                    }
+                    return Result::Ok(false);
+                }
+            }
+
             *self.update_available.lock().await = true;
             *self.pending_update.lock().await = Some(PendingUpdateSnapshot {
                 version: update.version.clone(),
@@ -643,8 +708,18 @@ impl UpdatesManager {
                                 || err_str.contains("403")
                                 || err_str.contains("Unauthorized")
                                 || err_str.contains("Forbidden");
+                            // Signature/verification/corrupt-bundle failures are not
+                            // transient either: re-downloading the same broken bundle
+                            // just wastes bandwidth and fires another app_downloaded.
+                            // Bail out immediately like auth errors do.
+                            let is_unrecoverable = is_auth
+                                || err_str.contains("signature")
+                                || err_str.contains("Signature")
+                                || err_str.contains("verif")
+                                || err_str.contains("minisign")
+                                || err_str.contains("corrupt");
                             let next_delay = retry_delays.get(attempt).copied();
-                            if is_auth || next_delay.is_none() {
+                            if is_unrecoverable || next_delay.is_none() {
                                 break result;
                             }
                             let delay = next_delay.unwrap();
@@ -669,6 +744,8 @@ impl UpdatesManager {
 
             match download_result {
                 Ok(_) => {
+                    // Clear any prior failure marker — this version is good now.
+                    *self.last_failed_update.lock().await = None;
                     *self.update_installed.lock().await = true;
                     if let Some(snap) = self.pending_update.lock().await.as_mut() {
                         snap.downloaded = true;
@@ -712,10 +789,15 @@ impl UpdatesManager {
                         }
                         return Ok(false);
                     }
-                    // Generic failure (network/disk/server). Clear latched state
-                    // so the periodic loop and tray can retry without an app
-                    // restart, and tell the user what happened.
+                    // Generic failure (network/disk/server/signature). Clear
+                    // latched state so the periodic loop and tray can retry
+                    // without an app restart, and tell the user what happened.
+                    // Record the failed version so the cooldown gate above stops
+                    // us from re-downloading this same broken bundle every 5 min
+                    // (the auto-update download-loop fix).
                     warn!("update download failed after retries: {}", err_str);
+                    *self.last_failed_update.lock().await =
+                        Some((update.version.clone(), std::time::Instant::now()));
                     *self.update_available.lock().await = false;
                     *self.pending_update.lock().await = None;
                     if let Some(ref item) = self.update_menu_item {
@@ -894,7 +976,7 @@ impl UpdatesManager {
             interval.tick().await;
             if !*self.update_available.lock().await {
                 // Don't show dialog for periodic checks - only for manual checks
-                if let Err(e) = self.check_for_updates(false).await {
+                if let Err(e) = self.check_for_updates(false, false).await {
                     // warn, not error — see updater check() note above.
                     warn!("Failed to check for updates: {}", e);
                 }
@@ -1028,7 +1110,9 @@ pub async fn trigger_update_check(
     state: tauri::State<'_, Arc<UpdatesManager>>,
 ) -> Result<bool, String> {
     state
-        .check_for_updates(false)
+        // User clicked "check for updates" in Settings — force past the
+        // post-failure cooldown so a manual retry always re-attempts.
+        .check_for_updates(false, true)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1055,7 +1139,7 @@ pub fn start_update_check(
     tokio::spawn({
         let updates_manager = updates_manager.clone();
         async move {
-            if let Err(e) = updates_manager.check_for_updates(false).await {
+            if let Err(e) = updates_manager.check_for_updates(false, false).await {
                 // warn, not error — see updater check() note above.
                 warn!("Failed to check for updates: {}", e);
             }
@@ -1077,6 +1161,44 @@ pub fn start_update_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn cooldown_blocks_same_version_within_window() {
+        // v2.5.57 failed 1h ago, 6h cooldown → still blocked (the loop fix).
+        assert!(failed_version_in_cooldown(
+            Some(("2.5.57", HOUR)),
+            "2.5.57",
+            UPDATE_FAILURE_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn cooldown_ignores_a_newer_version() {
+        // A newer version than the one that failed must download immediately.
+        assert!(!failed_version_in_cooldown(
+            Some(("2.5.57", HOUR)),
+            "2.5.62",
+            UPDATE_FAILURE_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn cooldown_absent_when_nothing_failed() {
+        assert!(!failed_version_in_cooldown(None, "2.5.57", UPDATE_FAILURE_COOLDOWN));
+    }
+
+    #[test]
+    fn cooldown_expires_after_window() {
+        // Same version, but the failure was longer ago than the cooldown →
+        // auto-download resumes.
+        assert!(!failed_version_in_cooldown(
+            Some(("2.5.57", Duration::from_secs(7 * 3600))),
+            "2.5.57",
+            UPDATE_FAILURE_COOLDOWN
+        ));
+    }
 
     #[test]
     fn auto_update_setting_respects_false() {

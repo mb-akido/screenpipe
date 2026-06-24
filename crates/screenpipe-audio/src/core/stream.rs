@@ -76,6 +76,13 @@ pub struct AudioStream {
     stream_control: mpsc::Sender<StreamControl>,
     stream_thread: Option<Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>>,
     pub is_disconnected: Arc<AtomicBool>,
+    /// True when this stream is backed by the cpal/ScreenCaptureKit path
+    /// (the default), false when it is backed by the CoreAudio Process Tap.
+    /// The macOS System Audio liveness watchdog ([`super::sck_output_watchdog`])
+    /// keys off a display-anchor signal that is meaningless for the tap (which
+    /// is anchored to the default output *device*, not a display), so it must
+    /// only run for SCK-backed streams. The tap has its own silence watchdog.
+    pub is_sck_backed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,7 +152,7 @@ impl AudioStream {
         let (stream_control_tx, stream_control_rx) = mpsc::channel();
 
         #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
-        let (audio_config, stream_thread) = {
+        let (audio_config, stream_thread, is_sck_backed) = {
             let config = super::pulse::get_pulse_device_config(&device)?;
             let thread = super::pulse::spawn_pulse_capture_thread(
                 (*device).clone(),
@@ -156,11 +163,12 @@ impl AudioStream {
             )?;
             // Drop the unused receiver so stop() doesn't block on it
             drop(stream_control_rx);
-            (config, thread)
+            // PulseAudio (Linux) is not SCK; the macOS SCK watchdog never runs here.
+            (config, thread, false)
         };
 
         #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
-        let (audio_config, stream_thread) = {
+        let (audio_config, stream_thread, is_sck_backed) = {
             // macOS 14.4+: try CoreAudio Process Tap for System Audio.
             // Bypasses SCK display enumeration which fails after sleep/wake.
             // Gated behind `use_coreaudio_tap` so the SCK path stays the
@@ -186,11 +194,12 @@ impl AudioStream {
                     ) {
                         Ok((config, thread)) => {
                             drop(stream_control_rx);
-                            (config, thread)
+                            // Process Tap backend → not SCK-backed.
+                            (config, thread, false)
                         }
                         Err(e) => {
                             tracing::warn!("Process Tap failed, falling back to SCK: {}", e);
-                            Self::start_cpal_stream(
+                            let (config, thread) = Self::start_cpal_stream(
                                 &device,
                                 tx,
                                 stream_control_rx,
@@ -200,7 +209,8 @@ impl AudioStream {
                                 windows_input_aec,
                                 macos_input_vpio,
                             )
-                            .await?
+                            .await?;
+                            (config, thread, true)
                         }
                     }
                 }
@@ -209,7 +219,7 @@ impl AudioStream {
                     unreachable!()
                 }
             } else {
-                Self::start_cpal_stream(
+                let (config, thread) = Self::start_cpal_stream(
                     &device,
                     tx,
                     stream_control_rx,
@@ -219,7 +229,8 @@ impl AudioStream {
                     windows_input_aec,
                     macos_input_vpio,
                 )
-                .await?
+                .await?;
+                (config, thread, true)
             }
         };
 
@@ -230,6 +241,7 @@ impl AudioStream {
             stream_control: stream_control_tx,
             stream_thread: Some(Arc::new(tokio::sync::Mutex::new(Some(stream_thread)))),
             is_disconnected,
+            is_sck_backed,
         })
     }
 
@@ -610,6 +622,7 @@ impl AudioStream {
             stream_control: stream_control_tx,
             stream_thread: None,
             is_disconnected: Arc::new(AtomicBool::new(false)),
+            is_sck_backed: false,
         };
         (stream, tx_arc)
     }
@@ -688,6 +701,8 @@ impl AudioStream {
             // shape so `stop()` can abort the playback task uniformly.
             stream_thread: Some(Arc::new(tokio::sync::Mutex::new(Some(thread)))),
             is_disconnected,
+            // wav playback fixture is an input device, never the SCK output path.
+            is_sck_backed: false,
         })
     }
 } // end impl AudioStream

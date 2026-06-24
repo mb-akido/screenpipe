@@ -879,6 +879,7 @@ mod tests {
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
+            schedule_config: None,
             config: std::collections::HashMap::new(),
         };
         let perms = PipePermissions::from_config(&config);
@@ -907,6 +908,7 @@ mod tests {
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
+            schedule_config: None,
             config: std::collections::HashMap::new(),
         };
         let perms = PipePermissions::from_config(&config);
@@ -947,6 +949,7 @@ mod tests {
             privacy_filter: false,
             artifacts: vec![],
             trigger: None,
+            schedule_config: None,
             config: std::collections::HashMap::new(),
         };
         let perms = PipePermissions::from_config(&config);

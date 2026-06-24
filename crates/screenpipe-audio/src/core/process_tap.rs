@@ -587,6 +587,11 @@ impl Drop for ProcessTapCapture {
 /// device it's anchored to (so callers can detect when the default changes),
 /// and the exclusion snapshot the tap was built with (so callers can detect
 /// when the exclusion list drifts and a rebuild is needed).
+///
+/// The user-configured exclusion list is always augmented with Screenpipe's
+/// own CoreAudio process object. Other tap-based meeting recorders do this by
+/// default to avoid recapturing their own playback, notifications, or live
+/// monitoring audio into the meeting/system stream.
 fn build_capture(
     tx: broadcast::Sender<Vec<f32>>,
     is_disconnected: Arc<AtomicBool>,
@@ -605,14 +610,20 @@ fn build_capture(
     debug!("Process Tap: anchoring to '{}'", output_uid_str);
 
     let snapshot = exclusions::snapshot();
-    let excluded_array = exclusions::build_exclusion_array(&snapshot.audio_object_ids);
+    let self_process_id = current_process_audio_object_id();
+    let exclusion_ids =
+        merge_exclusion_audio_object_ids(snapshot.audio_object_ids.clone(), self_process_id);
+    let excluded_array = exclusions::build_exclusion_array(&exclusion_ids);
     if !snapshot.bundle_ids.is_empty() {
         info!(
-            "Process Tap: excluding {} bundle ID(s), resolved to {} AudioObjectID(s): {:?}",
+            "Process Tap: excluding {} bundle ID(s), resolved to {} AudioObjectID(s), self_excluded={}: {:?}",
             snapshot.bundle_ids.len(),
             snapshot.audio_object_ids.len(),
+            self_process_id.is_some(),
             snapshot.bundle_ids
         );
+    } else if self_process_id.is_some() {
+        debug!("Process Tap: excluding Screenpipe's own audio process");
     }
     let tap_desc = ca::TapDesc::with_stereo_global_tap_excluding_processes(&excluded_array);
     let tap = tap_desc.create_process_tap().map_err(|s| {
@@ -704,6 +715,24 @@ fn build_capture(
     };
 
     Ok((capture, config, output_uid_str, snapshot))
+}
+
+fn current_process_audio_object_id() -> Option<u32> {
+    let process = ca::Process::with_pid(std::process::id() as i32).ok()?;
+    let ca::Obj(id) = *process;
+    (id != 0).then_some(id)
+}
+
+fn merge_exclusion_audio_object_ids(
+    mut configured: Vec<u32>,
+    self_process_id: Option<u32>,
+) -> Vec<u32> {
+    if let Some(id) = self_process_id {
+        configured.push(id);
+    }
+    configured.sort_unstable();
+    configured.dedup();
+    configured
 }
 
 /// Create and start a CoreAudio Process Tap for system audio capture.
@@ -985,5 +1014,72 @@ mod tests {
         // Timed out, so the full deadline must have elapsed and the caller
         // (Drop) would leak the ctx instead of freeing it.
         assert!(start.elapsed() >= std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn merge_exclusion_audio_object_ids_adds_self_and_dedupes() {
+        assert_eq!(
+            merge_exclusion_audio_object_ids(vec![42, 7, 42], Some(7)),
+            vec![7, 42]
+        );
+    }
+
+    #[test]
+    fn merge_exclusion_audio_object_ids_preserves_configured_when_self_unavailable() {
+        assert_eq!(
+            merge_exclusion_audio_object_ids(vec![3, 1, 3], None),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn coreaudio_tap_description_excludes_current_process() {
+        if !is_process_tap_available() {
+            eprintln!("skipping: CoreAudio Process Tap is unavailable on this macOS version");
+            return;
+        }
+
+        let Some(self_process_id) = current_process_audio_object_id() else {
+            panic!("current process did not translate to a CoreAudio process object");
+        };
+
+        let exclusion_ids = merge_exclusion_audio_object_ids(Vec::new(), Some(self_process_id));
+        let excluded_array = exclusions::build_exclusion_array(&exclusion_ids);
+        let tap_desc = ca::TapDesc::with_stereo_global_tap_excluding_processes(&excluded_array);
+
+        assert!(
+            tap_desc.is_exclusive(),
+            "global-excluding tap must be exclusive"
+        );
+        assert!(
+            tap_desc
+                .processes()
+                .iter()
+                .any(|n| n.as_u32() == self_process_id),
+            "pre-create tap description must include current process AudioObjectID {self_process_id}"
+        );
+
+        let tap = tap_desc
+            .create_process_tap()
+            .unwrap_or_else(|status| {
+                panic!(
+                    "CoreAudio refused to create process tap ({status:?}); this test creates a tap description but does not start aggregate-device recording"
+                )
+            });
+
+        let created_desc = tap
+            .desc()
+            .expect("created CoreAudio tap should expose its CATapDescription");
+        assert!(
+            created_desc.is_exclusive(),
+            "created CoreAudio tap must remain a global-excluding tap"
+        );
+        assert!(
+            created_desc
+                .processes()
+                .iter()
+                .any(|n| n.as_u32() == self_process_id),
+            "created CoreAudio tap description must contain current process AudioObjectID {self_process_id}"
+        );
     }
 }

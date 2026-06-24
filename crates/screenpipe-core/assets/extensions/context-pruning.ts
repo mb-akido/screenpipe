@@ -37,6 +37,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // 30K chars ≈ 7-8K tokens — leaves room for the model to work.
 const TOOL_RESULT_WARN_CHARS = 30_000;
 
+// Tools exempt from the oversized-result feedback. The feedback tells the model
+// to retry with narrower filters (smaller limit, shorter time range,
+// content_type, q query) — guidance that only makes sense for the screenpipe
+// data/search tools. A file `read` is NOT narrowable that way: the model asked
+// for one specific file and needs its contents. It's also already size-capped
+// by pi's read tool (2000 lines / 50KB), so it can never blow the window, and
+// the single-message clamp below is a further backstop. Without this exemption
+// an agent literally cannot read its own skill once it grows past 30K chars —
+// e.g. the morning-brief pipe failing to read screenpipe-api/SKILL.md (~33K).
+const TOOL_RESULT_GUARD_SKIP_TOOLS = new Set(["read"]);
+
 // In the context event we aggressively prune tool results from older turns.
 // Only keep full results for the N most recent messages.
 const KEEP_RECENT_MESSAGES = 30;
@@ -157,6 +168,12 @@ export default function (pi: ExtensionAPI) {
   // time range, specific content_type, etc.)
   pi.on("tool_result", async (event) => {
     if (!event.content || !Array.isArray(event.content)) return;
+
+    // Don't lecture the model to "narrow its filters" for a file read — it's
+    // not a narrowable query, and pi already caps read output at 2000 lines /
+    // 50KB. (Was breaking agents reading their own skill files, e.g. the
+    // morning-brief pipe couldn't read screenpipe-api/SKILL.md once it hit 33K.)
+    if (event.toolName && TOOL_RESULT_GUARD_SKIP_TOOLS.has(event.toolName)) return;
 
     let totalChars = 0;
     for (const item of event.content) {

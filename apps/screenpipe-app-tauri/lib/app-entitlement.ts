@@ -231,16 +231,25 @@ export function normalizePlanLabel(plan: string | null | undefined) {
 // The pricing page (app/onboarding) renames the tiers: standard→"Basic",
 // pro→"Business", enterprise→"Enterprise". Keep this in sync with the Rust
 // `plan_display_name` in src-tauri/src/tray.rs.
-export function planDisplayName(plan: string | null | undefined): string {
+//
+// `team`/`enterprise` are org/license-derived: the consumer build has no
+// self-serve Team/Enterprise product, so an account entitled via an enterprise
+// org (which still gets Business-equivalent features here) is shown as
+// "Business". Pass `isEnterpriseBuild` (the enterprise build) to surface the
+// real org label.
+export function planDisplayName(
+  plan: string | null | undefined,
+  isEnterpriseBuild = false,
+): string {
   switch ((plan || "none").toLowerCase()) {
     case "standard":
       return "Basic";
     case "pro":
       return "Business";
     case "team":
-      return "Team";
+      return isEnterpriseBuild ? "Team" : "Business";
     case "enterprise":
-      return "Enterprise";
+      return isEnterpriseBuild ? "Enterprise" : "Business";
     case "lifetime":
       return "Lifetime";
     default:

@@ -63,7 +63,7 @@ import { parsePipeSessionId } from "@/lib/events/types";
 import { ChatPrefillData } from "@/lib/chat-utils";
 import { commands } from "@/lib/utils/tauri";
 import { cn } from "@/lib/utils";
-import { humanizeDow, humanizeSchedule, parseHumanSchedule } from "@/lib/utils/schedule-format";
+import { describeSchedule, type ScheduleConfig } from "@/lib/utils/schedule-builder";
 import {
   PipeActivityIndicator,
   formatPipeElapsed,
@@ -331,6 +331,9 @@ function buildRemixPrompt(pipeName: string): string {
 interface PipeConfig {
   name: string;
   schedule: string;
+  /** Structured recurrence (Notion-style builder). Authoritative when present;
+   *  otherwise the legacy `schedule` string is used. */
+  schedule_config?: ScheduleConfig | null;
   enabled: boolean;
   agent: string;
   model: string;
@@ -935,6 +938,17 @@ function PipePresetSelector({
   );
 }
 
+/** Does this pipe have any (structured or legacy) schedule, vs. manual? */
+function pipeHasSchedule(config: PipeConfig): boolean {
+  return !!config.schedule_config || (!!config.schedule && config.schedule !== "manual");
+}
+
+/** Compact label for a pipe's current schedule (structured config preferred). */
+function pipeScheduleLabel(config: PipeConfig): string {
+  return describeSchedule(config.schedule_config ?? null, config.schedule);
+}
+
+
 export function PipesSection() {
   // Device selector: null = local machine, string = remote address
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
@@ -991,9 +1005,9 @@ export function PipesSection() {
     !!(p.config.trigger?.custom?.length) ||
     !!(p.config.trigger?.sources?.length);
   const isScheduledPipe = (p: PipeStatus) =>
-    !!p.config.schedule && p.config.schedule !== "manual" && !isTriggeredPipe(p);
+    pipeHasSchedule(p.config) && !isTriggeredPipe(p);
   const isManualPipe = (p: PipeStatus) =>
-    (!p.config.schedule || p.config.schedule === "manual") && !isTriggeredPipe(p);
+    !pipeHasSchedule(p.config) && !isTriggeredPipe(p);
   // "Automated" groups scheduled + event/connection-triggered pipes — anything
   // that runs on its own. Manual (run-on-demand) stands apart.
   const isAutomatedPipe = (p: PipeStatus) =>
@@ -2255,21 +2269,21 @@ export function PipesSection() {
                     pipe.config.trigger?.events?.length || pipe.config.trigger?.custom?.length
                       ? `triggers: ${[...(pipe.config.trigger?.events || []), ...(pipe.config.trigger?.custom || [])].join(", ")}`
                       : "",
-                    pipe.config.schedule && pipe.config.schedule !== "manual" ? `schedule: ${humanizeSchedule(pipe.config.schedule)}` : "",
+                    pipeHasSchedule(pipe.config) ? `schedule: ${pipeScheduleLabel(pipe.config)}` : "",
                   ].filter(Boolean).join(" | ") || "manual"}
                 >
                   {(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0) > 0 ? (
                     `› ${(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)} trigger${((pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)) > 1 ? "s" : ""}`
-                  ) : pipe.config.schedule && pipe.config.schedule !== "manual" ? (
+                  ) : pipeHasSchedule(pipe.config) ? (
                     <>
                       <Clock className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                      {humanizeSchedule(pipe.config.schedule)}
+                      {pipeScheduleLabel(pipe.config)}
                     </>
                   ) : (
                     "manual"
                   )}
-                  {(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0) > 0 && pipe.config.schedule && pipe.config.schedule !== "manual" ? (
-                    <span className="text-muted-foreground/50"> + {humanizeSchedule(pipe.config.schedule)}</span>
+                  {(pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0) > 0 && pipeHasSchedule(pipe.config) ? (
+                    <span className="text-muted-foreground/50"> + {pipeScheduleLabel(pipe.config)}</span>
                   ) : null}
                 </span>
 
@@ -2548,266 +2562,47 @@ export function PipesSection() {
                       {/* ═══ CONFIG TAB ═══ */}
                       <TabsContent value="config" className="mt-4 space-y-6">
 
-                        {/* Model */}
-                        <PipePresetSelector
-                          pipe={pipe}
-                          setPipes={setPipes}
-                          fetchPipes={fetchPipes}
-                          pendingConfigSaves={pendingConfigSaves}
+                        {/* Triggers — Notion-style picker (schedule, events + per-app connection sources) */}
+                        <PipeTriggerPicker
+                          pipeName={pipe.config.name}
+                          trigger={pipe.config.trigger}
                           apiBase={apiBase}
-                        />
-
-                        {/* Schedule */}
-                        <div>
-                      <Label className="text-xs flex items-center gap-1.5 mb-1 cursor-help" title={((pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)) > 0 ? "runs on this schedule in addition to triggers" : "how often to run this pipe"}>
-                        schedule
-                        {((pipe.config.trigger?.events?.length || 0) + (pipe.config.trigger?.custom?.length || 0)) > 0 && pipe.config.schedule && pipe.config.schedule !== "manual" && (
-                          <span className="text-muted-foreground font-normal">+ triggers</span>
-                        )}
-                      </Label>
-                      <Select
-                        value={pipe.config.schedule || "manual"}
-                        onValueChange={(value) => {
-                          const pipeName = pipe.config.name;
-                          setPipes((prev) =>
-                            prev.map((p) =>
-                              p.config.name === pipeName
-                                ? { ...p, config: { ...p.config, schedule: value } }
-                                : p
+                          scheduleConfig={pipe.config.schedule_config ?? null}
+                          scheduleString={pipe.config.schedule || "manual"}
+                          otherPipes={pipes
+                            .filter((p) => p.config.name !== pipe.config.name && p.config.enabled)
+                            .map((p) => ({ name: p.config.name }))}
+                          availableConnections={availableConnections}
+                          refreshConnections={async () => {
+                            const next = await fetchAvailablePipeConnections(apiBase, availableConnections);
+                            setAvailableConnections(next);
+                            return next;
+                          }}
+                          fetchPipes={fetchPipes}
+                          applyOptimistic={(t) =>
+                            setPipes((prev) =>
+                              prev.map((p) =>
+                                p.config.name === pipe.config.name
+                                  ? { ...p, config: { ...p.config, trigger: t } }
+                                  : p
+                              )
                             )
-                          );
-                          const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ schedule: value }),
-                          }).then(async () => {
-                            await new Promise((r) => setTimeout(r, 500));
-                            delete pendingConfigSaves.current[pipeName];
-                            fetchPipes();
-                          }).catch(() => {
-                            delete pendingConfigSaves.current[pipeName];
-                          });
-                          pendingConfigSaves.current[pipeName] = savePromise;
-                        }}
-                      >
-                        <SelectTrigger
-                          className="mt-1 h-8 text-xs"
-                        >
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {(() => {
-                            const presets = [
-                              { value: "manual", label: "manual" },
-                              { value: "*/5 8-23 * * *", label: "every 5 min (daytime 8a-11p)" },
-                              { value: "*/15 8-23 * * *", label: "every 15 min (daytime 8a-11p)" },
-                              { value: "*/30 8-23 * * *", label: "every 30 min (daytime 8a-11p)" },
-                              { value: "every 5m", label: "every 5 minutes" },
-                              { value: "every 15m", label: "every 15 minutes" },
-                              { value: "every 30m", label: "every 30 minutes" },
-                              { value: "every 1h", label: "every hour" },
-                              { value: "every 3h", label: "every 3 hours" },
-                              { value: "every day at 9am", label: "every morning (9 AM)" },
-                              { value: "every day at 12pm", label: "every noon (12 PM)" },
-                              { value: "every day at 6pm", label: "every evening (6 PM)" },
-                              { value: "every monday at 9am", label: "every monday (9 AM)" },
-                            ];
-                            const current = pipe.config.schedule || "manual";
-                            const isCustom = !presets.some((p) => p.value === current);
-                            return (
-                              <>
-                                {isCustom && (
-                                  <SelectItem value={current}>{humanizeSchedule(current)} (custom)</SelectItem>
-                                )}
-                                {presets.map((p) => (
-                                  <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
-                                ))}
-                              </>
+                          }
+                          onSaveSchedule={(cfg) => {
+                            setPipes((prev) =>
+                              prev.map((p) =>
+                                p.config.name === pipe.config.name
+                                  ? { ...p, config: { ...p.config, schedule_config: cfg, schedule: "manual" } }
+                                  : p
+                              )
                             );
-                          })()}
-                        </SelectContent>
-                      </Select>
-
-                          {/* Day-of-week picker */}
-                          {pipe.config.schedule && pipe.config.schedule !== "manual" && (() => {
-                            const schedule = pipe.config.schedule;
-                            const cronParts = schedule.trim().split(/\s+/);
-                            const isCron = cronParts.length === 5;
-
-                            // Parse human-readable "every <day> at <time>" schedules
-                            const humanParsed = parseHumanSchedule(schedule);
-                            const humanHour = humanParsed?.hour ?? null;
-
-                            // Extract current day-of-week from cron or human-readable schedule
-                            const currentDow = isCron
-                              ? cronParts[4]
-                              : humanParsed
-                                ? humanParsed.dow
-                                : "*";
-                            const allDays = currentDow === "*";
-                            // Parse active days into a Set
-                            const activeDays = new Set<number>();
-                            if (allDays) {
-                              for (let i = 0; i < 7; i++) activeDays.add(i);
-                            } else {
-                              // Handle ranges (1-5) and lists (1,3,5)
-                              for (const part of currentDow.split(",")) {
-                                if (part.includes("-")) {
-                                  const [a, b] = part.split("-").map(Number);
-                                  for (let i = a; i <= b; i++) activeDays.add(i);
-                                } else {
-                                  activeDays.add(Number(part));
-                                }
-                              }
-                            }
-                            const dayLabels = [
-                              { key: 1, label: "M", name: "Monday" },
-                              { key: 2, label: "T", name: "Tuesday" },
-                              { key: 3, label: "W", name: "Wednesday" },
-                              { key: 4, label: "T", name: "Thursday" },
-                              { key: 5, label: "F", name: "Friday" },
-                              { key: 6, label: "S", name: "Saturday" },
-                              { key: 0, label: "S", name: "Sunday" },
-                            ];
-
-                            const toggleDay = (dayNum: number) => {
-                              const next = new Set(activeDays);
-                              if (next.has(dayNum)) {
-                                next.delete(dayNum);
-                              } else {
-                                next.add(dayNum);
-                              }
-                              if (next.size === 0 || next.size === 7) {
-                                // All days or none → use "*"
-                                const baseParts = isCron ? cronParts.slice(0, 4) : ["*/30", "*", "*", "*"];
-                                // For "every Xm" format, convert to cron first
-                                let newSchedule: string;
-                                if (!isCron) {
-                                  if (humanHour !== null) {
-                                    // "every day/monday at Xam/pm" → cron with all days
-                                    newSchedule = `0 ${humanHour} * * *`;
-                                  } else {
-                                    // Can't add days to simple "every 30m" — keep as is
-                                    if (next.size === 7) return; // already all days
-                                    const everyMatch = schedule.match(/every\s+(\d+)\s*(m|h)/i);
-                                    if (everyMatch) {
-                                      const n = parseInt(everyMatch[1]);
-                                      const unit = everyMatch[2].toLowerCase();
-                                      if (unit === "m") {
-                                        newSchedule = `*/${n} * * * *`;
-                                      } else {
-                                        newSchedule = `0 */${n} * * *`;
-                                      }
-                                    } else {
-                                      return;
-                                    }
-                                  }
-                                } else {
-                                  newSchedule = [...baseParts, "*"].join(" ");
-                                }
-                                const pipeName = pipe.config.name;
-                                setPipes((prev) =>
-                                  prev.map((p) =>
-                                    p.config.name === pipeName
-                                      ? { ...p, config: { ...p.config, schedule: newSchedule } }
-                                      : p
-                                  )
-                                );
-                                const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
-                                  method: "POST",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ schedule: newSchedule }),
-                                }).then(() => {
-                                  delete pendingConfigSaves.current[pipeName];
-                                  fetchPipes();
-                                }).catch(() => {
-                                  delete pendingConfigSaves.current[pipeName];
-                                });
-                                pendingConfigSaves.current[pipeName] = savePromise;
-                                return;
-                              }
-                              // Build day-of-week field
-                              const sorted = Array.from(next).sort((a, b) => a - b);
-                              // Try to compress into range
-                              let dowStr: string;
-                              const isContiguous = sorted.every((v, i) => i === 0 || v === sorted[i - 1] + 1);
-                              if (isContiguous && sorted.length > 2) {
-                                dowStr = `${sorted[0]}-${sorted[sorted.length - 1]}`;
-                              } else {
-                                dowStr = sorted.join(",");
-                              }
-                              let baseParts: string[];
-                              if (isCron) {
-                                baseParts = cronParts.slice(0, 4);
-                              } else if (humanHour !== null) {
-                                // "every day/monday at Xam/pm" → cron base
-                                baseParts = ["0", String(humanHour), "*", "*"];
-                              } else {
-                                // Convert "every Xm/h" to cron base
-                                const everyMatch = schedule.match(/every\s+(\d+)\s*(m|h)/i);
-                                if (everyMatch) {
-                                  const n = parseInt(everyMatch[1]);
-                                  const unit = everyMatch[2].toLowerCase();
-                                  baseParts = unit === "m" ? [`*/${n}`, "*", "*", "*"] : ["0", `*/${n}`, "*", "*"];
-                                } else {
-                                  return;
-                                }
-                              }
-                              const newSchedule = [...baseParts, dowStr].join(" ");
-                              const pipeName = pipe.config.name;
-                              setPipes((prev) =>
-                                prev.map((p) =>
-                                  p.config.name === pipeName
-                                    ? { ...p, config: { ...p.config, schedule: newSchedule } }
-                                    : p
-                                )
-                              );
-                              const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ schedule: newSchedule }),
-                              }).then(() => {
-                                delete pendingConfigSaves.current[pipeName];
-                                fetchPipes();
-                              }).catch(() => {
-                                delete pendingConfigSaves.current[pipeName];
-                              });
-                              pendingConfigSaves.current[pipeName] = savePromise;
-                            };
-
-                            const dowSummary = humanizeDow(currentDow) || "daily";
-
-                            return (
-                              <div className="mt-2 flex items-center justify-between gap-3">
-                                <div className="flex items-center gap-1">
-                                {dayLabels.map((d, i) => {
-                                  const on = activeDays.has(d.key);
-                                  return (
-                                    <button
-                                      key={`${d.key}-${i}`}
-                                      onClick={() => toggleDay(d.key)}
-                                      title={`${d.name} — ${on ? "enabled, click to disable" : "disabled, click to enable"}`}
-                                      aria-label={d.name}
-                                      aria-pressed={on}
-                                      className={cn(
-                                        "w-6 h-6 text-[10px] font-mono border rounded-sm transition-colors",
-                                        on
-                                          ? "bg-foreground text-background border-foreground hover:bg-foreground/90"
-                                          : "bg-muted/40 text-muted-foreground border-border hover:bg-muted hover:text-foreground hover:border-foreground/50"
-                                      )}
-                                    >
-                                      {d.label}
-                                    </button>
-                                  );
-                                })}
-                                </div>
-                                <span className="text-[11px] text-muted-foreground whitespace-nowrap">
-                                  runs <span className="text-foreground">{dowSummary}</span>
-                                </span>
-                              </div>
-                            );
-                          })()}
-                        </div>
+                            localFetch(`/pipes/${pipe.config.name}/config`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ schedule_config: cfg }),
+                            }).then(() => fetchPipes());
+                          }}
+                        />
 
                         {/* Connections */}
                         <div>
@@ -2877,54 +2672,15 @@ export function PipesSection() {
                           </div>
                         </div>
 
-                        {/* Triggers — Notion-style picker (events + per-app connection sources) */}
-                        <PipeTriggerPicker
-                          pipeName={pipe.config.name}
-                          trigger={pipe.config.trigger}
-                          schedule={pipe.config.schedule}
-                          otherPipes={pipes
-                            .filter((p) => p.config.name !== pipe.config.name && p.config.enabled)
-                            .map((p) => ({ name: p.config.name }))}
-                          availableConnections={availableConnections}
-                          refreshConnections={async () => {
-                            const next = await fetchAvailablePipeConnections(apiBase, availableConnections);
-                            setAvailableConnections(next);
-                            return next;
-                          }}
-                          fetchPipes={fetchPipes}
-                          applyOptimistic={(t) =>
-                            setPipes((prev) =>
-                              prev.map((p) =>
-                                p.config.name === pipe.config.name
-                                  ? { ...p, config: { ...p.config, trigger: t } }
-                                  : p
-                              )
-                            )
-                          }
-                          applySchedule={(s) => {
-                            setPipes((prev) =>
-                              prev.map((p) =>
-                                p.config.name === pipe.config.name
-                                  ? { ...p, config: { ...p.config, schedule: s } }
-                                  : p
-                              )
-                            );
-                            localFetch(`/pipes/${pipe.config.name}/config`, {
-                              method: "POST",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ schedule: s }),
-                            }).then(() => fetchPipes());
-                          }}
-                        />
 
-                        {/* Notifications toggle */}
-                        <div className="flex items-center justify-between border px-3 py-2.5">
-                          <span className="text-xs font-medium cursor-help" title="allow this pipe to send notifications">notifications</span>
-                          <Switch
-                            checked={!isNotificationsDenied(promptDrafts[pipe.config.name] ?? pipe.raw_content)}
-                            onCheckedChange={(checked) => toggleNotifications(pipe.config.name, checked)}
-                          />
-                        </div>
+                        {/* Model — secondary; most pipes run fine on the default */}
+                        <PipePresetSelector
+                          pipe={pipe}
+                          setPipes={setPipes}
+                          fetchPipes={fetchPipes}
+                          pendingConfigSaves={pendingConfigSaves}
+                          apiBase={apiBase}
+                        />
 
                       </TabsContent>
 
@@ -3041,6 +2797,15 @@ export function PipesSection() {
 
                       {/* ═══ ADVANCED TAB ═══ */}
                       <TabsContent value="advanced" className="mt-3 space-y-3">
+                      {/* Notifications toggle */}
+                      <div className="flex items-center justify-between border px-3 py-2.5">
+                        <span className="text-xs font-medium cursor-help" title="allow this pipe to send notifications">notifications</span>
+                        <Switch
+                          checked={!isNotificationsDenied(promptDrafts[pipe.config.name] ?? pipe.raw_content)}
+                          onCheckedChange={(checked) => toggleNotifications(pipe.config.name, checked)}
+                        />
+                      </div>
+
                       {/* Timeout */}
                       <div>
                         <Label className="text-xs mb-2 block cursor-help" title="max execution time before the pipe is killed — increase for slow LLMs or complex pipes">timeout</Label>

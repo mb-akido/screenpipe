@@ -1027,7 +1027,7 @@ async fn main() {
                             let app = app_handle.clone();
                             tauri::async_runtime::spawn(async move {
                                 let state = app.state::<std::sync::Arc<crate::updates::UpdatesManager>>();
-                                if let Err(e) = state.check_for_updates(true).await {
+                                if let Err(e) = state.check_for_updates(true, true).await {
                                     tracing::error!("menu: check for updates failed: {}", e);
                                 }
                             });

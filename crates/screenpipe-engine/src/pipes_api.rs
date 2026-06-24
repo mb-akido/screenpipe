@@ -10,7 +10,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use screenpipe_connect::connections::render_context;
-use screenpipe_core::pipes::PipeManager;
+use screenpipe_core::pipes::{
+    describe_schedule_config, next_occurrences, PipeManager, ScheduleConfig,
+};
 use screenpipe_secrets::SecretStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -318,6 +320,22 @@ pub async fn update_pipe_config(
     }
 }
 
+/// POST /pipes/schedule/preview — stateless preview for the schedule builder.
+/// Body is a `ScheduleConfig`; returns its human summary and the next few fire
+/// times so the UI can show "Next occurrence …" without duplicating timezone /
+/// recurrence math in the frontend.
+pub async fn preview_schedule(Json(cfg): Json<ScheduleConfig>) -> (StatusCode, Json<Value>) {
+    let summary = describe_schedule_config(&cfg);
+    let next: Vec<String> = next_occurrences(&cfg, 5)
+        .iter()
+        .map(|t| t.to_rfc3339())
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "valid": true, "summary": summary, "next": next })),
+    )
+}
+
 /// POST /pipes/install — install a pipe from URL or local path.
 pub async fn install_pipe(
     State(pm): State<SharedPipeManager>,
@@ -598,6 +616,51 @@ mod tests {
         let payload = stop_payload(test_router(pm), "missing").await;
         assert_eq!(payload["success"], false);
         assert_eq!(payload["status"], "not_running");
+    }
+
+    #[tokio::test]
+    async fn schedule_preview_returns_summary_and_next() {
+        // Stateless endpoint — no pipe manager needed.
+        let app = Router::new().route("/pipes/schedule/preview", post(preview_schedule));
+        let body = serde_json::json!({
+            "frequency": "weeks",
+            "interval": 1,
+            "days_of_week": [1, 3, 5],
+            "at_hour": 9,
+            "at_minute": 30,
+            "timezone": "America/New_York"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pipes/schedule/preview")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["valid"], true);
+        assert_eq!(
+            payload["summary"],
+            "weekly on Mon, Wed, Fri at 9:30 AM (America/New_York)"
+        );
+        let next = payload["next"].as_array().expect("next array");
+        assert_eq!(next.len(), 5);
+        // Each entry is a parseable RFC3339 timestamp, strictly increasing.
+        let times: Vec<chrono::DateTime<chrono::Utc>> = next
+            .iter()
+            .map(|v| {
+                chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap())
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            })
+            .collect();
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[tokio::test]

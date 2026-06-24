@@ -266,6 +266,30 @@ describe("tool_result handler", () => {
     expect(res.content[0].text).toContain("TOOL RESULT TOO LARGE");
     expect(res.content[0].text).toContain("narrower filters");
   });
+
+  it("still guards oversized results from a query tool (e.g. bash/curl dumps)", async () => {
+    const res = await handlers.tool_result({
+      type: "tool_result",
+      toolName: "bash",
+      content: [{ type: "text", text: "x".repeat(40_000) }],
+    });
+    expect(res).toBeDefined();
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("TOOL RESULT TOO LARGE");
+  });
+
+  it("exempts a file read so an agent can read its own large skill file", async () => {
+    // morning-brief pipe couldn't read screenpipe-api/SKILL.md (~33K chars):
+    // a `read` is not narrowable and pi already caps it at 2000 lines / 50KB,
+    // so the oversized-result guard must let it through untouched.
+    const res = await handlers.tool_result({
+      type: "tool_result",
+      toolName: "read",
+      input: { path: ".pi/skills/screenpipe-api/SKILL.md" },
+      content: [{ type: "text", text: "S".repeat(33_259) }],
+    });
+    expect(res).toBeUndefined();
+  });
 });
 
 describe("clampMessageText — malformed history blocks fall back to head+tail", () => {

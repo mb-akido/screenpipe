@@ -6,10 +6,11 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { localFetch } from "@/lib/api";
-import { commands } from "@/lib/utils/tauri";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { notifyConnectionsUpdated } from "@/lib/connections-events";
 import { IntegrationIcon } from "@/components/settings/connections-section";
+import { PipeScheduleBuilder } from "./pipe-schedule-builder";
+import type { ScheduleConfig } from "@/lib/utils/schedule-builder";
 import type { AvailableConnection } from "@/lib/pipe-connections";
 import { Plus, Search, Clock, CalendarClock, Workflow, Loader2, Check } from "lucide-react";
 
@@ -29,13 +30,15 @@ export interface Trigger {
 interface PickerProps {
   pipeName: string;
   trigger?: Trigger;
-  schedule?: string;
+  apiBase: string;
+  scheduleConfig: ScheduleConfig | null;
+  scheduleString: string;
   otherPipes: { name: string }[];
   availableConnections: AvailableConnection[];
   refreshConnections: () => Promise<AvailableConnection[]>;
   fetchPipes: () => void;
   applyOptimistic: (trigger: Trigger | undefined) => void;
-  applySchedule: (schedule: string) => void;
+  onSaveSchedule: (cfg: ScheduleConfig | null) => void;
 }
 
 // ── shared brand-aligned classes (DESIGN.md: sharp corners, grayscale only) ───
@@ -124,9 +127,9 @@ export function PipeTriggerPicker(props: PickerProps) {
 
   return (
     <div>
-      <div className="flex items-center gap-1.5 mb-2">
-        <span className="text-xs font-medium">triggers</span>
-        <span className="text-[10px] text-muted-foreground">run this pipe when something happens</span>
+      <div className="mb-2.5">
+        <div className="text-sm font-medium lowercase">when to run</div>
+        <div className="text-[11px] text-muted-foreground">on a schedule, after a meeting, on a new message…</div>
       </div>
       <div className="space-y-1.5">
         {events.map((e, i) => (
@@ -178,11 +181,13 @@ export function PipeTriggerPicker(props: PickerProps) {
 // ── modal (two panes) ────────────────────────────────────────────────────────
 
 function TriggerModal({
-  schedule,
+  apiBase,
+  scheduleConfig,
+  scheduleString,
   otherPipes,
   availableConnections,
   refreshConnections,
-  applySchedule,
+  onSaveSchedule,
   onClose,
   onAddSource,
   onAddEvent,
@@ -256,14 +261,16 @@ function TriggerModal({
         <Detail
           key={active.id}
           option={active}
-          schedule={schedule}
+          apiBase={apiBase}
+          scheduleConfig={scheduleConfig}
+          scheduleString={scheduleString}
           otherPipes={otherPipes}
           availableConnections={availableConnections}
           refreshConnections={refreshConnections}
           onClose={onClose}
           onAddSource={onAddSource}
           onAddEvent={onAddEvent}
-          applySchedule={applySchedule}
+          onSaveSchedule={onSaveSchedule}
         />
       </div>
     </div>
@@ -274,24 +281,28 @@ function TriggerModal({
 
 function Detail({
   option,
-  schedule,
+  apiBase,
+  scheduleConfig,
+  scheduleString,
   otherPipes,
   availableConnections,
   refreshConnections,
   onClose,
   onAddSource,
   onAddEvent,
-  applySchedule,
+  onSaveSchedule,
 }: {
   option: Option;
-  schedule?: string;
+  apiBase: string;
+  scheduleConfig: ScheduleConfig | null;
+  scheduleString: string;
   otherPipes: { name: string }[];
   availableConnections: AvailableConnection[];
   refreshConnections: () => Promise<AvailableConnection[]>;
   onClose: () => void;
   onAddSource: (s: TriggerSource) => void;
   onAddEvent: (e: string) => void;
-  applySchedule: (s: string) => void;
+  onSaveSchedule: (cfg: ScheduleConfig | null) => void;
 }) {
   return (
     <div className="h-full flex flex-col">
@@ -300,7 +311,15 @@ function Detail({
         <span className="text-sm font-medium">{detailTitle(option.id)}</span>
       </div>
       <div className="flex-1 overflow-y-auto px-5 py-4">
-        {option.id === "schedule" && <ScheduleDetail schedule={schedule} onSave={(s) => { applySchedule(s); onClose(); }} />}
+        {option.id === "schedule" && (
+          <PipeScheduleBuilder
+            current={scheduleConfig}
+            currentScheduleString={scheduleString}
+            apiBase={apiBase}
+            onSave={(cfg) => { onSaveSchedule(cfg); onClose(); }}
+            onCancel={onClose}
+          />
+        )}
         {(option.id === "meeting_started" || option.id === "meeting_ended") && (
           <SimpleDetail
             text={option.id === "meeting_started" ? "Runs whenever screenpipe detects a call starting." : "Runs whenever a call wraps up — great for summaries."}
@@ -314,6 +333,7 @@ function Detail({
             availableConnections={availableConnections}
             refreshConnections={refreshConnections}
             onAdd={onAddSource}
+            onClose={onClose}
           />
         )}
       </div>
@@ -346,35 +366,6 @@ function SimpleDetail({ text, onAdd }: { text: string; onAdd: () => void }) {
     <div>
       <p className="text-xs text-muted-foreground">{text}</p>
       <PrimaryAdd onClick={onAdd} />
-    </div>
-  );
-}
-
-function ScheduleDetail({ schedule, onSave }: { schedule?: string; onSave: (s: string) => void }) {
-  const presets = [
-    { v: "every 30m", l: "every 30 minutes" },
-    { v: "every 1h", l: "hourly" },
-    { v: "every day at 9am", l: "daily at 9am" },
-    { v: "every monday at 9am", l: "weekly (mon 9am)" },
-  ];
-  const [val, setVal] = useState(schedule && schedule !== "manual" ? schedule : "every 1h");
-  return (
-    <div>
-      <p className="text-xs text-muted-foreground mb-3">Run this pipe on a clock — independent of any app.</p>
-      <div className="grid grid-cols-2 gap-2 mb-3">
-        {presets.map((p) => (
-          <button
-            key={p.v}
-            onClick={() => setVal(p.v)}
-            className={`text-xs border rounded-none px-3 py-2 text-left transition-colors ${val === p.v ? "border-foreground bg-accent" : "hover:bg-accent/60"}`}
-          >
-            {p.l}
-          </button>
-        ))}
-      </div>
-      <label className={LABEL}>custom (interval or cron)</label>
-      <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="every 15m  ·  0 9 * * 1-5" className={`${INPUT} mt-1`} />
-      <PrimaryAdd disabled={!val.trim()} onClick={() => onSave(val.trim())} label="set schedule" />
     </div>
   );
 }
@@ -414,11 +405,13 @@ function SourceDetail({
   availableConnections,
   refreshConnections,
   onAdd,
+  onClose,
 }: {
   app: "slack" | "notion" | "obsidian";
   availableConnections: AvailableConnection[];
   refreshConnections: () => Promise<AvailableConnection[]>;
   onAdd: (s: TriggerSource) => void;
+  onClose: () => void;
 }) {
   const [conns, setConns] = useState(availableConnections);
   const connected = !!conns.find((c) => c.id === app)?.connected;
@@ -429,9 +422,10 @@ function SourceDetail({
   useEffect(() => setConns(availableConnections), [availableConnections]);
 
   async function doConnect() {
-    setConnecting(true);
-    try {
-      if (app === "obsidian") {
+    // Obsidian is local — pick a vault folder inline.
+    if (app === "obsidian") {
+      setConnecting(true);
+      try {
         const picked = await openDialog({ directory: true, multiple: false, title: "Select Obsidian vault folder" });
         if (typeof picked !== "string") return;
         await localFetch("/connections/obsidian", {
@@ -439,17 +433,20 @@ function SourceDetail({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ credentials: { vault_path: picked } }),
         });
-      } else {
-        const res = await commands.oauthConnect(app, null, null);
-        if (res.status !== "ok" || !res.data.connected) return;
+        notifyConnectionsUpdated();
+        setConns(await refreshConnections());
+      } catch (e) {
+        console.error("connect failed", e);
+      } finally {
+        setConnecting(false);
       }
-      notifyConnectionsUpdated();
-      setConns(await refreshConnections());
-    } catch (e) {
-      console.error("connect failed", e);
-    } finally {
-      setConnecting(false);
+      return;
     }
+    // Slack/Notion OAuth needs scope-variant + account selection (read access,
+    // not the send-only default) — hand off to the full Connections flow rather
+    // than reimplement it here. Reopen this picker once connected.
+    onClose();
+    window.dispatchEvent(new CustomEvent("open-settings", { detail: { section: "connections" } }));
   }
 
   if (!connected) return <ConnectCard app={app} connecting={connecting} onConnect={doConnect} />;
