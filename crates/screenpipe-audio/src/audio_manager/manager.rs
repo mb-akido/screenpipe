@@ -661,6 +661,9 @@ impl AudioManager {
         let device_clone = device.clone();
         let metrics = self.metrics.clone();
         let meeting_audio_tap = self.meeting_audio_tap.clone();
+        // Used only on macOS to demote a runtime-dead VPIO device to the HAL path.
+        #[cfg(target_os = "macos")]
+        let device_manager = self.device_manager.clone();
 
         let recording_handle = tokio::spawn(async move {
             let record_result = tokio::spawn(record_and_transcribe_with_live_tap(
@@ -685,6 +688,17 @@ impl AudioManager {
                     "recording for device {} exited with error: {}",
                     device_clone, e
                 );
+                // macOS VPIO can create a stream that delivers no audio then dies
+                // at the receive timeout; the recovery monitor would rebuild it
+                // with VPIO still on and loop forever. Count the death so the
+                // device falls back to the plain HAL input path after a few
+                // rapid failures (no-op when VPIO is off / already demoted).
+                #[cfg(target_os = "macos")]
+                if device_clone.device_type == crate::core::device::DeviceType::Input
+                    && e.to_string().contains("stream dead")
+                {
+                    device_manager.note_vpio_runtime_failure(&device_clone);
+                }
                 return Err(anyhow!("record_device {} failed: {}", device_clone, e));
             }
 
