@@ -142,8 +142,7 @@ fn vision_capture_silent(
         && now_ts.saturating_sub(last_db_write_ts) > SILENT_DB_STALE_SECS
         && attempts_stopped;
 
-    let never_produced =
-        last_db_write_ts == 0 && uptime_secs > SILENT_NEVER_PRODUCED_UPTIME_SECS;
+    let never_produced = last_db_write_ts == 0 && uptime_secs > SILENT_NEVER_PRODUCED_UPTIME_SECS;
 
     went_silent || never_produced
 }

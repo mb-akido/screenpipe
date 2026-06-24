@@ -85,7 +85,9 @@ pub struct SckOutputDecision {
 
 /// Returns the backoff cooldown for a given consecutive-rebuild streak.
 fn rebuild_cooldown(streak: u32) -> Duration {
-    Duration::from_secs(SCK_OUTPUT_SILENCE_SECS.saturating_mul(1u64 << streak.min(SCK_OUTPUT_BACKOFF_CAP)))
+    Duration::from_secs(
+        SCK_OUTPUT_SILENCE_SECS.saturating_mul(1u64 << streak.min(SCK_OUTPUT_BACKOFF_CAP)),
+    )
 }
 
 /// The crux. Returns `true` iff the SCK System Audio **output** stream is
@@ -122,7 +124,9 @@ pub fn decide_sck_output_dead(d: &SckOutputDecision) -> bool {
     // inequality) so that ADDING a display (second monitor, resolution change
     // that re-adds an id) never trips — only a display *leaving* usable does.
     let no_usable = d.current_usable_displays.is_empty();
-    let a_healthy_display_went_away = !d.last_healthy_displays.is_subset(&d.current_usable_displays);
+    let a_healthy_display_went_away = !d
+        .last_healthy_displays
+        .is_subset(&d.current_usable_displays);
     no_usable || a_healthy_display_went_away
 }
 
@@ -252,11 +256,16 @@ impl SckOutputWatchdog {
         let decision = SckOutputDecision {
             device_type: DeviceType::Output,
             stream_elapsed,
-            since_last_real_audio: last_non_zero_at.map(|t| t.elapsed()).unwrap_or(Duration::MAX),
+            since_last_real_audio: last_non_zero_at
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::MAX),
             ever_had_real_audio: self.last_healthy_displays.is_some(),
             last_healthy_displays: self.last_healthy_displays.clone().unwrap_or_default(),
             current_usable_displays: current.clone(),
-            since_last_rebuild: self.last_rebuild.map(|t| t.elapsed()).unwrap_or(Duration::MAX),
+            since_last_rebuild: self
+                .last_rebuild
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::MAX),
             rebuild_streak: self.rebuild_streak,
         };
         if decide_sck_output_dead(&decision) {
@@ -428,11 +437,11 @@ mod tests {
         // only the built-in is dropped when inactive/asleep; an asleep EXTERNAL
         // (Energy-Saver display-off) stays usable so it doesn't read as departed.
         let got = filter_usable([
-            (1u32, true, true, false),  // built-in, awake → usable
-            (2, true, false, false),    // built-in, inactive → dropped (clamshell)
-            (3, true, true, true),      // built-in, asleep → dropped (clamshell)
-            (4, false, true, true),     // external, asleep on idle → KEPT
-            (5, false, true, false),    // external, awake → usable
+            (1u32, true, true, false), // built-in, awake → usable
+            (2, true, false, false),   // built-in, inactive → dropped (clamshell)
+            (3, true, true, true),     // built-in, asleep → dropped (clamshell)
+            (4, false, true, true),    // external, asleep on idle → KEPT
+            (5, false, true, false),   // external, awake → usable
         ]);
         assert_eq!(got, set(&[1, 4, 5]));
     }

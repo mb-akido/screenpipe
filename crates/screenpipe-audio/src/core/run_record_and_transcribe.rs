@@ -367,7 +367,8 @@ async fn recv_audio_chunk(
                 // SCK-backed streams only — the Process Tap is anchored to the
                 // default output device, not a display, and has its own watchdog.
                 #[cfg(target_os = "macos")]
-                if audio_stream.device.device_type == DeviceType::Output && audio_stream.is_sck_backed
+                if audio_stream.device.device_type == DeviceType::Output
+                    && audio_stream.is_sck_backed
                 {
                     sck_watchdog.note_real_audio();
                 }
