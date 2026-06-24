@@ -353,21 +353,15 @@ describe('Pipes: discover → install → play', function () {
       await confirmRiskGateIfPresent();
 
       // After GET click the app auto-switches to My Pipes (onInstalled
-      // callback). Wait for an unambiguous marker: the My Pipes section
-      // root or its sub-tab strip. Body-text matching on "scheduled" /
-      // "manual pipe" was fragile to the v2.4.280 toolbar refactor.
+      // callback). Wait for the stable filter trigger instead of body copy,
+      // which changes as the compact toolbar evolves.
       await browser.waitUntil(
         async () => {
-          const section = await $('[data-testid="section-pipes"]');
-          if (!(await section.isExisting())) return false;
-          const text = (await browser.execute(() => {
-            const root = document.querySelector('[data-testid="section-pipes"]');
-            return root ? (root as HTMLElement).innerText : '';
-          })) as string;
-          // The PipesSection toolbar shows "scheduled agents that run on
-          // your screen data" (subtitle copy in pipes-section.tsx:1507)
-          // when the Scheduled sub-tab is active (default after install).
-          return text.toLowerCase().includes('scheduled');
+          const trigger = await $('[data-testid="pipe-type-filter-trigger"]');
+          return (
+            (await trigger.isExisting()) &&
+            (await trigger.getAttribute('data-pipe-type-filter')) === 'scheduled'
+          );
         },
         { timeout: 30_000, timeoutMsg: 'App did not switch to My Pipes section after installation' }
       );

@@ -1898,7 +1898,13 @@ export function PipesSection() {
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm" className="gap-1.5 h-8 text-xs capitalize">
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1.5 h-8 text-xs capitalize"
+              data-testid="pipe-type-filter-trigger"
+              data-pipe-type-filter={pipeTypeFilter}
+            >
               {pipeTypeFilter === "cloud" ? "cloud" : `${pipeTypeFilter} (${tabCounts[pipeTypeFilter]})`}
               <ChevronDown className="h-3 w-3 opacity-50" />
             </Button>
@@ -1914,6 +1920,7 @@ export function PipesSection() {
                 key={tab}
                 onClick={() => setPipeTypeFilter(tab)}
                 className={cn("capitalize gap-2", pipeTypeFilter === tab && "font-medium")}
+                data-testid={`pipe-type-filter-option-${tab}`}
               >
                 <span className="flex-1">{tab}</span>
                 {tab !== "cloud" && (
