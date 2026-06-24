@@ -111,6 +111,67 @@ export function recurringPipeGroupKeys(
   );
 }
 
+/** Minimal session shape needed to derive group membership. Accepts both
+ *  live `SessionRecord`s and persisted `ConversationMeta`s. */
+type GroupableSession = {
+  sidebarGroup?: string;
+  pipeContext?: { pipeName?: string } | null;
+};
+
+/**
+ * Maps lowercased pipe-group name → its display (canonical) casing for
+ * every auto pipe-group present: a pipe name carried by ≥2 sessions that
+ * aren't manually re-grouped. Used both to detect when a manual "Move to
+ * group" target coincides with a pipe group (so the two merge) and to list
+ * the pipe groups as move targets.
+ */
+function recurringPipeDisplayNames(
+  sessions: ReadonlyArray<GroupableSession>,
+): Map<string, string> {
+  const counts = new Map<string, { display: string; count: number }>();
+  for (const s of sessions) {
+    if (s.sidebarGroup?.trim()) continue;
+    const name = s.pipeContext?.pipeName?.trim();
+    if (!name) continue;
+    const lower = name.toLowerCase();
+    const entry = counts.get(lower);
+    if (entry) entry.count += 1;
+    else counts.set(lower, { display: name, count: 1 });
+  }
+  const out = new Map<string, string>();
+  for (const [lower, { display, count }] of counts) {
+    if (count >= 2) out.set(lower, display);
+  }
+  return out;
+}
+
+/**
+ * Group names to offer in the "Move to group" submenu: manual sidebar
+ * groups first (insertion order, original casing), then auto pipe-groups
+ * (the groups the user actually sees in the sidebar). Deduped
+ * case-insensitively so a manual group shadowing a pipe name appears once.
+ */
+export function listMoveTargetGroups(
+  sessions: ReadonlyArray<GroupableSession>,
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of sessions) {
+    const g = s.sidebarGroup?.trim();
+    if (!g) continue;
+    const lower = g.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    out.push(g);
+  }
+  for (const [lower, display] of recurringPipeDisplayNames(sessions)) {
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    out.push(display);
+  }
+  return out;
+}
+
 // ── Grouped recents builder ──────────────────────────────────────────
 
 /**
@@ -124,12 +185,14 @@ export function recurringPipeGroupKeys(
 export function buildGroupedRecents(
   recents: SessionRecord[],
   cap = 15,
+  keyOf: (s: SessionRecord) => string | null = sessionGroupKey,
+  titleOf: (s: SessionRecord) => string = sessionGroupTitle,
 ): SidebarItem[] {
   // Pre-count how many times each key appears so we know upfront
   // whether a key will become a group (count ≥ 2) or a single.
   const keyCounts = new Map<string, number>();
   for (const s of recents) {
-    const key = sessionGroupKey(s);
+    const key = keyOf(s);
     if (key) keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
   }
 
@@ -137,7 +200,7 @@ export function buildGroupedRecents(
   const result: SidebarItem[] = [];
 
   for (const s of recents) {
-    const key = sessionGroupKey(s);
+    const key = keyOf(s);
 
     if (key) {
       // Append to an already-visible group — bypasses cap.
@@ -160,7 +223,7 @@ export function buildGroupedRecents(
         result.push({
           kind: "group",
           key,
-          title: sessionGroupTitle(s),
+          title: titleOf(s),
           sessions: group,
         });
       }
@@ -195,23 +258,44 @@ export function buildSidebarRecentsSections(
   recents: SessionRecord[],
   cap = Number.POSITIVE_INFINITY,
 ): SidebarRecentsSection[] {
-  // Split sessions by manual sidebarGroup label.
+  // Auto pipe-groups present in this list (pipe name with ≥2 sessions that
+  // aren't manually re-grouped). A chat manually moved into one of these
+  // names folds into the same group row instead of a duplicate section,
+  // so "Move to group" can target the groups the user actually sees.
+  const recurringPipe = recurringPipeDisplayNames(recents);
+
+  // Split sessions by manual sidebarGroup label. A manual label matching an
+  // auto pipe-group is "adopted" into that group (see keyOf/titleOf below).
   const manualGroups = new Map<string, SessionRecord[]>();
   const ungrouped: SessionRecord[] = [];
+  const adoptedKey = new Map<string, string>();
+  const adoptedTitle = new Map<string, string>();
 
   for (const session of recents) {
     const group = session.sidebarGroup?.trim();
     if (group) {
-      const existing = manualGroups.get(group);
-      if (existing) {
-        existing.push(session);
+      const pipeMatch = recurringPipe.get(group.toLowerCase());
+      if (pipeMatch) {
+        ungrouped.push(session);
+        adoptedKey.set(session.id, `pipe:${pipeMatch}`);
+        adoptedTitle.set(session.id, pipeMatch);
       } else {
-        manualGroups.set(group, [session]);
+        const existing = manualGroups.get(group);
+        if (existing) {
+          existing.push(session);
+        } else {
+          manualGroups.set(group, [session]);
+        }
       }
     } else {
       ungrouped.push(session);
     }
   }
+
+  const keyOf = (s: SessionRecord): string | null =>
+    adoptedKey.get(s.id) ?? sessionGroupKey(s);
+  const titleOf = (s: SessionRecord): string =>
+    adoptedTitle.get(s.id) ?? sessionGroupTitle(s);
 
   const sections: SidebarRecentsSection[] = [];
 
@@ -226,7 +310,7 @@ export function buildSidebarRecentsSections(
 
   // Ungrouped section. The main sidebar applies the global recents cap
   // later, after subsection collapsed state is known.
-  const ungroupedItems = buildGroupedRecents(ungrouped, cap);
+  const ungroupedItems = buildGroupedRecents(ungrouped, cap, keyOf, titleOf);
   if (ungroupedItems.length > 0 || sections.length === 0) {
     sections.push({
       key: "manual:__ungrouped__",

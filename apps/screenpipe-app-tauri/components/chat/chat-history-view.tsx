@@ -39,7 +39,10 @@ import {
   type ConversationMeta,
 } from "@/lib/chat-storage";
 import { useChatStore } from "@/lib/stores/chat-store";
-import { validateSidebarGroupName } from "@/lib/utils/chat-sidebar-grouping";
+import {
+  listMoveTargetGroups,
+  validateSidebarGroupName,
+} from "@/lib/utils/chat-sidebar-grouping";
 
 type HistoryTab = "active" | "archived" | "all";
 
@@ -302,17 +305,12 @@ export function ChatHistoryView({
     [patchSidebarSession, visibleById]
   );
 
-  // Derive existing manual groups from loaded conversations for the
-  // "Move to group" submenu. Insertion order preserved.
-  const existingGroups = useMemo(() => {
-    const groups: string[] = [];
-    const seen = new Set<string>();
-    for (const c of conversations) {
-      const g = (c as any).sidebarGroup?.trim() as string | undefined;
-      if (g && !seen.has(g)) { seen.add(g); groups.push(g); }
-    }
-    return groups;
-  }, [conversations]);
+  // Group names for the "Move to group" submenu: manual groups plus the
+  // auto pipe-groups visible in the sidebar. Insertion order preserved.
+  const existingGroups = useMemo(
+    () => listMoveTargetGroups(conversations),
+    [conversations],
+  );
   const selectableExistingGroups = existingGroups;
 
   // State for the "New group" dialog — stores the conversation id being moved.
@@ -352,9 +350,14 @@ export function ChatHistoryView({
     const selectionMode = selectedIds.size > 0;
     const rowPending = rowPendingIds.has(conv.id);
     const showCheckbox = selectionMode || selected;
-    const currentSidebarGroup = (conv as any).sidebarGroup as string | undefined;
+    const currentSidebarGroup = conv.sidebarGroup;
+    // Exclude the group the conversation already lives in — placed there
+    // manually (sidebarGroup) or auto-grouped by pipe name.
+    const currentGroup = (
+      currentSidebarGroup ?? conv.pipeContext?.pipeName
+    )?.trim().toLowerCase();
     const availableMoveGroups = selectableExistingGroups.filter(
-      (group) => group !== currentSidebarGroup,
+      (group) => group.trim().toLowerCase() !== currentGroup,
     );
     return (
       <div

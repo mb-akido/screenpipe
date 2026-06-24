@@ -115,6 +115,7 @@ import { requestPipeStop } from "@/lib/pipe-stop";
 import {
   applySidebarRecentsCap,
   buildSidebarRecentsSections,
+  listMoveTargetGroups,
   recurringPipeGroupKeys,
   type SidebarItem,
   validateSidebarGroupName,
@@ -545,21 +546,14 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     } catch { /* ignore */ }
   }, [groupedSections]);
 
-  // Derive existing manual group names from all visible non-hidden
-  // sessions (pinned + recents) so the "Move to group" submenu
-  // includes groups that currently only contain pinned chats.
-  const existingGroups = useMemo(() => {
-    const groups: string[] = [];
-    const seen = new Set<string>();
-    for (const s of [...pinned, ...recents]) {
-      const g = s.sidebarGroup?.trim();
-      if (g && !seen.has(g)) {
-        seen.add(g);
-        groups.push(g);
-      }
-    }
-    return groups;
-  }, [pinned, recents]);
+  // Group names offered in the "Move to group" submenu, derived from all
+  // visible non-hidden sessions (pinned + recents): manual groups plus the
+  // auto pipe-groups the user actually sees in the sidebar. Moving a chat
+  // into a pipe-group's name folds it into that same group.
+  const existingGroups = useMemo(
+    () => listMoveTargetGroups([...pinned, ...recents]),
+    [pinned, recents],
+  );
 
   // Resolve each running pipe to its SessionRecord so the Scheduled-row
   // kebab can offer Pin / Rename / Archive / Delete with the same
@@ -2206,8 +2200,14 @@ export function SidebarChatRow({
   const age = formatCompactAge(activityAt, now);
   const canSwapAgeForMenu = !isLive && !isError && queuedCount === 0 && !isUnread && Boolean(age);
   const menuOpen = openConversationMenuId === session.id;
+  // Exclude the group the session already lives in — whether it was placed
+  // there manually (sidebarGroup) or auto-grouped by pipe name.
+  const currentGroup = (
+    session.sidebarGroup ?? session.pipeContext?.pipeName
+  )?.trim().toLowerCase();
   const availableMoveGroups =
-    existingGroups?.filter((group) => group !== session.sidebarGroup) ?? [];
+    existingGroups?.filter((group) => group.trim().toLowerCase() !== currentGroup) ??
+    [];
   const rowMenuActions = {
     onArchive,
     onUnarchive,

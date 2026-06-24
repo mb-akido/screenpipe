@@ -9,6 +9,7 @@ import {
   sessionGroupTitle,
   buildGroupedRecents,
   buildSidebarRecentsSections,
+  listMoveTargetGroups,
   recurringPipeGroupKeys,
   validateSidebarGroupName,
 } from "@/lib/utils/chat-sidebar-grouping";
@@ -299,6 +300,96 @@ describe("buildSidebarRecentsSections", () => {
     );
     expect(productSection?.items).toHaveLength(10);
     expect(ungroupedSection?.items).toHaveLength(20);
+  });
+
+  it("folds a chat moved into a pipe-group name into that group", () => {
+    // Two runs of the "daily" pipe form an auto group; a plain chat moved
+    // into "daily" should join that group, not spawn a separate section.
+    const result = buildSidebarRecentsSections([
+      s("p1", "daily #1", "daily"),
+      s("p2", "daily #2", "daily"),
+      s("c", "moved chat", undefined, "daily"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].title).toBe("");
+    expect(result[0].items).toHaveLength(1);
+    const group = result[0].items[0];
+    expect(group.kind).toBe("group");
+    if (group.kind === "group") {
+      expect(group.title).toBe("daily");
+      expect(group.sessions.map((x) => x.id).sort()).toEqual(["c", "p1", "p2"]);
+    }
+  });
+
+  it("merges case-insensitively against the pipe-group name", () => {
+    const result = buildSidebarRecentsSections([
+      s("p1", "daily #1", "daily"),
+      s("p2", "daily #2", "daily"),
+      s("c", "moved chat", undefined, "DAILY"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].items[0].kind).toBe("group");
+    if (result[0].items[0].kind === "group") {
+      expect(result[0].items[0].sessions).toHaveLength(3);
+    }
+  });
+
+  it("keeps a manual group separate when no pipe-group shares its name", () => {
+    const result = buildSidebarRecentsSections([
+      s("p1", "daily #1", "daily"),
+      s("p2", "daily #2", "daily"),
+      s("c", "moved chat", undefined, "work"),
+    ]);
+    // "work" has no matching pipe → its own titled section; "daily" stays a
+    // pipe group in the ungrouped section.
+    expect(result.map((sec) => sec.title)).toEqual(["work", "other"]);
+    expect(result[0].items[0].kind).toBe("single");
+    expect(result[1].items[0].kind).toBe("group");
+  });
+
+  it("does not adopt into a single (non-recurring) pipe session", () => {
+    // Only one "daily" run → not an auto group, so "daily" is a plain
+    // manual section, not a merge target.
+    const result = buildSidebarRecentsSections([
+      s("p1", "daily #1", "daily"),
+      s("c", "moved chat", undefined, "daily"),
+    ]);
+    expect(result.map((sec) => sec.title)).toEqual(["daily", "other"]);
+  });
+});
+
+// ── listMoveTargetGroups ─────────────────────────────────────────────
+
+describe("listMoveTargetGroups", () => {
+  it("lists manual groups before recurring pipe groups", () => {
+    const result = listMoveTargetGroups([
+      s("a", "chat", undefined, "work"),
+      s("p1", "daily #1", "daily"),
+      s("p2", "daily #2", "daily"),
+      s("u", "ungrouped chat"),
+    ]);
+    expect(result).toEqual(["work", "daily"]);
+  });
+
+  it("omits pipe names that appear only once", () => {
+    const result = listMoveTargetGroups([
+      s("p1", "daily #1", "daily"),
+      s("o", "one-off #1", "oneoff"),
+    ]);
+    expect(result).toEqual([]);
+  });
+
+  it("dedupes a manual group that shadows a pipe name", () => {
+    const result = listMoveTargetGroups([
+      s("p1", "daily #1", "daily"),
+      s("p2", "daily #2", "daily"),
+      s("c", "moved chat", undefined, "daily"),
+    ]);
+    expect(result).toEqual(["daily"]);
+  });
+
+  it("returns an empty list when there are no groups", () => {
+    expect(listMoveTargetGroups([s("a", "chat A"), s("b", "chat B")])).toEqual([]);
   });
 });
 
