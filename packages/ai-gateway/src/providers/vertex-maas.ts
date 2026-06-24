@@ -18,7 +18,6 @@
 import { AIProvider } from './base';
 import { Message, RequestBody, ResponseFormat, ToolCall } from '../types';
 import { VertexAIProvider, WifConfig } from './vertex';
-import { dropNamelessToolCalls } from '../utils/message-sanitize';
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
@@ -49,6 +48,18 @@ function safeJson(value: unknown): string {
 	} catch {
 		return '{}';
 	}
+}
+
+/**
+ * A tool_call is only usable if its function name is populated. Vertex MaaS
+ * rejects the WHOLE request with 400 "Expected a function 'name' in a(n)
+ * 'assistant' message to be populated" if any assistant tool_call has an
+ * empty/missing name (AI-PROXY-C: 164 users). Accepts the OpenAI shape
+ * (`function.name`) and a bare top-level `name` fallback.
+ */
+export function hasToolCallName(call: any): boolean {
+	const name = call?.function?.name ?? call?.name;
+	return typeof name === 'string' && name.trim().length > 0;
 }
 
 export async function parseVertexMaasJsonResponse(response: Response, model: string): Promise<any> {
@@ -369,11 +380,6 @@ export class VertexMaasProvider implements AIProvider {
 	}
 
 	formatMessages(messages: Message[]): any[] {
-		// Drop tool calls with no function name (and their orphaned tool results)
-		// up front — Vertex MaaS otherwise 400s with "Expected a function 'name'
-		// in a(n) 'assistant' message to be populated" (SCREENPIPE-AI-PROXY-24).
-		messages = dropNamelessToolCalls(messages);
-
 		// Repair assistant tool_calls (and their matching tool result) that lack
 		// an id before anything else, so Vertex doesn't 400 with "Expected the
 		// 'id' of a(n) 'assistant' 'tool_calls' array element to be populated".
@@ -390,11 +396,15 @@ export class VertexMaasProvider implements AIProvider {
 		const collectIds = (msg: Message) => {
 			if (msg.role !== 'assistant') return;
 			for (const call of ((msg as any).tool_calls ?? [])) {
-				if (call?.id) knownToolCallIds.add(call.id);
+				// Only register NAMED tool_calls. A nameless one is dropped in
+				// formatMessageContent, so its id must NOT be "known" — otherwise its
+				// matching tool result survives as an orphan and Vertex 400s with
+				// "No tool calls but found tool output".
+				if (call?.id && hasToolCallName(call)) knownToolCallIds.add(call.id);
 			}
 			if (Array.isArray(msg.content)) {
 				for (const part of msg.content as any[]) {
-					if (part?.type === 'tool_use' && part.id) knownToolCallIds.add(part.id);
+					if (part?.type === 'tool_use' && part.id && part.name) knownToolCallIds.add(part.id);
 				}
 			}
 		};
@@ -438,7 +448,11 @@ export class VertexMaasProvider implements AIProvider {
 		// next tool-response message because Vertex sees the assistant with
 		// no tool_calls and rejects the batch with "No tool calls but found
 		// tool output".
-		const topLevelToolCalls: any[] = [...((msg as any).tool_calls ?? [])];
+		// Drop nameless tool_calls — Vertex MaaS 400s on an assistant tool_call
+		// whose function.name is empty/missing (AI-PROXY-C). The content-array
+		// `tool_use` path below already guards on `part.name`; this is the
+		// top-level OpenAI-shape equivalent.
+		const topLevelToolCalls: any[] = ((msg as any).tool_calls ?? []).filter(hasToolCallName);
 
 		if (!Array.isArray(msg.content)) {
 			const out: { content: any; tool_calls?: any[] } = {
