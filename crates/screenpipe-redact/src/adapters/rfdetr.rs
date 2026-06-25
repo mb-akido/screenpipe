@@ -80,7 +80,7 @@ const CLASSES: [SpanLabel; NUM_CLASSES] = [
 /// Configuration for [`RfdetrRedactor`].
 #[derive(Debug, Clone)]
 pub struct RfdetrConfig {
-    /// Path to `rfdetr_vN.onnx`. We default to `~/.screenpipe/models/rfdetr_v12.onnx`
+    /// Path to `rfdetr_vN.onnx`. We default to `~/.screenpipe/models/rfdetr_v13.onnx`
     /// in [`Self::default_model_path`] but callers may override (e.g.
     /// for an INT8-quantized variant in the future).
     pub model_path: PathBuf,
@@ -201,7 +201,7 @@ impl RfdetrConfig {
         tracing::info!(
             target = %self.model_path.display(),
             bytes = bytes.len(),
-            "rfdetr_v12.onnx ready"
+            "rfdetr_v13.onnx ready"
         );
         Ok(())
     }
@@ -537,8 +537,15 @@ mod tests {
     #[test]
     fn default_path_lives_under_screenpipe_dir() {
         let p = RfdetrConfig::default_model_path();
-        let s = p.to_string_lossy();
-        assert!(s.contains(".screenpipe/models/rfdetr_v12.onnx"));
+        let expected_suffix = Path::new(".screenpipe")
+            .join("models")
+            .join("rfdetr_v13.onnx");
+        assert!(
+            p.ends_with(&expected_suffix),
+            "default path {} should end with {}",
+            p.display(),
+            expected_suffix.display()
+        );
     }
 
     #[test]
@@ -598,7 +605,7 @@ mod tests {
         // (Real download path is exercised by integration tests off
         // the unit-test harness.)
         let d = tempdir().unwrap();
-        let p = d.path().join("models").join("rfdetr_v12.onnx");
+        let p = d.path().join("models").join("rfdetr_v13.onnx");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"not the real model").unwrap();
         let cfg = RfdetrConfig {
