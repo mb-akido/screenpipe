@@ -1153,6 +1153,32 @@ fn should_auto_submit_stall_logs(
     since_last_submit.map_or(true, |d| d >= AUTO_LOG_COOLDOWN)
 }
 
+/// Path of the persisted last-auto-submit marker (next to the sync cursor). The
+/// cooldown is persisted so it survives app restarts — otherwise a crash-looping
+/// or frequently-restarting stuck device would re-submit logs on every boot.
+fn stall_marker_path(cfg: &EnterpriseSyncConfig) -> PathBuf {
+    cfg.cursor_path.with_file_name(".enterprise-stall-log")
+}
+
+/// Load the persisted last-auto-submit time (unix seconds). None when never
+/// submitted / unreadable / malformed.
+fn load_last_auto_submit(cfg: &EnterpriseSyncConfig) -> Option<std::time::SystemTime> {
+    let secs: u64 = std::fs::read_to_string(stall_marker_path(cfg))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// Persist the last-auto-submit time (best-effort; a write failure only risks an
+/// earlier retry, never a crash).
+fn save_last_auto_submit(cfg: &EnterpriseSyncConfig, when: std::time::SystemTime) {
+    if let Ok(d) = when.duration_since(std::time::UNIX_EPOCH) {
+        let _ = std::fs::write(stall_marker_path(cfg), d.as_secs().to_string());
+    }
+}
+
 /// Origin (`scheme://host[:port]`) of the ingest URL — the logs endpoints live
 /// on the same host. Falls back to prod if the URL is malformed.
 fn logs_base_url(ingest_url: &str) -> String {
@@ -1317,11 +1343,13 @@ pub async fn run(
     let mut cursor = Cursor::load(&cfg.cursor_path);
     let mut backoff = BACKOFF_INITIAL;
 
-    // Stalled-upload watchdog state (see should_auto_submit_stall_logs).
+    // Stalled-upload watchdog state. `last_auto_submit` is persisted (wall-clock)
+    // so the cooldown survives app restarts; the rest is in-memory (a fresh start
+    // re-applies the startup grace, which is the desired behavior).
     let started = std::time::Instant::now();
     let mut last_data_upload: Option<std::time::Instant> = None;
     let mut saw_failure_since_data = false;
-    let mut last_auto_submit: Option<std::time::Instant> = None;
+    let mut last_auto_submit: Option<std::time::SystemTime> = load_last_auto_submit(&cfg);
 
     loop {
         let result = run_one_sync(&cfg, &mut cursor, local.as_ref(), &http).await;
@@ -1336,14 +1364,27 @@ pub async fn run(
             Ok(_) => {}
             Err(_) => saw_failure_since_data = true,
         }
+        // Wall-clock elapsed since the persisted last submit. A clock that moved
+        // backwards (Err) is treated as "just submitted" (Duration::ZERO) so we
+        // never spam on a clock glitch.
+        let since_last_submit = last_auto_submit.map(|t| {
+            std::time::SystemTime::now()
+                .duration_since(t)
+                .unwrap_or(Duration::ZERO)
+        });
         if should_auto_submit_stall_logs(
             started.elapsed(),
             last_data_upload.map(|t| t.elapsed()),
             saw_failure_since_data,
-            last_auto_submit.map(|t| t.elapsed()),
+            since_last_submit,
         ) {
             submit_stall_logs(&cfg, &http).await;
-            last_auto_submit = Some(std::time::Instant::now());
+            // Persist BEFORE updating memory so a restart right after still honors
+            // the cooldown. Set regardless of submit success → a fully-offline
+            // device retries next window rather than hammering every tick.
+            let now = std::time::SystemTime::now();
+            save_last_auto_submit(&cfg, now);
+            last_auto_submit = Some(now);
         }
 
         match result {
@@ -1488,6 +1529,26 @@ mod tests {
             true,
             Some(13 * 60 * MIN)
         ));
+    }
+
+    #[test]
+    fn cooldown_persists_across_restarts() {
+        // The crash-loop guard: a restart must NOT reset the cooldown, or a
+        // stuck device would re-submit on every boot.
+        let dir = TempDir::new().unwrap();
+        let cfg = test_cfg(&dir, "http://x".into());
+        assert!(load_last_auto_submit(&cfg).is_none()); // nothing yet
+
+        let now = std::time::SystemTime::now();
+        save_last_auto_submit(&cfg, now);
+
+        // a fresh process reloads the marker and is still within cooldown
+        let loaded = load_last_auto_submit(&cfg).expect("persisted");
+        let since = std::time::SystemTime::now()
+            .duration_since(loaded)
+            .unwrap_or(Duration::ZERO);
+        assert!(since < AUTO_LOG_COOLDOWN);
+        assert!(!should_auto_submit_stall_logs(60 * MIN, None, true, Some(since)));
     }
 
     #[test]
