@@ -272,6 +272,8 @@ const SERVER_RESTART_SETTINGS = new Set<keyof SettingsStore>([
   "apiAuth",
   "apiKey",
   "listenOnLan",
+  "disableAudio",
+  "audioCaptureMode",
   "encryptStore",
   "asyncPiiRedaction",
   "asyncImagePiiRedaction",

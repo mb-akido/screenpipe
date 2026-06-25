@@ -93,6 +93,16 @@ pub(crate) async fn start_audio_device(
 ) -> Result<Json<AudioDeviceControlResponse>, (StatusCode, JsonResponse<Value>)> {
     let device_name = payload.device_name.clone();
 
+    if state.audio_disabled || state.audio_manager.is_disabled().await {
+        return Err((
+            StatusCode::CONFLICT,
+            JsonResponse(json!({
+                "success": false,
+                "message": "Audio capture is disabled in settings"
+            })),
+        ));
+    }
+
     if let Err(e) = state.audio_manager.resume_device(&device_name).await {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -187,6 +197,16 @@ pub(crate) async fn audio_device_status(
 pub(crate) async fn start_audio(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, (StatusCode, JsonResponse<Value>)> {
+    if state.audio_disabled || state.audio_manager.is_disabled().await {
+        return Err((
+            StatusCode::CONFLICT,
+            JsonResponse(json!({
+                "success": false,
+                "message": "Audio capture is disabled in settings",
+            })),
+        ));
+    }
+
     match state.audio_manager.start().await {
         Ok(_) => Ok(Response::builder().status(200).body(Body::empty()).unwrap()),
         Err(e) => Err((

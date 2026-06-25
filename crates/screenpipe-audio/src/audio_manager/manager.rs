@@ -250,7 +250,10 @@ impl AudioManager {
     /// live-meeting provider, devices, language, vocabulary, and batch mode
     /// update on a capture-level restart.
     pub async fn apply_options(&self, options: AudioManagerOptions) -> Result<()> {
-        if self.status().await == AudioManagerStatus::Running {
+        if self.status().await == AudioManagerStatus::Running
+            || options.is_disabled
+            || !self.recording_handles.is_empty()
+        {
             self.stop_internal().await?;
         }
 
@@ -488,11 +491,9 @@ impl AudioManager {
     }
 
     pub async fn stop(&self) -> Result<()> {
-        if self.status().await == AudioManagerStatus::Stopped {
+        if self.status().await == AudioManagerStatus::Stopped && self.recording_handles.is_empty() {
             return Ok(());
         }
-        *self.status.write().await = AudioManagerStatus::Stopped;
-        stop_device_monitor().await?;
         self.stop_internal().await
     }
 
@@ -548,6 +549,10 @@ impl AudioManager {
         self.status.read().await.clone()
     }
 
+    pub async fn is_disabled(&self) -> bool {
+        self.options.read().await.is_disabled
+    }
+
     /// Temporarily pause a device without changing the configured device list.
     /// Idempotent — safe to call if already paused. Never errors.
     pub async fn pause_device(&self, device_name: &str) -> Result<()> {
@@ -567,8 +572,20 @@ impl AudioManager {
 
     /// Resume a previously paused device. Idempotent — safe to call if already running.
     pub async fn resume_device(&self, device_name: &str) -> Result<()> {
+        if self.options.read().await.is_disabled {
+            return Err(anyhow!("audio capture is disabled"));
+        }
+
         // Remove from disabled FIRST so start_device gate allows it
         self.user_disabled_devices.write().await.remove(device_name);
+
+        if self.status().await != AudioManagerStatus::Running {
+            info!(
+                "user re-enabled audio device while audio manager is stopped: {}",
+                device_name
+            );
+            return Ok(());
+        }
 
         let device = match parse_audio_device(device_name) {
             Ok(device) => device,
@@ -600,6 +617,14 @@ impl AudioManager {
     }
 
     pub async fn start_device(&self, device: &AudioDevice) -> Result<()> {
+        if self.options.read().await.is_disabled {
+            debug!(
+                "skipping start of audio device because audio capture is disabled: {}",
+                device
+            );
+            return Ok(());
+        }
+
         // Don't restart devices that are paused due to DRM content detection.
         // The monitor watcher will call start_output_devices() when DRM clears.
         if self
