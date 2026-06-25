@@ -132,11 +132,28 @@ pub fn perform_ocr_tesseract(
         }
     };
 
-    // Extract data output
-    let data_output = match rusty_tesseract::image_to_data(&ocr_image, &args) {
-        Ok(data) => data,
-        Err(e) => {
+    // Extract data output.
+    //
+    // rusty_tesseract shells out to the `tesseract` binary and unwraps its
+    // output internally; when the binary is missing or misbehaving (common on
+    // Linux without a system tesseract) it PANICS with `Option::unwrap()` on a
+    // `None` value (rusty-tesseract command.rs:108) rather than returning Err,
+    // taking down the calling worker. Guard with catch_unwind so a panic becomes
+    // an empty OCR result instead of an unwind — the established pattern for
+    // panicky deps (fbank #4159, ort #3290). SCREENPIPE-CLI-V3 / CLI-T0.
+    let ocr_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rusty_tesseract::image_to_data(&ocr_image, &args)
+    }));
+    let data_output = match ocr_result {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
             warn!("tesseract: OCR failed: {}", e);
+            return (String::new(), "[]".to_string(), None);
+        }
+        Err(_) => {
+            warn!(
+                "tesseract: OCR panicked (tesseract binary missing or misbehaving) — skipping frame"
+            );
             return (String::new(), "[]".to_string(), None);
         }
     };
@@ -246,5 +263,18 @@ mod tests {
         let (bin_dir, tessdata) = bundled_tesseract(dir.path()).expect("binary present");
         assert_eq!(bin_dir, dir.path());
         assert_eq!(tessdata, Some(dir.path().join("tessdata")));
+    }
+
+    // SCREENPIPE-CLI-V3 / CLI-T0: rusty_tesseract panics (unwrap on None) when
+    // the tesseract binary is unavailable. perform_ocr_tesseract must absorb that
+    // via catch_unwind and return an empty result instead of unwinding the
+    // worker. Runs whether or not tesseract is installed: missing → exercises the
+    // catch_unwind path; present → normal OCR of a blank image. Either way it
+    // must return (not panic) with structured JSON.
+    #[test]
+    fn perform_ocr_tesseract_is_panic_safe() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        let (_text, json, _conf) = perform_ocr_tesseract(&img, vec![]);
+        assert!(json.starts_with('['), "expected JSON array, got: {json}");
     }
 }
