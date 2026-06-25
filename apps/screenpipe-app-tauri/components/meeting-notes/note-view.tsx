@@ -73,6 +73,7 @@ import {
   buildMeetingMarkdown,
   fetchMeetingAudio,
   fetchMeetingContext,
+  type ActivitySummary,
   type MeetingContext,
 } from "@/lib/utils/meeting-context";
 import {
@@ -1046,7 +1047,7 @@ export function NoteView({
           on the footer and the caret could only be moved there with the arrow
           keys. Making `main` the scroll viewport and the footer `shrink-0`
           removes that dead zone entirely. */}
-      <main className="relative min-h-0 flex-1 overflow-y-auto w-full max-w-5xl mx-auto px-5 pt-5 pb-16 sm:px-10 lg:px-16">
+      <main className="relative min-h-0 flex-1 overflow-y-auto w-full max-w-6xl mx-auto px-5 pt-5 pb-16 sm:px-10 lg:px-16">
         <div className="flex items-center justify-between mb-9">
           <Button
             variant="ghost"
@@ -1126,69 +1127,98 @@ export function NoteView({
           </div>
         </div>
 
-        <section className="mx-auto max-w-3xl">
-          <input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="untitled meeting"
-            spellCheck={false}
-            className="w-full bg-transparent text-4xl font-medium leading-tight tracking-tight text-foreground focus:outline-none placeholder:text-muted-foreground/40 sm:text-5xl"
-          />
-
-          <div className="mt-5 flex flex-wrap items-center gap-2">
-            <Pill icon={<Calendar className="h-3.5 w-3.5" />}>
-              {meetingDateLabel}
-            </Pill>
-            <Pill icon={<Clock className="h-3.5 w-3.5" />}>
-              <span className="text-foreground/80">{meetingStartClock}</span>
-              {isLive || !meetingEndClock ? (
-                <span className="inline-flex items-center gap-1 border border-foreground/15 bg-foreground/[0.03] px-1.5 py-0.5 text-[10px] font-medium leading-none text-foreground">
-                  <span className="h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
-                  ongoing
-                </span>
-              ) : (
-                <>
-                  <span className="text-muted-foreground/35">-</span>
-                  <span className="text-foreground/80">{meetingEndClock}</span>
-                  <span className="text-muted-foreground/35">·</span>
-                  <span>{meetingDurationLabel}</span>
-                </>
-              )}
-            </Pill>
-            <AttendeesPill
-              value={attendees}
-              count={attendeeCount}
-              onChange={setAttendees}
+        <section className="mx-auto grid max-w-6xl gap-8 lg:grid-cols-[minmax(0,1fr)_17rem] lg:items-start">
+          <article className="min-w-0">
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="untitled meeting"
+              spellCheck={false}
+              className="w-full bg-transparent text-4xl font-medium leading-tight tracking-tight text-foreground focus:outline-none placeholder:text-muted-foreground/40 sm:text-5xl"
             />
-            {meeting.meeting_app && meeting.meeting_app !== "manual" && (
-              <Pill>{meeting.meeting_app.toLowerCase()}</Pill>
-            )}
-          </div>
 
-          <NoteEditor
-            ref={noteEditorRef}
-            key={meeting.id}
-            value={note}
-            onChange={setNote}
-            placeholder={'write notes, or type "/" for blocks'}
-            className="mt-10 [&_.ProseMirror]:min-h-[50vh] [&_.ProseMirror]:text-[15px] [&_.ProseMirror]:leading-7"
-          />
-
-          {meetingCtx?.activity && (
-            <div className="mt-10 space-y-6">
-              <ReplayStrip
-                meetingId={meeting.id}
-                segments={meetingCtx.activity.audio_summary.top_transcriptions}
-                timeRange={meetingCtx.activity.time_range}
+            <div className="mt-5 flex flex-wrap items-center gap-2">
+              <Pill icon={<Calendar className="h-3.5 w-3.5" />}>
+                {meetingDateLabel}
+              </Pill>
+              <Pill icon={<Clock className="h-3.5 w-3.5" />}>
+                <span className="text-foreground/80">{meetingStartClock}</span>
+                {isLive || !meetingEndClock ? (
+                  <span className="inline-flex items-center gap-1 border border-foreground/15 bg-foreground/[0.03] px-1.5 py-0.5 text-[10px] font-medium leading-none text-foreground">
+                    <span className="h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
+                    ongoing
+                  </span>
+                ) : (
+                  <>
+                    <span className="text-muted-foreground/35">-</span>
+                    <span className="text-foreground/80">
+                      {meetingEndClock}
+                    </span>
+                    <span className="text-muted-foreground/35">·</span>
+                    <span>{meetingDurationLabel}</span>
+                  </>
+                )}
+              </Pill>
+              <AttendeesPill
+                value={attendees}
+                count={attendeeCount}
+                onChange={setAttendees}
               />
-              <Receipts activity={meetingCtx.activity} />
+              {meeting.meeting_app && meeting.meeting_app !== "manual" && (
+                <Pill>{meeting.meeting_app.toLowerCase()}</Pill>
+              )}
             </div>
-          )}
+
+            <NoteEditor
+              ref={noteEditorRef}
+              key={meeting.id}
+              value={note}
+              onChange={setNote}
+              placeholder={'write notes, or type "/" for blocks'}
+              className="mt-10 [&_.ProseMirror]:min-h-[50vh] [&_.ProseMirror]:text-[15px] [&_.ProseMirror]:leading-7"
+            />
+
+            {meetingCtx?.activity && (
+              <div className="mt-10 space-y-6">
+                <ReplayStrip
+                  meetingId={meeting.id}
+                  segments={
+                    meetingCtx.activity.audio_summary.top_transcriptions
+                  }
+                  timeRange={meetingCtx.activity.time_range}
+                />
+                <Receipts activity={meetingCtx.activity} />
+              </div>
+            )}
+          </article>
+
+          <MeetingContextRail
+            activity={meetingCtx?.activity ?? null}
+            clipboardCount={meetingCtx?.clipboardCount ?? 0}
+            copied={copied}
+            copying={copying}
+            durationLabel={dockDuration}
+            exporting={exporting}
+            isLive={isLive}
+            meetingCtxOk={meetingCtx?.ok ?? false}
+            onCopy={() => void handleCopy()}
+            onExport={() => void handleExport()}
+            onRetranscribe={() => void handleRetranscribe()}
+            onSummarize={() => void handleSummarize()}
+            onToggleTranscript={() => setTranscriptOpen((v) => !v)}
+            retranscribing={retranscribing}
+            saveState={saveState}
+            statusLabel={
+              isLive ? (captureState?.shortLabel ?? "recording") : "saved"
+            }
+            summarizing={summarizing}
+            transcriptOpen={transcriptOpen}
+          />
         </section>
       </main>
 
       <footer className="z-30 shrink-0 border-t border-border bg-background">
-        <div className="mx-auto max-w-3xl px-5 py-3 sm:px-0">
+        <div className="mx-auto max-w-6xl px-5 py-3 sm:px-0">
           {!isLive && inactivityPrompt && (
             <InactivityResumeBanner
               resuming={resuming}
@@ -1377,6 +1407,249 @@ export function NoteView({
       </footer>
     </div>
   );
+}
+
+function MeetingContextRail({
+  activity,
+  clipboardCount,
+  copied,
+  copying,
+  durationLabel,
+  exporting,
+  isLive,
+  meetingCtxOk,
+  onCopy,
+  onExport,
+  onRetranscribe,
+  onSummarize,
+  onToggleTranscript,
+  retranscribing,
+  saveState,
+  statusLabel,
+  summarizing,
+  transcriptOpen,
+}: {
+  activity: ActivitySummary | null;
+  clipboardCount: number;
+  copied: boolean;
+  copying: boolean;
+  durationLabel: string;
+  exporting: boolean;
+  isLive: boolean;
+  meetingCtxOk: boolean;
+  onCopy: () => void;
+  onExport: () => void;
+  onRetranscribe: () => void;
+  onSummarize: () => void;
+  onToggleTranscript: () => void;
+  retranscribing: boolean;
+  saveState: SaveState;
+  statusLabel: string;
+  summarizing: boolean;
+  transcriptOpen: boolean;
+}) {
+  const transcriptCount = activity?.audio_summary.segment_count ?? 0;
+  const speakerCount = activity?.audio_summary.speakers.length ?? 0;
+  const windowCount = activity?.windows.length ?? 0;
+  const appCount = activity?.apps.length ?? 0;
+  const fileCount = activity?.edited_files?.length ?? 0;
+  const frameCount = activity?.total_frames ?? 0;
+  const contextReady = activity !== null || meetingCtxOk;
+
+  return (
+    <aside className="space-y-3 lg:sticky lg:top-5">
+      <section className="border border-border bg-background p-3 shadow-sm">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+              {isLive ? "live capture" : "meeting"}
+            </div>
+            <div className="mt-1 truncate text-sm font-medium text-foreground">
+              {statusLabel}
+            </div>
+          </div>
+          <span
+            className={cn(
+              "flex h-8 w-8 shrink-0 items-center justify-center border border-border",
+              isLive
+                ? "bg-foreground text-background"
+                : "bg-muted text-muted-foreground",
+            )}
+          >
+            {isLive ? (
+              <AudioLines className="h-4 w-4" />
+            ) : (
+              <Check className="h-4 w-4" />
+            )}
+          </span>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+          <span className="tabular-nums">{durationLabel}</span>
+          {saveState.kind !== "idle" && (
+            <>
+              <span aria-hidden>·</span>
+              <SaveIndicator state={saveState} />
+            </>
+          )}
+        </div>
+      </section>
+
+      <section className="border border-border bg-background p-3">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+              context
+            </div>
+            <div className="mt-1 text-sm font-medium">
+              {contextReady ? "receipts ready" : "loading"}
+            </div>
+          </div>
+          {!contextReady && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <ContextStat
+            icon={<FileText className="h-3.5 w-3.5" />}
+            label="transcript"
+            value={transcriptCount}
+          />
+          <ContextStat
+            icon={<Users className="h-3.5 w-3.5" />}
+            label="speakers"
+            value={speakerCount}
+          />
+          <ContextStat
+            icon={<Video className="h-3.5 w-3.5" />}
+            label="frames"
+            value={compactCount(frameCount)}
+          />
+          <ContextStat
+            icon={<FileText className="h-3.5 w-3.5" />}
+            label="files"
+            value={fileCount}
+          />
+          <ContextStat
+            icon={<Sparkles className="h-3.5 w-3.5" />}
+            label="apps"
+            value={appCount}
+          />
+          <ContextStat
+            icon={<Copy className="h-3.5 w-3.5" />}
+            label="clipboard"
+            value={clipboardCount}
+          />
+        </div>
+
+        {windowCount > 0 && (
+          <div className="mt-3 border-t border-border pt-3 text-[11px] leading-5 text-muted-foreground">
+            {windowCount} {windowCount === 1 ? "window" : "windows"} linked to
+            this meeting
+          </div>
+        )}
+      </section>
+
+      <section className="border border-border bg-background p-1">
+        <RailActionButton
+          active={transcriptOpen}
+          icon={<FileText className="h-3.5 w-3.5" />}
+          label={transcriptOpen ? "hide transcript" : "show transcript"}
+          onClick={onToggleTranscript}
+        />
+        <RailActionButton
+          busy={summarizing}
+          icon={<Sparkles className="h-3.5 w-3.5" />}
+          label="summarize"
+          onClick={onSummarize}
+        />
+        <RailActionButton
+          busy={copying}
+          icon={
+            copied ? (
+              <Check className="h-3.5 w-3.5" />
+            ) : (
+              <Copy className="h-3.5 w-3.5" />
+            )
+          }
+          label={copied ? "copied" : "copy"}
+          onClick={onCopy}
+        />
+        {!isLive && (
+          <>
+            <RailActionButton
+              busy={retranscribing}
+              icon={<RefreshCw className="h-3.5 w-3.5" />}
+              label="retranscribe"
+              onClick={onRetranscribe}
+            />
+            <RailActionButton
+              busy={exporting}
+              icon={<Download className="h-3.5 w-3.5" />}
+              label="export video"
+              onClick={onExport}
+            />
+          </>
+        )}
+      </section>
+    </aside>
+  );
+}
+
+function ContextStat({
+  icon,
+  label,
+  value,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: React.ReactNode;
+}) {
+  return (
+    <div className="min-w-0 border border-border bg-muted/20 p-2">
+      <div className="mb-1 flex items-center gap-1.5 text-muted-foreground">
+        {icon}
+        <span className="truncate text-[10px] uppercase tracking-[0.12em]">
+          {label}
+        </span>
+      </div>
+      <div className="truncate text-sm font-medium tabular-nums">{value}</div>
+    </div>
+  );
+}
+
+function RailActionButton({
+  active,
+  busy,
+  icon,
+  label,
+  onClick,
+}: {
+  active?: boolean;
+  busy?: boolean;
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      variant={active ? "default" : "ghost"}
+      size="sm"
+      onClick={onClick}
+      disabled={busy}
+      className="h-9 w-full justify-start gap-2 rounded-none px-2 text-xs normal-case tracking-normal"
+    >
+      {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : icon}
+      <span className="truncate">{label}</span>
+    </Button>
+  );
+}
+
+function compactCount(value: number): string {
+  if (value >= 1_000_000) return `${Math.floor(value / 100_000) / 10}m`;
+  if (value >= 1_000) return `${Math.floor(value / 100) / 10}k`;
+  return String(value);
 }
 
 function AudioHealthButton({
