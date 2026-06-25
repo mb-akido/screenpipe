@@ -526,6 +526,21 @@ mod imp {
             cfg.device_id, cfg.device_label, cfg.ingest_url
         );
 
+        // Point the stalled-upload watchdog at the real app-log dirs. App logs
+        // live in the screenpipe data dir (RollingFileAppender), NOT Tauri's
+        // app_data_dir — so the from_env default would miss them.
+        let mut cfg = cfg;
+        let mut log_dirs = Vec::new();
+        if let Ok(d) = crate::log_files::get_screenpipe_data_dir(app) {
+            log_dirs.push(d);
+        }
+        if let Ok(d) = crate::log_files::get_data_dir(app) {
+            log_dirs.push(d);
+        }
+        if !log_dirs.is_empty() {
+            cfg.log_dirs = log_dirs;
+        }
+
         let api = local_api_context_from_app(app);
         let api_url_base = api.url("");
         // NB: don't capture `api.api_key` here — at spawn-time the

@@ -64,6 +64,15 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// retrying every interval.
 const RETRY_AFTER_AUTH_FAIL: Duration = Duration::from_secs(60 * 60);
 
+/// Stalled-upload watchdog: an enrolled device that's been failing to land data
+/// in the org's storage for this long auto-submits its logs to support (the
+/// same endpoint the in-app "send logs" button uses — no UI, so it works on
+/// "run hidden" managed devices). Several missed 5-min ticks past first-run lag.
+const UPLOAD_STALL_THRESHOLD: Duration = Duration::from_secs(30 * 60);
+/// Re-arm window for the auto-submit, so a persistently-broken device reports at
+/// most ~twice a day instead of every tick.
+const AUTO_LOG_COOLDOWN: Duration = Duration::from_secs(12 * 60 * 60);
+
 /// Default endpoint. Overridable via `SCREENPIPE_ENTERPRISE_INGEST_URL` for
 /// staging / on-prem.
 pub const DEFAULT_INGEST_URL: &str = "https://screenpi.pe/api/enterprise/ingest";
@@ -87,6 +96,10 @@ pub struct EnterpriseSyncConfig {
     pub cursor_path: PathBuf,
     /// Hosted plaintext ingest or direct encrypted customer-storage upload.
     pub upload_mode: EnterpriseUploadMode,
+    /// Directories to scan for `*.log` files when the stalled-upload watchdog
+    /// auto-submits diagnostics. Empty = watchdog can still fire but ships a
+    /// "no log files found" marker. Set by the caller to the app's log dirs.
+    pub log_dirs: Vec<PathBuf>,
 }
 
 impl EnterpriseSyncConfig {
@@ -152,6 +165,9 @@ impl EnterpriseSyncConfig {
             ingest_url,
             cursor_path,
             upload_mode,
+            // Logs live in the app data dir by default; the caller may extend
+            // this (e.g. the second tracing dir) after construction.
+            log_dirs: vec![app_data_dir],
         })
     }
 
@@ -1112,6 +1128,177 @@ pub async fn fulfill_frame_requests(
 
 /// Run the sync forever (or until shutdown signal fires). Resilient to all
 /// transient errors. Idempotent across restarts via the cursor file.
+/// Decide whether to auto-submit diagnostic logs for a stalled upload pipeline.
+/// Pure so it unit-tests without a clock. Fires only when ALL hold:
+///   - the sync has run long enough to have had a fair shot (startup grace);
+///   - no data has actually landed in the org's storage within the stall window
+///     (`since_last_data` = None means it never has);
+///   - we've seen at least one REAL upload failure since data last landed — so a
+///     genuinely idle/paused device (uploads succeed with nothing new) never
+///     phones home; and
+///   - we're past the cooldown since the last auto-submit.
+fn should_auto_submit_stall_logs(
+    running_for: Duration,
+    since_last_data: Option<Duration>,
+    saw_failure_since_data: bool,
+    since_last_submit: Option<Duration>,
+) -> bool {
+    if running_for < UPLOAD_STALL_THRESHOLD {
+        return false;
+    }
+    let stale = since_last_data.map_or(true, |d| d >= UPLOAD_STALL_THRESHOLD);
+    if !stale || !saw_failure_since_data {
+        return false;
+    }
+    since_last_submit.map_or(true, |d| d >= AUTO_LOG_COOLDOWN)
+}
+
+/// Origin (`scheme://host[:port]`) of the ingest URL — the logs endpoints live
+/// on the same host. Falls back to prod if the URL is malformed.
+fn logs_base_url(ingest_url: &str) -> String {
+    if let Some(scheme_end) = ingest_url.find("://") {
+        let rest = &ingest_url[scheme_end + 3..];
+        let host_len = rest.find('/').unwrap_or(rest.len());
+        return ingest_url[..scheme_end + 3 + host_len].to_string();
+    }
+    "https://screenpi.pe".to_string()
+}
+
+/// Stable, regex-safe identifier (`^[A-Za-z0-9._:-]+$`, ≤128) for the logs API.
+fn stall_log_identifier(device_id: &str) -> String {
+    let safe: String = device_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+        .collect();
+    format!("enterprise-auto-{safe}").chars().take(128).collect()
+}
+
+/// UTF-8-boundary-safe tail of `s`, at most `max_bytes`.
+fn tail_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// Read recent `*.log` content from `dirs`, newest file first, bounded total.
+async fn collect_log_text(dirs: &[PathBuf]) -> String {
+    const MAX_TOTAL: usize = 256 * 1024;
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for dir in dirs {
+        if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let path = entry.path();
+                if path.extension().map(|e| e == "log").unwrap_or(false) {
+                    let modified = entry
+                        .metadata()
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    files.push((modified, path));
+                }
+            }
+        }
+    }
+    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+
+    let mut out = String::new();
+    for (_, path) in files {
+        if out.len() >= MAX_TOTAL {
+            break;
+        }
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let budget = MAX_TOTAL - out.len();
+            out.push_str(&format!("\n=== {} ===\n{}", name, tail_str(&content, budget)));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("[no log files found]");
+    }
+    out
+}
+
+/// Best-effort: ship the device's app logs to support via the same public
+/// endpoint the in-app "send logs" button uses. No UI required, so it works on
+/// "run hidden" managed devices. Never panics; failures just warn and are
+/// retried next cooldown.
+async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
+    let base = logs_base_url(&cfg.ingest_url);
+    let identifier = stall_log_identifier(&cfg.device_id);
+
+    // 1. signed upload URL
+    let signed: serde_json::Value = match http
+        .post(format!("{base}/api/logs"))
+        .json(&serde_json::json!({ "identifier": identifier, "type": "machine" }))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("enterprise sync: stall-log url decode failed: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            warn!("enterprise sync: stall-log url request failed: {e}");
+            return;
+        }
+    };
+    let signed_url = signed["data"]["signedUrl"].as_str();
+    let path = signed["data"]["path"].as_str();
+    let (signed_url, path) = match (signed_url, path) {
+        (Some(u), Some(p)) => (u.to_string(), p.to_string()),
+        _ => {
+            warn!("enterprise sync: stall-log url response missing fields");
+            return;
+        }
+    };
+
+    // 2. upload the log bytes
+    let body = collect_log_text(&cfg.log_dirs).await;
+    if let Err(e) = http
+        .put(&signed_url)
+        .header("Content-Type", "text/plain")
+        .body(body)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        warn!("enterprise sync: stall-log upload failed: {e}");
+        return;
+    }
+
+    // 3. confirm (this is what files it for support)
+    let feedback = format!(
+        "auto: enterprise device recording but not landing data in org storage (license {}, device {}, mode {:?})",
+        cfg.license_key,
+        cfg.device_id,
+        std::mem::discriminant(&cfg.upload_mode)
+    );
+    let _ = http
+        .post(format!("{base}/api/logs/confirm"))
+        .json(&serde_json::json!({
+            "path": path,
+            "identifier": identifier,
+            "type": "machine",
+            "os": std::env::consts::OS,
+            "os_version": "",
+            "app_version": option_env!("CARGO_PKG_VERSION").unwrap_or("unknown"),
+            "feedback_text": feedback,
+        }))
+        .send()
+        .await;
+    info!("enterprise sync: auto-submitted diagnostic logs (device enrolled but not uploading)");
+}
+
 pub async fn run(
     cfg: EnterpriseSyncConfig,
     local: Arc<dyn LocalApiClient>,
@@ -1130,8 +1317,36 @@ pub async fn run(
     let mut cursor = Cursor::load(&cfg.cursor_path);
     let mut backoff = BACKOFF_INITIAL;
 
+    // Stalled-upload watchdog state (see should_auto_submit_stall_logs).
+    let started = std::time::Instant::now();
+    let mut last_data_upload: Option<std::time::Instant> = None;
+    let mut saw_failure_since_data = false;
+    let mut last_auto_submit: Option<std::time::Instant> = None;
+
     loop {
-        match run_one_sync(&cfg, &mut cursor, local.as_ref(), &http).await {
+        let result = run_one_sync(&cfg, &mut cursor, local.as_ref(), &http).await;
+
+        // Watchdog bookkeeping: a data-bearing success clears the failure flag;
+        // any error counts as a real upload failure. Then maybe phone home.
+        match &result {
+            Ok(report) if report.bytes > 0 => {
+                last_data_upload = Some(std::time::Instant::now());
+                saw_failure_since_data = false;
+            }
+            Ok(_) => {}
+            Err(_) => saw_failure_since_data = true,
+        }
+        if should_auto_submit_stall_logs(
+            started.elapsed(),
+            last_data_upload.map(|t| t.elapsed()),
+            saw_failure_since_data,
+            last_auto_submit.map(|t| t.elapsed()),
+        ) {
+            submit_stall_logs(&cfg, &http).await;
+            last_auto_submit = Some(std::time::Instant::now());
+        }
+
+        match result {
             Ok(report) => {
                 if report.frames > 0
                     || report.audio > 0
@@ -1222,6 +1437,89 @@ mod tests {
     use enterprise_upload::DirectUploadConfig;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn watchdog_fires_when_stalled_with_failures_past_grace() {
+        // running long enough, no data ever, saw a failure, never submitted
+        assert!(should_auto_submit_stall_logs(40 * MIN, None, true, None));
+        // last data is old + a failure since → fire
+        assert!(should_auto_submit_stall_logs(
+            2 * 60 * MIN,
+            Some(35 * MIN),
+            true,
+            None
+        ));
+    }
+
+    #[test]
+    fn watchdog_silent_during_startup_grace() {
+        // only just started — give the first ticks a chance even with no data
+        assert!(!should_auto_submit_stall_logs(5 * MIN, None, true, None));
+    }
+
+    #[test]
+    fn watchdog_silent_for_idle_device_no_failures() {
+        // no data recently but NO upload failure → genuinely idle/paused, not broken
+        assert!(!should_auto_submit_stall_logs(60 * MIN, Some(40 * MIN), false, None));
+        assert!(!should_auto_submit_stall_logs(60 * MIN, None, false, None));
+    }
+
+    #[test]
+    fn watchdog_silent_when_data_is_flowing() {
+        // recent successful upload → healthy even if a failure was seen
+        assert!(!should_auto_submit_stall_logs(60 * MIN, Some(2 * MIN), true, None));
+    }
+
+    #[test]
+    fn watchdog_respects_cooldown() {
+        // stalled + failing, but submitted recently → wait
+        assert!(!should_auto_submit_stall_logs(
+            5 * 60 * MIN,
+            Some(40 * MIN),
+            true,
+            Some(60 * MIN)
+        ));
+        // cooldown elapsed → fire again
+        assert!(should_auto_submit_stall_logs(
+            20 * 60 * MIN,
+            Some(40 * MIN),
+            true,
+            Some(13 * 60 * MIN)
+        ));
+    }
+
+    #[test]
+    fn logs_base_url_takes_origin() {
+        assert_eq!(
+            logs_base_url("https://screenpi.pe/api/enterprise/ingest"),
+            "https://screenpi.pe"
+        );
+        assert_eq!(
+            logs_base_url("http://localhost:3000/api/enterprise/ingest"),
+            "http://localhost:3000"
+        );
+        assert_eq!(logs_base_url("not a url"), "https://screenpi.pe");
+    }
+
+    #[test]
+    fn stall_log_identifier_is_regex_safe() {
+        let id = stall_log_identifier("AB-12 34/xy");
+        assert!(id.starts_with("enterprise-auto-"));
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')));
+        assert!(id.len() <= 128);
+    }
+
+    #[test]
+    fn tail_str_is_char_boundary_safe() {
+        assert_eq!(tail_str("hello", 100), "hello");
+        assert_eq!(tail_str("hello", 2), "lo");
+        // multi-byte: never split a char
+        let s = "aé"; // 'é' is 2 bytes
+        let t = tail_str(s, 1); // would land mid-'é' → step forward to boundary
+        assert!(s.ends_with(t) || t.is_empty());
+    }
 
     fn frame(id: i64, ts: &str, app: &str, text: &str) -> FrameRow {
         FrameRow {
@@ -1796,6 +2094,7 @@ mod tests {
             ingest_url,
             cursor_path: dir.path().join(CURSOR_FILENAME),
             upload_mode: EnterpriseUploadMode::HostedIngest,
+            log_dirs: vec![dir.path().to_path_buf()],
         }
     }
 
@@ -2509,6 +2808,7 @@ mod tests {
             ingest_url: format!("{server_uri}/api/enterprise/ingest"),
             cursor_path: tmp.path().join("cursor.json"),
             upload_mode: EnterpriseUploadMode::HostedIngest,
+            log_dirs: vec![tmp.path().to_path_buf()],
         }
     }
 
