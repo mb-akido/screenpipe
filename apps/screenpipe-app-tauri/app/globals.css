@@ -568,6 +568,37 @@
     animation: shimmer 1.5s infinite linear;
   }
 
+  /* Settings "AI audio & video analysis" preview — a dot traveling along a
+     connector track to show data flowing into / out of the enclave. */
+  @keyframes sp-flow {
+    0% {
+      left: 0;
+      opacity: 0;
+    }
+    15% {
+      opacity: 1;
+    }
+    85% {
+      opacity: 1;
+    }
+    100% {
+      left: calc(100% - 3px);
+      opacity: 0;
+    }
+  }
+
+  .sp-flow-dot {
+    animation: sp-flow 1.8s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sp-flow-dot {
+      animation: none;
+      left: 50%;
+      opacity: 1;
+    }
+  }
+
 
 }
 
