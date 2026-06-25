@@ -18,6 +18,12 @@ pub struct AudioPipelineMetrics {
     pub chunks_channel_full: AtomicU64,
     /// Device stream timeouts (no audio data received for >30s)
     pub stream_timeouts: AtomicU64,
+    /// Unix-seconds timestamp of the most recent stream timeout (0 = never).
+    /// Unlike the cumulative `stream_timeouts` counter, this lets the health
+    /// endpoint distinguish a *current* stall ("active_no_data") from one that
+    /// recovered long ago. Without it, a single historical timeout pins the
+    /// audio status to "active_no_data" forever — even while audio flows again.
+    pub last_stream_timeout_at: AtomicU64,
     /// Audio buffers skipped because the recorder consumer fell behind the
     /// capture broadcast channel. This is otherwise-silent audio loss under
     /// CPU contention — previously invisible to telemetry.
@@ -87,6 +93,7 @@ impl AudioPipelineMetrics {
             chunks_sent: AtomicU64::new(0),
             chunks_channel_full: AtomicU64::new(0),
             stream_timeouts: AtomicU64::new(0),
+            last_stream_timeout_at: AtomicU64::new(0),
             chunks_lagged: AtomicU64::new(0),
             vad_passed: AtomicU64::new(0),
             vad_rejected: AtomicU64::new(0),
@@ -124,6 +131,11 @@ impl AudioPipelineMetrics {
 
     pub fn record_stream_timeout(&self) {
         self.stream_timeouts.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.last_stream_timeout_at.store(now, Ordering::Relaxed);
     }
 
     /// Record `n` audio buffers skipped because the recorder consumer fell
@@ -294,6 +306,7 @@ impl AudioPipelineMetrics {
             chunks_sent,
             chunks_channel_full: self.chunks_channel_full.load(Ordering::Relaxed),
             stream_timeouts: self.stream_timeouts.load(Ordering::Relaxed),
+            last_stream_timeout_at: self.last_stream_timeout_at.load(Ordering::Relaxed),
             chunks_lagged: self.chunks_lagged.load(Ordering::Relaxed),
             // Consumer
             chunks_received: self.chunks_received.load(Ordering::Relaxed),
@@ -356,6 +369,10 @@ pub struct AudioMetricsSnapshot {
     pub chunks_sent: u64,
     pub chunks_channel_full: u64,
     pub stream_timeouts: u64,
+    /// Unix-seconds timestamp of the most recent stream timeout (0 = never).
+    /// Recency, unlike the cumulative `stream_timeouts`, tells a current stall
+    /// from a recovered one.
+    pub last_stream_timeout_at: u64,
     /// Audio buffers skipped because the recorder lagged the capture channel
     /// (silent loss under CPU contention).
     pub chunks_lagged: u64,

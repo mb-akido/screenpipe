@@ -83,6 +83,53 @@ fn suspected_stall_cause(read_idle: u32, write_idle: u32) -> &'static str {
 
 const SILENT_AUDIO_RMS_THRESHOLD: f64 = 0.001;
 
+/// How recently the audio stream-timeout watchdog must have fired for the audio
+/// status to be reported as "active_no_data". The watchdog re-fires every recv
+/// timeout while a stream is dead, so a window comfortably larger than one cycle
+/// keeps a genuinely dead stream flagged, while a stream that recovered (no new
+/// timeouts) clears back to "ok" instead of sticking forever on a stale count.
+const STREAM_TIMEOUT_RECENCY_SECS: u64 = 90;
+
+/// Classify the raw audio capture status from health signals. Pure so it can be
+/// unit-tested in isolation. `stream_timeout_recent` must reflect a *recent*
+/// stream timeout (see `STREAM_TIMEOUT_RECENCY_SECS`), NOT a cumulative count —
+/// passing "ever had a timeout" here is exactly the bug this extraction fixes.
+#[allow(clippy::too_many_arguments)]
+fn classify_audio_status(
+    audio_disabled: bool,
+    audio_never_captured: bool,
+    has_input_device: bool,
+    stream_timeout_recent: bool,
+    global_audio_active: bool,
+    last_audio_ts: u64,
+    now_ts: u64,
+    threshold_secs: u64,
+) -> &'static str {
+    if audio_disabled {
+        "disabled"
+    } else if audio_never_captured && !has_input_device {
+        // Audio is on but there is no microphone to capture from — expected
+        // idle, not a failure. Distinct from "not_started" so /health stays 200
+        // and the desktop stall notification (which keys off "not_started")
+        // does not false-fire on machines without a mic.
+        "no_input_device"
+    } else if audio_never_captured {
+        "not_started"
+    } else if stream_timeout_recent && global_audio_active {
+        // Device active but the watchdog fired recently — hijack/dead-stream
+        // recovery in progress. Clears automatically once timeouts stop.
+        "active_no_data"
+    } else if global_audio_active {
+        "ok"
+    } else if last_audio_ts == 0 {
+        "not_started"
+    } else if now_ts.saturating_sub(last_audio_ts) < threshold_secs {
+        "ok"
+    } else {
+        "stale"
+    }
+}
+
 fn capture_status(
     audio_disabled: bool,
     audio_status: &str,
@@ -800,37 +847,34 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         .iter()
         .any(|device| device.to_string().contains("(input)"));
 
-    // Detect "active_no_data" condition: device appears active (was selected and in
-    // the device list) but the zero-fill watchdog has fired, indicating the stream
-    // was hijacked by another app or went silent (Issue #3144). The watchdog
-    // automatically triggers a reconnect after 30s of no real audio, so this metric
-    // captures recovery attempts.
-    let stream_hijacked = audio_snap.stream_timeouts > 0;
+    // Detect "active_no_data": the device appears active (selected and in the
+    // device list) but the zero-fill watchdog has fired *recently*, indicating
+    // the stream was hijacked by another app or went dead (Issue #3144). The
+    // watchdog reconnects after 30s of no real audio and keeps re-firing while
+    // the stream stays dead.
+    //
+    // Gate on the RECENCY of the last timeout, not the cumulative count. The old
+    // `stream_timeouts > 0` check pinned the status to "active_no_data" forever
+    // after a single historical timeout (a wake/display invalidation, a device
+    // switch, a transient glitch) — so a fully recovered mic with chunks flowing
+    // again still read as broken. A healthy-but-silent room never trips this:
+    // raw chunks keep arriving so the watchdog never fires; only a genuinely
+    // dead/hijacked stream keeps refreshing `last_stream_timeout_at`.
+    let now_ts = now.timestamp().max(0) as u64;
+    let stream_timeout_recent = audio_snap.last_stream_timeout_at > 0
+        && now_ts.saturating_sub(audio_snap.last_stream_timeout_at) < STREAM_TIMEOUT_RECENCY_SECS;
 
-    let audio_status = if state.audio_disabled {
-        "disabled".to_string()
-    } else if audio_never_captured && !has_input_device {
-        // Audio is on but there is no microphone to capture from — expected idle,
-        // not a failure. Reported distinctly from "not_started" so /health stays
-        // 200 and the desktop stall notification (which keys off "not_started")
-        // does not false-fire on machines without a mic.
-        "no_input_device".to_string()
-    } else if audio_never_captured {
-        "not_started".to_string()
-    } else if stream_hijacked && global_audio_active {
-        // Device is active but the watchdog has fired — indicates hijack recovery
-        // in progress or recently completed. This is the "active_no_data" state
-        // the user requested in #3144.
-        "active_no_data".to_string()
-    } else if global_audio_active {
-        "ok".to_string()
-    } else if last_audio_ts == 0 {
-        "not_started".to_string()
-    } else if now.timestamp() as u64 - last_audio_ts < threshold_secs {
-        "ok".to_string()
-    } else {
-        "stale".to_string()
-    };
+    let audio_status = classify_audio_status(
+        state.audio_disabled,
+        audio_never_captured,
+        has_input_device,
+        stream_timeout_recent,
+        global_audio_active,
+        last_audio_ts,
+        now_ts,
+        threshold_secs,
+    )
+    .to_string();
 
     let transcription_paused = if !state.audio_disabled {
         state
@@ -1512,51 +1556,91 @@ mod tests {
         assert!(!audio_backlog_is_stalled(200, freshness, false));
     }
 
+    /// Healthy, actively-capturing mic with no recent timeout, varying only the
+    /// two signals under test. Calls the REAL `classify_audio_status` (the old
+    /// test re-implemented the logic inline, so it could never catch a bug).
+    fn audio_status_for(stream_timeout_recent: bool, global_audio_active: bool) -> &'static str {
+        classify_audio_status(
+            false, // audio_disabled
+            false, // audio_never_captured
+            true,  // has_input_device
+            stream_timeout_recent,
+            global_audio_active,
+            1_000, // last_audio_ts
+            1_010, // now_ts
+            60,    // threshold_secs
+        )
+    }
+
     #[test]
-    fn audio_status_active_no_data_when_stream_timeouts_nonzero() {
-        // This test verifies the fix for Issue #3144: detect when audio device
-        // is "active but producing no data" (hijacked or silent Bluetooth device).
-        // The stream_timeouts metric indicates the zero-fill watchdog has activated,
-        // which is the signal for active_no_data status.
+    fn audio_status_active_no_data_only_while_timeout_is_recent() {
+        // Issue #3144: an active device whose zero-fill watchdog fired *recently*
+        // is "active_no_data" (hijacked / dead stream, recovery in progress).
+        assert_eq!(audio_status_for(true, true), "active_no_data");
+    }
 
-        // Simulate the logic in the health check: when stream_timeouts > 0 and
-        // the device is globally active, we should report "active_no_data" status.
+    #[test]
+    fn audio_status_recovers_to_ok_after_timeout_goes_stale() {
+        // REGRESSION for the bug this PR fixes: a *historical* timeout must not
+        // pin the status to "active_no_data". Once the watchdog stops firing
+        // (stream recovered, chunks flowing again) the recency flag goes false
+        // and the status clears to "ok". The old `stream_timeouts > 0`
+        // (cumulative) check made a single past timeout stick forever — a
+        // perfectly healthy mic permanently read as broken.
+        assert_eq!(audio_status_for(false, true), "ok");
+    }
 
-        let stream_timeouts = 1; // Watchdog has fired — device hijacked or silent
-        let is_global_active = true;
+    #[test]
+    fn audio_status_silent_room_is_ok_not_active_no_data() {
+        // A healthy-but-silent mic still delivers raw chunks, so the watchdog
+        // never fires -> stream_timeout_recent stays false -> "ok", never the
+        // alarming "active_no_data"/degraded. This is the user-reported false
+        // "degraded on silence".
+        assert_eq!(audio_status_for(false, true), "ok");
+    }
 
-        let stream_hijacked = stream_timeouts > 0;
-
-        // Validate: with stream_hijacked=true and is_global_active=true,
-        // audio_status should be "active_no_data", not "ok".
-        let audio_status = if stream_hijacked && is_global_active {
-            "active_no_data".to_string()
-        } else if is_global_active {
-            "ok".to_string()
-        } else {
-            "not_started".to_string()
+    #[test]
+    fn audio_status_recency_window_boundary() {
+        // Drive the exact recency computation the health route performs, proving
+        // the window boundary: a timeout 30s ago counts as recent (within 90s)
+        // -> active_no_data; one 120s ago is stale -> ok.
+        let now: u64 = 1_000_000;
+        let recent = |ago: u64| -> bool {
+            let last = now - ago;
+            last > 0 && now.saturating_sub(last) < STREAM_TIMEOUT_RECENCY_SECS
         };
+        assert!(recent(30), "30s-old timeout should be recent");
+        assert!(!recent(120), "120s-old timeout should be stale");
+        assert_eq!(audio_status_for(recent(30), true), "active_no_data");
+        assert_eq!(audio_status_for(recent(120), true), "ok");
+    }
 
+    #[test]
+    fn audio_status_non_timeout_branches_unchanged() {
+        // Guard the unrelated branches against accidental regressions.
         assert_eq!(
-            audio_status, "active_no_data",
-            "audio_status should be 'active_no_data' when stream_timeouts > 0 and device is active (Issue #3144)"
+            classify_audio_status(true, false, true, true, true, 1000, 1010, 60),
+            "disabled"
         );
-
-        // Also verify the converse: if stream_timeouts == 0, should be "ok"
-        let no_hijack = 0;
-        let is_still_active = true;
-        let stream_hijacked_2 = no_hijack > 0;
-        let audio_status_2 = if stream_hijacked_2 && is_still_active {
-            "active_no_data".to_string()
-        } else if is_still_active {
-            "ok".to_string()
-        } else {
-            "not_started".to_string()
-        };
-
+        // never captured + no mic -> benign no_input_device (stays 200)
         assert_eq!(
-            audio_status_2, "ok",
-            "audio_status should be 'ok' when stream_timeouts == 0 and device is active"
+            classify_audio_status(false, true, false, false, false, 0, 1010, 60),
+            "no_input_device"
+        );
+        // never captured but a mic exists -> not_started
+        assert_eq!(
+            classify_audio_status(false, true, true, false, false, 0, 1010, 60),
+            "not_started"
+        );
+        // not active, last audio within threshold -> ok
+        assert_eq!(
+            classify_audio_status(false, false, true, false, false, 1000, 1030, 60),
+            "ok"
+        );
+        // not active, last audio stale -> stale
+        assert_eq!(
+            classify_audio_status(false, false, true, false, false, 1000, 2000, 60),
+            "stale"
         );
     }
 
