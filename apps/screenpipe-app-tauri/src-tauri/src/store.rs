@@ -113,6 +113,54 @@ fn store_json_has_presets(data: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Atomically and *durably* write `bytes` to `path`.
+///
+/// tauri-plugin-store's own save() is `fs::write` (O_TRUNC, no fsync): it
+/// zeroes the target first and never flushes, so a power loss mid-save — or
+/// even seconds after a "successful" save, before the OS flushes dirty pages —
+/// can leave store.bin truncated or zero-length. On the next boot the plugin
+/// swallows the parse error, hands back an empty store, and init_store saves
+/// defaults over it: every setting and AI model is gone. (Reproduced; this is
+/// the power-loss path of the 2026-06 settings-wipe reports.)
+///
+/// This helper instead writes to a sibling temp file, fsyncs it, atomically
+/// renames it over the target, then fsyncs the parent directory. The target is
+/// therefore always either the previous complete file or the new complete one —
+/// never a torn one. Used for store.bin and its recovery snapshots so a single
+/// crash can never destroy both the live file and its backup at once.
+fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".durable.tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?; // contents + metadata to stable storage before the rename
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // store.bin and its snapshots hold API keys — keep them owner-only.
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // fsync the directory so the rename itself survives a crash. Best-effort:
+    // not all platforms allow opening a dir for sync (Windows), and rename is
+    // already atomic there via MoveFileEx.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// L1 — copy `store.bin` → `store.bin.last-good` if the current file parses
 /// and has aiPresets. Skipped silently otherwise so we never freeze a wiped
 /// state as the recovery source. Called after every successful save.
@@ -132,31 +180,21 @@ pub fn snapshot_last_good(store_path: &Path) {
     if let Ok(existing) = std::fs::read(&last_good) {
         if existing != data && store_json_has_presets(&existing) {
             let prev = store_path.with_extension(LAST_GOOD_PREV_SUFFIX);
-            if let Err(e) = std::fs::write(&prev, &existing) {
+            if let Err(e) = durable_write(&prev, &existing) {
                 tracing::warn!(
                     "snapshot_last_good: failed to rotate {}: {}",
                     prev.display(),
                     e
                 );
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o600));
-            }
         }
     }
-    if let Err(e) = std::fs::write(&last_good, &data) {
+    if let Err(e) = durable_write(&last_good, &data) {
         tracing::warn!(
             "snapshot_last_good: failed to write {}: {}",
             last_good.display(),
             e
         );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&last_good, std::fs::Permissions::from_mode(0o600));
     }
 }
 
@@ -204,7 +242,7 @@ fn restore_snapshot_over(store_path: &Path, why: &str) -> bool {
         }
     }
 
-    if let Err(e) = std::fs::write(store_path, &data) {
+    if let Err(e) = durable_write(store_path, &data) {
         tracing::error!(
             "settings recovery: failed to restore {} from {}: {}",
             store_path.display(),
@@ -212,11 +250,6 @@ fn restore_snapshot_over(store_path: &Path, why: &str) -> bool {
             e
         );
         return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(store_path, std::fs::Permissions::from_mode(0o600));
     }
     tracing::warn!(
         "settings recovery: {} — restored {} from {}; pre-restore copy at {}",
@@ -330,8 +363,7 @@ fn decrypt_store_file(path: &Path) -> DecryptOutcome {
     };
     match screenpipe_vault::crypto::decrypt_small(&data[8..], &key) {
         Ok(plaintext) => {
-            let tmp = path.with_extension("bin.dec.tmp");
-            if std::fs::write(&tmp, &plaintext).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+            if durable_write(path, &plaintext).is_ok() {
                 DecryptOutcome::Decrypted
             } else {
                 tracing::error!("failed to write decrypted store.bin to disk");
@@ -412,9 +444,8 @@ fn encrypt_store_file(path: &Path) {
             let mut out = Vec::with_capacity(8 + ciphertext.len());
             out.extend_from_slice(STORE_MAGIC);
             out.extend(ciphertext);
-            let tmp = path.with_extension("bin.enc.tmp");
-            if std::fs::write(&tmp, &out).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
+            if let Err(e) = durable_write(path, &out) {
+                tracing::error!("failed to write encrypted store.bin: {}", e);
             }
         }
         Err(e) => {
@@ -446,6 +477,20 @@ pub fn reencrypt_store_file(app: &AppHandle) {
             let _ = std::fs::write(&flag_path, b"");
         } else if !encrypt_enabled && flag_path.exists() {
             let _ = std::fs::remove_file(&flag_path);
+        }
+
+        // Durably flush the plugin's non-atomic write of store.bin before we
+        // snapshot or encrypt it. tauri-plugin-store saves via fs::write
+        // (O_TRUNC, no fsync), leaving a window where a power loss truncates
+        // the file to zero/partial; rewriting it atomically + fsync closes that
+        // window so the on-disk store is always a complete document. Guarded on
+        // non-empty so a transient empty read never clobbers a good file.
+        if let Ok(bytes) = std::fs::read(&store_path) {
+            if !bytes.is_empty() {
+                if let Err(e) = durable_write(&store_path, &bytes) {
+                    tracing::warn!("durable flush of store.bin failed: {}", e);
+                }
+            }
         }
 
         // L1 — snapshot the current state to .last-good IFF it's healthy
@@ -2034,6 +2079,76 @@ mod tests {
         assert!(!store_json_has_presets(&missing));
         assert!(!store_json_has_presets(&no_settings));
         assert!(!store_json_has_presets(&invalid_json));
+    }
+
+    #[test]
+    fn durable_write_writes_full_content_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("store.bin");
+        let payload =
+            serde_json::to_vec(&json!({"settings": {"aiPresets": presets_n(3)}})).unwrap();
+        durable_write(&p, &payload).unwrap();
+
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            payload,
+            "content must match exactly"
+        );
+
+        // The atomic temp must be gone — never left as a torn sibling.
+        let mut tmp_path = p.clone().into_os_string();
+        tmp_path.push(".durable.tmp");
+        assert!(
+            !std::path::Path::new(&tmp_path).exists(),
+            "durable .tmp must not linger after a successful write"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "store file must stay owner-only (holds API keys)"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_write_replaces_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("store.bin");
+        std::fs::write(&p, b"old-and-much-longer-content").unwrap();
+        durable_write(&p, b"new").unwrap();
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"new",
+            "shorter new content must fully replace the old file"
+        );
+    }
+
+    #[test]
+    fn snapshot_last_good_leaves_no_torn_tempfile() {
+        // The snapshot is itself the recovery source, so it must be created via
+        // atomic rename — never an in-place write a crash could tear.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = write_store(
+            tmp.path(),
+            &json!({"settings": {"aiPresets": presets_n(2)}}),
+        );
+        snapshot_last_good(&store_path);
+        let lingering: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .filter(|n| n.ends_with(".durable.tmp"))
+            .collect();
+        assert!(
+            lingering.is_empty(),
+            "no temp files should remain: {lingering:?}"
+        );
+        let lg = store_path.with_extension(LAST_GOOD_SUFFIX);
+        assert!(store_json_has_presets(&std::fs::read(&lg).unwrap()));
     }
 
     #[test]
