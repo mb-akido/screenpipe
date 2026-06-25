@@ -857,6 +857,43 @@ const TEAM_TOOLS: Tool[] = [
       },
     },
   },
+  {
+    name: "team-files",
+    description:
+      "List raw telemetry JSONL object keys for the org. Use only for audit/export " +
+      "or when you need a key to pass to team-file-ticket. Requires read:files.",
+    annotations: { title: "Team Files", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        device_id: { type: "string", description: "Restrict to one device." },
+        since: { type: "string", description: "ISO 8601 lower bound. Default = now - 24h." },
+        until: { type: "string", description: "ISO 8601 upper bound. Default = now." },
+        since_hours_ago: { type: "integer", description: "Convenience: equivalent to since=now-N*h." },
+        page_size: { type: "integer", description: "Files to list (default 100, max 1000).", default: 100 },
+        cursor: { type: "string", description: "Opaque cursor from a previous response." },
+      },
+    },
+  },
+  {
+    name: "team-file-ticket",
+    description:
+      "Mint a direct-download ticket for one raw telemetry JSONL object key returned " +
+      "by team-files. R2/S3 tickets are short-lived presigned GET URLs; Azure returns " +
+      "the configured read SAS URL. Requires read:files:raw.",
+    annotations: { title: "Team File Ticket", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: {
+          type: "string",
+          description:
+            "Raw object key exactly as returned by team-files, e.g. enterprise-telemetry/<license>/<device>/<file>.jsonl",
+        },
+      },
+      required: ["key"],
+    },
+  },
 ];
 
 // Pipe-output kinds map to /workflows/generated, raw kinds map to /records.
@@ -2073,7 +2110,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ---------------------------------------------------------------------
       case "team-search":
       case "team-devices":
-      case "team-records": {
+      case "team-records":
+      case "team-files":
+      case "team-file-ticket": {
         if (!TEAM_TOKEN) {
           return {
             content: [
@@ -2089,6 +2128,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ],
           };
         }
+        if (name === "team-file-ticket") {
+          const key = typeof args.key === "string" ? args.key.trim() : "";
+          if (!key) throw new Error("team-file-ticket requires key");
+          const encodedKey = key.split("/").map(encodeURIComponent).join("/");
+          const response = await fetchTeam(`/files/${encodedKey}?ticket=1`);
+          const body = await response.text();
+          if (!response.ok) {
+            throw new Error(
+              `team-file-ticket failed ${response.status}: ${body.slice(0, 500)}`
+            );
+          }
+          return {
+            content: [{ type: "text", text: body }],
+          };
+        }
+
         // Map MCP tool name → /api/enterprise/v1 path. team-records also
         // routes synthesized pipe outputs (kind=sop|skill|...) to the
         // workflows endpoint so callers see one tool surface for "give me
@@ -2097,6 +2152,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const subpath =
           name === "team-search" ? "/search"
           : name === "team-devices" ? "/devices"
+          : name === "team-files" ? "/files"
           : name === "team-records" && SYNTHESIZED_KINDS.has(kindArg) ? "/workflows/generated"
           : "/records";
         // Forward every primitive arg as a query param. The server validates;

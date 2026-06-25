@@ -9,7 +9,7 @@ Query the customer's team telemetry. Data lives in the customer's own Azure Blob
 
 ## Auth
 
-The skill authenticates with an **enterprise admin API token** the admin minted once on `https://screenpi.pe/enterprise?tab=tokens` (with scopes `read:devices`, `read:search`, `read:records`) and pasted into Settings → Privacy → Admin Team API Token. The desktop stored it in `~/.screenpipe/enterprise.json` under `team_api_token`.
+The skill authenticates with an **enterprise admin API token** the admin minted once on `https://screenpi.pe/enterprise?tab=tokens` (with scopes `read:devices`, `read:search`, `read:records`; add `read:files` and `read:files:raw` only for raw export/download-ticket workflows) and pasted into Settings → Privacy → Admin Team API Token. The desktop stored it in `~/.screenpipe/enterprise.json` under `team_api_token`.
 
 License-key + token are intentionally separate concerns:
 - `license_key` proves *which org* this machine belongs to (deployed by IT, same on every employee's device).
@@ -51,6 +51,7 @@ Escalate from cheap to expensive:
 | 2 | `GET /search?q=...&since_hours_ago=24` | The user has a topic (e.g. "atlas", "q3 forecast"). Default 24h, narrow further if results are noisy. |
 | 3 | `GET /search?q=...&device_id=...` | Once you know whose data you want, scope to that device. |
 | 4 | `GET /records?device_id=...&since_hours_ago=4` | "Walk me through what X did between Y and Z" — chronological dump. Use AFTER you know the device + window from steps 1–3. |
+| 5 | `GET /files` → `GET /files/<key>?ticket=1` | Raw audit/export only. List keys first, then mint a direct-download ticket for one key. Requires `read:files` + `read:files:raw`. |
 
 Default `since_hours_ago` to 24 unless the user implies otherwise. Max 720 (30d).
 
@@ -109,6 +110,31 @@ jq '.records[] | {t, app, window, text: (.text // "")[0:120]}' /tmp/sp_team_reco
 | `limit` | Default 50, max 200. |
 
 Records come oldest-first so you can describe a chronological flow.
+
+## 4. Raw files and download tickets
+
+Only use this path when the user explicitly asks for raw evidence, export, or a direct storage URL. Prefer `/search` and `/records` for normal questions.
+
+List raw files:
+
+```bash
+curl -s "${AUTH_HEADERS[@]}" \
+  "$SP_URL/files?since_hours_ago=24&page_size=25" \
+  -o /tmp/sp_team_files.json
+jq '.files[] | {key, size, last_modified, device_id}' /tmp/sp_team_files.json
+```
+
+Mint a direct-download ticket for one returned key:
+
+```bash
+KEY=$(jq -r '.files[0].key' /tmp/sp_team_files.json)
+curl -s "${AUTH_HEADERS[@]}" \
+  "$SP_URL/files/$KEY?ticket=1" \
+  -o /tmp/sp_team_ticket.json
+jq '{provider, key, url, expires_at, temporary, note}' /tmp/sp_team_ticket.json
+```
+
+R2/S3 responses are short-lived presigned GET URLs. Azure responses are direct Blob URLs using the configured read SAS; check `temporary` and `expires_at` before treating them as fresh per-call tokens.
 
 ---
 
