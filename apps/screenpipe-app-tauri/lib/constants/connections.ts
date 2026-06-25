@@ -76,6 +76,9 @@ export const CONNECTION_CATEGORY_BY_ID: Record<string, string> = {
   loops: "Communication",
   resend: "Communication",
 
+  // Admin — tenant and fleet administration
+  "microsoft-admin": "Admin",
+
   // Notes — notes, knowledge bases & read-later
   notion: "Notes",
   obsidian: "Notes",

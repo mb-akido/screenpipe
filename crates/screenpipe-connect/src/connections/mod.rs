@@ -41,6 +41,7 @@ pub mod logseq;
 pub mod loops;
 pub mod make;
 pub mod microsoft365;
+pub mod microsoft_admin;
 pub mod mochi;
 pub mod monday;
 pub mod n8n;
@@ -304,6 +305,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(clickup::ClickUp),
         Box::new(confluence::Confluence),
         Box::new(salesforce::Salesforce),
+        Box::new(microsoft_admin::MicrosoftAdmin),
         Box::new(microsoft365::Microsoft365),
         Box::new(outlook_email::OutlookEmail),
         Box::new(trello::Trello),

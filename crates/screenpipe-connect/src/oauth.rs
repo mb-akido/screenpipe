@@ -975,8 +975,9 @@ pub async fn refresh_token_instance(
     let mut attempt = 0u8;
     let resp: Value = loop {
         attempt += 1;
+        let exchange_integration_id = exchange_proxy_integration_id(integration_id);
         let mut refresh_body = serde_json::json!({
-            "integration_id": integration_id,
+            "integration_id": exchange_integration_id,
             "grant_type": "refresh_token",
             "refresh_token": refresh_tok,
         });
@@ -1159,6 +1160,16 @@ pub async fn get_valid_token_instance(
 
 const EXCHANGE_PROXY_URL: &str = "https://screenpi.pe/api/oauth/exchange";
 
+fn exchange_proxy_integration_id(integration_id: &str) -> &str {
+    match integration_id {
+        // These desktop connectors intentionally keep separate local token
+        // namespaces while reusing the shared Microsoft Azure AD app secret
+        // held by the website-side exchange proxy.
+        "outlook-email" | "microsoft-admin" => "microsoft365",
+        _ => integration_id,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -1221,6 +1232,19 @@ mod tests {
             StatusCode::BAD_REQUEST,
             r#"{"error":"invalid_scope"}"#
         ));
+    }
+
+    #[test]
+    fn microsoft_aliases_reuse_shared_exchange_provider() {
+        assert_eq!(
+            exchange_proxy_integration_id("outlook-email"),
+            "microsoft365"
+        );
+        assert_eq!(
+            exchange_proxy_integration_id("microsoft-admin"),
+            "microsoft365"
+        );
+        assert_eq!(exchange_proxy_integration_id("teams"), "teams");
     }
 
     // Each test uses a unique fake integration_id so the filesystem fallback
@@ -2191,8 +2215,9 @@ pub async fn exchange_code(
     // `extra` carries provider-specific routing fields the proxy needs to build
     // the token URL — e.g. Zendesk's `subdomain`, whose token endpoint lives on
     // the customer's own subdomain rather than a central host.
+    let exchange_integration_id = exchange_proxy_integration_id(integration_id);
     let mut payload = serde_json::json!({
-        "integration_id": integration_id,
+        "integration_id": exchange_integration_id,
         "code":           code,
         "redirect_uri":   redirect_uri,
     });
@@ -2209,9 +2234,14 @@ pub async fn exchange_code(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        let exchange_label = if exchange_integration_id == integration_id {
+            integration_id.to_string()
+        } else {
+            format!("{integration_id} via {exchange_integration_id}")
+        };
         return Err(anyhow::anyhow!(
             "oauth exchange for {} returned {}: {}",
-            integration_id,
+            exchange_label,
             status,
             body
         ));
