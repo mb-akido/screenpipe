@@ -702,14 +702,27 @@ export function NoteView({
     try {
       const current = { title, attendees, note };
       if (!sameMeetingNoteDraft(current, lastSavedRef.current)) {
-        await save(current, { throwOnError: true });
+        // Best-effort: a failed note save must NEVER block the stop. If the DB
+        // write pool is wedged the save can 500, and gating stop on it leaves
+        // the meeting permanently un-stoppable (#4525). Warn and stop anyway —
+        // stopping is what releases the deferral pressure that wedged the pool.
+        try {
+          await save(current, { throwOnError: true });
+        } catch (saveErr) {
+          console.error("failed to save meeting note before stop", saveErr);
+          toast({
+            title: "couldn't save notes",
+            description: "stopping anyway — your latest edits may not be saved.",
+            variant: "destructive",
+          });
+        }
       }
       await onStop();
     } catch (err) {
-      console.error("failed to save meeting note before stop", err);
+      console.error("failed to stop meeting", err);
       toast({
-        title: "couldn't save notes",
-        description: "try again before stopping the meeting.",
+        title: "couldn't stop meeting",
+        description: String(err),
         variant: "destructive",
       });
     } finally {

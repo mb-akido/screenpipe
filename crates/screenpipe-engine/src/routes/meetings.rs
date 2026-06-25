@@ -768,6 +768,46 @@ pub(crate) async fn stop_meeting_handler(
 
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
+    // Release runtime state BEFORE persisting. An explicit stop is a runtime
+    // intent — the audio batch-deferral flag and detector tracking must release
+    // even when the write pool is wedged. If they only release *after* the
+    // end-write (as before), a stalled write pool turns the stop into a
+    // deadlock: audio stays in batch-deferral, the transcription/write queue
+    // never drains, so the end-write can never acquire a connection
+    // ("pool timed out while waiting for an open connection"), so the flag
+    // never clears — leaving the meeting permanently unstoppable with hundreds
+    // of transcription segments stranded (#4525). These three releases touch
+    // no DB (RwLock + AtomicBool + in-process event bus), so a stalled write
+    // pool cannot block them.
+    {
+        let mut lock = state.manual_meeting.write().await;
+        if *lock == Some(id) {
+            *lock = None;
+        }
+    }
+    if let Some(detector) = state.audio_manager.meeting_detector().await {
+        detector.set_v2_in_meeting(false);
+    }
+    // Signal the detector loop to drop tracking immediately (skip grace period).
+    // The app comes from the already-resolved status so this needs no DB read
+    // and fires even when the pool is wedged.
+    if let Err(e) = screenpipe_events::send_event(
+        "detector_stop_tracking",
+        serde_json::json!({
+            "meeting_id": id,
+            "app": status.meeting_app.clone().unwrap_or_default(),
+        }),
+    ) {
+        tracing::warn!(
+            "failed to emit detector_stop_tracking event for meeting {}: {}",
+            id,
+            e
+        );
+    }
+
+    // Persist the end best-effort. The runtime is already released above, so
+    // even if this times out (pool wedged), the deferral drains and a retry —
+    // or the detector's own grace-timeout end — completes persistence.
     state
         .db
         .end_meeting_with_typed_text(
@@ -783,16 +823,6 @@ pub(crate) async fn stop_meeting_handler(
                 JsonResponse(json!({"error": e.to_string()})),
             )
         })?;
-
-    {
-        let mut lock = state.manual_meeting.write().await;
-        if *lock == Some(id) {
-            *lock = None;
-        }
-    }
-    if let Some(detector) = state.audio_manager.meeting_detector().await {
-        detector.set_v2_in_meeting(false);
-    }
 
     if let Ok(status) = resolve_meeting_status(&state).await {
         emit_meeting_status_changed(&status);
@@ -818,18 +848,6 @@ pub(crate) async fn stop_meeting_handler(
         std::slice::from_ref(&meeting),
         None,
     );
-
-    // Signal detector to stop tracking this meeting immediately (skip grace period)
-    if let Err(e) = screenpipe_events::send_event(
-        "detector_stop_tracking",
-        serde_json::json!({ "meeting_id": id, "app": &meeting.meeting_app }),
-    ) {
-        tracing::warn!(
-            "failed to emit detector_stop_tracking event for meeting {}: {}",
-            id,
-            e
-        );
-    }
 
     Ok(JsonResponse(meeting))
 }
