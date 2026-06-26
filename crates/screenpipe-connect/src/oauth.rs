@@ -300,8 +300,22 @@ pub(crate) async fn load_oauth_json_with_instance(
     }
 }
 
+/// The usable bearer token from an OAuth JSON blob. Most providers store it at
+/// the top level, but Slack's user-token flow (`user_scope` only, no bot scope)
+/// nests it under `authed_user.access_token` and returns NO top-level
+/// `access_token` — so a freshly connected Slack account otherwise reads as
+/// unrecoverable and the whole connection looks dead. Checking both keeps
+/// connection-status and token reads working for Slack without a
+/// provider-specific branch in every caller. Other providers never populate
+/// `authed_user`, so the fallback is inert for them.
+fn oauth_access_token_str(v: &Value) -> Option<&str> {
+    v["access_token"]
+        .as_str()
+        .or_else(|| v["authed_user"]["access_token"].as_str())
+}
+
 fn oauth_json_has_valid_access_token(v: &Value) -> bool {
-    if v["access_token"].as_str().is_none() {
+    if oauth_access_token_str(v).is_none() {
         return false;
     }
 
@@ -403,7 +417,7 @@ pub async fn read_oauth_token_instance(
         }
     }
 
-    v["access_token"].as_str().map(String::from)
+    oauth_access_token_str(&v).map(String::from)
 }
 
 /// Check if an OAuth instance is recoverable — has a valid token or a
@@ -1525,6 +1539,33 @@ mod tests {
             .unwrap();
 
         assert!(is_oauth_instance_connected(Some(&store), id, None).await);
+    }
+
+    #[tokio::test]
+    async fn is_oauth_instance_connected_accepts_slack_nested_user_token() {
+        // Slack's user-token flow stores the usable token under
+        // authed_user.access_token with no top-level access_token and no
+        // refresh_token. Regression guard for #4286: a freshly connected
+        // Slack account must read as connected, not "default token is not
+        // recoverable".
+        let store = mem_store().await;
+        let id = "slack";
+        store
+            .set_json(
+                &format!("oauth:{}", id),
+                &json!({
+                    "authed_user": {"id": "U123", "access_token": "xoxp-user-token"},
+                    "team": {"name": "acme"},
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(is_oauth_instance_connected(Some(&store), id, None).await);
+        assert_eq!(
+            read_oauth_token_instance(Some(&store), id, None).await,
+            Some("xoxp-user-token".to_string()),
+        );
     }
 
     #[tokio::test]
