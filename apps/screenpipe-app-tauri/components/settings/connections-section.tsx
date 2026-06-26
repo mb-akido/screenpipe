@@ -3278,6 +3278,32 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
 
 const KRISP_MCP_URL = "https://mcp.krisp.ai/mcp";
 const PLAUD_MCP_URL = "https://mcp.plaud.ai/mcp";
+// Providers that run a first-party remote MCP server whose OAuth supports
+// Dynamic Client Registration (RFC 7591). For these, the tile connects in
+// one click via OAuthMcpPanel — no API key and no human-created
+// client_id/secret — replacing the old API-key form (or the connector
+// OAuth flow + its registered app). URLs are the streamable-HTTP endpoint
+// (/mcp), NOT the legacy /sse transport the engine can't drive. Each id
+// must match a registered connector id so it lands on the right tile.
+// (DCR support verified live against each provider's OAuth metadata.)
+const MCP_OAUTH_PROVIDERS: {
+  id: string;
+  name: string;
+  url: string;
+  description: React.ReactNode;
+}[] = [
+  { id: "linear", name: "Linear", url: "https://mcp.linear.app/mcp", description: <>Connect Linear so your AI can search and manage your issues, projects, and cycles. Sign-in uses Linear&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "stripe", name: "Stripe", url: "https://mcp.stripe.com", description: <>Connect Stripe so your AI can query your customers, payments, invoices, and subscriptions. Sign-in uses Stripe&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "sentry", name: "Sentry", url: "https://mcp.sentry.dev/mcp", description: <>Connect Sentry so your AI can search your issues, events, and releases. Sign-in uses Sentry&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "intercom", name: "Intercom", url: "https://mcp.intercom.com/mcp", description: <>Connect Intercom so your AI can search your conversations, contacts, and help content. Sign-in uses Intercom&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "asana", name: "Asana", url: "https://mcp.asana.com/mcp", description: <>Connect Asana so your AI can search and manage your tasks, projects, and portfolios. Sign-in uses Asana&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "monday", name: "monday.com", url: "https://mcp.monday.com/mcp", description: <>Connect monday.com so your AI can work with your boards, items, and updates. Sign-in uses monday&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "clickup", name: "ClickUp", url: "https://mcp.clickup.com/mcp", description: <>Connect ClickUp so your AI can search and manage your tasks, docs, and spaces. Sign-in uses ClickUp&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "airtable", name: "Airtable", url: "https://mcp.airtable.com/mcp", description: <>Connect Airtable so your AI can read and update your bases, tables, and records. Sign-in uses Airtable&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "confluence", name: "Confluence", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and edit your Confluence pages (and Jira issues). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "jira", name: "Jira", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and manage your Jira issues (and Confluence pages). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "notion", name: "Notion", url: "https://mcp.notion.com/mcp", description: <>Connect Notion so your AI can search, read, and write your pages and databases. Sign-in uses Notion&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+];
 // Excalidraw+ exposes the workspace (scenes, collections, search) over a
 // remote MCP gated by a static API key, not OAuth (no discovery metadata on
 // the host), so it uses the ApiKeyMcpPanel below instead of OAuthMcpPanel.
@@ -3763,6 +3789,8 @@ export function ConnectionsSection({
   const [customMcpEnabledCount, setCustomMcpEnabledCount] = useState(0);
   const [krispConnected, setKrispConnected] = useState(false);
   const [plaudConnected, setPlaudConnected] = useState(false);
+  // Per-provider connection status for the MCP-OAuth tiles (keyed by id).
+  const [mcpProviderConnected, setMcpProviderConnected] = useState<Record<string, boolean>>({});
   const [excalidrawConnected, setExcalidrawConnected] = useState(false);
   const [importedSkillsCount, setImportedSkillsCount] = useState(0);
 
@@ -3809,6 +3837,7 @@ export function ConnectionsSection({
         setCustomMcpEnabledCount(0);
         setKrispConnected(false);
         setPlaudConnected(false);
+        setMcpProviderConnected({});
         setExcalidrawConnected(false);
         return;
       }
@@ -3820,6 +3849,10 @@ export function ConnectionsSection({
       setCustomMcpConnected(enabled.length > 0);
       setKrispConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === KRISP_MCP_URL));
       setPlaudConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === PLAUD_MCP_URL));
+      const enabledUrls = new Set(list.filter(s => s.enabled).map(s => (s.url ?? "").replace(/\/+$/, "")));
+      setMcpProviderConnected(Object.fromEntries(
+        MCP_OAUTH_PROVIDERS.map(p => [p.id, enabledUrls.has(p.url.replace(/\/+$/, ""))])
+      ));
       setExcalidrawConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === EXCALIDRAW_MCP_URL));
     }).catch(() => {
       setCustomMcpConnected(false);
@@ -3827,6 +3860,7 @@ export function ConnectionsSection({
       setCustomMcpEnabledCount(0);
       setKrispConnected(false);
       setPlaudConnected(false);
+      setMcpProviderConnected({});
       setExcalidrawConnected(false);
     });
     if (typeof window !== "undefined" && platform() === "macos") {
@@ -3951,7 +3985,12 @@ export function ConnectionsSection({
         id: i.id,
         name: i.name,
         icon: i.icon,
-        connected: i.connected,
+        // MCP-OAuth providers connect via their remote MCP server. The dot
+        // lights for the MCP connection OR an existing API-key/connector-OAuth
+        // connection, so users who connected the old way don't appear to lose it.
+        connected: MCP_OAUTH_PROVIDERS.some(p => p.id === i.id)
+          ? (!!mcpProviderConnected[i.id] || i.connected)
+          : i.connected,
         category: normalizeConnectionCategory(i.category),
         description: i.description || undefined,
       }));
@@ -3982,7 +4021,7 @@ export function ConnectionsSection({
       category: CONNECTION_CATEGORY_BY_ID[tile.id] ?? tile.category ?? "Other",
       description: tile.description ?? CONNECTION_HARDCODED_DESCRIPTIONS[tile.id],
     }));
-  }, [os, claudeInstalled, cursorInstalled, codexInstalled, grokInstalled, chatgptConnected, browserUrlConnected, browserUrlDetected, integrations, appleCalendarConnected, googleCalendarConnected, googleDocsConnected, googleSheetsConnected, gmailConnected, customMcpConnected, customMcpServerCount, krispConnected, plaudConnected, excalidrawConnected, importedSkillsCount, detectedConnectionIds]);
+  }, [os, claudeInstalled, cursorInstalled, codexInstalled, grokInstalled, chatgptConnected, browserUrlConnected, browserUrlDetected, integrations, appleCalendarConnected, googleCalendarConnected, googleDocsConnected, googleSheetsConnected, gmailConnected, customMcpConnected, customMcpServerCount, krispConnected, plaudConnected, mcpProviderConnected, excalidrawConnected, importedSkillsCount, detectedConnectionIds]);
 
   const isDefaultView = !search.trim() && categoryFilter === ALL_CONNECTION_CATEGORIES;
 
@@ -4037,6 +4076,54 @@ export function ConnectionsSection({
 
   const renderPanel = () => {
     if (!selected) return null;
+    // Providers with a first-party remote MCP (OAuth + DCR) connect in one
+    // click — this intercepts both old API-key tiles (Linear, Stripe, …) and
+    // connector-OAuth tiles (Notion, Jira) before the switch below.
+    const mcpProvider = MCP_OAUTH_PROVIDERS.find(p => p.id === selected);
+    if (mcpProvider) {
+      // Anyone already connected the old way (API key, or connector OAuth for
+      // Notion/Jira) keeps that connection — the credential and pipes are
+      // untouched. Surface it under an "advanced" disclosure so they can still
+      // see/rotate/remove it; otherwise the one-click OAuth is the primary path.
+      const existing = selectedIntegration;
+      const hasManual = !!existing && (existing.is_oauth || existing.fields.length > 0);
+      return (
+        <div className="space-y-3">
+          <OAuthMcpPanel
+            name={mcpProvider.name}
+            mcpUrl={mcpProvider.url}
+            description={mcpProvider.description}
+            onConnected={() => setMcpProviderConnected(m => ({ ...m, [mcpProvider.id]: true }))}
+            onDisconnected={() => setMcpProviderConnected(m => ({ ...m, [mcpProvider.id]: false }))}
+          />
+          {hasManual && existing && (
+            <details open={existing.connected && !mcpProviderConnected[mcpProvider.id]}>
+              <summary className="text-[11px] text-muted-foreground cursor-pointer select-none hover:text-foreground">
+                advanced: {existing.connected
+                  ? "manage your existing connection"
+                  : "connect with an API key instead"}
+              </summary>
+              <div className="pt-2">
+                {existing.is_oauth ? (
+                  <OAuthPanel
+                    integrationId={existing.id}
+                    integrationName={existing.name}
+                    supportsOAuthInstances={!!existing.supports_oauth_instances}
+                    onConnected={() => refreshIntegrationConnection(existing.id, true)}
+                    onDisconnected={() => refreshIntegrationConnection(existing.id, false)}
+                  />
+                ) : (
+                  <ApiIntegrationPanel
+                    integration={existing}
+                    onRefresh={fetchIntegrations}
+                  />
+                )}
+              </div>
+            </details>
+          )}
+        </div>
+      );
+    }
     switch (selected) {
       case "claude": return <ClaudePanel
         onConnected={() => setClaudeInstalled(true)}
