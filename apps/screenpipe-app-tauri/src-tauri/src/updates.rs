@@ -335,6 +335,17 @@ fn auto_update_enabled_from_settings(settings: Result<Option<SettingsStore>, Str
         .unwrap_or(false)
 }
 
+/// A "Run hidden" managed device has no UI: no settings panel to flip auto-update
+/// on, and no "Restart to update" banner to click. So if auto-update resolved to
+/// off (an admin disabled it, or `allow_employee_override` left the device's own
+/// setting off), a hidden device would be stranded on whatever version it
+/// installed — silently, forever, with no recourse. Force auto-update ON whenever
+/// the app UI is hidden: the employee-override only makes sense when there's a UI
+/// to honor it. Visible installs keep honoring the stored setting.
+fn resolve_auto_update_enabled(settings_enabled: bool, app_ui_hidden: bool) -> bool {
+    app_ui_hidden || settings_enabled
+}
+
 fn load_auto_update_enabled(app: &tauri::AppHandle) -> bool {
     let settings = SettingsStore::get(app);
     match &settings {
@@ -345,7 +356,15 @@ fn load_auto_update_enabled(app: &tauri::AppHandle) -> bool {
             err
         ),
     }
-    auto_update_enabled_from_settings(settings)
+    let settings_enabled = auto_update_enabled_from_settings(settings);
+    let app_ui_hidden = crate::enterprise_policy::is_app_ui_hidden();
+    if app_ui_hidden && !settings_enabled {
+        info!(
+            "enterprise: forcing auto-update ON in hidden UI mode \
+             (no banner/settings exist to trigger it otherwise)"
+        );
+    }
+    resolve_auto_update_enabled(settings_enabled, app_ui_hidden)
 }
 
 pub struct UpdatesManager {
@@ -1219,6 +1238,20 @@ mod tests {
     #[test]
     fn auto_update_setting_fails_closed_when_missing() {
         assert!(!auto_update_enabled_from_settings(Ok(None)));
+    }
+
+    #[test]
+    fn hidden_ui_forces_auto_update_on_even_when_setting_off() {
+        // a "run hidden" device has no banner/settings to update otherwise — it
+        // must auto-update or it's stranded forever
+        assert!(resolve_auto_update_enabled(false, true));
+        assert!(resolve_auto_update_enabled(true, true));
+    }
+
+    #[test]
+    fn visible_ui_respects_the_stored_setting() {
+        assert!(!resolve_auto_update_enabled(false, false));
+        assert!(resolve_auto_update_enabled(true, false));
     }
 
     #[test]
