@@ -137,10 +137,16 @@ export function RecordingStatus({
                 aria-hidden="true"
                 className={cn(
                   "h-2 w-2 rounded-full transition-all",
+                  // Drive the dot color off `currentColor` so it follows the
+                  // theme on the translucent sidebar: `vibrant-sidebar-fg`
+                  // resolves to black in light mode and white in dark mode
+                  // (with the same pre-JS system-preference fallbacks the rest
+                  // of the vibrant sidebar uses). A hardcoded white dot was
+                  // invisible on the light translucent background.
                   isTranslucent
                     ? allActive
-                      ? "bg-white"
-                      : "border border-white bg-transparent"
+                      ? "vibrant-sidebar-fg bg-current"
+                      : "vibrant-sidebar-fg border border-current bg-transparent"
                     : allActive
                       ? "bg-foreground"
                       : "border border-foreground bg-transparent",
