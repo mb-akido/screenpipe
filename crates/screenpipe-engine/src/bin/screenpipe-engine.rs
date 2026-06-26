@@ -397,6 +397,22 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Command::Diagnose {
+            ref message,
+            ref data_dir,
+            port,
+            dry_run,
+        } => {
+            let local_data_dir = get_base_dir(data_dir)?;
+            screenpipe_engine::cli::diagnose::handle_diagnose_command(
+                &local_data_dir,
+                message.as_deref(),
+                port,
+                dry_run,
+            )
+            .await?;
+            return Ok(());
+        }
         Command::Record(args) => args,
     };
 
