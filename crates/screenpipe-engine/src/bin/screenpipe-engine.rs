@@ -499,6 +499,16 @@ async fn main() -> anyhow::Result<()> {
                             // app holding the device exclusively) refuses capture;
                             // retrying can't clear it, so it's not an actionable bug.
                             r"backend-specific error has occurred: Access is denied",
+                            // device_monitor's periodic capture-device check failing with an
+                            // OS backend error — overwhelmingly a denied macOS TCC permission
+                            // (screen/audio capture), which the OS reports in the user's
+                            // LOCALE, so the English "Screen recording permission denied"
+                            // pattern above misses it (CLI-WH: 1 user / 126 events, a
+                            // Japanese TCC-denied string). The check re-runs each cycle, so a
+                            // standing denial floods Sentry. Matching the English wrapper
+                            // prefix catches every locale; device-check backend errors
+                            // (permission, unplugged) are user-environment, not our bug.
+                            r"device check error: A backend-specific error has occurred",
                             // Local DB corruption — user dropped/restored part of their db.sqlite
                             r"no such table: main\.speaker_embeddings",
                             // Concurrent DB access / user ran CLI while app was running
