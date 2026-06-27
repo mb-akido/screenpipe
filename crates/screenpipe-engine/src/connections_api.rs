@@ -292,6 +292,84 @@ pub struct WhatsAppPairRequest {
     pub bun_path: String,
 }
 
+/// Canonical one-click MCP-OAuth providers (#4580). Maps a connector id to the
+/// provider's remote MCP URL. Keep in sync with `MCP_OAUTH_PROVIDERS` in
+/// `apps/screenpipe-app-tauri/components/settings/connections-section.tsx`.
+///
+/// When a user connects one of these via one-click MCP OAuth, the connection is
+/// persisted in the MCP server store (keyed by a *random* server id + this URL)
+/// — not the connector secret store — so the connector's own `connected` flag
+/// stays false and the in-app agent reports it "not connected". We match a
+/// live, oauth-connected MCP server back to its connector by URL.
+const MCP_OAUTH_PROVIDER_URLS: &[(&str, &str)] = &[
+    ("linear", "https://mcp.linear.app/mcp"),
+    ("stripe", "https://mcp.stripe.com"),
+    ("sentry", "https://mcp.sentry.dev/mcp"),
+    ("intercom", "https://mcp.intercom.com/mcp"),
+    ("asana", "https://mcp.asana.com/mcp"),
+    ("monday", "https://mcp.monday.com/mcp"),
+    ("clickup", "https://mcp.clickup.com/mcp"),
+    ("airtable", "https://mcp.airtable.com/mcp"),
+    ("confluence", "https://mcp.atlassian.com/v1/mcp"),
+    ("jira", "https://mcp.atlassian.com/v1/mcp"),
+    ("notion", "https://mcp.notion.com/mcp"),
+];
+
+fn normalize_mcp_url(url: &str) -> &str {
+    url.trim_end_matches('/')
+}
+
+/// Resolve an MCP server URL to the connector id it belongs to (trailing-slash
+/// insensitive, mirroring the frontend's matching). `None` if it isn't one of
+/// the known one-click providers.
+fn connector_id_for_mcp_url(url: &str) -> Option<&'static str> {
+    let normalized = normalize_mcp_url(url);
+    MCP_OAUTH_PROVIDER_URLS
+        .iter()
+        .find(|(_, provider_url)| normalize_mcp_url(provider_url) == normalized)
+        .map(|(id, _)| *id)
+}
+
+/// Connector ids currently connected via one-click MCP OAuth (#4580). Reads the
+/// MCP server store and matches each enabled, oauth-connected server back to its
+/// connector by URL. Best-effort: any read error yields an empty set so the
+/// connections list degrades to the pre-existing behavior.
+async fn mcp_oauth_connected_ids(
+    screenpipe_dir: &std::path::Path,
+    secret_store: Option<Arc<SecretStore>>,
+) -> std::collections::HashSet<String> {
+    use screenpipe_connect::mcp_servers::McpServerStore;
+    let mut connected = std::collections::HashSet::new();
+    let store = McpServerStore::new(screenpipe_dir.to_path_buf(), secret_store);
+    let servers = match store.list().await {
+        Ok(servers) => servers,
+        Err(err) => {
+            tracing::warn!("[connections] failed to read mcp servers for connection status: {err}");
+            return connected;
+        }
+    };
+    for server in servers {
+        if !server.enabled {
+            continue;
+        }
+        let Some(conn_id) = connector_id_for_mcp_url(&server.url) else {
+            continue;
+        };
+        if connected.contains(conn_id) {
+            continue;
+        }
+        let is_connected = store
+            .oauth_status(&server.id)
+            .await
+            .map(|status| status.connected)
+            .unwrap_or(false);
+        if is_connected {
+            connected.insert(conn_id.to_string());
+        }
+    }
+    connected
+}
+
 /// GET /connections — list all integrations with connection status.
 async fn list_connections(State(state): State<ConnectionsState>) -> Json<Value> {
     let mgr = state.cm.lock().await;
@@ -323,7 +401,35 @@ async fn list_connections(State(state): State<ConnectionsState>) -> Json<Value> 
     };
 
     let mut data = serde_json::to_value(&list).unwrap_or(json!([]));
+
+    // One-click MCP-OAuth connectors (#4580) persist their connection in the
+    // MCP server store (random id + provider URL), not the connector secret
+    // store — so the base entry above reports connected=false even after the
+    // user signs in, and the in-app agent that reads this list says "Linear is
+    // not connected". Reflect a live MCP-OAuth connection back onto its
+    // connector so both the list and the agent see the truth.
+    let mcp_connected_ids =
+        mcp_oauth_connected_ids(&state.screenpipe_dir, state.secret_store.clone()).await;
+
     if let Some(arr) = data.as_array_mut() {
+        if !mcp_connected_ids.is_empty() {
+            for entry in arr.iter_mut() {
+                let is_mcp_connected = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| mcp_connected_ids.contains(id))
+                    .unwrap_or(false);
+                if is_mcp_connected {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("connected".to_string(), json!(true));
+                        // Mark *how* it's connected so the agent/frontend knows
+                        // to drive it over MCP, not the /connections/:id/proxy.
+                        obj.insert("mcp".to_string(), json!(true));
+                    }
+                }
+            }
+        }
+
         // Native calendar — macOS only (EventKit). Windows/Linux have no equivalent.
         #[cfg(target_os = "macos")]
         {
@@ -3029,6 +3135,73 @@ where
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mcp_oauth_connector_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_known_providers_trailing_slash_insensitive() {
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.linear.app/mcp"),
+            Some("linear")
+        );
+        // trailing slash must still match (frontend stores either form)
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.linear.app/mcp/"),
+            Some("linear")
+        );
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.notion.com/mcp"),
+            Some("notion")
+        );
+        // stripe has no /mcp path suffix
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.stripe.com"),
+            Some("stripe")
+        );
+    }
+
+    #[test]
+    fn unknown_url_resolves_to_none() {
+        assert_eq!(connector_id_for_mcp_url("https://example.com/mcp"), None);
+        assert_eq!(connector_id_for_mcp_url(""), None);
+    }
+
+    #[test]
+    fn enriches_only_matching_connector_entries() {
+        // Simulate the post-list enrichment with a known connected id.
+        let mut data = json!([
+            { "id": "linear", "name": "Linear", "connected": false, "is_oauth": false },
+            { "id": "notion", "name": "Notion", "connected": true, "is_oauth": true },
+        ]);
+        let mut mcp_connected = std::collections::HashSet::new();
+        mcp_connected.insert("linear".to_string());
+
+        if let Some(arr) = data.as_array_mut() {
+            for entry in arr.iter_mut() {
+                let hit = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| mcp_connected.contains(id))
+                    .unwrap_or(false);
+                if hit {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("connected".to_string(), json!(true));
+                        obj.insert("mcp".to_string(), json!(true));
+                    }
+                }
+            }
+        }
+
+        // linear flips to connected + gains the mcp marker
+        assert_eq!(data[0]["connected"], json!(true));
+        assert_eq!(data[0]["mcp"], json!(true));
+        // notion (not in the MCP set) is untouched — no spurious mcp marker
+        assert_eq!(data[1]["connected"], json!(true));
+        assert!(data[1].get("mcp").is_none());
+    }
+}
 
 #[cfg(test)]
 mod gcal_merge_tests {
