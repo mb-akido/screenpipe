@@ -233,6 +233,16 @@
       "notes": "Cross-window prefill duplicate regression."
     },
     {
+      "spec": "chat-prefill-context-leak.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "storage-privacy"],
+      "features": ["chat", "chat-prefill", "chat-context"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "mixed",
+      "notes": "Regression coverage for keeping internal prefill context out of the visible user prompt while preserving the clean request."
+    },
+    {
       "spec": "chat-streaming-performance.spec.ts",
       "platforms": ["macos"],
       "layers": ["chat-ai", "performance"],
@@ -391,6 +401,16 @@
       "confidence": "strong",
       "ux": "real-user-flow",
       "notes": "Seeds and opens a long meeting note, checks editor shell click focus behavior, then clicks the bottom editor line."
+    },
+    {
+      "spec": "mobile-control.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["real-ui-e2e", "local-api", "pipes", "chat-ai"],
+      "features": ["app-launch", "pipes", "chat", "local-api-auth"],
+      "criticality": "medium",
+      "confidence": "smoke",
+      "ux": "real-user-flow",
+      "notes": "Mobile controller route smoke: direct /mobile navigation renders status, pipe controls, and chat prompt shell without a runtime error."
     },
     {
       "spec": "notification-viewer-link.spec.ts",
