@@ -211,6 +211,9 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends \
                 ca-certificates \
+                dbus \
+                dbus-x11 \
+                desktop-file-utils \
                 libasound2t64 \
                 libayatana-appindicator3-1 \
                 libgtk-3-0 \
@@ -222,10 +225,12 @@ jobs:
                 libxdo3 \
                 libxtst6 \
                 xauth \
+                xdg-utils \
                 xvfb
 
               useradd -m smoke-user
               chown -R smoke-user:smoke-user /smoke
+              install -d -m 700 -o smoke-user -g smoke-user /tmp/screenpipe-runtime
               cd /smoke
               chmod +x screenpipe.AppImage
               ./screenpipe.AppImage --appimage-extract >/dev/null
@@ -269,7 +274,7 @@ jobs:
               fi
 
               set +e
-              su smoke-user -c "cd /smoke && export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} && timeout 20 xvfb-run -a squashfs-root/AppRun --help"
+              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH} && timeout 20 dbus-run-session -- xvfb-run -a squashfs-root/AppRun --help"
               status="$?"
               set -e
               if [ "${status}" != "0" ] && [ "${status}" != "124" ]; then
