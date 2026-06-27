@@ -18,6 +18,7 @@ import {
   Search,
   Plug,
   NotebookPen,
+  Smartphone,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
 import {
@@ -1134,6 +1135,18 @@ function HomeContent() {
                   );
                   return btn;
                 })()}
+
+                <button
+                  data-testid="nav-mobile"
+                  onClick={() => router.push("/mobile")}
+                  className={cn(
+                    "w-full flex items-center space-x-2.5 px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
+                    isTranslucent ? "vibrant-nav-item vibrant-nav-hover" : "hover:bg-card/50 text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Smartphone className={cn("h-3.5 w-3.5 transition-colors flex-shrink-0", isTranslucent ? "" : "text-muted-foreground group-hover:text-foreground")} />
+                  <span className="font-medium text-xs truncate">Mobile</span>
+                </button>
 
                 {/* Settings — always visible; individual sections are enterprise-filtered inside /settings */}
                 {(() => {
