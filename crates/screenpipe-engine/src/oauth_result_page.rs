@@ -27,14 +27,16 @@ pub(crate) fn render_oauth_result_page(
   <style>
     :root {{
       color-scheme: dark;
-      --bg: #080a09;
-      --paper: #f8f3e7;
-      --muted: rgba(248, 243, 231, 0.66);
-      --line: rgba(248, 243, 231, 0.12);
-      --green: #38e58b;
-      --amber: #ffd166;
+      --bg: #050706;
+      --panel: rgba(9, 14, 11, 0.82);
+      --paper: #f7f1e4;
+      --muted: rgba(247, 241, 228, 0.64);
+      --line: rgba(247, 241, 228, 0.13);
+      --grid: rgba(247, 241, 228, 0.035);
+      --green: #39f49a;
+      --amber: #f4c95d;
       --red: #ff5c7a;
-      --cyan: #7dd3fc;
+      --shadow: rgba(0, 0, 0, 0.58);
     }}
 
     * {{
@@ -48,23 +50,27 @@ pub(crate) fn render_oauth_result_page(
       place-items: center;
       overflow: hidden;
       background:
-        linear-gradient(transparent 0 23px, rgba(248, 243, 231, 0.035) 24px),
-        linear-gradient(90deg, transparent 0 23px, rgba(248, 243, 231, 0.035) 24px),
-        linear-gradient(135deg, rgba(56, 229, 139, 0.10), transparent 36%),
+        linear-gradient(135deg, rgba(57, 244, 154, 0.18), rgba(57, 244, 154, 0.04) 28%, transparent 52%),
+        linear-gradient(315deg, rgba(244, 201, 93, 0.13), transparent 42%),
+        linear-gradient(transparent 0 23px, var(--grid) 24px),
+        linear-gradient(90deg, transparent 0 23px, var(--grid) 24px),
         var(--bg);
-      background-size: 24px 24px, 24px 24px, auto, auto;
+      background-size: auto, auto, 24px 24px, 24px 24px, auto;
       color: var(--paper);
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
 
     .stage {{
       position: relative;
-      width: min(92vw, 560px);
-      padding: 44px;
+      width: min(92vw, 540px);
+      padding: 42px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: rgba(8, 10, 9, 0.78);
-      box-shadow: 0 28px 90px rgba(0, 0, 0, 0.54), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+      background:
+        linear-gradient(145deg, rgba(247, 241, 228, 0.06), transparent 42%),
+        linear-gradient(315deg, rgba(57, 244, 154, 0.10), transparent 48%),
+        var(--panel);
+      box-shadow: 0 28px 90px var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.06);
       backdrop-filter: blur(18px);
       text-align: center;
       animation: rise 700ms cubic-bezier(.2,.9,.2,1) both;
@@ -76,74 +82,95 @@ pub(crate) fn render_oauth_result_page(
       inset: -1px;
       z-index: -1;
       border-radius: inherit;
-      background: conic-gradient(from var(--spin), var(--green), var(--cyan), var(--amber), var(--green));
-      filter: blur(18px);
-      opacity: 0.22;
-      animation: orbit 4.8s linear infinite;
+      background: linear-gradient(135deg, rgba(57, 244, 154, 0.55), rgba(244, 201, 93, 0.28), rgba(247, 241, 228, 0.16));
+      filter: blur(16px);
+      opacity: 0.24;
     }}
 
     .brand {{
       display: inline-flex;
       align-items: center;
-      gap: 10px;
+      gap: 11px;
       margin-bottom: 28px;
       color: var(--muted);
       font-size: 14px;
+      font-weight: 650;
       letter-spacing: 0;
     }}
 
-    .mark {{
-      width: 26px;
-      height: 26px;
-      border-radius: 6px;
-      position: relative;
-      background: linear-gradient(135deg, var(--paper), rgba(248, 243, 231, 0.38));
-      box-shadow: inset 0 0 0 1px rgba(8, 10, 9, 0.18);
+    .brand-mark,
+    .app-icon {{
+      display: grid;
+      place-items: center;
+      background: linear-gradient(145deg, #ffffff, #d8d8d8);
+      color: #050706;
+      box-shadow: inset 0 0 0 1px rgba(5, 7, 6, 0.16), 0 10px 28px rgba(0, 0, 0, 0.24);
     }}
 
-    .mark::after {{
-      content: "";
-      position: absolute;
-      inset: 7px;
-      border-radius: 3px;
-      background: var(--bg);
-      box-shadow: 0 0 0 1px rgba(8, 10, 9, 0.3);
+    .brand-mark {{
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+    }}
+
+    .brand-mark svg {{
+      width: 19px;
+      height: 19px;
     }}
 
     .signal {{
-      width: 112px;
-      height: 112px;
+      width: 126px;
+      height: 126px;
       margin: 0 auto 28px;
-      border-radius: 50%;
+      position: relative;
       display: grid;
       place-items: center;
-      position: relative;
     }}
 
-    .signal::before,
-    .signal::after {{
+    .signal::before {{
       content: "";
       position: absolute;
-      inset: 0;
-      border-radius: inherit;
-      border: 1px solid color-mix(in srgb, var(--accent) 52%, transparent);
-      animation: ripple 1.8s ease-out infinite;
+      inset: 8px;
+      border-radius: 32px;
+      border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+      transform: rotate(45deg);
+      animation: halo 2.8s ease-in-out infinite;
     }}
 
-    .signal::after {{
-      animation-delay: 550ms;
-    }}
-
-    .glyph {{
-      width: 72px;
-      height: 72px;
+    .app-icon {{
+      width: 82px;
+      height: 82px;
       border-radius: 8px;
+      position: relative;
+      z-index: 1;
+      box-shadow: inset 0 0 0 1px rgba(5, 7, 6, 0.14), 0 18px 54px color-mix(in srgb, var(--accent) 22%, transparent);
+      animation: breathe 2.4s ease-in-out infinite;
+    }}
+
+    .app-icon svg {{
+      width: 52px;
+      height: 52px;
+    }}
+
+    .status-badge {{
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      z-index: 2;
+      width: 34px;
+      height: 34px;
       display: grid;
       place-items: center;
-      color: var(--bg);
+      border-radius: 999px;
+      color: #050706;
       background: var(--accent);
-      box-shadow: 0 18px 54px color-mix(in srgb, var(--accent) 34%, transparent);
-      animation: breathe 2.4s ease-in-out infinite;
+      box-shadow: 0 12px 34px color-mix(in srgb, var(--accent) 36%, transparent), 0 0 0 5px rgba(5, 7, 6, 0.84);
+    }}
+
+    .status-badge svg {{
+      width: 20px;
+      height: 20px;
+      stroke-width: 3;
     }}
 
     body[data-tone="success"] {{
@@ -154,16 +181,11 @@ pub(crate) fn render_oauth_result_page(
       --accent: var(--red);
     }}
 
-    svg {{
-      width: 36px;
-      height: 36px;
-      stroke-width: 2.7;
-    }}
-
     h1 {{
       margin: 0;
-      font-size: clamp(32px, 7vw, 54px);
-      line-height: 0.95;
+      font-size: 48px;
+      line-height: 1;
+      font-weight: 780;
       letter-spacing: 0;
     }}
 
@@ -181,27 +203,18 @@ pub(crate) fn render_oauth_result_page(
       padding: 14px 16px;
       border-radius: 8px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.045);
-      color: rgba(248, 243, 231, 0.86);
+      background: rgba(247, 241, 228, 0.055);
+      color: rgba(247, 241, 228, 0.88);
       font-size: 14px;
+      font-weight: 600;
       line-height: 1.5;
       overflow-wrap: anywhere;
     }}
 
     .hint {{
       margin-top: 22px;
-      color: rgba(248, 243, 231, 0.5);
+      color: rgba(247, 241, 228, 0.5);
       font-size: 13px;
-    }}
-
-    @property --spin {{
-      syntax: "<angle>";
-      initial-value: 0deg;
-      inherits: false;
-    }}
-
-    @keyframes orbit {{
-      to {{ --spin: 360deg; }}
     }}
 
     @keyframes rise {{
@@ -209,14 +222,24 @@ pub(crate) fn render_oauth_result_page(
       to {{ opacity: 1; transform: translateY(0) scale(1); }}
     }}
 
-    @keyframes ripple {{
-      0% {{ opacity: .7; transform: scale(.62); }}
-      100% {{ opacity: 0; transform: scale(1.28); }}
+    @keyframes halo {{
+      0%, 100% {{ opacity: .42; transform: rotate(45deg) scale(.92); }}
+      50% {{ opacity: .74; transform: rotate(45deg) scale(1.03); }}
     }}
 
     @keyframes breathe {{
       0%, 100% {{ transform: scale(1); }}
       50% {{ transform: scale(1.04); }}
+    }}
+
+    @media (max-width: 560px) {{
+      .stage {{
+        padding: 32px 22px;
+      }}
+
+      h1 {{
+        font-size: 36px;
+      }}
     }}
 
     @media (prefers-reduced-motion: reduce) {{
@@ -228,11 +251,10 @@ pub(crate) fn render_oauth_result_page(
 </head>
 <body data-tone="{tone}" data-auto-close="{auto_close}">
   <main class="stage">
-    <div class="brand"><span class="mark" aria-hidden="true"></span><span>screenpipe</span></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">{brand_icon}</span><span>screenpipe</span></div>
     <div class="signal" aria-hidden="true">
-      <div class="glyph">
-        {icon}
-      </div>
+      <div class="app-icon">{brand_icon}</div>
+      <div class="status-badge">{icon}</div>
     </div>
     <h1>{title}</h1>
     <p class="detail">{detail}</p>
@@ -249,12 +271,17 @@ pub(crate) fn render_oauth_result_page(
         page_title = html_escape(page_title),
         tone = tone,
         auto_close = auto_close,
+        brand_icon = screenpipe_brand_icon(),
         icon = oauth_result_icon(ok),
         title = html_escape(title),
         detail = html_escape(detail),
         message = html_escape(message),
         hint = html_escape(hint),
     )
+}
+
+fn screenpipe_brand_icon() -> &'static str {
+    r#"<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13.7 13.19c-.46 2.97-2.92 5.24-5.88 5.24H6.4v-3.78h1.42c.98 0 1.82-.6 2.2-1.46h3.68M14.77 12.19H9.22c0 .81-.63 1.46-1.41 1.46H6.1c-.1 0-.17-.08-.17-.17v-.46h-.54V20h.54v-.39c0-.1.08-.17.17-.17h1.71c3.84 0 6.96-3.25 6.96-7.24Z"/><path d="M17.61 5.57v3.78h-1.42c-.98 0-1.82.6-2.2 1.46h-3.68c.46-2.97 2.92-5.24 5.88-5.24h1.42M18.61 4h-.54v.39c0 .1-.08.17-.17.17h-1.71c-3.84 0-6.96 3.25-6.96 7.24h5.55c0-.81.63-1.46 1.41-1.46h1.71c.1 0 .17.08.17.17v.46h.54V4Z"/></svg>"#
 }
 
 fn oauth_result_icon(ok: bool) -> &'static str {
