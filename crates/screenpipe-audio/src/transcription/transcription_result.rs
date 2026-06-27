@@ -208,7 +208,12 @@ pub async fn process_transcription_result(
                     // marker so the sweep re-inserts the row (and re-transcribes)
                     // once the pool recovers — mirrors the audio_manager path.
                     // SCREENPIPE-CLI-RC. device is a structured field so Sentry
-                    // dedups across devices into a single issue.
+                    // dedups across devices into a single issue. Kept at error!
+                    // (not warn!) on purpose: the data is recovered, but a dropped
+                    // live insert means the write pool saturated badly, which we
+                    // still want visible in Sentry — recovery shouldn't silence the
+                    // degradation signal (and would mask a true loss if the sweep
+                    // is disabled or the marker cap is hit).
                     if let Some(dir) = data_dir {
                         crate::audio_manager::reconciliation::persist_orphaned_chunk(
                             dir,
@@ -216,9 +221,10 @@ pub async fn process_transcription_result(
                             capture_ts,
                         )
                         .await;
-                        warn!(
+                        error!(
                             device = %result.input.device,
                             error = %e,
+                            recovered = true,
                             "audio chunk+transcription insert failed after 3 retries; persisted for reconciliation recovery"
                         );
                     } else {
