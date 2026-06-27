@@ -148,7 +148,7 @@ function useSuggestions(isOpen: boolean) {
     let cancelled = false;
     setIsLoading(true);
 
-    (async () => {
+    const run = async () => {
       try {
         const now = new Date();
         const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
@@ -246,10 +246,31 @@ function useSuggestions(isOpen: boolean) {
       } catch {
         if (!cancelled) setIsLoading(false);
       }
-    })();
+    };
+
+    // Defer the 24h OCR scan off the open/first-paint path so this cosmetic
+    // suggestion query (empty-state chips) doesn't compete with the initial
+    // render + first keyword search for the engine's heavy-read slots when the
+    // modal opens. Runs when the main thread next goes idle (or after a short
+    // fallback delay where requestIdleCallback is unavailable).
+    const w = window as unknown as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    let idleHandle = 0;
+    let timeoutHandle = 0;
+    if (typeof w.requestIdleCallback === "function") {
+      idleHandle = w.requestIdleCallback(() => void run(), { timeout: 1500 });
+    } else {
+      timeoutHandle = window.setTimeout(() => void run(), 200);
+    }
 
     return () => {
       cancelled = true;
+      if (idleHandle && typeof w.cancelIdleCallback === "function") {
+        w.cancelIdleCallback(idleHandle);
+      }
+      if (timeoutHandle) window.clearTimeout(timeoutHandle);
     };
   }, [isOpen]);
 
