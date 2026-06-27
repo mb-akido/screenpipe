@@ -972,6 +972,23 @@ mod tests {
     }
 
     #[test]
+    fn vocab_entry_accepts_bare_string_and_struct_mixed() {
+        // Regression for SCREENPIPE-APP-DN: legacy store.bin stored vocabularyWords
+        // as bare strings; the current app stores structs. A mixed list (with a
+        // non-ASCII bare string, the exact crashing input) must all deserialize
+        // instead of failing the whole RecordingSettings object.
+        let json = r#"{"vocabularyWords": ["せばんぬ", {"word": "screenpipe"}, {"word": "foo", "replace_with": "bar"}]}"#;
+        let s: RecordingSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.vocabulary.len(), 3);
+        assert_eq!(s.vocabulary[0].word, "せばんぬ");
+        assert_eq!(s.vocabulary[0].replace_with, None);
+        assert_eq!(s.vocabulary[1].word, "screenpipe");
+        assert_eq!(s.vocabulary[1].replace_with, None);
+        assert_eq!(s.vocabulary[2].word, "foo");
+        assert_eq!(s.vocabulary[2].replace_with.as_deref(), Some("bar"));
+    }
+
+    #[test]
     fn round_trips_through_toml() {
         let settings = RecordingSettings::default();
         let toml_str = toml::to_string_pretty(&settings).unwrap();
