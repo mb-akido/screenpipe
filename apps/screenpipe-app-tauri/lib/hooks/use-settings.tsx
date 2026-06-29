@@ -15,6 +15,7 @@ import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 import { installAuthInterceptor } from "../auth-guard";
 import { hasAppEntitlement, normalizeAppUser } from "@/lib/app-entitlement";
+import { reconcilePresetsWithGateway } from "@/lib/utils/heal-presets";
 import { screenpipeWebUrl } from "@/lib/web-url";
 import type { SourceCitation } from "@/lib/source-citations";
 import type {
@@ -1358,6 +1359,30 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			configureApi({ port: merged.port ?? 3030 });
 		}
 	};
+
+	// Reconcile cloud presets with the gateway's LIVE model list on load. A preset
+	// pinned to a screenpipe-cloud model the gateway no longer serves (a retired
+	// model) heals → "auto". The gateway is the single source of truth — retiring a
+	// model is purely server-side (drop it from /v1/models), no app release needed.
+	// Fails OPEN: a failed/empty fetch heals nothing, so a transient API blip can't
+	// wipe valid selections.
+	useEffect(() => {
+		if (!isSettingsLoaded) return;
+		let cancelled = false;
+		(async () => {
+			const healed = await reconcilePresetsWithGateway({
+				presets: settingsRef.current.aiPresets,
+				token: settingsRef.current.user?.token || "",
+			});
+			if (healed && !cancelled) {
+				console.log("[presets] healed cloud preset(s) pinned to a removed model → auto");
+				await updateSettings({ aiPresets: healed });
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	}, [isSettingsLoaded]);
 
 	const resetSettings = async () => {
 		await settingsStore.reset();

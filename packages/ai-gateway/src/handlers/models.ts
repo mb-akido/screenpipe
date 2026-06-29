@@ -495,36 +495,8 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'low',
     recommended_for: ['pipes', 'chat', 'coding'],
   },
-  {
-    id: 'qwen/qwen3.5-flash-02-23',
-    object: 'model',
-    owned_by: 'openrouter',
-    name: 'Qwen3.5 Flash',
-    description: '1M context, cheapest paid model',
-    tags: ['cheap', 'long-context'],
-    free: false,
-    context_window: 1000000,
-    best_for: ['long documents', 'pipes'],
-    speed: 'fast',
-    intelligence: 'standard',
-    cost_tier: 'low',
-    recommended_for: ['pipes', 'chat'],
-  },
-  {
-    id: 'qwen/qwen3.5-397b-a17b',
-    object: 'model',
-    owned_by: 'openrouter',
-    name: 'Qwen3.5 397B',
-    description: 'vision + SOTA performance',
-    tags: ['vision', 'premium'],
-    free: false,
-    context_window: 131000,
-    best_for: ['vision', 'complex tasks'],
-    speed: 'slow',
-    intelligence: 'highest',
-    cost_tier: 'high',
-    recommended_for: ['chat', 'analysis'],
-  },
+  // qwen3.5-flash / qwen3.5-397b removed 2026-06 — they were OpenRouter-only (no
+  // Vertex MaaS home); OpenRouter is retired, so these now redirect to glm-5.
   // meta-llama/llama-4-scout and meta-llama/llama-4-maverick removed
   // — use llama-4-scout / llama-4-maverick on Vertex MaaS (GCP infra, free, no China data risk)
   {

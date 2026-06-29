@@ -1123,7 +1123,6 @@ const AISection = ({
             { id: "gemini-3-flash", name: "Gemini 3 Flash (fast)", provider: "screenpipe" },
             { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite (cheapest)", provider: "screenpipe" },
             { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro (balanced)", provider: "screenpipe" },
-            { id: "qwen/qwen3.5-flash-02-23", name: "Qwen3.5 Flash (cheapest, 1M ctx)", provider: "screenpipe" },
             { id: "meta-llama/llama-4-scout", name: "Llama 4 Scout", provider: "screenpipe" },
           ]);
           break;
