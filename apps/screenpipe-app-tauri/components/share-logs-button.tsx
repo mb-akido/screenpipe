@@ -24,7 +24,7 @@ import {
 import { localFetch } from "@/lib/api";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { loadAllConversations } from "@/lib/chat-storage";
-import { redactPii } from "@/lib/utils/redact-pii";
+import { redactPii, redactSettingsForSharing } from "@/lib/utils/redact-pii";
 import { firstImageFile } from "@/lib/utils/clipboard-image";
 
 // Read an image File and return a compressed JPEG data URL (max 1920px wide).
@@ -278,12 +278,26 @@ export const ShareLogsButton = ({
         }
       }
 
+      // Settings snapshot — invaluable for debugging ("did you change the
+      // transcription engine / a privacy filter?"), which the logs alone don't
+      // reveal. Secrets (API keys, tokens, credentials) are stripped and PII
+      // scrubbed by `redactSettingsForSharing` before it leaves the device.
+      let settingsSection = "";
+      try {
+        settingsSection =
+          "\n\n=== Settings (secrets & PII redacted) ===\n" +
+          redactSettingsForSharing(settings);
+      } catch (e) {
+        console.error("failed to serialize settings:", e);
+      }
+
       const combinedLogs =
         logContents
           .map((log) => `\n=== ${log.name} ===\n${log.content}`)
           .join("\n\n") +
         "\n\n=== Browser Console Logs ===\n" +
         consoleLog +
+        settingsSection +
         chatSection;
 
       await fetch(signedUrl, {
@@ -457,7 +471,8 @@ export const ShareLogsButton = ({
         )}
 
         <p className="text-[10px] text-muted-foreground leading-tight">
-          pi chat history is included to help us debug. personal info is automatically removed.
+          logs, settings, and pi chat history are included to help us debug.
+          api keys, secrets, and personal info are automatically removed.
         </p>
 
         <Button
