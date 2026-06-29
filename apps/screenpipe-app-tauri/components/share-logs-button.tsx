@@ -291,32 +291,38 @@ export const ShareLogsButton = ({
         console.error("failed to serialize settings:", e);
       }
 
-      const combinedLogs =
+      // Bulk, mostly-structured logs: scrub with the fast on-device regex
+      // pass. Routing hundreds of KB through the cloud enclave (~10-15s/2KB)
+      // would hang submission for minutes, so the enclave is reserved for the
+      // PII-dense free text below.
+      const bulkLogs = redactPii(
         logContents
           .map((log) => `\n=== ${log.name} ===\n${log.content}`)
           .join("\n\n") +
-        "\n\n=== Browser Console Logs ===\n" +
-        consoleLog +
-        settingsSection +
-        chatSection;
+          "\n\n=== Browser Console Logs ===\n" +
+          consoleLog
+      );
 
-      // Redact PII with the real model (regex pre-pass + the same checkpoint
-      // the Tinfoil enclave runs, local ONNX preferred, enclave fallback)
-      // before anything leaves the device. If the model can't be loaded we
-      // fall back to the local regex pass — feedback must never be blocked.
-      let redactedLogs = combinedLogs;
-      try {
-        const res = await commands.redactPiiForFeedback(combinedLogs);
-        if (res.status === "ok") {
-          redactedLogs = res.data;
-        } else {
-          console.warn("model PII redaction unavailable, using local regex:", res.error);
-          redactedLogs = redactPii(combinedLogs);
+      // PII-dense free text (chat + settings) → the cloud PII model running in
+      // the Tinfoil confidential-compute enclave. The command chunks + time-
+      // budgets the enclave calls and falls back to the local regex pass for
+      // any overflow / failure, so feedback is never blocked.
+      const piiDense = chatSection + settingsSection;
+      let redactedPiiDense = redactPii(piiDense);
+      if (piiDense.trim()) {
+        try {
+          const res = await commands.redactPiiForFeedback(piiDense);
+          if (res.status === "ok") {
+            redactedPiiDense = res.data;
+          } else {
+            console.warn("cloud PII redaction unavailable, using local regex:", res.error);
+          }
+        } catch (e) {
+          console.warn("cloud PII redaction failed, using local regex:", e);
         }
-      } catch (e) {
-        console.warn("model PII redaction failed, using local regex:", e);
-        redactedLogs = redactPii(combinedLogs);
       }
+
+      const redactedLogs = bulkLogs + redactedPiiDense;
 
       await fetch(signedUrl, {
         method: "PUT",
