@@ -64,13 +64,15 @@ pub async fn seed_search_fixture(db: &DatabaseManager) {
         }
     }
 
-    // Highlight over-match fixture: "cat" is a real token AND a substring of
-    // "concatenate". Correct highlighting matches the whole token only (1 box);
-    // the current `text.includes(term)` matcher highlights both (the bug).
-    let cat_text = "cat concatenate vectorization";
-    let cat_json = r#"[
-        {"text":"cat","conf":"95","left":"0.10","top":"0.20","width":"0.06","height":"0.03"},
-        {"text":"concatenate","conf":"95","left":"0.50","top":"0.20","width":"0.20","height":"0.03"}
+    // Extra "vector" result whose OCR text also contains "vectorization" (with
+    // separate boxes). Reserved for a future whole-token highlight test: the
+    // overlay's `text.includes(term)` matcher over-matches substrings, but that
+    // wasn't reproducible deterministically via the rendered overlay in e2e yet
+    // (see #4645). Harmless for the reflow test — it's just another result.
+    let hl_text = "vector vectorization overmatch";
+    let hl_json = r#"[
+        {"text":"vector","conf":"95","left":"0.10","top":"0.20","width":"0.10","height":"0.03"},
+        {"text":"vectorization","conf":"95","left":"0.45","top":"0.20","width":"0.22","height":"0.03"}
     ]"#;
     if let Err(e) = db
         .insert_snapshot_frame_with_ocr(
@@ -78,7 +80,7 @@ pub async fn seed_search_fixture(db: &DatabaseManager) {
             now,
             "e2e-search-fixture.jpg",
             Some("Code"),
-            Some("highlight fixture"),
+            Some("highlight overmatch"),
             None,
             None,
             true,
@@ -88,7 +90,7 @@ pub async fn seed_search_fixture(db: &DatabaseManager) {
             None,
             None,
             None,
-            Some((cat_text, cat_json, "e2e")),
+            Some((hl_text, hl_json, "e2e")),
             None,
         )
         .await
