@@ -191,7 +191,18 @@ jobs:
                 squashfs-root/usr/lib/libgmodule-2.0.so* \
                 squashfs-root/usr/lib/libmount.so* \
                 squashfs-root/usr/lib/libblkid.so* \
-                squashfs-root/usr/lib/libpcre2-8.so*
+                squashfs-root/usr/lib/libpcre2-8.so* \
+                squashfs-root/usr/lib/libsharpyuv.so* \
+                squashfs-root/usr/lib/libavif.so*
+
+          # Guard the libavif/libsharpyuv fix: an orphan bundled libsharpyuv
+          # shadows the host one and breaks Arch (libavif 1.4.2) with
+          # "undefined symbol: SharpYuvConvertWithOptions". Fail if either
+          # survives the strip.
+          if ls squashfs-root/usr/lib/libsharpyuv.so* squashfs-root/usr/lib/libavif.so* 2>/dev/null; then
+            echo "::error::bundled libavif/libsharpyuv still present after strip"
+            exit 1
+          fi
 
           ARCH=x86_64 /tmp/appimagetool squashfs-root "${appimage}"
           rm -rf squashfs-root
@@ -288,6 +299,75 @@ jobs:
               if grep -E "Pi background install failed|bun version: unknown .*SIGSEGV|killed by signal 11" /tmp/apprun.log; then
                 echo "AppRun logged a Pi/bun runtime failure"
                 exit 1
+              fi
+            '
+
+      - name: Smoke AppImage on Arch (newer libavif regression)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Arch is rolling and ships a newer libavif than the Ubuntu 24.04 build
+          # host. This reproduces the Discord report where a stale *bundled*
+          # libsharpyuv shadowed the host one and the host libavif.so.16 died with
+          # "undefined symbol: SharpYuvConvertWithOptions". The repacked AppImage
+          # must launch here.
+          mkdir -p /tmp/screenpipe-appimage-arch
+          cp "apps/screenpipe-app-tauri/${APPIMAGE}" /tmp/screenpipe-appimage-arch/screenpipe.AppImage
+
+          docker run --rm \
+            -v /tmp/screenpipe-appimage-arch:/smoke \
+            archlinux:latest \
+            bash -euxo pipefail -c '
+              pacman -Sy --noconfirm --needed \
+                gtk3 \
+                webkit2gtk-4.1 \
+                libavif \
+                openblas \
+                alsa-lib \
+                libpulse \
+                librsvg \
+                libsecret \
+                libayatana-appindicator \
+                libxtst \
+                xdotool \
+                dbus \
+                xorg-server-xvfb \
+                xorg-xauth \
+                ttf-dejavu
+
+              # Prove the host ships a newer libavif/libsharpyuv pair (the trigger).
+              pacman -Q libavif libsharpyuv || true
+              ls -l /usr/lib/libavif.so.* /usr/lib/libsharpyuv.so.* || true
+
+              useradd -m smoke-user
+              chown -R smoke-user:smoke-user /smoke
+              install -d -m 700 -o smoke-user -g smoke-user /tmp/screenpipe-runtime
+              cd /smoke
+              chmod +x screenpipe.AppImage
+              ./screenpipe.AppImage --appimage-extract >/dev/null
+
+              # The fix strips these from the bundle; they must NOT be back.
+              if ls squashfs-root/usr/lib/libsharpyuv.so* squashfs-root/usr/lib/libavif.so* 2>/dev/null; then
+                echo "bundled libavif/libsharpyuv present - host pair would be shadowed"
+                exit 1
+              fi
+
+              app_bin="$(find squashfs-root/usr/bin -maxdepth 1 -type f -executable -iname "*screenpipe*" -print -quit)"
+              test -n "${app_bin}"
+
+              export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib
+              set +e
+              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib && timeout 20 dbus-run-session -- xvfb-run -a squashfs-root/AppRun --help" 2>&1 | tee /tmp/apprun-arch.log
+              status="${PIPESTATUS[0]}"
+              set -e
+              # The exact failure we are guarding against.
+              if grep -E "symbol lookup error|SharpYuvConvertWithOptions|undefined symbol" /tmp/apprun-arch.log; then
+                echo "AppRun hit the libavif/libsharpyuv symbol error on Arch"
+                exit 1
+              fi
+              if [ "${status}" != "0" ] && [ "${status}" != "124" ]; then
+                echo "AppRun failed with status ${status} on Arch"
+                exit "${status}"
               fi
             '
 
