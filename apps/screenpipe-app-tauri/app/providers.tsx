@@ -61,7 +61,12 @@ export const Providers = forwardRef<
   useEffect(() => {
     if (typeof window !== "undefined") {
       const isDebug = process.env.TAURI_ENV_DEBUG === "true";
-      if (isDebug) return;
+      // Skip in E2E too: the suite runs a release-like build, so posthog would
+      // otherwise init, load the live `app-announcement` flag, and pop a modal
+      // over every spec (clean localStorage each run = empty dismissed-set) —
+      // plus pollute prod analytics with test traffic.
+      const isE2E = process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true";
+      if (isDebug || isE2E) return;
       // Bootstrap with the stable per-install id (mirrors settings.analyticsId,
       // cached by the identify() effect in use-settings) so EVERY event — incl.
       // ones fired by overlay windows like the floating search bar before the
