@@ -531,6 +531,15 @@ curl -X POST http://localhost:11435/notify \
   -H "Content-Type: application/json" \
   -d '{"title": "share meeting notes with the team?", "body": "approve to send the adriaan call notes", "actions": [{"id": "approve", "label": "approve", "type": "pipe", "primary": true, "pipe": "share-data", "context": {"meeting_id": 274}}, {"id": "decline", "label": "decline", "type": "dismiss"}]}'
 
+# Run an inline prompt in a fresh chat session on click (`type: "chat"`).
+# No pre-installed pipe needed — write the whole task in `prompt`, attach data
+# in `context`. Add `"auto_send": false` to pre-fill chat for the user to
+# review/edit before sending. This is the lightweight counterpart to a `pipe`
+# action for one-off "approve → do this specific thing" flows.
+curl -X POST http://localhost:11435/notify \
+  -H "Content-Type: application/json" \
+  -d '{"title": "summarize this call into a CRM note?", "body": "approve to draft it", "actions": [{"id": "go", "label": "draft it", "type": "chat", "primary": true, "prompt": "summarize meeting 274 into a short CRM follow-up note and save it to output/", "context": {"meeting_id": 274}}, {"id": "no", "label": "no", "type": "dismiss"}]}'
+
 # Call a local API endpoint on click (`type: "api"`)
 curl -X POST http://localhost:11435/notify \
   -H "Content-Type: application/json" \
@@ -554,7 +563,8 @@ curl -X POST http://localhost:11435/notify \
 **Action button `type`s:**
 - `link` — open a web URL in the browser (`url`)
 - `deeplink` — navigate within screenpipe (`url` = `screenpipe://...`)
-- `pipe` — run a pipe on click (`pipe` = target pipe name, optional `context` injected into its prompt, optional `open_in_chat`). The opt-in / agent-gated-sharing primitive.
+- `pipe` — run an installed pipe on click (`pipe` = target pipe name, optional `context` injected into its prompt, optional `open_in_chat`). The opt-in / agent-gated-sharing primitive.
+- `chat` — run an inline `prompt` in a fresh chat session (no installed pipe needed; optional `context` as background data, optional `auto_send` default true). Lightweight counterpart to `pipe` for one-off approve-and-do flows.
 - `api` — POST a local endpoint (`url`, optional `method`, optional `body`)
 - `dismiss` — close the notification, no side effect
 - `primary: true` renders the button filled (the recommended action). Actions persist into the notification bell, so a missed toast can still be acted on.

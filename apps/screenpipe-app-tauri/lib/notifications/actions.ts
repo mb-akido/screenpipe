@@ -19,6 +19,7 @@ export interface NotificationAction {
   id?: string;
   type?:
     | "pipe"
+    | "chat"
     | "api"
     | "deeplink"
     | "link"
@@ -29,6 +30,12 @@ export interface NotificationAction {
   /** Target pipe to run (type=pipe). Set this explicitly — when omitted it
    *  falls back to the *sending* pipe, which is rarely what you want. */
   pipe?: string;
+  /** Free-form instruction run in a fresh chat session (type=chat). No
+   *  pre-installed pipe needed — the agent writes the task inline. */
+  prompt?: string;
+  /** type=chat: auto-send the prompt (default true). Set false to drop the
+   *  user into chat with the prompt pre-filled but unsent, to review first. */
+  auto_send?: boolean;
   context?: Record<string, unknown>;
   url?: string;
   value?: string;
@@ -113,6 +120,26 @@ export async function executeNotificationAction(
             );
           }
         }
+      }
+      break;
+    }
+    case "chat": {
+      // Run an arbitrary instruction in a fresh chat session — no installed
+      // pipe required. The agent writes the task inline in `prompt`; any
+      // `context` is serialized in as background data. This is the lightweight
+      // counterpart to a `pipe` action: use it for one-off "approve → do this
+      // specific thing" flows where standing up a dedicated pipe is overkill.
+      if (action.prompt || action.context) {
+        const contextStr = action.context
+          ? `context:\n${JSON.stringify(action.context, null, 2)}`
+          : "";
+        await showChatWithPrefill({
+          context: contextStr,
+          prompt: action.prompt,
+          displayLabel: action.label,
+          autoSend: action.auto_send !== false,
+          source: `notification-${ctx.sourceId ?? ""}`,
+        });
       }
       break;
     }

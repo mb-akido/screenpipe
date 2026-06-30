@@ -218,6 +218,7 @@ export function NotificationBell() {
     // a window) isn't hidden behind it.
     if (
       action.open_in_chat ||
+      action.type === "chat" ||
       action.type === "deeplink" ||
       action.type === "link" ||
       action.type === "meeting_join"
