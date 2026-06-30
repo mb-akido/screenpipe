@@ -68,6 +68,21 @@ pub fn mark_all_read() {
     write_all(&history);
 }
 
+pub fn mark_read_by_id(id: &str) -> bool {
+    let mut history = read_all();
+    let mut changed = false;
+    for entry in &mut history {
+        if entry.id == id && !entry.read {
+            entry.read = true;
+            changed = true;
+        }
+    }
+    if changed {
+        write_all(&history);
+    }
+    changed
+}
+
 pub fn remove_by_id(id: &str) -> bool {
     let mut history = read_all();
     let before = history.len();

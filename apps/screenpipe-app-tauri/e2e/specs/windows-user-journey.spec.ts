@@ -741,7 +741,7 @@ describe("Windows user journey", function () {
       // inner div and *toggles* expand/collapse, so the click must never fire on
       // an already-open row. The earlier version split the "is it expanded?"
       // check and the click across two WebDriver round-trips; the 5s history
-      // poll + mark-all-read pass re-render the list between those two calls, so
+      // poll re-renders the list between those two calls, so
       // the unconditional toggle-click could land on a row that had just
       // expanded and collapse it again — livelocking until the 30s timeout (it
       // failed on both the initial attempt and the retry in CI). Do the check
