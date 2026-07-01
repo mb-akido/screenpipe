@@ -469,7 +469,12 @@ impl DatabaseManager {
         let fts_query = frame_fts_parts.join(" ");
         let has_fts = !fts_query.trim().is_empty();
 
-        let sql = format!(
+        // Keep the candidate scan lightweight:
+        // - build predicates only for active filters so SQLite can keep using
+        //   the timestamp index (the old `? IS NULL OR` pattern defeated it)
+        // - compute tags via a per-row correlated subquery instead of joining
+        //   `vision_tags` into the hot scan and forcing a `GROUP BY`
+        let mut query_builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
         SELECT
             frames.id as frame_id,
@@ -483,71 +488,108 @@ impl DatabaseManager {
             '' as ocr_engine,
             frames.window_name,
             COALESCE(video_chunks.device_name, frames.device_name) as device_name,
-            GROUP_CONCAT(tags.name, ',') as tags,
+            (
+                SELECT GROUP_CONCAT(t.name, ',')
+                FROM vision_tags vt
+                JOIN tags t ON vt.tag_id = t.id
+                WHERE vt.vision_id = frames.id
+            ) as tags,
             frames.browser_url,
             frames.focused,
             frames.text_source
         FROM frames
         LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
-        LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
-        LEFT JOIN tags ON vision_tags.tag_id = tags.id
-        {fts_join}
-        WHERE 1=1
-            {fts_condition}
-            AND (?2 IS NULL OR frames.timestamp >= ?2)
-            AND (?3 IS NULL OR frames.timestamp <= ?3)
-            AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) >= ?4)
-            AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
-            AND (?6 IS NULL OR COALESCE(video_chunks.device_name, frames.device_name) LIKE '%' || ?6 || '%')
-            AND (?7 IS NULL OR frames.machine_id = ?7)
-            AND (?8 IS NULL OR frames.focused = ?8)
-            AND (?9 IS NULL OR frames.name LIKE '%' || ?9 || '%')
-            AND (json_array_length(?12) = 0 OR frames.id IN (
-                SELECT vt.vision_id
-                FROM vision_tags vt
-                JOIN tags t ON vt.tag_id = t.id
-                WHERE t.name IN (SELECT value FROM json_each(?12))
-                GROUP BY vt.vision_id
-                HAVING COUNT(DISTINCT t.name) = json_array_length(?12)
-            ))
-        GROUP BY frames.id
-        ORDER BY frames.timestamp DESC
-        LIMIT ?10 OFFSET ?11
         "#,
-            fts_join = if has_fts {
-                "JOIN frames_fts ON frames.id = frames_fts.rowid"
-            } else {
-                ""
-            },
-            fts_condition = if has_fts {
-                "AND frames_fts MATCH ?1"
-            } else {
-                ""
-            },
         );
+        if has_fts {
+            query_builder.push(" JOIN frames_fts ON frames.id = frames_fts.rowid ");
+        }
+        query_builder.push(" WHERE 1=1 ");
+        if has_fts {
+            query_builder
+                .push(" AND frames_fts MATCH ")
+                .push_bind(&fts_query);
+        }
+        if let Some(start) = start_time {
+            query_builder
+                .push(" AND frames.timestamp >= ")
+                .push_bind(start);
+        }
+        if let Some(end) = end_time {
+            query_builder
+                .push(" AND frames.timestamp <= ")
+                .push_bind(end);
+        }
+        if let Some(min) = min_length {
+            query_builder
+                .push(" AND LENGTH(COALESCE(frames.full_text, '')) >= ")
+                .push_bind(min as i64);
+        }
+        if let Some(max) = max_length {
+            query_builder
+                .push(" AND LENGTH(COALESCE(frames.full_text, '')) <= ")
+                .push_bind(max as i64);
+        }
+        if let Some(device) = device_name {
+            if !device.is_empty() {
+                query_builder
+                    .push(
+                        " AND COALESCE(video_chunks.device_name, frames.device_name) LIKE '%' || ",
+                    )
+                    .push_bind(device)
+                    .push(" || '%'");
+            }
+        }
+        if let Some(machine) = machine_id {
+            if !machine.is_empty() {
+                query_builder
+                    .push(" AND frames.machine_id = ")
+                    .push_bind(machine);
+            }
+        }
+        if let Some(is_focused) = focused {
+            query_builder
+                .push(" AND frames.focused = ")
+                .push_bind(is_focused);
+        }
+        if let Some(name) = frame_name {
+            if !name.is_empty() {
+                query_builder
+                    .push(" AND frames.name LIKE '%' || ")
+                    .push_bind(name)
+                    .push(" || '%'");
+            }
+        }
 
         // Serialize the tag filter to a JSON array so the SQL can use
-        // `json_each` / `json_array_length`. Empty array short-circuits the
-        // filter via the `json_array_length(?12) = 0` guard above.
+        // `json_each` / `json_array_length`.
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+        if !tags.is_empty() {
+            query_builder
+                .push(
+                    " AND frames.id IN (
+                        SELECT vt.vision_id
+                        FROM vision_tags vt
+                        JOIN tags t ON vt.tag_id = t.id
+                        WHERE t.name IN (SELECT value FROM json_each(",
+                )
+                .push_bind(&tags_json)
+                .push(
+                    "))
+                        GROUP BY vt.vision_id
+                        HAVING COUNT(DISTINCT t.name) = json_array_length(",
+                )
+                .push_bind(&tags_json)
+                .push("))");
+        }
+        query_builder
+            .push(" ORDER BY frames.timestamp DESC LIMIT ")
+            .push_bind(limit as i64)
+            .push(" OFFSET ")
+            .push_bind(offset as i64);
 
-        let query_builder = sqlx::query_as(&sql);
-
-        let raw_results: Vec<OCRResultRaw> = query_builder
-            .bind(if has_fts { Some(&fts_query) } else { None })
-            .bind(start_time)
-            .bind(end_time)
-            .bind(min_length.map(|l| l as i64))
-            .bind(max_length.map(|l| l as i64))
-            .bind(device_name)
-            .bind(machine_id)
-            .bind(focused)
-            .bind(frame_name)
-            .bind(limit)
-            .bind(offset)
-            .bind(&tags_json)
-            .fetch_all(&self.pool)
-            .await?;
+        let raw_results: Vec<OCRResultRaw> =
+            query_builder.build_query_as().fetch_all(&self.pool).await?;
 
         Ok(raw_results
             .into_iter()
@@ -1510,43 +1552,7 @@ impl DatabaseManager {
         let has_fts = !fts_query.trim().is_empty();
 
         let sql = match content_type {
-            ContentType::OCR | ContentType::Accessibility => format!(
-                r#"SELECT COUNT(DISTINCT frames.id)
-                   FROM frames
-                   {fts_join}
-                   WHERE 1=1
-                       {fts_condition}
-                       AND (?2 IS NULL OR frames.timestamp >= ?2)
-                       AND (?3 IS NULL OR frames.timestamp <= ?3)
-                       AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) >= ?4)
-                       AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
-                       AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
-                       AND (?7 IS NULL OR frames.focused = ?7)
-                       AND (json_array_length(?8) = 0 OR frames.id IN (
-                           SELECT vt.vision_id
-                           FROM vision_tags vt
-                           JOIN tags t ON vt.tag_id = t.id
-                           WHERE t.name IN (SELECT value FROM json_each(?8))
-                           GROUP BY vt.vision_id
-                           HAVING COUNT(DISTINCT t.name) = json_array_length(?8)
-                       ))
-                       {a11y_filter}"#,
-                fts_join = if has_fts {
-                    "JOIN frames_fts ON frames.id = frames_fts.rowid"
-                } else {
-                    ""
-                },
-                fts_condition = if has_fts {
-                    "AND frames_fts MATCH ?1"
-                } else {
-                    ""
-                },
-                a11y_filter = if content_type == ContentType::Accessibility {
-                    "AND frames.accessibility_text IS NOT NULL AND frames.accessibility_text != ''"
-                } else {
-                    ""
-                }
-            ),
+            ContentType::OCR | ContentType::Accessibility => String::new(),
             ContentType::Audio => format!(
                 r#"SELECT COUNT(DISTINCT audio_transcriptions.id)
                    FROM {table}
@@ -1674,15 +1680,76 @@ impl DatabaseManager {
 
         let count: i64 = match content_type {
             ContentType::OCR | ContentType::Accessibility => {
-                sqlx::query_scalar(&sql)
-                    .bind(if has_fts { fts_query } else { "*".to_owned() })
-                    .bind(start_time)
-                    .bind(end_time)
-                    .bind(min_length.map(|l| l as i64))
-                    .bind(max_length.map(|l| l as i64))
-                    .bind(frame_name)
-                    .bind(focused)
-                    .bind(&tags_json)
+                let mut query_builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT COUNT(DISTINCT frames.id) FROM frames",
+                );
+                if has_fts {
+                    query_builder.push(" JOIN frames_fts ON frames.id = frames_fts.rowid");
+                }
+                query_builder.push(" WHERE 1=1");
+                if has_fts {
+                    query_builder
+                        .push(" AND frames_fts MATCH ")
+                        .push_bind(&fts_query);
+                }
+                if let Some(start) = start_time {
+                    query_builder
+                        .push(" AND frames.timestamp >= ")
+                        .push_bind(start);
+                }
+                if let Some(end) = end_time {
+                    query_builder
+                        .push(" AND frames.timestamp <= ")
+                        .push_bind(end);
+                }
+                if let Some(min) = min_length {
+                    query_builder
+                        .push(" AND LENGTH(COALESCE(frames.full_text, '')) >= ")
+                        .push_bind(min as i64);
+                }
+                if let Some(max) = max_length {
+                    query_builder
+                        .push(" AND LENGTH(COALESCE(frames.full_text, '')) <= ")
+                        .push_bind(max as i64);
+                }
+                if let Some(name) = frame_name {
+                    if !name.is_empty() {
+                        query_builder
+                            .push(" AND frames.name LIKE '%' || ")
+                            .push_bind(name)
+                            .push(" || '%'");
+                    }
+                }
+                if let Some(is_focused) = focused {
+                    query_builder
+                        .push(" AND frames.focused = ")
+                        .push_bind(is_focused);
+                }
+                if !tags.is_empty() {
+                    query_builder
+                        .push(
+                            " AND frames.id IN (
+                                SELECT vt.vision_id
+                                FROM vision_tags vt
+                                JOIN tags t ON vt.tag_id = t.id
+                                WHERE t.name IN (SELECT value FROM json_each(",
+                        )
+                        .push_bind(&tags_json)
+                        .push(
+                            "))
+                                GROUP BY vt.vision_id
+                                HAVING COUNT(DISTINCT t.name) = json_array_length(",
+                        )
+                        .push_bind(&tags_json)
+                        .push("))");
+                }
+                if content_type == ContentType::Accessibility {
+                    query_builder.push(
+                        " AND frames.accessibility_text IS NOT NULL AND frames.accessibility_text != ''",
+                    );
+                }
+                query_builder
+                    .build_query_scalar()
                     .fetch_one(&self.pool)
                     .await?
             }

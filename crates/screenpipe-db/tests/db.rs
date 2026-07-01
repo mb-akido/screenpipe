@@ -163,7 +163,12 @@ mod tests {
         let only_ada = run(&db, &["person:ada".to_string()]).await;
         assert_eq!(only_ada.len(), 1);
         match &only_ada[0] {
-            SearchResult::OCR(o) => assert_eq!(o.frame_id, a),
+            SearchResult::OCR(o) => {
+                assert_eq!(o.frame_id, a);
+                assert_eq!(o.tags.len(), 2, "search should still return frame tags");
+                assert!(o.tags.contains(&"person:ada".to_string()));
+                assert!(o.tags.contains(&"project:atlas".to_string()));
+            }
             other => panic!("expected OCR, got {other:?}"),
         }
 

@@ -170,6 +170,42 @@ mod query_plan_tests {
     }
 
     #[tokio::test]
+    async fn test_search_ocr_hot_path_avoids_group_by_temp_btree() {
+        let db = setup_test_db().await;
+        seed_data(&db, 100).await;
+
+        let plan = explain(
+            &db,
+            r#"SELECT
+                frames.id as frame_id,
+                COALESCE(frames.full_text, frames.accessibility_text, '') as ocr_text,
+                frames.timestamp,
+                (
+                    SELECT GROUP_CONCAT(t.name, ',')
+                    FROM vision_tags vt
+                    JOIN tags t ON vt.tag_id = t.id
+                    WHERE vt.vision_id = frames.id
+                ) as tags
+            FROM frames
+            WHERE frames.timestamp >= '2020-01-01'
+              AND frames.timestamp <= '2030-01-01'
+            ORDER BY frames.timestamp DESC
+            LIMIT 20 OFFSET 0"#,
+        )
+        .await;
+
+        assert_uses_index(&plan, "search_ocr_hot_path");
+        let uses_group_by_temp = plan
+            .iter()
+            .any(|l| l.contains("USE TEMP B-TREE FOR GROUP BY"));
+        assert!(
+            !uses_group_by_temp,
+            "search_ocr_hot_path should avoid GROUP BY temp btree.\nPlan:\n{}",
+            plan.join("\n")
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_audio_with_time_range_uses_index() {
         let db = setup_test_db().await;
 
