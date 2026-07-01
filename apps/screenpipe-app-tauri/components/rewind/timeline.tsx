@@ -40,6 +40,7 @@ import { useScrollZoom } from "@/components/rewind/hooks/use-scroll-zoom";
 import { useDateNavigation } from "@/components/rewind/hooks/use-date-navigation";
 import { useTimelineKeyboard } from "@/components/rewind/hooks/use-timeline-keyboard";
 import { localFetch } from "@/lib/api";
+import { openSearchForQuery } from "@/lib/timeline-navigation";
 
 export interface StreamTimeSeriesResponse {
 	timestamp: string;
@@ -163,6 +164,13 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	})();
 
 	const inSearchReviewMode = hasSearchHighlight && searchResults.length > 0 && searchResultIndex >= 0;
+	const handleSearchWindowOpen = useCallback(() => {
+		if (inSearchReviewMode && searchQuery.trim()) {
+			void openSearchForQuery(searchQuery);
+			return;
+		}
+		void commands.showWindow({ Search: { query: null } });
+	}, [inSearchReviewMode, searchQuery]);
 
 	// Get timeline selection for chat context
 	const { selectionRange, loadTagsForFrames, tags } = useTimelineSelection();
@@ -1281,7 +1289,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 						onSearchClick={
 							embedded
 								? undefined
-								: () => commands.showWindow({ Search: { query: null } })
+								: handleSearchWindowOpen
 						}
 						onChatClick={embedded ? undefined : () => commands.showWindow("Chat")}
 						embedded={embedded}
