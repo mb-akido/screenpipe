@@ -3534,7 +3534,7 @@ mod tests {
 
         let env_value = cmd
             .get_envs()
-            .find(|(key, _)| key == OsStr::new("LD_LIBRARY_PATH"))
+            .find(|(key, _)| *key == OsStr::new("LD_LIBRARY_PATH"))
             .map(|(_, value)| value);
         assert_eq!(
             env_value,
