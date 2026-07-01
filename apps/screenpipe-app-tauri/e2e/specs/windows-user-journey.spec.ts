@@ -450,7 +450,7 @@ describe("Windows user journey", function () {
       await waitForBodyText(
         (bodyText) =>
           bodyText.includes("auto-select audio devices") &&
-          bodyText.includes("microphone echo cancellation") &&
+          bodyText.includes("echo cancellation") &&
           bodyText.includes("windows wasapi aec"),
         "Windows audio troubleshooting controls did not appear after enabling audio recording",
       );
@@ -716,7 +716,7 @@ describe("Windows user journey", function () {
     const notificationId = `windows-e2e-bell-${Date.now()}`;
     const notificationTitle = "Windows UX notification";
     const notificationBody = "Notification body visible from the bell history.";
-    const displayChangesSelector = '[data-testid="notification-pref-display-changes"]';
+    const displayChangesSelector = '[data-testid="notification-pref-displayChanges"]';
     let initialDisplayChanges: boolean | null = null;
 
     try {
