@@ -52,6 +52,14 @@ const SCREENPIPE_API = (
   `http://${host}:${port}`
 ).replace(/\/+$/, "");
 
+function bundledBunEnv(): NodeJS.ProcessEnv {
+  if (process.platform !== "linux") return process.env;
+  return {
+    ...process.env,
+    BUN_JSC_useJIT: process.env.BUN_JSC_useJIT ?? "0",
+  };
+}
+
 // Discover the local API key, in priority order:
 //
 //   1. env vars set by the launcher (Claude Desktop config, terminal, etc.)
@@ -123,6 +131,7 @@ function discoverApiKey(): string {
         timeout: 30000, // first run downloads the package; subsequent runs are cached
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
+        env: bundledBunEnv(),
       }).trim();
       if (token && token.startsWith("sp-")) return token;
     } catch {

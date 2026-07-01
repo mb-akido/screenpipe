@@ -250,7 +250,7 @@ jobs:
               squashfs-root/usr/bin/ffmpeg -version
               squashfs-root/usr/bin/ffprobe -version
               squashfs-root/usr/bin/tesseract --version
-              env -u LD_LIBRARY_PATH squashfs-root/usr/bin/bun --version
+              env -u LD_LIBRARY_PATH BUN_JSC_useJIT=0 squashfs-root/usr/bin/bun --version
 
               check_ldd() {
                 local target="$1"

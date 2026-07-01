@@ -2267,9 +2267,15 @@ fn should_scrub_bun_runtime_env() -> bool {
 
 /// Strip the AppImage runtime library path from a bun command (see
 /// [`should_scrub_bun_runtime_env`]). Shared with the Tauri app crate.
+///
+/// On Linux we also force Bun's JSC JIT off for spawned subprocesses. Bun has
+/// a documented `BUN_JSC_useJIT=0` workaround for startup segfault classes on
+/// hardened / newer Linux hosts; this matches the Debian 13 AppImage smoke
+/// failure where the bundled baseline bun crashed before printing `--version`.
 pub fn scrub_bun_runtime_env(cmd: &mut std::process::Command) {
     if should_scrub_bun_runtime_env() {
         cmd.env_remove("LD_LIBRARY_PATH");
+        cmd.env("BUN_JSC_useJIT", "0");
     }
 }
 
@@ -3535,9 +3541,8 @@ mod tests {
         assert!(tail.ends_with('é'));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn scrub_bun_runtime_env_always_removes_ld_library_path_on_linux() {
+    fn scrub_bun_runtime_env_sets_platform_expected_env() {
         use std::ffi::OsStr;
 
         let mut cmd = std::process::Command::new("sh");
@@ -3549,10 +3554,34 @@ mod tests {
             .get_envs()
             .find(|(key, _)| *key == OsStr::new("LD_LIBRARY_PATH"))
             .map(|(_, value)| value);
-        assert_eq!(
-            env_value,
-            Some(None),
-            "bun subprocesses on Linux must clear inherited LD_LIBRARY_PATH"
-        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                env_value,
+                Some(None),
+                "bun subprocesses on Linux must clear inherited LD_LIBRARY_PATH"
+            );
+
+            let jit_value = cmd
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("BUN_JSC_useJIT"))
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_os_string());
+            assert_eq!(
+                jit_value,
+                Some(std::ffi::OsString::from("0")),
+                "linux bun subprocesses should disable JSC JIT to avoid startup segfaults"
+            );
+        } else {
+            assert_eq!(
+                env_value,
+                Some(Some(OsStr::new("/tmp/appimage/usr/lib"))),
+                "non-linux bun subprocesses should not rewrite LD_LIBRARY_PATH"
+            );
+            assert!(
+                cmd.get_envs()
+                    .all(|(key, _)| key != OsStr::new("BUN_JSC_useJIT")),
+                "non-linux bun subprocesses should not inject Linux-only Bun flags"
+            );
+        }
     }
 }
