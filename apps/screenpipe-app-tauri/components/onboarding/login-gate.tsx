@@ -282,24 +282,25 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
     setRechecking(false);
   }, [settings.user?.token, rechecking, loadUser]);
 
-  const useDifferentAccount = useCallback(() => {
+  const useDifferentAccount = useCallback(async () => {
     posthog.capture("onboarding_login_switch_account");
     reverifiedRef.current = false;
-    // Clear the auth-bearing fields so we drop back to the "sign in" button and the
-    // member can re-authenticate with their work email (the one on the license).
-    updateSettings({
-      user: {
-        ...settings.user,
-        id: null,
-        token: null,
-        clerk_id: null,
-        cloud_subscribed: null,
-        app_entitled: null,
-        subscription_plan: null,
-        entitlement: null,
-      },
-    });
-  }, [settings.user, updateSettings]);
+    // Match the entitlement gate's switch-account flow: clear local auth state,
+    // then open a fresh browser session so Google shows the account chooser
+    // instead of silently reusing the previous session.
+    await updateSettings({ user: null as any });
+    try {
+      await commands.setCloudToken(null);
+    } catch (e) {
+      console.warn("failed to clear cloud token before switching accounts:", e);
+    }
+    try {
+      await commands.piUpdateConfig(null, null);
+    } catch (e) {
+      console.warn("failed to clear pi config before switching accounts:", e);
+    }
+    await commands.openLoginWindow(true);
+  }, [updateSettings]);
 
   const handleLogin = useCallback(() => {
     posthog.capture("onboarding_login_clicked");
