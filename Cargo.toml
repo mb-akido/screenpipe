@@ -154,6 +154,10 @@ uiautomation = "0.16.1"
 [patch.crates-io]
 # enables chinese mirror (hf is banned in china) and rustls-tls
 hf-hub = { git = "https://github.com/neo773/hf-hub", rev = "437dcf4049233f4a0e0cfc4e1c1dbf5ed2c57760" }
+# knf-rs-sys v0.3.2 can still emit /MT objects on some Windows MSVC hosts,
+# which then fail to link against ONNX Runtime's /MD import libs (issue #4682).
+# Keep this local override until upstream ships an equivalent runtime-selection fix.
+knf-rs-sys = { path = "patches/knf-rs-sys" }
 
 [profile.release]
 codegen-units = 1
