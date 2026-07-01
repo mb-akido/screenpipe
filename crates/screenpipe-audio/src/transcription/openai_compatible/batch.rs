@@ -150,12 +150,14 @@ pub async fn transcribe_with_openai_compatible(
 /// Whether a transport-level error is transient (worth retrying) rather than
 /// deterministic. HTTP status errors don't reach here (they're `Ok(Response)`).
 fn openai_error_is_transient(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect() || transient_error_text(&format!("{err:?}"))
+    err.is_timeout()
+        || err.is_connect()
+        || openai_compatible_error_is_transient_text(&format!("{err:?}"))
 }
 
 /// String-level fallback for transient transport failures reqwest doesn't flag
 /// via `is_timeout`/`is_connect`.
-fn transient_error_text(debug: &str) -> bool {
+pub(crate) fn openai_compatible_error_is_transient_text(debug: &str) -> bool {
     let d = debug.to_lowercase();
     d.contains("timed out")
         || d.contains("timeout")
@@ -335,14 +337,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transient_error_text_flags_blips_only() {
-        assert!(transient_error_text(
+    fn openai_compatible_error_is_transient_text_flags_blips_only() {
+        assert!(openai_compatible_error_is_transient_text(
             "reqwest::Error { kind: Request, source: error sending request }"
         ));
-        assert!(transient_error_text("operation timed out"));
-        assert!(transient_error_text("Connection refused (os error 61)"));
-        assert!(!transient_error_text("invalid api key"));
-        assert!(!transient_error_text("404 not found"));
+        assert!(openai_compatible_error_is_transient_text(
+            "operation timed out"
+        ));
+        assert!(openai_compatible_error_is_transient_text(
+            "Connection refused (os error 61)"
+        ));
+        assert!(!openai_compatible_error_is_transient_text(
+            "invalid api key"
+        ));
+        assert!(!openai_compatible_error_is_transient_text("404 not found"));
     }
 
     #[test]

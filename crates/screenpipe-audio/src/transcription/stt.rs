@@ -12,7 +12,9 @@ use crate::speaker::segment::SpeechSegment;
 use crate::transcription::deepgram::batch::transcribe_with_deepgram;
 use crate::transcription::deepgram::DeepgramTranscriptionConfig;
 use crate::transcription::engine::TranscriptionSession;
-use crate::transcription::openai_compatible::batch::transcribe_with_openai_compatible;
+use crate::transcription::openai_compatible::batch::{
+    openai_compatible_error_is_transient_text, transcribe_with_openai_compatible,
+};
 use crate::transcription::whisper::batch::process_with_whisper;
 use crate::transcription::VocabularyEntry;
 use crate::utils::audio::resample;
@@ -24,7 +26,7 @@ use screenpipe_core::Language;
 use std::path::PathBuf;
 use std::{sync::Arc, sync::Mutex as StdMutex};
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, warn};
 use whisper_rs::WhisperState;
 
 use crate::{AudioInput, TranscriptionResult};
@@ -237,10 +239,17 @@ pub async fn stt(
         {
             Ok(transcription) => Ok(transcription),
             Err(e) => {
-                error!(
+                if openai_compatible_error_is_transient_text(&format!("{e:?}")) {
+                    warn!(
+                        "device: {}, openai compatible transcription unavailable, falling back to Whisper: {:?}",
+                        device, e
+                    );
+                } else {
+                    error!(
                         "device: {}, openai compatible transcription failed, falling back to Whisper: {:?}",
                         device, e
                     );
+                }
                 // Fallback to Whisper
                 process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
             }
@@ -392,7 +401,11 @@ pub async fn run_stt(
             })
         }
         Err(e) => {
-            error!("STT error for input {}: {:?}", device, e);
+            if session_error_should_warn(session, &e) {
+                warn!("STT transient provider error for input {}: {:?}", device, e);
+            } else {
+                error!("STT error for input {}: {:?}", device, e);
+            }
             Ok(TranscriptionResult {
                 input: AudioInput {
                     data: Arc::new(segment.samples),
@@ -413,6 +426,11 @@ pub async fn run_stt(
             })
         }
     }
+}
+
+fn session_error_should_warn(session: &TranscriptionSession, err: &anyhow::Error) -> bool {
+    matches!(session, TranscriptionSession::OpenAICompatible { .. })
+        && openai_compatible_error_is_transient_text(&format!("{err:?}"))
 }
 
 fn offset_diarization_segments(

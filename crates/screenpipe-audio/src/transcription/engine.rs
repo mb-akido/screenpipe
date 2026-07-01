@@ -7,7 +7,9 @@ use crate::transcription::deepgram::batch::{
     transcribe_with_deepgram, transcribe_with_deepgram_detailed,
 };
 use crate::transcription::deepgram::DeepgramTranscriptionConfig;
-use crate::transcription::openai_compatible::batch::transcribe_with_openai_compatible;
+use crate::transcription::openai_compatible::batch::{
+    openai_compatible_error_is_transient_text, transcribe_with_openai_compatible,
+};
 use crate::transcription::whisper::batch::process_with_whisper;
 use crate::transcription::whisper::model::{
     create_whisper_context_parameters, download_whisper_model, get_cached_whisper_model_path,
@@ -840,10 +842,17 @@ impl TranscriptionSession {
                 {
                     Ok(t) => Ok(t),
                     Err(e) => {
-                        error!(
-                            "device: {}, openai compatible transcription failed: {:?}",
-                            device, e
-                        );
+                        if openai_compatible_error_is_transient_text(&format!("{e:?}")) {
+                            warn!(
+                                "device: {}, openai compatible transcription unavailable after retries: {:?}",
+                                device, e
+                            );
+                        } else {
+                            error!(
+                                "device: {}, openai compatible transcription failed: {:?}",
+                                device, e
+                            );
+                        }
                         Err(e)
                     }
                 }
