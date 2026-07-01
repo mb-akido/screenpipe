@@ -85,14 +85,21 @@ export async function hasFramesForDate(date: Date): Promise<boolean> {
 			endOfDay = new Date(now.getTime() - 5 * 60 * 1000); // 5 minutes ago
 		}
 
-		// Use SELECT 1 ... LIMIT 1 instead of COUNT(*) — short-circuits after first row
+		// Use SELECT 1 ... LIMIT 1 instead of COUNT(*) — short-circuits after
+		// first row. Include audio_transcriptions so audio-only days stay
+		// navigable: the calendar already enables those days and the timeline can
+		// render them, so date jumps must query the same capture surfaces.
 		const query = `
-            SELECT 1 as has_frames
-            FROM frames f
-            WHERE f.timestamp >= '${startOfDay.toISOString()}'
-            AND f.timestamp <= '${endOfDay.toISOString()}'
-            LIMIT 1
-        `;
+			SELECT 1 as has_frames
+			FROM (
+				SELECT timestamp FROM frames WHERE timestamp IS NOT NULL
+				UNION ALL
+				SELECT timestamp FROM audio_transcriptions WHERE timestamp IS NOT NULL
+			) captured
+			WHERE captured.timestamp >= '${startOfDay.toISOString()}'
+			AND captured.timestamp <= '${endOfDay.toISOString()}'
+			LIMIT 1
+		`;
 
 		const response = await localFetch("/raw_sql", {
 			method: "POST",
@@ -166,18 +173,24 @@ export async function findNearestDateWithFrames(
 			}
 		}
 
-		// Single query: find the nearest frame timestamp within the range,
-		// ordered so the closest to targetDate comes first.
+		// Single query: find the nearest captured timestamp within the range,
+		// ordered so the closest to targetDate comes first. Include
+		// audio_transcriptions so audio-only days are reachable from the same
+		// calendar/arrow controls that already expose them.
 		// For backward: we want the most recent frame (ORDER BY DESC)
 		// For forward: we want the earliest frame (ORDER BY ASC)
 		const order = direction === "backward" ? "DESC" : "ASC";
 
 		const query = `
-			SELECT f.timestamp
-			FROM frames f
-			WHERE f.timestamp >= '${rangeStart.toISOString()}'
-			AND f.timestamp <= '${rangeEnd.toISOString()}'
-			ORDER BY f.timestamp ${order}
+			SELECT captured.timestamp
+			FROM (
+				SELECT timestamp FROM frames WHERE timestamp IS NOT NULL
+				UNION ALL
+				SELECT timestamp FROM audio_transcriptions WHERE timestamp IS NOT NULL
+			) captured
+			WHERE captured.timestamp >= '${rangeStart.toISOString()}'
+			AND captured.timestamp <= '${rangeEnd.toISOString()}'
+			ORDER BY captured.timestamp ${order}
 			LIMIT 1
 		`;
 
