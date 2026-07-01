@@ -663,6 +663,16 @@
       "notes": "Production billing gate blocks an unentitled session behind the paywall and restores access when the forced-gate flag is cleared."
     },
     {
+      "spec": "zz-enterprise-license-prompt.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["settings", "billing", "real-ui-e2e"],
+      "features": ["enterprise-license-prompt", "billing-gate"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Enterprise activation gate surfaces invalid-key and seat-limit failures, then allows a successful retry after policy seats recover without requiring a reload."
+    },
+    {
       "spec": "zz-logout-resurrect.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["real-ui-e2e", "settings"],
