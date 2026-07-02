@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 const mocks = vi.hoisted(() => ({
   awaitSafeRestart: vi.fn(async () => "proceed"),
   stopScreenpipe: vi.fn(async () => undefined),
+  spawnScreenpipe: vi.fn(async () => ({ status: "ok", data: null })),
   restartForUpdate: vi.fn(async () => ({ status: "ok", data: "proceed" })),
   isEnterpriseBuildCmd: vi.fn(async () => false),
   getEnterpriseLicenseKey: vi.fn(async () => null),
@@ -23,6 +24,7 @@ vi.mock("@/lib/utils/tauri", () => ({
   commands: {
     awaitSafeRestart: mocks.awaitSafeRestart,
     stopScreenpipe: mocks.stopScreenpipe,
+    spawnScreenpipe: mocks.spawnScreenpipe,
     restartForUpdate: mocks.restartForUpdate,
     isEnterpriseBuildCmd: mocks.isEnterpriseBuildCmd,
     getEnterpriseLicenseKey: mocks.getEnterpriseLicenseKey,
@@ -113,10 +115,73 @@ describe("UpdateBanner windows restart flow", () => {
     await waitFor(() => expect(downloadAndInstall).toHaveBeenCalled());
     expect(mocks.stopScreenpipe).toHaveBeenCalledTimes(1);
     expect(mocks.restartForUpdate).toHaveBeenCalledWith(60);
+    expect(mocks.spawnScreenpipe).not.toHaveBeenCalled();
     expect(mocks.toast).toHaveBeenCalledWith(
       expect.objectContaining({
         title: "update complete",
       }),
     );
+  });
+
+  it("restores the backend when the installer fails after recording was stopped", async () => {
+    const downloadAndInstall = vi.fn(async () => {
+      throw new Error("installer boom");
+    });
+    mocks.check.mockResolvedValueOnce({
+      available: true,
+      downloadAndInstall,
+    });
+
+    render(<UpdateBanner />);
+
+    fireEvent.click(screen.getByRole("button", { name: /restart to update/i }));
+
+    await waitFor(() => expect(downloadAndInstall).toHaveBeenCalled());
+    await waitFor(() => expect(mocks.spawnScreenpipe).toHaveBeenCalledWith(null));
+    expect(mocks.stopScreenpipe).toHaveBeenCalledTimes(1);
+    expect(mocks.restartForUpdate).not.toHaveBeenCalled();
+    expect(mocks.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "update failed",
+        variant: "destructive",
+      }),
+    );
+  });
+
+  it("restores the backend when the installer returns but restart is gated", async () => {
+    const downloadAndInstall = vi.fn(async () => undefined);
+    mocks.check.mockResolvedValueOnce({
+      available: true,
+      downloadAndInstall,
+    });
+    mocks.restartForUpdate.mockResolvedValueOnce({ status: "ok", data: "pending" });
+
+    render(<UpdateBanner />);
+
+    fireEvent.click(screen.getByRole("button", { name: /restart to update/i }));
+
+    await waitFor(() => expect(mocks.restartForUpdate).toHaveBeenCalledWith(60));
+    await waitFor(() => expect(mocks.spawnScreenpipe).toHaveBeenCalledWith(null));
+    expect(mocks.toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "screenpipe is still starting up",
+      }),
+    );
+  });
+
+  it("does not respawn the backend when it was never stopped", async () => {
+    mocks.check.mockRejectedValueOnce(new Error("network down"));
+
+    render(<UpdateBanner />);
+
+    fireEvent.click(screen.getByRole("button", { name: /restart to update/i }));
+
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "update failed" }),
+      ),
+    );
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
+    expect(mocks.spawnScreenpipe).not.toHaveBeenCalled();
   });
 });

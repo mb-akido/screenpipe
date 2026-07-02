@@ -94,6 +94,23 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
   const handleUpdate = async () => {
     setIsInstalling(true);
     const os = platform();
+    let stoppedBackendForUpdate = false;
+
+    // Best-effort: if we stopped recording for an install that then failed or
+    // returned without exiting the process, bring the backend back — stop_screenpipe
+    // clears capture intent, so the health watchdog will NOT respawn it on its own
+    // and a broken update would otherwise leave recording silently off.
+    const recoverWindowsBackend = async () => {
+      if (!stoppedBackendForUpdate) return;
+      try {
+        const res = await commands.spawnScreenpipe(null);
+        if (res.status === "error") {
+          console.warn("failed to recover screenpipe after update failure:", res.error);
+        }
+      } catch (e) {
+        console.warn("failed to recover screenpipe after update failure:", e);
+      }
+    };
 
     try {
       // Windows: NSIS installer calls process::exit directly, bypassing our
@@ -151,6 +168,7 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
         // run. This avoids stale-banner clicks creating recording gaps.
         try {
           await commands.stopScreenpipe();
+          stoppedBackendForUpdate = true;
         } catch (e) {
           console.warn("failed to stop screenpipe:", e);
         }
@@ -164,6 +182,7 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
         const restartOutcome =
           restartRes.status === "ok" ? restartRes.data : "errored";
         if (restartOutcome !== "proceed") {
+          await recoverWindowsBackend();
           setIsInstalling(false);
           toast({
             title: "screenpipe is still starting up",
@@ -208,6 +227,7 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
       }
     } catch (error) {
       console.error("failed to update:", error);
+      await recoverWindowsBackend();
       setIsInstalling(false);
       toast({
         title: "update failed",
