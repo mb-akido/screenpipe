@@ -470,9 +470,11 @@ export function BrainSection() {
     total: artifactsTotal,
     sources: artifactSources,
     isLoading: artifactsLoading,
+    error: artifactsError,
     hasMore: artifactsHaveMore,
     loadMore: loadMoreArtifacts,
     deleteRegistered,
+    refresh: refreshArtifacts,
   } = useUnifiedArtifacts(
     parsedSearch.contentQuery,
     artifactSourceFilter,
@@ -1539,6 +1541,25 @@ export function BrainSection() {
 
       {(typeFilter === "memories" ? loading : artifactsLoading) ? (
         <BrainSkeleton />
+      ) : typeFilter === "artifacts" && artifactsError && unifiedItems.length === 0 ? (
+        <div
+          data-testid="brain-artifacts-error"
+          className="text-sm text-muted-foreground py-8 space-y-3 text-center"
+        >
+          <div className="space-y-1">
+            <p className="font-medium text-foreground">failed to load artifacts</p>
+            <p className="text-xs">{artifactsError}</p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={refreshArtifacts}
+          >
+            retry
+          </Button>
+        </div>
       ) : unifiedItems.length === 0 ? (
         <div className="text-sm text-muted-foreground py-8 space-y-2 text-center">
           <p>{emptyStateMessage(typeFilter, debouncedQuery, activeTags.length > 0)}</p>
