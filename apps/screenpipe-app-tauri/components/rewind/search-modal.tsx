@@ -20,6 +20,10 @@ import { format, isToday, isYesterday } from "date-fns";
 import { cn } from "@/lib/utils";
 import { commands } from "@/lib/utils/tauri";
 import { showChatWithPrefill } from "@/lib/chat-utils";
+import {
+  getSearchGridColumnCount,
+  getSearchGridTemplateColumns,
+} from "./search-grid-layout";
 import { ThumbnailHighlightOverlay } from "./thumbnail-highlight-overlay";
 import { localFetch, getApiBaseUrl, appendAuthToken } from "@/lib/api";
 import { buildBoundedFacetSql, sanitizeFts5Query } from "@/lib/search/facet-sql";
@@ -392,6 +396,8 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const { inputRef, inputElRef, focusInput } = useSearchFocus(isOpen);
   const gridRef = useRef<HTMLDivElement>(null);
+  const screenResultsGridRef = useRef<HTMLDivElement>(null);
+  const screenResultsColumnsRef = useRef(3);
 
   // Programmatically scroll via native-scroll events (macOS).
   // WKWebView in settings WebviewWindow doesn't dispatch JS wheel events,
@@ -740,6 +746,28 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     if (timeFilter) results = results.filter(r => matchesTimeFilter(r.timestamp));
     return results;
   }, [searchResults, appFilter, domainFilter, timeFilter, matchesTimeFilter]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const updateScreenGridColumns = () => {
+      const width = screenResultsGridRef.current?.clientWidth ?? 0;
+      screenResultsColumnsRef.current = getSearchGridColumnCount(width);
+    };
+
+    updateScreenGridColumns();
+
+    if (typeof ResizeObserver !== "function" || !screenResultsGridRef.current) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      updateScreenGridColumns();
+    });
+    observer.observe(screenResultsGridRef.current);
+
+    return () => observer.disconnect();
+  }, [isOpen, filteredResults.length, contentFilter]);
 
   // Keep a ref so keyboard handler reads current value without re-mounting the effect
   const filteredResultsRef = useRef(filteredResults);
@@ -1279,7 +1307,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
         return;
       }
 
-      const cols = 3;
+      const cols = screenResultsColumnsRef.current;
       const results = filteredResultsRef.current;
 
       switch (e.key) {
@@ -1460,7 +1488,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             <div
                 className="grid gap-3"
                 style={{
-                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                  gridTemplateColumns: getSearchGridTemplateColumns(),
                 }}
               >
               {filteredSpeakerTranscriptions.map((t, index) => {
@@ -1595,7 +1623,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             <div
                 className="grid gap-3"
                 style={{
-                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                  gridTemplateColumns: getSearchGridTemplateColumns(),
                 }}
               >
               {tagResults.map((frame) => (
@@ -1692,7 +1720,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               <div
                 className="grid gap-3"
                 style={{
-                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                  gridTemplateColumns: getSearchGridTemplateColumns(),
                 }}
               >
                 {Array.from({ length: 6 }).map((_, i) => (
@@ -1839,7 +1867,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               <div
                 className="grid gap-3"
                 style={{
-                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                  gridTemplateColumns: getSearchGridTemplateColumns(),
                 }}
               >
                 {Array.from({ length: 6 }).map((_, i) => (
@@ -2021,9 +2049,10 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               )}
 
               <div
+                ref={screenResultsGridRef}
                 className="grid gap-3"
                 style={{
-                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                  gridTemplateColumns: getSearchGridTemplateColumns(),
                 }}
               >
                 {filteredResults.map((result, index) => {
@@ -2224,7 +2253,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             ref={gridRef}
             className={cn(
               "flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y",
-              standalone ? "p-3 max-h-[500px] scrollbar-hide" : "p-4",
+              standalone ? "p-3 scrollbar-hide" : "p-4",
             )}
             onWheel={(e) => {
               e.stopPropagation();
