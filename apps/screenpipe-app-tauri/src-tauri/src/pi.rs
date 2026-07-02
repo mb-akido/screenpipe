@@ -864,42 +864,6 @@ fn clear_pi_install_artifacts(install_dir: &Path) {
     let _ = std::fs::remove_file(install_dir.join("package-lock.json"));
 }
 
-#[cfg(target_os = "linux")]
-fn should_relocate_linux_bundled_bun() -> bool {
-    std::env::var_os("APPIMAGE").is_some() || std::env::var_os("APPDIR").is_some()
-}
-
-#[cfg(target_os = "linux")]
-fn relocate_linux_bundled_bun(bundled: &Path, data_dir: &Path) -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let runtime_dir = data_dir.join("runtime");
-    std::fs::create_dir_all(&runtime_dir)?;
-
-    let relocated = runtime_dir.join("bun");
-    let needs_refresh = match std::fs::metadata(&relocated) {
-        Ok(existing) => {
-            let source = std::fs::metadata(bundled)?;
-            source.len() != existing.len()
-                || source.modified().ok() != existing.modified().ok()
-        }
-        Err(_) => true,
-    };
-
-    if needs_refresh {
-        let temp = runtime_dir.join("bun.tmp");
-        let _ = std::fs::remove_file(&temp);
-        let _ = std::fs::remove_file(&relocated);
-        std::fs::copy(bundled, &temp)?;
-        let mut perms = std::fs::metadata(&temp)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&temp, perms)?;
-        std::fs::rename(&temp, &relocated)?;
-    }
-
-    Ok(relocated)
-}
-
 fn apply_no_window(_cmd: &mut Command) {
     #[cfg(windows)]
     {
@@ -3045,25 +3009,6 @@ fn find_bun_executable() -> Option<String> {
             let bundled = exe_folder.join(if cfg!(windows) { "bun.exe" } else { "bun" });
             debug!("Checking bundled bun at: {}", bundled.display());
             if bundled.exists() {
-                #[cfg(target_os = "linux")]
-                if should_relocate_linux_bundled_bun() {
-                    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
-                    match relocate_linux_bundled_bun(&bundled, &data_dir) {
-                        Ok(relocated) => {
-                            info!(
-                                "Using relocated bundled bun at: {} (source: {})",
-                                relocated.display(),
-                                bundled.display()
-                            );
-                            return Some(relocated.to_string_lossy().to_string());
-                        }
-                        Err(e) => warn!(
-                            "Failed to relocate bundled bun from {}: {}; falling back to in-place binary",
-                            bundled.display(),
-                            e
-                        ),
-                    }
-                }
                 info!("Found bundled bun at: {}", bundled.display());
                 return Some(bundled.to_string_lossy().to_string());
             }
@@ -3481,66 +3426,6 @@ mod tests {
         super::remove_screenpipe_auth_from_path(&auth_path).expect("missing auth is ok");
 
         assert!(!auth_path.exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn relocate_linux_bundled_bun_copies_into_runtime_dir() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bundled_dir = dir.path().join("squashfs-root/usr/bin");
-        let data_dir = dir.path().join("screenpipe-data");
-        std::fs::create_dir_all(&bundled_dir).expect("create bundled dir");
-
-        let bundled = bundled_dir.join("bun");
-        std::fs::write(&bundled, b"#!/bin/sh\necho bundled-bun\n").expect("write bun");
-        let mut perms = std::fs::metadata(&bundled).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bundled, perms).expect("chmod");
-
-        let relocated =
-            super::relocate_linux_bundled_bun(&bundled, &data_dir).expect("relocate bun");
-        assert_eq!(relocated, data_dir.join("runtime").join("bun"));
-        assert_ne!(relocated, bundled);
-        assert_eq!(
-            std::fs::read(&relocated).expect("read relocated"),
-            b"#!/bin/sh\necho bundled-bun\n"
-        );
-        let relocated_mode = std::fs::metadata(&relocated)
-            .expect("relocated metadata")
-            .permissions()
-            .mode();
-        assert_ne!(relocated_mode & 0o111, 0, "relocated bun must stay executable");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn relocate_linux_bundled_bun_refreshes_changed_source() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bundled_dir = dir.path().join("squashfs-root/usr/bin");
-        let data_dir = dir.path().join("screenpipe-data");
-        std::fs::create_dir_all(&bundled_dir).expect("create bundled dir");
-
-        let bundled = bundled_dir.join("bun");
-        std::fs::write(&bundled, b"bun-v1").expect("write bun v1");
-        let mut perms = std::fs::metadata(&bundled).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bundled, perms).expect("chmod");
-
-        let relocated =
-            super::relocate_linux_bundled_bun(&bundled, &data_dir).expect("initial relocate");
-        assert_eq!(std::fs::read(&relocated).expect("read relocated"), b"bun-v1");
-
-        std::fs::write(&bundled, b"bun-v2-with-new-bytes").expect("write bun v2");
-        let relocated =
-            super::relocate_linux_bundled_bun(&bundled, &data_dir).expect("refresh relocate");
-        assert_eq!(
-            std::fs::read(&relocated).expect("read refreshed relocated"),
-            b"bun-v2-with-new-bytes"
-        );
     }
 
     #[test]
