@@ -12,6 +12,7 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { E2E_DATA_DIR, getAppPath, getAppPid, WEBDRIVER_PORT } from "../helpers/app-launcher.js";
 import { authHeaders, fetchJson, getLocalApiConfig, waitForLocalApi } from "../helpers/api-utils.js";
@@ -197,6 +198,7 @@ Add-Type -AssemblyName System.Windows.Forms
     if (!isWindows || !api) this.skip();
 
     expect(E2E_DATA_DIR.toLowerCase()).toContain(".e2e");
+    expect(E2E_DATA_DIR.toLowerCase()).toContain(tmpdir().toLowerCase());
     expect(E2E_DATA_DIR.toLowerCase()).not.toContain("\\appdata\\roaming\\.screenpipe");
     expect(existsSync(E2E_DATA_DIR)).toBe(true);
     expect(statSync(E2E_DATA_DIR).isDirectory()).toBe(true);

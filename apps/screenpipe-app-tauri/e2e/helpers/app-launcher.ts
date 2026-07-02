@@ -4,6 +4,7 @@
 
 import { spawn, execSync } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 
@@ -50,7 +51,9 @@ function killPort(port: number): void {
 
 // e2e/helpers/ → ../.. = app root (Bun runs from source, no dist)
 const APP_ROOT = resolve(__dirname, '../..');
-export const E2E_DATA_DIR = resolve(APP_ROOT, '.e2e');
+// Keep E2E data outside the repo checkout so Tauri's fs scope (which already
+// allows $TEMP/**) can read/write chats and fixtures on Windows CI.
+export const E2E_DATA_DIR = resolve(tmpdir(), 'screenpipe-app-tauri.e2e');
 const APP_PID_FILE = resolve(E2E_DATA_DIR, 'app.pid');
 
 // `onboarding` marks the onboarding store complete so the app drops straight
