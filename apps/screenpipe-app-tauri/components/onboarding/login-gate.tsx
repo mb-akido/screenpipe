@@ -229,6 +229,7 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
   const { settings, loadUser, updateSettings } = useSettings();
   const hasAdvanced = useRef(false);
   const reverifiedRef = useRef(false);
+  const freshSessionLoginRef = useRef(false);
   const [showSkip, setShowSkip] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [rechecking, setRechecking] = useState(false);
@@ -282,12 +283,13 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
     setRechecking(false);
   }, [settings.user?.token, rechecking, loadUser]);
 
-  const useDifferentAccount = useCallback(() => {
+  const useDifferentAccount = useCallback(async () => {
     posthog.capture("onboarding_login_switch_account");
     reverifiedRef.current = false;
+    freshSessionLoginRef.current = true;
     // Clear the auth-bearing fields so we drop back to the "sign in" button and the
     // member can re-authenticate with their work email (the one on the license).
-    updateSettings({
+    await updateSettings({
       user: {
         ...settings.user,
         id: null,
@@ -299,13 +301,14 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
         entitlement: null,
       },
     });
+    await commands.openLoginWindow(true);
   }, [settings.user, updateSettings]);
 
   const handleLogin = useCallback(() => {
     posthog.capture("onboarding_login_clicked");
     // Open login in an in-app WebView instead of Safari so we can intercept
     // the screenpipe:// deep-link redirect (Safari blocks custom-scheme redirects)
-    commands.openLoginWindow(null);
+    commands.openLoginWindow(freshSessionLoginRef.current ? true : null);
   }, []);
 
   const handleSkip = useCallback(() => {
