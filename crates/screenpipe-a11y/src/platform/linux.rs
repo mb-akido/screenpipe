@@ -16,7 +16,7 @@
 //!
 //! ## Window Tracking
 //!
-//! Uses Hyprland IPC (Wayland) or `xdotool` (X11) to track the active window.
+//! Uses compositor IPC (Hyprland/Sway on Wayland) or `xdotool` (X11) to track the active window.
 //!
 //! ## Clipboard
 //!
@@ -990,7 +990,7 @@ fn run_window_observer(
 }
 
 /// Get active window info: (app_name, window_title, pid).
-/// Uses Hyprland IPC on Hyprland/Wayland, then falls back to xdotool for X11.
+/// Uses compositor IPC on Wayland, then falls back to xdotool for X11.
 pub fn get_active_window_info() -> Option<(String, String, i32)> {
     const ACTIVE_WINDOW_CACHE_TTL: Duration = Duration::from_secs(1);
     static CACHE: OnceLock<Mutex<Option<(Option<(String, String, i32)>, Instant)>>> =
@@ -1016,7 +1016,9 @@ pub fn get_active_window_info() -> Option<(String, String, i32)> {
 ///
 /// Use this when stale focused-window metadata would affect privacy gates.
 pub fn get_active_window_info_fresh() -> Option<(String, String, i32)> {
-    get_hyprland_active_window_info().or_else(get_x11_active_window_info)
+    get_hyprland_active_window_info()
+        .or_else(get_sway_active_window_info)
+        .or_else(get_x11_active_window_info)
 }
 
 fn get_hyprland_active_window_info() -> Option<(String, String, i32)> {
@@ -1036,6 +1038,22 @@ fn get_hyprland_active_window_info() -> Option<(String, String, i32)> {
     .filter(|o| o.status.success())?;
 
     parse_hyprland_active_window_json(&output.stdout)
+}
+
+fn get_sway_active_window_info() -> Option<(String, String, i32)> {
+    let is_sway_desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|desktop| desktop.to_ascii_lowercase().contains("sway"))
+        .unwrap_or(false);
+
+    if std::env::var_os("SWAYSOCK").is_none() && !is_sway_desktop {
+        return None;
+    }
+
+    let output =
+        command_output_with_timeout("swaymsg", &["-t", "get_tree"], Duration::from_millis(300))
+            .filter(|o| o.status.success())?;
+
+    parse_sway_tree_focused_window_json(&output.stdout)
 }
 
 fn parse_hyprland_active_window_json(raw: &[u8]) -> Option<(String, String, i32)> {
@@ -1063,6 +1081,72 @@ fn parse_hyprland_active_window_json(raw: &[u8]) -> Option<(String, String, i32)
     let pid = value.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
     Some((app_name, window_title, pid))
+}
+
+fn parse_sway_tree_focused_window_json(raw: &[u8]) -> Option<(String, String, i32)> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let node = find_focused_sway_window(&value)?;
+
+    let app_name = node
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            node.get("window_properties")
+                .and_then(|v| v.get("class"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            node.get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })?
+        .to_string();
+
+    let window_title = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+
+    let pid = node.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+    Some((app_name, window_title, pid))
+}
+
+fn find_focused_sway_window(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    let has_window_identity = value
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+        || value
+            .get("window_properties")
+            .and_then(|v| v.get("class"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+
+    if value.get("focused").and_then(|v| v.as_bool()) == Some(true) && has_window_identity {
+        return Some(value);
+    }
+
+    for key in ["nodes", "floating_nodes"] {
+        if let Some(children) = value.get(key).and_then(|v| v.as_array()) {
+            for child in children {
+                if let Some(found) = find_focused_sway_window(child) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn clean_hyprland_title(title: &str) -> String {
@@ -1550,6 +1634,119 @@ mod tests {
         assert_eq!(app_name, "Alacritty");
         assert_eq!(window_title, "Terminal");
         assert_eq!(pid, 123);
+    }
+
+    #[test]
+    fn test_parse_sway_tree_focused_wayland_window_json() {
+        let raw = br#"{
+            "type": "root",
+            "focused": false,
+            "nodes": [{
+                "type": "output",
+                "focused": false,
+                "nodes": [{
+                    "type": "workspace",
+                    "focused": true,
+                    "nodes": [{
+                        "type": "con",
+                        "app_id": "foot",
+                        "name": "screenpipe-wayland-ci-active",
+                        "pid": 4242,
+                        "focused": true,
+                        "nodes": [],
+                        "floating_nodes": []
+                    }],
+                    "floating_nodes": []
+                }],
+                "floating_nodes": []
+            }],
+            "floating_nodes": []
+        }"#;
+
+        let (app_name, window_title, pid) = parse_sway_tree_focused_window_json(raw).unwrap();
+
+        assert_eq!(app_name, "foot");
+        assert_eq!(window_title, "screenpipe-wayland-ci-active");
+        assert_eq!(pid, 4242);
+    }
+
+    #[test]
+    fn test_parse_sway_tree_focused_xwayland_window_json() {
+        let raw = br#"{
+            "type": "root",
+            "focused": false,
+            "nodes": [{
+                "type": "output",
+                "focused": true,
+                "nodes": [{
+                    "type": "workspace",
+                    "focused": true,
+                    "floating_nodes": [{
+                        "type": "floating_con",
+                        "name": "Legacy App",
+                        "pid": 31337,
+                        "focused": true,
+                        "window_properties": {
+                            "class": "LegacyX11"
+                        },
+                        "nodes": [],
+                        "floating_nodes": []
+                    }],
+                    "nodes": []
+                }],
+                "floating_nodes": []
+            }],
+            "floating_nodes": []
+        }"#;
+
+        let (app_name, window_title, pid) = parse_sway_tree_focused_window_json(raw).unwrap();
+
+        assert_eq!(app_name, "LegacyX11");
+        assert_eq!(window_title, "Legacy App");
+        assert_eq!(pid, 31337);
+    }
+
+    #[test]
+    #[ignore = "requires a live Sway session with a focused Wayland window"]
+    fn linux_live_sway_active_window_info_reads_focused_window() {
+        if std::env::var("SCREENPIPE_RUN_LIVE_SWAY_TEST")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            eprintln!("skipping live Sway test; set SCREENPIPE_RUN_LIVE_SWAY_TEST=1");
+            return;
+        }
+
+        let expected_title = std::env::var("SCREENPIPE_WAYLAND_TEST_TITLE")
+            .unwrap_or_else(|_| "screenpipe-wayland-ci-active".to_string());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last_seen = None;
+
+        while Instant::now() < deadline {
+            last_seen = get_active_window_info_fresh();
+            if let Some((app_name, window_title, pid)) = &last_seen {
+                if app_name.to_ascii_lowercase().contains("foot")
+                    && window_title.contains(&expected_title)
+                    && *pid > 0
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let sway_tree = Command::new("swaymsg")
+            .args(["-t", "get_tree"])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_else(|| "<swaymsg unavailable>".to_string());
+
+        panic!(
+            "expected focused Sway window title containing {:?}; last_seen={:?}; sway_tree={}",
+            expected_title, last_seen, sway_tree
+        );
     }
 
     #[test]
