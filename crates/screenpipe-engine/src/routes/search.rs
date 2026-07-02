@@ -48,7 +48,10 @@ impl oasgen::OaParameter for OptionalPipePerms {}
 use chrono::{DateTime, Utc};
 use screenpipe_db::{ContentType, DatabaseManager, Order, SearchResult};
 
-use futures::future::{join_all, try_join};
+use futures::{
+    future::try_join,
+    stream::{self, StreamExt},
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -252,6 +255,14 @@ const RELATED_TAGS_LIMIT: u32 = 30;
 /// a generous safety net, not a normal-path limit.
 const RELATED_TAGS_TIMEOUT_SECS: u64 = 5;
 
+/// Max frame extractions in flight per search request. Each extraction spawns
+/// a full ffmpeg process that seeks + decodes a video chunk (tens of MB RSS and
+/// real CPU each), so running one per result item concurrently — `limit` has no
+/// upper clamp — turns `include_frames=true` into a process-spawn storm (e.g.
+/// `limit=500` → 500 simultaneous ffmpeg processes). Four keeps the wall-clock
+/// win of overlapping seeks without letting a single request monopolize the box.
+const FRAME_EXTRACT_CONCURRENCY: usize = 4;
+
 async fn attach_frames_to_ocr_items<F, Fut>(content_items: &mut [ContentItem], extract: F)
 where
     F: Fn(String, i64) -> Fut,
@@ -272,11 +283,16 @@ where
         })
         .collect();
 
-    // join_all (not try_join_all): one frame that can't be extracted — e.g. an
-    // offset in the still-being-recorded chunk, or a corrupt file — must not
-    // discard the frames for the whole batch. A missing frame here is expected,
-    // so log it at debug rather than spamming warnings.
-    let frames = join_all(frame_futures).await;
+    // Collect every result rather than failing fast (`try_*` variants): one
+    // frame that can't be extracted — e.g. an offset in the still-being-recorded
+    // chunk, or a corrupt file — must not discard the frames for the whole
+    // batch. A missing frame here is expected, so log it at debug rather than
+    // spamming warnings. `buffered` preserves input order (unlike
+    // `buffer_unordered`), which the zip-back loop below relies on.
+    let frames: Vec<_> = stream::iter(frame_futures)
+        .buffered(FRAME_EXTRACT_CONCURRENCY)
+        .collect()
+        .await;
 
     let mut frames = frames.into_iter();
     for item in content_items.iter_mut() {
@@ -1153,6 +1169,60 @@ mod tests {
                 assert_eq!(ocr.frame.as_deref(), Some("encoded:good-frame.mp4"));
             }
             other => panic!("expected second OCR item, got {other:?}"),
+        }
+    }
+
+    /// Reproduces the frame-extraction process storm: before bounding, a search
+    /// with `include_frames=true` ran one ffmpeg per result item concurrently
+    /// (`limit` has no upper clamp — `limit=500` meant 500 simultaneous ffmpeg
+    /// processes). Assert extraction is capped at `FRAME_EXTRACT_CONCURRENCY`
+    /// in flight and that results still land on their own items, in order.
+    #[tokio::test]
+    async fn include_frames_bounds_concurrent_extractions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let mut items: Vec<ContentItem> = (0..32)
+            .map(|i| ContentItem::OCR(test_ocr(i, &format!("chunk-{i}.mp4"))))
+            .collect();
+
+        let in_flight_clone = in_flight.clone();
+        let max_clone = max_in_flight.clone();
+        attach_frames_to_ocr_items(&mut items, move |file_path, _offset_index| {
+            let in_flight = in_flight_clone.clone();
+            let max_in_flight = max_clone.clone();
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                // Yield so the runtime gets a chance to poll every queued
+                // future — an unbounded join_all would drive all 32 here.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(format!("encoded:{file_path}"))
+            }
+        })
+        .await;
+
+        let observed_max = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            observed_max <= FRAME_EXTRACT_CONCURRENCY,
+            "extraction storm not contained: {observed_max} in flight (cap {FRAME_EXTRACT_CONCURRENCY}, was 32 unbounded)"
+        );
+        assert!(observed_max >= 2, "extractions should still overlap");
+
+        // Order preserved: each item got its own frame back.
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                ContentItem::OCR(ocr) => assert_eq!(
+                    ocr.frame.as_deref(),
+                    Some(format!("encoded:chunk-{i}.mp4").as_str()),
+                    "item {i} got the wrong frame"
+                ),
+                other => panic!("expected OCR item, got {other:?}"),
+            }
         }
     }
 
