@@ -2289,6 +2289,7 @@ fn tokio_bun_command(bun: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(bun);
     if should_scrub_bun_runtime_env() {
         cmd.env_remove("LD_LIBRARY_PATH");
+        cmd.env("BUN_JSC_useJIT", "0");
     }
     cmd
 }
@@ -3581,6 +3582,46 @@ mod tests {
                 cmd.get_envs()
                     .all(|(key, _)| key != OsStr::new("BUN_JSC_useJIT")),
                 "non-linux bun subprocesses should not inject Linux-only Bun flags"
+            );
+        }
+    }
+
+    #[test]
+    fn tokio_bun_command_sets_platform_expected_env() {
+        use std::ffi::OsStr;
+
+        let cmd = tokio_bun_command("bun");
+
+        let env_value = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("LD_LIBRARY_PATH"))
+            .map(|(_, value)| value);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                env_value,
+                Some(None),
+                "async bun subprocesses on Linux must clear inherited LD_LIBRARY_PATH"
+            );
+
+            let jit_value = cmd
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("BUN_JSC_useJIT"))
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_os_string());
+            assert_eq!(
+                jit_value,
+                Some(std::ffi::OsString::from("0")),
+                "async bun subprocesses should disable JSC JIT to avoid startup segfaults"
+            );
+        } else {
+            assert_eq!(env_value, None);
+            assert!(
+                cmd.as_std()
+                    .get_envs()
+                    .all(|(key, _)| key != OsStr::new("BUN_JSC_useJIT")),
+                "non-linux async bun subprocesses should not inject Linux-only Bun flags"
             );
         }
     }
