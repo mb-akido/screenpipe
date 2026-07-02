@@ -363,9 +363,10 @@ jobs:
               app_bin="$(find squashfs-root/usr/bin -maxdepth 1 -type f -executable -iname "*screenpipe*" -print -quit)"
               test -n "${app_bin}"
 
-              export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib
+              app_ld_library_path=/smoke/squashfs-root/usr/lib
+              unset LD_LIBRARY_PATH
               set +e
-              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib && timeout 20 dbus-run-session -- xvfb-run -a squashfs-root/AppRun --help" 2>&1 | tee /tmp/apprun-arch.log
+              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && timeout 20 dbus-run-session -- xvfb-run -a env LD_LIBRARY_PATH=\"${app_ld_library_path}\" squashfs-root/AppRun --help" 2>&1 | tee /tmp/apprun-arch.log
               status="${PIPESTATUS[0]}"
               set -e
               # The exact failure we are guarding against.
