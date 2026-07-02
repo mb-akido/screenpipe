@@ -580,6 +580,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # macos-14's default Xcode (15.4) ships Swift tools 5.10, but
+    # PermissionFlowShim declares swift-tools-version 6.0 — swift-rs panics
+    # with "package is using Swift tools version 6.0.0 but the installed
+    # version is 5.10.0". Select the newest installed Xcode so the pinned
+    # image still gets a Swift 6 toolchain (and its complete clang runtime).
+    - name: Select newest installed Xcode (Swift 6 needed by PermissionFlowShim)
+      run: |
+        NEWEST=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+        echo "selecting $NEWEST"
+        sudo xcode-select -s "$NEWEST/Contents/Developer"
+        swift --version
+
     - name: Setup Bun
       uses: oven-sh/setup-bun@v2
       with:

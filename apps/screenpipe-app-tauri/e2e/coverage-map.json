@@ -193,6 +193,16 @@
       "notes": "Synthetic chat event regression for duplicate sidebar rows."
     },
     {
+      "spec": "chat-connections-context-duplicate.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "real-ui-e2e"],
+      "features": ["chat"],
+      "criticality": "medium",
+      "confidence": "partial",
+      "ux": "mixed",
+      "notes": "Reproducer for #4689: connections-context blob must not spawn a duplicate chat or leak into titles."
+    },
+    {
       "spec": "chat-sidebar-stub-dedup.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["chat-ai"],
