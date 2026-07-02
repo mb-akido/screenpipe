@@ -285,8 +285,9 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
   const useDifferentAccount = useCallback(() => {
     posthog.capture("onboarding_login_switch_account");
     reverifiedRef.current = false;
-    // Clear the auth-bearing fields so we drop back to the "sign in" button and the
-    // member can re-authenticate with their work email (the one on the license).
+    // Clear the auth-bearing fields, then reopen auth in a fresh session so
+    // Google/Clerk shows the account picker instead of silently reusing the
+    // same cookies.
     updateSettings({
       user: {
         ...settings.user,
@@ -299,6 +300,7 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
         entitlement: null,
       },
     });
+    void commands.openLoginWindow(true);
   }, [settings.user, updateSettings]);
 
   const handleLogin = useCallback(() => {

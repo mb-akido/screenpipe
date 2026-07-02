@@ -104,7 +104,7 @@ describe("onboarding login gate", () => {
     expect(mocks.loadUser).toHaveBeenLastCalledWith("t3", true);
   });
 
-  it("'use a different account' clears the auth token so they can re-login", async () => {
+  it("'use a different account' clears auth state and reopens login with a fresh session", async () => {
     mocks.settings = { user: { token: "t4", id: "u4", email: "x@y.com", cloud_subscribed: true } };
     mocks.hasAppEntitlement.mockReturnValue(false);
     render(<OnboardingLogin handleNextSlide={vi.fn()} />);
@@ -113,6 +113,7 @@ describe("onboarding login gate", () => {
     const arg = mocks.updateSettings.mock.calls[0][0];
     expect(arg.user.token).toBeNull();
     expect(arg.user.id).toBeNull();
+    expect(mocks.openLoginWindow).toHaveBeenCalledWith(true);
   });
 
   it("shows the sign-in button when not signed in", () => {
