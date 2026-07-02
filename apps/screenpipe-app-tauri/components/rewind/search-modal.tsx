@@ -20,6 +20,7 @@ import { format, isToday, isYesterday } from "date-fns";
 import { cn } from "@/lib/utils";
 import { commands } from "@/lib/utils/tauri";
 import { showChatWithPrefill } from "@/lib/chat-utils";
+import { SearchResultDetail } from "./search-result-detail";
 import { ThumbnailHighlightOverlay } from "./thumbnail-highlight-overlay";
 import { localFetch, getApiBaseUrl, appendAuthToken } from "@/lib/api";
 import { buildBoundedFacetSql, sanitizeFts5Query } from "@/lib/search/facet-sql";
@@ -2074,18 +2075,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                         <p className="text-xs font-medium text-foreground truncate">
                           {result.app_name}
                         </p>
-                        {isActive && (
-                          <div className="mt-1 pt-1 border-t border-border space-y-1">
-                            <p className="text-xs text-muted-foreground line-clamp-2">
-                              {result.window_name}
-                            </p>
-                            {result.url && (
-                              <p className="text-xs text-muted-foreground/70 truncate">
-                                {result.url}
-                              </p>
-                            )}
-                          </div>
-                        )}
+                        <SearchResultDetail result={result} isActive={isActive} />
                       </div>
                     </div>
                   );
