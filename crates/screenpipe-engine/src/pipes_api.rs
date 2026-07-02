@@ -188,7 +188,7 @@ pub async fn run_pipe_now(
         if !missing.is_empty() {
             return Json(json!({
                 "error": format!(
-                    "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
+                    "pipe '{}' requires unconfigured connections: {} — set them up from the Connections page in the desktop app",
                     id,
                     missing.join(", ")
                 )

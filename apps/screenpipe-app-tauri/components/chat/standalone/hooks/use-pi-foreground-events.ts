@@ -711,6 +711,7 @@ export function usePiForegroundEvents({
                 existing?.content?.includes("requires an upgrade") ||
                 existing?.content?.includes("Rate limited") ||
                 existing?.content?.includes("rate limit") ||
+                existing?.content?.includes("chat is too long") ||
                 existing?.content?.startsWith("Error:");
               if (isErrorMessage) {
                 return prev;
