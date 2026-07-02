@@ -15,9 +15,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   settings: { user: null as any },
   loadUser: vi.fn().mockResolvedValue(undefined),
-  updateSettings: vi.fn(),
+  updateSettings: vi.fn().mockResolvedValue(undefined),
   capture: vi.fn(),
-  openLoginWindow: vi.fn(),
+  openLoginWindow: vi.fn().mockResolvedValue(undefined),
+  setCloudToken: vi.fn().mockResolvedValue(undefined),
+  piUpdateConfig: vi.fn().mockResolvedValue(undefined),
   hasAppEntitlement: vi.fn(),
   isDevBillingBypassEnabled: vi.fn().mockReturnValue(false),
 }));
@@ -34,7 +36,11 @@ vi.mock("@/lib/app-entitlement", () => ({
   isDevBillingBypassEnabled: () => mocks.isDevBillingBypassEnabled(),
 }));
 vi.mock("@/lib/utils/tauri", () => ({
-  commands: { openLoginWindow: mocks.openLoginWindow },
+  commands: {
+    openLoginWindow: mocks.openLoginWindow,
+    setCloudToken: mocks.setCloudToken,
+    piUpdateConfig: mocks.piUpdateConfig,
+  },
 }));
 vi.mock("posthog-js", () => ({ default: { capture: mocks.capture } }));
 vi.mock("framer-motion", () => ({
@@ -60,8 +66,11 @@ beforeEach(() => {
   HTMLCanvasElement.prototype.getContext = vi.fn(() => null) as any;
   mocks.settings = { user: null };
   mocks.loadUser.mockReset().mockResolvedValue(undefined);
-  mocks.updateSettings.mockClear();
+  mocks.updateSettings.mockReset().mockResolvedValue(undefined);
   mocks.capture.mockClear();
+  mocks.openLoginWindow.mockReset().mockResolvedValue(undefined);
+  mocks.setCloudToken.mockReset().mockResolvedValue(undefined);
+  mocks.piUpdateConfig.mockReset().mockResolvedValue(undefined);
   mocks.hasAppEntitlement.mockReset();
   mocks.isDevBillingBypassEnabled.mockReturnValue(false);
 });
@@ -104,15 +113,15 @@ describe("onboarding login gate", () => {
     expect(mocks.loadUser).toHaveBeenLastCalledWith("t3", true);
   });
 
-  it("'use a different account' clears the auth token so they can re-login", async () => {
+  it("'use a different account' clears local auth and reopens login with a fresh session", async () => {
     mocks.settings = { user: { token: "t4", id: "u4", email: "x@y.com", cloud_subscribed: true } };
     mocks.hasAppEntitlement.mockReturnValue(false);
     render(<OnboardingLogin handleNextSlide={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /use a different account/i }));
-    expect(mocks.updateSettings).toHaveBeenCalledTimes(1);
-    const arg = mocks.updateSettings.mock.calls[0][0];
-    expect(arg.user.token).toBeNull();
-    expect(arg.user.id).toBeNull();
+    await waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledWith({ user: null }));
+    expect(mocks.setCloudToken).toHaveBeenCalledWith(null);
+    expect(mocks.piUpdateConfig).toHaveBeenCalledWith(null, null);
+    expect(mocks.openLoginWindow).toHaveBeenCalledWith(true);
   });
 
   it("shows the sign-in button when not signed in", () => {

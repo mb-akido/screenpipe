@@ -282,24 +282,26 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
     setRechecking(false);
   }, [settings.user?.token, rechecking, loadUser]);
 
-  const useDifferentAccount = useCallback(() => {
+  const useDifferentAccount = useCallback(async () => {
     posthog.capture("onboarding_login_switch_account");
     reverifiedRef.current = false;
-    // Clear the auth-bearing fields so we drop back to the "sign in" button and the
-    // member can re-authenticate with their work email (the one on the license).
-    updateSettings({
-      user: {
-        ...settings.user,
-        id: null,
-        token: null,
-        clerk_id: null,
-        cloud_subscribed: null,
-        app_entitled: null,
-        subscription_plan: null,
-        entitlement: null,
-      },
-    });
-  }, [settings.user, updateSettings]);
+    await updateSettings({ user: null as any });
+    try {
+      await commands.setCloudToken(null);
+    } catch (e) {
+      console.warn("failed to clear cloud token before switching accounts:", e);
+    }
+    try {
+      await commands.piUpdateConfig(null, null);
+    } catch (e) {
+      console.warn("failed to clear pi config before switching accounts:", e);
+    }
+    try {
+      await commands.openLoginWindow(true);
+    } catch (e) {
+      console.warn("failed to reopen login for account switch:", e);
+    }
+  }, [updateSettings]);
 
   const handleLogin = useCallback(() => {
     posthog.capture("onboarding_login_clicked");
