@@ -194,13 +194,13 @@
     },
     {
       "spec": "chat-connections-context-duplicate.spec.ts",
-      "platforms": ["windows", "macos", "linux"],
+      "platforms": ["windows", "macos"],
       "layers": ["chat-ai", "real-ui-e2e"],
       "features": ["chat"],
       "criticality": "medium",
       "confidence": "partial",
       "ux": "mixed",
-      "notes": "Reproducer for #4689: connections-context blob must not spawn a duplicate chat or leak into titles."
+      "notes": "Reproducer for #4689: connections-context blob must not spawn a duplicate chat or leak into titles. Skipped on Linux: background persist never lands on WebKitGTK."
     },
     {
       "spec": "chat-sidebar-stub-dedup.spec.ts",
