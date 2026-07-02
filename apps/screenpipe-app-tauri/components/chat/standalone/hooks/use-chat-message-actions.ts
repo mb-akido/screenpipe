@@ -15,6 +15,7 @@ interface UseChatMessageActionsOptions {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   isLoading: boolean;
   isStreaming: boolean;
+  thinkingStartedAtMs?: number | null;
   activeSourceFooterMessageId: string | null;
   highlightedMessageId: string | null;
   citationPlan: MarkdownCitationPlan;
@@ -29,6 +30,7 @@ export function useChatMessageActions({
   setMessages,
   isLoading,
   isStreaming,
+  thinkingStartedAtMs = null,
   activeSourceFooterMessageId,
   highlightedMessageId,
   citationPlan,
@@ -176,6 +178,7 @@ export function useChatMessageActions({
     messages,
     isLoading,
     isStreaming,
+    thinkingStartedAtMs,
     activeSourceFooterMessageId,
     expandedSteerWorkIds,
     onToggleCollapsedSteerWork: toggleCollapsedSteerWork,

@@ -27,6 +27,7 @@ export interface ChatMessageListProps {
   messages: Message[];
   isLoading: boolean;
   isStreaming: boolean;
+  thinkingStartedAtMs?: number | null;
   activeSourceFooterMessageId: string | null;
   expandedSteerWorkIds: Set<string>;
   onToggleCollapsedSteerWork: (id: string) => void;
@@ -60,6 +61,7 @@ export function ChatMessageList({
   messages,
   isLoading,
   isStreaming,
+  thinkingStartedAtMs = null,
   activeSourceFooterMessageId,
   expandedSteerWorkIds,
   onToggleCollapsedSteerWork,
@@ -88,6 +90,18 @@ export function ChatMessageList({
   branchConversation,
   suppressSourceFooters = false,
 }: ChatMessageListProps) {
+  const [, setLoaderTick] = React.useState(0);
+
+  React.useEffect(() => {
+    if (!isLoading || thinkingStartedAtMs == null) return;
+
+    const id = window.setInterval(() => {
+      setLoaderTick((tick) => tick + 1);
+    }, 1000);
+
+    return () => window.clearInterval(id);
+  }, [isLoading, thinkingStartedAtMs]);
+
   return (
     <>
       <AnimatePresence mode="popLayout">
@@ -390,12 +404,18 @@ export function ChatMessageList({
           const blocks = lastAssistant?.contentBlocks;
           let loaderPhase: LoaderPhase = "analyzing";
           let toolName: string | undefined;
-          const thinkingSecs: number | undefined = undefined;
+          let thinkingSecs: number | undefined;
 
           if (blocks && blocks.length > 0) {
             const lastBlock = blocks[blocks.length - 1];
             if (lastBlock.type === "thinking" && lastBlock.isThinking) {
               loaderPhase = "thinking";
+              if (thinkingStartedAtMs != null) {
+                thinkingSecs = Math.max(
+                  0,
+                  Math.floor((Date.now() - thinkingStartedAtMs) / 1000),
+                );
+              }
             } else if (lastBlock.type === "tool" && lastBlock.toolCall.isRunning) {
               loaderPhase = "tool";
               toolName = lastBlock.toolCall.toolName;

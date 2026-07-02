@@ -1029,6 +1029,7 @@ export function StandaloneChat({
     setMessages,
     isLoading,
     isStreaming,
+    thinkingStartedAtMs: piThinkingStartRef.current,
     activeSourceFooterMessageId,
     highlightedMessageId,
     citationPlan,
