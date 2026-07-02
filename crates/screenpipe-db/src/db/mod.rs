@@ -35,9 +35,9 @@ use crate::{
     AudioResultRaw, ChunkOutcome, ContentType, DeviceType, Element, ElementRow, ElementSource,
     FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord,
     MeetingTranscriptSegment, MemoryRecord, MemorySyncRow, NewDiarizationSegment, OCREntry,
-    OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, ReplacementAudioTranscription,
-    SearchMatch, SearchMatchGroup, SearchResult, Speaker, TagAutocompleteItem, TagContentType,
-    TextBounds, TextPosition, TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
+    OCRResult, OcrEngine, OcrTextBlock, Order, ReplacementAudioTranscription, SearchMatch,
+    SearchMatchGroup, SearchResult, Speaker, TagAutocompleteItem, TagContentType, TextBounds,
+    TextPosition, TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
     MAX_TRANSCRIPTION_ATTEMPTS,
 };
 

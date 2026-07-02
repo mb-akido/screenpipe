@@ -469,28 +469,45 @@ impl DatabaseManager {
         let fts_query = frame_fts_parts.join(" ");
         let has_fts = !fts_query.trim().is_empty();
 
-        let sql = format!(
+        #[derive(sqlx::FromRow)]
+        struct OCRResultLightRow {
+            frame_id: i64,
+            frame_name: String,
+            timestamp: DateTime<Utc>,
+            file_path: String,
+            offset_index: i64,
+            app_name: String,
+            window_name: String,
+            browser_url: Option<String>,
+            focused: Option<bool>,
+            text_source: Option<String>,
+            device_name: String,
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct OCRResultHeavyRow {
+            frame_id: i64,
+            ocr_text: String,
+            text_json: String,
+            tags: Option<String>,
+        }
+
+        let light_sql = format!(
             r#"
         SELECT
             frames.id as frame_id,
-            COALESCE(frames.full_text, frames.accessibility_text, '') as ocr_text,
-            frames.text_json,
-            frames.timestamp,
             frames.name as frame_name,
+            frames.timestamp,
             COALESCE(frames.snapshot_path, video_chunks.file_path) as file_path,
             frames.offset_index,
             frames.app_name,
-            '' as ocr_engine,
             frames.window_name,
-            COALESCE(video_chunks.device_name, frames.device_name) as device_name,
-            GROUP_CONCAT(tags.name, ',') as tags,
             frames.browser_url,
             frames.focused,
-            frames.text_source
+            frames.text_source,
+            COALESCE(video_chunks.device_name, frames.device_name) as device_name
         FROM frames
         LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
-        LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
-        LEFT JOIN tags ON vision_tags.tag_id = tags.id
         {fts_join}
         WHERE 1=1
             {fts_condition}
@@ -510,7 +527,6 @@ impl DatabaseManager {
                 GROUP BY vt.vision_id
                 HAVING COUNT(DISTINCT t.name) = json_array_length(?12)
             ))
-        GROUP BY frames.id
         ORDER BY frames.timestamp DESC
         LIMIT ?10 OFFSET ?11
         "#,
@@ -531,9 +547,9 @@ impl DatabaseManager {
         // filter via the `json_array_length(?12) = 0` guard above.
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
 
-        let query_builder = sqlx::query_as(&sql);
+        let query_builder = sqlx::query_as::<_, OCRResultLightRow>(&light_sql);
 
-        let raw_results: Vec<OCRResultRaw> = query_builder
+        let light_results: Vec<OCRResultLightRow> = query_builder
             .bind(if has_fts { Some(&fts_query) } else { None })
             .bind(start_time)
             .bind(end_time)
@@ -549,27 +565,66 @@ impl DatabaseManager {
             .fetch_all(&self.pool)
             .await?;
 
-        Ok(raw_results
+        if light_results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let frame_ids: Vec<i64> = light_results.iter().map(|row| row.frame_id).collect();
+        let mut heavy_by_id = std::collections::HashMap::with_capacity(frame_ids.len());
+
+        for chunk in frame_ids.chunks(200) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let heavy_sql = format!(
+                r#"
+            SELECT
+                frames.id as frame_id,
+                COALESCE(frames.full_text, frames.accessibility_text, '') as ocr_text,
+                frames.text_json,
+                GROUP_CONCAT(tags.name, ',') as tags
+            FROM frames
+            LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
+            LEFT JOIN tags ON vision_tags.tag_id = tags.id
+            WHERE frames.id IN ({placeholders})
+            GROUP BY frames.id
+            "#
+            );
+
+            let mut heavy_query = sqlx::query_as::<_, OCRResultHeavyRow>(&heavy_sql);
+            for frame_id in chunk {
+                heavy_query = heavy_query.bind(frame_id);
+            }
+
+            for row in heavy_query.fetch_all(&self.pool).await? {
+                heavy_by_id.insert(row.frame_id, row);
+            }
+        }
+
+        Ok(light_results
             .into_iter()
-            .map(|raw| OCRResult {
-                frame_id: raw.frame_id,
-                ocr_text: raw.ocr_text,
-                text_json: raw.text_json,
-                timestamp: raw.timestamp,
-                frame_name: raw.frame_name,
-                file_path: raw.file_path,
-                offset_index: raw.offset_index,
-                app_name: raw.app_name,
-                ocr_engine: raw.ocr_engine,
-                window_name: raw.window_name,
-                device_name: raw.device_name,
-                tags: raw
-                    .tags
-                    .map(|t| t.split(',').map(String::from).collect())
-                    .unwrap_or_default(),
-                browser_url: raw.browser_url,
-                focused: raw.focused,
-                text_source: raw.text_source,
+            .filter_map(|light| {
+                let heavy = heavy_by_id.remove(&light.frame_id)?;
+                Some(OCRResult {
+                    frame_id: light.frame_id,
+                    ocr_text: heavy.ocr_text,
+                    text_json: heavy.text_json,
+                    timestamp: light.timestamp,
+                    frame_name: light.frame_name,
+                    file_path: light.file_path,
+                    offset_index: light.offset_index,
+                    app_name: light.app_name,
+                    ocr_engine: String::new(),
+                    window_name: light.window_name,
+                    device_name: light.device_name,
+                    tags: heavy
+                        .tags
+                        .map(|t| t.split(',').map(String::from).collect())
+                        .unwrap_or_default(),
+                    browser_url: light.browser_url,
+                    focused: light.focused,
+                    text_source: light.text_source,
+                })
             })
             .collect())
     }

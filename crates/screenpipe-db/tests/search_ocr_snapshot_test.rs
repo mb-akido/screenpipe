@@ -459,4 +459,121 @@ mod tests {
             page2.len()
         );
     }
+
+    #[tokio::test]
+    async fn test_search_ocr_deferred_join_preserves_order_and_pages() {
+        let db = setup_test_db().await;
+
+        let now = Utc::now();
+        for i in 0..10i64 {
+            let timestamp = now + chrono::Duration::seconds(i);
+            let frame_id: i64 = sqlx::query_scalar(
+                "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name) VALUES (NULL, ?1, ?2, ?3, NULL, 'test_app', 'test_window', 0, 'test-device') RETURNING id"
+            )
+            .bind(i)
+            .bind(timestamp)
+            .bind(format!("frame_{i}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+            sqlx::query("UPDATE frames SET full_text = ?1, text_json = ?2 WHERE id = ?3")
+                .bind(format!("ocr content for frame {i}"))
+                .bind(r#"[{"word":"hello","x":10,"y":20,"w":50,"h":15}]"#)
+                .bind(frame_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let page1 = db
+            .search(
+                "",
+                ContentType::OCR,
+                3,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page1.len(), 3, "page 1 should return 3 OCR results");
+
+        let page1_names: Vec<String> = page1
+            .iter()
+            .map(|result| match result {
+                SearchResult::OCR(ocr) => {
+                    assert!(!ocr.ocr_text.is_empty());
+                    assert!(!ocr.text_json.is_empty());
+                    ocr.frame_name.clone()
+                }
+                other => panic!("expected OCR result, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(page1_names, vec!["frame_9", "frame_8", "frame_7"]);
+
+        let page2 = db
+            .search(
+                "",
+                ContentType::OCR,
+                3,
+                3,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let page2_names: Vec<String> = page2
+            .iter()
+            .map(|result| match result {
+                SearchResult::OCR(ocr) => ocr.frame_name.clone(),
+                other => panic!("expected OCR result, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(page2_names, vec!["frame_6", "frame_5", "frame_4"]);
+
+        let page1_ids: Vec<i64> = page1
+            .iter()
+            .map(|result| match result {
+                SearchResult::OCR(ocr) => ocr.frame_id,
+                other => panic!("expected OCR result, got {other:?}"),
+            })
+            .collect();
+
+        for frame_id in page2.iter().map(|result| match result {
+            SearchResult::OCR(ocr) => ocr.frame_id,
+            other => panic!("expected OCR result, got {other:?}"),
+        }) {
+            assert!(
+                !page1_ids.contains(&frame_id),
+                "frame {frame_id} appeared on both pages"
+            );
+        }
+    }
 }
