@@ -119,8 +119,13 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
 /// - `window_title` — runtime window title (FTS-indexed).
 /// - `element_name` — AX name (FTS-indexed; can mirror field content).
 /// - `element_description` — AX description / help text.
+/// - `element_ancestors` — the ONE non-free-text member: compact JSON
+///   (`[{"role","name"},...]`, the clicked element's window-hierarchy path)
+///   whose hop `name` values carry window titles / content-mirroring group
+///   labels. Redacted JSON-aware in `process_ui_events` (names only,
+///   structure preserved), never through the flat string batch.
 ///
-/// The extra two are cheap: they ride the SAME per-row `redact_batch` the
+/// The extras are cheap: they ride the SAME per-row `redact_batch` the
 /// other columns already use (a few more strings, no extra round-trip).
 /// Structural identifiers (`element_role` / `element_automation_id` /
 /// `element_bounds`) are NOT free text and stay untouched. `browser_url` is
@@ -131,6 +136,7 @@ pub const UI_EVENT_TEXT_COLS: &[&str] = &[
     "window_title",
     "element_name",
     "element_description",
+    "element_ancestors",
 ];
 
 /// One row to redact.
@@ -773,6 +779,7 @@ mod tests {
                 element_name TEXT,
                 element_value TEXT,
                 element_description TEXT,
+                element_ancestors TEXT,
                 redacted_at INTEGER
             );
             -- Per-element OCR/accessibility rows; `text` is NULL on

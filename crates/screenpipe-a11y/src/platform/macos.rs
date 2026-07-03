@@ -795,6 +795,27 @@ fn run_event_tap(
         .name("ctx-capture".into())
         .spawn(move || {
             while let Ok(req) = context_rx.recv() {
+                // Excluded apps / ignored windows / private-browsing windows
+                // are never AX-inspected — parity with the tree walker's
+                // gating. The bare click row is filtered downstream by the
+                // same config; this stops the enriched element/ancestor
+                // context at the source so excluded surfaces never even get
+                // an AX round-trip.
+                if let Some(app) = req.app_name.as_deref() {
+                    if !req
+                        .config
+                        .should_capture_target(app, req.window_title.as_deref())
+                    {
+                        continue;
+                    }
+                }
+                if req
+                    .window_title
+                    .as_deref()
+                    .is_some_and(crate::incognito::is_title_private)
+                {
+                    continue;
+                }
                 if let Some(element) =
                     get_element_at_position(req.x, req.y, &req.config, req.app_pid)
                 {
@@ -1143,21 +1164,39 @@ extern "C" fn tap_callback(
                 let dy = event.field_i64(cg::EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS1) as i16;
                 let dx = event.field_i64(cg::EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS2) as i16;
                 if dx != 0 || dy != 0 {
+                    // macOS routes scroll to the window UNDER THE CURSOR, not
+                    // the focused window — attributing bursts to the focused
+                    // app would be wrong whenever the user scrolls a background
+                    // window. The event itself says who receives it
+                    // (kCGEventTargetUnixProcessID, a plain field read, no
+                    // IPC): when that differs from the focused pid we keep the
+                    // burst UNATTRIBUTED (None) rather than mislabeled, and the
+                    // pid keys the buffer so bursts split when the cursor moves
+                    // to another app's window.
+                    let target_pid = event_target_pid;
+                    let focused_pid = state.current_pid.load(Ordering::Acquire);
+                    let (scroll_app, scroll_window) =
+                        if target_pid <= 0 || target_pid == focused_pid {
+                            (app_name, window_title)
+                        } else {
+                            (None, None)
+                        };
                     // Coalesce: one row per gesture, not per 60-120 Hz tick —
                     // this is what makes scroll capture cheap enough to default
                     // on. `push` returns the PREVIOUS burst when this tick
-                    // starts a new one (app/window change, quiet gap, max-age
-                    // split); a quiet gap with no follow-up tick is drained by
-                    // the run loop below, same as the text buffer.
+                    // starts a new one (target/app/window change, quiet gap,
+                    // max-age split); a quiet gap with no follow-up tick is
+                    // drained by the run loop below, same as the text buffer.
                     let finished = state.scroll_buf.lock().push(
+                        target_pid,
                         loc.x as i32,
                         loc.y as i32,
                         dx,
                         dy,
                         timestamp,
                         t,
-                        app_name,
-                        window_title,
+                        scroll_app,
+                        scroll_window,
                     );
                     if let Some(f) = finished {
                         let _ = state.tx.try_send(scroll_flush_to_event(f));
@@ -1654,6 +1693,10 @@ fn find_labeled_descendant_at(
             break;
         }
         *budget -= 1;
+        // Each child is its own AX ref — cap its messaging timeout so a busy
+        // app costs at most ~0.1s per read instead of the ~6s macOS default
+        // (tree-walker pattern, tree/macos.rs).
+        let _ = child.set_messaging_timeout_secs(0.1);
         let Some(b) = get_element_bounds(&child) else {
             continue;
         };
@@ -1711,6 +1754,13 @@ fn get_element_at_position(
         }
     }
 
+    // Every AX read below is IPC into the target app, and the macOS default
+    // messaging timeout is ~6s PER CALL — a busy app (Electron under load, IDE
+    // indexing) would stall this worker for seconds while it holds
+    // AX_QUERY_LOCK, and the bounded ctx channel would then silently drop the
+    // next clicks' context. Cap it like the tree walker does (tree/macos.rs).
+    let _ = elem.set_messaging_timeout_secs(0.1);
+
     let role = role_string(&elem)?;
     let bounds = get_element_bounds(&elem);
 
@@ -1745,18 +1795,11 @@ fn get_element_at_position(
         (role, name, bounds)
     };
 
-    // The element's path in the window hierarchy — what disambiguates "the
-    // Profile button in the sidebar" from "the Profile button in the modal"
-    // for downstream trajectory/workflow consumers. Walked from the hit-test
-    // element (a labeled descendant found above sits below it, so the chain
-    // is a valid prefix either way). Budgeted: <=12 hops, 15 ms wall clock.
-    let ancestors = crate::events::ancestors_to_json(
-        collect_ancestor_chain(&elem, 12, Duration::from_millis(15)),
-        12,
-    );
-
     if config.is_password_field(Some(&role), name.as_deref()) {
-        // Don't capture value for password fields
+        // Don't capture value for password fields — and no ancestor chain
+        // either: container/group names around a password field routinely
+        // mirror the account/site context ("Sign in to <bank>"), which is
+        // exactly what the '[password field]' scrub is hiding.
         return Some(ElementContext {
             role,
             name: Some("[password field]".to_string()),
@@ -1764,9 +1807,26 @@ fn get_element_at_position(
             description: None,
             automation_id: None,
             bounds,
-            ancestors,
+            ancestors: None,
         });
     }
+
+    // The element's path in the window hierarchy — what disambiguates "the
+    // Profile button in the sidebar" from "the Profile button in the modal"
+    // for downstream trajectory/workflow consumers. Walked from the hit-test
+    // element (a labeled descendant found above sits below it, so the chain
+    // is a valid prefix either way). Budgeted: <=12 hops, 15 ms wall clock.
+    // Hop names can mirror on-screen content (web group labels, document
+    // titles), so they get the same hot-path PII scrub as element_value.
+    let mut chain = collect_ancestor_chain(&elem, 12, Duration::from_millis(15));
+    if config.apply_pii_removal {
+        for hop in &mut chain {
+            if let Some(n) = hop.name.take() {
+                hop.name = Some(remove_pii(&n));
+            }
+        }
+    }
+    let ancestors = crate::events::ancestors_to_json(chain, 12);
 
     let value =
         if role.contains("TextField") || role.contains("TextArea") || role.contains("ComboBox") {
@@ -1802,9 +1862,13 @@ fn get_element_at_position(
 /// Cost discipline (this runs on the ctx-capture worker under AX_QUERY_LOCK,
 /// never on the tap thread): each hop is 2-3 AX IPC calls into the target app,
 /// capped at `max_hops` hops AND a wall-clock budget so one busy/unresponsive
-/// app can't stall the worker — on timeout the partial chain is returned.
-/// Read-only AXParent/AXTitle reads; never pokes AXEnhancedUserInterface (the
-/// Chromium phantom-IME-commit bug — see ENHANCED_MODE_CACHE in tree/macos.rs).
+/// app can't stall the worker — on timeout the partial chain is returned. The
+/// wall budget alone can't interrupt a blocking AX call, so every hop element
+/// ALSO gets a 100ms messaging timeout (the tree-walker pattern,
+/// tree/macos.rs) — worst case is one timed-out call, not the ~6s macOS
+/// default. Read-only AXParent/AXTitle reads; never pokes
+/// AXEnhancedUserInterface (the Chromium phantom-IME-commit bug — see
+/// ENHANCED_MODE_CACHE in tree/macos.rs).
 fn collect_ancestor_chain(
     elem: &ax::UiElement,
     max_hops: usize,
@@ -1816,6 +1880,12 @@ fn collect_ancestor_chain(
     let parent_attr = ax::Attr::with_string(&parent_attr_name);
 
     let mut chain: Vec<AncestorHop> = Vec::with_capacity(max_hops.min(12));
+    // The caller already capped `elem`'s messaging timeout, and the budget is
+    // checked before this first fetch too — an already-blown budget (slow
+    // role/name reads above) must not buy one more IPC round-trip.
+    if started.elapsed() >= budget {
+        return chain;
+    }
     let mut cur: Option<Retained<cf::Type>> = {
         elem.attr_value(parent_attr)
             .ok()
@@ -1826,6 +1896,9 @@ fn collect_ancestor_chain(
             break;
         }
         let node_elem: &ax::UiElement = unsafe { std::mem::transmute(&*node) };
+        // Per-hop cap: each ancestor is a NEW AXUIElement ref, so the
+        // timeout set on the hit-test element does not carry over.
+        let _ = node_elem.set_messaging_timeout_secs(0.1);
         let Some(role) = role_string(node_elem) else {
             break;
         };

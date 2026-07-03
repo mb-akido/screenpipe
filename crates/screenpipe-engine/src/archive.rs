@@ -1227,7 +1227,7 @@ async fn get_archive_chunk(
                text_content, x, y, key_code, modifiers, element_role, element_name,
                session_id, relative_ms, delta_x, delta_y, button, click_count,
                text_length, app_pid, element_value, element_description,
-               element_automation_id, element_bounds, frame_id
+               element_automation_id, element_bounds, element_ancestors, frame_id
         FROM ui_events
         WHERE timestamp >= ? AND timestamp < ?
         ORDER BY timestamp ASC
@@ -1392,6 +1392,7 @@ async fn get_archive_chunk(
             element_description: r.get("element_description"),
             element_automation_id: r.get("element_automation_id"),
             element_bounds: r.get("element_bounds"),
+            element_ancestors: r.get("element_ancestors"),
             frame_id: r.get("frame_id"),
         })
         .collect();

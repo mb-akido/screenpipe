@@ -193,11 +193,14 @@ impl Default for UiCaptureConfig {
             capture_keystrokes: false, // Privacy risk
             capture_app_switch: true,
             capture_window_focus: true,
-            // Coalesced to one row per gesture (see `crate::scroll`), so the
-            // former "very high volume" concern (a row per 60-120 Hz tick) no
-            // longer applies — a heavy browsing day is a few thousand rows,
-            // comparable to clicks.
-            capture_scroll: true,
+            // macOS coalesces to one row per gesture (crate::scroll) and
+            // Windows aggregates in its own ScrollAggregator, so the former
+            // "very high volume" concern (a row per raw wheel tick) no longer
+            // applies there — a heavy browsing day is a few thousand rows,
+            // comparable to clicks. The Linux evdev path still persists one
+            // row per REL_WHEEL detent with no coalescer, so it keeps the old
+            // default until it gets one.
+            capture_scroll: !cfg!(target_os = "linux"),
             capture_clipboard: true,
             capture_clipboard_content: true,
             capture_context: true,

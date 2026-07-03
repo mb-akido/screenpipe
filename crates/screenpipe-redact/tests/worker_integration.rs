@@ -79,6 +79,7 @@ async fn setup_db() -> sqlx::SqlitePool {
             element_name TEXT,
             element_value TEXT,
             element_description TEXT,
+            element_ancestors TEXT,
             redacted_at INTEGER
         );
         -- Per-element OCR/accessibility rows (issue #3993); text is NULL on
@@ -1279,4 +1280,59 @@ async fn default_columns_leave_optin_columns_untouched() {
         ev_name.contains(email),
         "element_name must be left raw by default: {ev_name:?}"
     );
+}
+
+/// `element_ancestors` (compact JSON `[{"role","name"},...]`) must be scrubbed
+/// JSON-aware: hop `name` values redacted, roles + structure preserved, and
+/// the row watermarked — a raw copy of a window title surviving inside the
+/// ancestors blob while `window_title` itself gets redacted would silently
+/// defeat the redaction contract for clicks.
+#[tokio::test]
+async fn ui_events_ancestors_json_scrubbed_structure_preserved() {
+    let pool = setup_db().await;
+    sqlx::query(
+        "INSERT INTO ui_events (event_type, window_title, element_ancestors) VALUES ( \
+            'click', \
+            'Mail — dave@example.com', \
+            '[{\"role\":\"AXWindow\",\"name\":\"Mail — dave@example.com\"},{\"role\":\"AXGroup\"},{\"role\":\"AXButton\",\"name\":\"Reply\"}]' \
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let redactor = Arc::new(RegexRedactor::new()) as Arc<dyn Redactor>;
+    let cfg = WorkerConfig {
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::UiEvents],
+        ..Default::default()
+    };
+    let worker = Worker::new(pool.clone(), redactor, cfg);
+    let handle = worker.clone().spawn();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handle.abort();
+
+    let (title, ancestors, redacted_at): (String, String, Option<i64>) = sqlx::query_as(
+        "SELECT window_title, element_ancestors, redacted_at FROM ui_events LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert!(redacted_at.is_some(), "row watermarked");
+    assert!(
+        !title.contains("dave@example.com"),
+        "title scrubbed: {title}"
+    );
+    assert!(
+        !ancestors.contains("dave@example.com"),
+        "ancestor hop name scrubbed: {ancestors}"
+    );
+    // structure + roles survive the JSON-aware pass
+    let parsed: serde_json::Value = serde_json::from_str(&ancestors).expect("still valid JSON");
+    let hops = parsed.as_array().expect("still an array");
+    assert_eq!(hops.len(), 3, "no hops dropped");
+    assert_eq!(hops[0]["role"], "AXWindow");
+    assert_eq!(hops[2]["name"], "Reply", "non-PII hop name untouched");
 }

@@ -806,6 +806,7 @@ fn default_pii_redaction_columns() -> Vec<String> {
         "ui_text_content",
         "ui_element_value",
         "ui_window_title",
+        "ui_element_ancestors",
         "element_text",
         "element_properties",
     ]

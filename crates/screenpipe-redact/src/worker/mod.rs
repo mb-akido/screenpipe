@@ -609,12 +609,21 @@ impl Worker {
             "redacting ui_events batch (multi-column)"
         );
 
+        // `element_ancestors` is a JSON blob ([{"role","name"},...]), not free
+        // text: running the flat redactor over it risks the AI step mangling
+        // the JSON. It gets the structure-preserving path below (only the
+        // `name` values are scrubbed), so keep it OUT of the flat batch.
+        let ancestors_ci = active.iter().position(|c| *c == "element_ancestors");
+
         // Flatten every non-empty cell into one batch, remembering where
         // each output goes (row index, column index).
         let mut inputs: Vec<String> = Vec::new();
         let mut coords: Vec<(usize, usize)> = Vec::new();
         for (ri, row) in rows.iter().enumerate() {
             for (ci, cell) in row.cols.iter().enumerate() {
+                if Some(ci) == ancestors_ci {
+                    continue;
+                }
                 if let Some(text) = cell {
                     inputs.push(text.clone());
                     coords.push((ri, ci));
@@ -639,6 +648,35 @@ impl Worker {
             }
             for ((ri, ci), out) in coords.into_iter().zip(redacted.into_iter()) {
                 outputs_by_row[ri][ci] = Some(out.redacted);
+            }
+        }
+
+        // Ancestors: JSON-aware pass, scrubbing ONLY the hop `name` values so
+        // the structure (and the `role` path) survives. A malformed blob is
+        // warned + left as-is rather than wedging the row forever — same
+        // policy as the frames tree-JSON path.
+        if let Some(aci) = ancestors_ci {
+            for (ri, row) in rows.iter().enumerate() {
+                let Some(blob) = row.cols[aci].as_deref().filter(|b| !b.is_empty()) else {
+                    continue;
+                };
+                match crate::tree_json::redact_tree_json_with_redactor_fields(
+                    blob,
+                    &*self.redactor,
+                    &["name"],
+                )
+                .await
+                {
+                    Ok(Some(clean)) => outputs_by_row[ri][aci] = Some(clean),
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            row_id = row.id,
+                            error = %e,
+                            "element_ancestors JSON unredactable — leaving as captured"
+                        );
+                    }
+                }
             }
         }
 

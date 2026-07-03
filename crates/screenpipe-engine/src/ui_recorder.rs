@@ -151,9 +151,11 @@ impl Default for UiRecorderConfig {
             capture_clipboard_content: true,
             capture_app_switch: true,
             capture_window_focus: true,
-            // On by default now that the a11y tap coalesces bursts (one row per
-            // gesture); see screenpipe_a11y::scroll.
-            capture_scroll: true,
+            // On by default where bursts are coalesced to one row per gesture
+            // (macOS: screenpipe_a11y::scroll; Windows: ScrollAggregator).
+            // Linux's evdev path still emits one row per wheel detent, so it
+            // keeps the old default until it grows a coalescer.
+            capture_scroll: !cfg!(target_os = "linux"),
             capture_context: true,
             capture_on_keystroke: true,
             capture_on_clipboard: true,
@@ -720,10 +722,18 @@ pub async fn start_ui_recording(
         // DB stays unavailable. `batch_size * 2` leaves a useful retry buffer.
         let max_retained = batch_size.saturating_mul(2).max(200);
         let max_batch_age = Duration::from_secs(30); // Drop events older than 30s during storms
-                                                     // Track the tail of an in-progress scroll burst so we can emit a
-                                                     // single `ScrollStop` trigger when it settles. 300ms matches the
-                                                     // historical default that the capture loop used to enforce.
-        let mut scroll_burst = ScrollBurstTracker::new(Duration::from_millis(300));
+
+        // Track the tail of an in-progress scroll burst so we can emit a
+        // single `ScrollStop` trigger when it settles. The settle delay MUST
+        // exceed the a11y coalescer's max-burst split interval (2s — see
+        // ScrollBuffer::new in screenpipe_a11y::scroll): a long sustained
+        // scroll emits a Scroll row every ~2s mid-gesture, and each row resets
+        // this timer. At the historical 300ms every mid-gesture split row
+        // looked like a settled burst, so sustained scrolling fired a forced
+        // ScrollStop capture (dedup/throttle-bypassing, see
+        // is_workflow_checkpoint_trigger) every ~2s. At 3s the trigger fires
+        // once, after the gesture actually ends.
+        let mut scroll_burst = ScrollBurstTracker::new(Duration::from_secs(3));
 
         loop {
             if stop_flag_clone.load(Ordering::Relaxed) {
@@ -960,7 +970,13 @@ fn should_record_input_event(
             record_keyboard_events
         }
         screenpipe_db::UiEventType::Clipboard => record_clipboard_events,
-        screenpipe_db::UiEventType::Click => record_click_events,
+        // Scroll rides the click gate: both are pointer activity, and a user
+        // who turned off click recording has said "don't persist what I do
+        // with the pointer" — scroll rows appearing anyway (now that
+        // capture_scroll defaults on) would silently widen that surface.
+        screenpipe_db::UiEventType::Click | screenpipe_db::UiEventType::Scroll => {
+            record_click_events
+        }
         _ => true,
     }
 }
@@ -1149,9 +1165,11 @@ fn capture_trigger_kind(
 /// the resulting frame to the LAST Scroll row in the burst.
 ///
 /// The "burst" definition is `Instant::now() - last_scroll > delay`.
-/// Default delay matches the historical `scroll_stop_delay_ms` value
-/// (300ms) — long enough that a mouse-wheel flick is treated as a
-/// single burst, short enough that a deliberate pause re-triggers.
+/// The production delay (3s) must stay ABOVE the a11y coalescer's
+/// max-burst split interval (2s): a sustained gesture lands a Scroll
+/// row every ~2s, and each row resets this timer — a shorter delay
+/// treats every mid-gesture split row as a settled burst and fires a
+/// throttle-bypassing ScrollStop capture per split.
 struct ScrollBurstTracker {
     last_scroll_at: Option<std::time::Instant>,
     last_scroll_corr_id: Option<CorrelationId>,
@@ -1633,6 +1651,17 @@ mod capture_trigger_kind_tests {
             capture_trigger_kind(&event, &[], gates(true, true)),
             Some(CaptureTrigger::Click { x: 10, y: 20 })
         ));
+    }
+
+    #[test]
+    fn scroll_rides_the_click_gate() {
+        // Scroll is pointer activity: a user who disabled click recording
+        // must not get scroll rows either (capture_scroll defaults on).
+        let event = evt(UiEventType::Scroll);
+        assert!(should_record_input_event(&event, true, true, true));
+        assert!(!should_record_input_event(&event, true, true, false));
+        // ...and keyboard/clipboard gates don't affect it.
+        assert!(should_record_input_event(&event, false, false, true));
     }
 
     #[test]

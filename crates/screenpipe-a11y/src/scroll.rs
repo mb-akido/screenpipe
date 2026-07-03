@@ -13,9 +13,10 @@
 //!
 //! A burst ends when (a) no tick arrives for [`ScrollBuffer::gap_timeout_ms`],
 //! (b) it has lasted [`ScrollBuffer::max_burst_ms`] (so an endless momentum
-//! scroll still produces periodic rows), or (c) the foreground app/window
-//! changes mid-burst (callers flush before pushing the next tick — a gesture
-//! never spans two apps in the recorded data).
+//! scroll still produces periodic rows), or (c) the target pid or foreground
+//! app/window changes mid-burst (a gesture never spans two apps in the
+//! recorded data — macOS delivers scroll to the window under the cursor, so
+//! the pid is part of the burst identity).
 //!
 //! Platform-agnostic and pure so the logic is unit-testable on every OS.
 
@@ -50,10 +51,19 @@ pub struct ScrollBuffer {
 }
 
 struct Burst {
+    /// Target pid of the burst (the window under the cursor receives macOS
+    /// scroll) — part of the burst identity so gestures over different apps'
+    /// windows never merge, even when both are unattributed (`app_name ==
+    /// None`). 0 = unknown.
+    pid: i32,
     x: i32,
     y: i32,
     delta_x: i64,
     delta_y: i64,
+    /// Magnitude sums. A real gesture can NET to zero (scroll down, then back
+    /// up) — the emit gate uses these, never the signed sums.
+    abs_x: u64,
+    abs_y: u64,
     timestamp: DateTime<Utc>,
     relative_ms: u64,
     app_name: Option<String>,
@@ -79,11 +89,13 @@ impl ScrollBuffer {
     }
 
     /// Add one raw tick. Returns a finished burst when this tick starts a NEW
-    /// gesture because the app/window changed or the previous burst aged out —
-    /// the caller emits that flush, and the tick opens the next burst.
+    /// gesture because the target pid / app / window changed or the previous
+    /// burst aged out — the caller emits that flush, and the tick opens the
+    /// next burst.
     #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
+        pid: i32,
         x: i32,
         y: i32,
         delta_x: i16,
@@ -96,7 +108,8 @@ impl ScrollBuffer {
         let now = Instant::now();
         let flushed = match &self.cur {
             Some(b)
-                if b.app_name != app_name
+                if b.pid != pid
+                    || b.app_name != app_name
                     || b.window_title != window_title
                     || now.duration_since(b.last_tick).as_millis() as u64
                         >= self.gap_timeout_ms
@@ -110,14 +123,19 @@ impl ScrollBuffer {
             Some(b) => {
                 b.delta_x += delta_x as i64;
                 b.delta_y += delta_y as i64;
+                b.abs_x += delta_x.unsigned_abs() as u64;
+                b.abs_y += delta_y.unsigned_abs() as u64;
                 b.last_tick = now;
             }
             None => {
                 self.cur = Some(Burst {
+                    pid,
                     x,
                     y,
                     delta_x: delta_x as i64,
                     delta_y: delta_y as i64,
+                    abs_x: delta_x.unsigned_abs() as u64,
+                    abs_y: delta_y.unsigned_abs() as u64,
                     timestamp,
                     relative_ms,
                     app_name,
@@ -143,10 +161,13 @@ impl ScrollBuffer {
         }
     }
 
-    /// Close the open burst and return it (None when idle or all-zero deltas).
+    /// Close the open burst and return it (None when idle or when no tick
+    /// carried any movement). The gate is on MAGNITUDE, not the signed sums —
+    /// a "scroll down, scroll back up" gesture nets to zero but is still a
+    /// real recorded action (its row keeps delta 0/0).
     pub fn flush(&mut self) -> Option<ScrollFlush> {
         let b = self.cur.take()?;
-        if b.delta_x == 0 && b.delta_y == 0 {
+        if b.abs_x == 0 && b.abs_y == 0 {
             return None;
         }
         Some(ScrollFlush {
@@ -175,7 +196,18 @@ mod tests {
     use super::*;
 
     fn tick(buf: &mut ScrollBuffer, dx: i16, dy: i16, app: &str) -> Option<ScrollFlush> {
+        tick_pid(buf, 777, dx, dy, app)
+    }
+
+    fn tick_pid(
+        buf: &mut ScrollBuffer,
+        pid: i32,
+        dx: i16,
+        dy: i16,
+        app: &str,
+    ) -> Option<ScrollFlush> {
         buf.push(
+            pid,
             100,
             200,
             dx,
@@ -251,6 +283,28 @@ mod tests {
         let mut buf = ScrollBuffer::new();
         assert!(tick(&mut buf, 0, 0, "Arc").is_none());
         assert!(buf.flush().is_none(), "all-zero burst produces no event");
+    }
+
+    #[test]
+    fn zero_net_gesture_still_emits() {
+        // Scroll down then back up: signed sums are 0/0 but the gesture is
+        // real — magnitude gates the emit, so the row survives.
+        let mut buf = ScrollBuffer::new();
+        assert!(tick(&mut buf, 0, -25, "Arc").is_none());
+        assert!(tick(&mut buf, 0, 25, "Arc").is_none());
+        let f = buf.flush().expect("zero-net gesture still flushes");
+        assert_eq!((f.delta_x, f.delta_y), (0, 0));
+    }
+
+    #[test]
+    fn target_pid_change_splits_bursts() {
+        // Same (unattributed) app context but the cursor moved over another
+        // app's window: pid keys the burst, so the gestures never merge.
+        let mut buf = ScrollBuffer::with_timeouts(400, 2_000);
+        assert!(tick_pid(&mut buf, 100, 0, -10, "Arc").is_none());
+        let f = tick_pid(&mut buf, 200, 0, -7, "Arc").expect("pid switch flushes");
+        assert_eq!(f.delta_y, -10);
+        assert_eq!(buf.flush().expect("second burst").delta_y, -7);
     }
 
     #[test]
