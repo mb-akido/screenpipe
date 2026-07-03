@@ -22,8 +22,8 @@ use std::time::Duration;
 use tauri::Manager;
 use tracing::{error, info, warn};
 
+use crate::process_exit;
 use crate::recording::{bounded_teardown, TeardownOutcome, PRE_EXIT_TEARDOWN_TIMEOUT};
-use crate::tray::QUIT_REQUESTED;
 
 /// Consecutive DB-init respawn failures before escalating. Attempts are ~5 min
 /// apart (health-watchdog restart grace), so 2 ≈ ten minutes of proven-futile
@@ -108,9 +108,9 @@ pub async fn escalate_relaunch(app: &tauri::AppHandle, reason: &str) {
     );
 
     // Mirror updates.rs restart_for_update: time-bounded teardown (a wedged
-    // capture stop must not hold the relaunch hostage), gate ExitRequested,
-    // then restart from a fresh thread (app.restart() from a non-main thread
-    // blocks forever once it succeeds — that's fine, the process is replaced).
+    // capture stop must not hold the relaunch hostage), then spawn a fresh app
+    // process and _exit so ORT/ggml C++ atexit handlers cannot abort the old
+    // process during restart.
     let state = app.state::<crate::recording::RecordingState>();
     match bounded_teardown(
         PRE_EXIT_TEARDOWN_TIMEOUT,
@@ -128,13 +128,8 @@ pub async fn escalate_relaunch(app: &tauri::AppHandle, reason: &str) {
         ),
     }
 
-    QUIT_REQUESTED.store(true, Ordering::SeqCst);
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(250));
-        info!("db relaunch: restarting app now");
-        app_clone.restart();
-    });
+    info!("db relaunch: restarting app now");
+    process_exit::request_app_relaunch(app.clone(), "db relaunch", Duration::from_millis(250));
 }
 
 /// Sliding-window rate limit persisted at `~/.screenpipe/db_relaunch_guard.json`

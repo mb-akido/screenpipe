@@ -5,7 +5,6 @@
 use crate::recording::{bounded_teardown, TeardownOutcome, PRE_EXIT_TEARDOWN_TIMEOUT};
 use crate::stop_screenpipe;
 use crate::store::{get_store, SettingsStore};
-use crate::tray::QUIT_REQUESTED;
 use crate::RecordingState;
 use anyhow::Error;
 use dark_light::Mode;
@@ -278,11 +277,9 @@ pub async fn await_safe_restart(timeout_secs: Option<u64>) -> String {
         .to_string()
 }
 
-/// Banner-click restart. plugin-process `relaunch()` fires
-/// `ExitRequested` which `main.rs` blocks unless `QUIT_REQUESTED` is set —
-/// banner never set it, so the exit was silently cancelled and the button
-/// hung on "restarting…". Mirror the auto-update path: gate, stop server,
-/// set `QUIT_REQUESTED`, then `app.restart()`. See 2026-06-10 report.
+/// Banner-click restart. Mirror the auto-update path: gate, stop server, then
+/// spawn the replacement app and `_exit` the old process so C/C++ atexit
+/// handlers cannot abort during restart. See 2026-06-10 and 2026-07-02 reports.
 #[tauri::command]
 #[specta::specta]
 pub async fn restart_for_update(
@@ -320,15 +317,12 @@ pub async fn restart_for_update(
         ),
     }
 
-    QUIT_REQUESTED.store(true, Ordering::SeqCst);
-
-    // Off-thread so the IPC reply flushes before runtime teardown; also
-    // `app.restart()` from a non-main thread blocks forever once it succeeds.
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(250));
-        app_clone.restart();
-    });
+    // Off-thread so the IPC reply flushes before runtime teardown.
+    crate::process_exit::request_app_relaunch(
+        app.clone(),
+        "banner update restart",
+        Duration::from_millis(250),
+    );
 
     Ok("proceed".to_string())
 }
@@ -959,8 +953,11 @@ impl UpdatesManager {
                         PRE_EXIT_TEARDOWN_TIMEOUT.as_secs()
                     ),
                 }
-                QUIT_REQUESTED.store(true, Ordering::SeqCst);
-                self.app.restart();
+                crate::process_exit::request_app_relaunch(
+                    self.app.clone(),
+                    "auto-update restart",
+                    Duration::from_millis(0),
+                );
             }
 
             return Result::Ok(true);
@@ -1319,9 +1316,9 @@ mod tests {
         )));
     }
 
-    // Banner-restart gate contract (2026-06-10 report). Full end-to-end isn't
-    // unit-testable (`app.restart()` needs a real AppHandle); we lock down the
-    // gate's return values so the frontend string-match path can't drift.
+    // Banner-restart gate contract (2026-06-10 report). Full end-to-end still
+    // needs a real AppHandle; we lock down the gate's return values so the
+    // frontend string-match path can't drift.
     use crate::health::{set_boot_error, set_boot_phase};
 
     #[tokio::test]

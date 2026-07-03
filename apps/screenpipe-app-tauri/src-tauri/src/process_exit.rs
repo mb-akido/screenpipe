@@ -14,8 +14,15 @@
 //! [`request_app_quit`] / [`run_blocking_pre_exit_teardown`] + [`force_process_exit`].
 
 use crate::pi;
-use crate::recording::{bounded_teardown, RecordingState, TeardownOutcome, PRE_EXIT_TEARDOWN_TIMEOUT};
+use crate::recording::{
+    bounded_teardown, RecordingState, TeardownOutcome, PRE_EXIT_TEARDOWN_TIMEOUT,
+};
+#[cfg(any(target_os = "macos", test))]
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tracing::{info, warn};
 
@@ -45,7 +52,9 @@ pub static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Latched once quit teardown starts — ignores duplicate Quit clicks.
 pub static QUIT_TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Set when [`tauri::RESTART_EXIT_CODE`] is seen — `RunEvent::Exit` must not `_exit`.
+/// Set when [`tauri::RESTART_EXIT_CODE`] is seen — `RunEvent::Exit` must spawn
+/// the replacement app itself, then `_exit` before Tauri's normal restart path
+/// reaches `std::process::exit`.
 pub static PENDING_RESTART: AtomicBool = AtomicBool::new(false);
 
 /// Stop capture, shut down the embedded server (ort sessions, ggml Metal, redact
@@ -107,6 +116,87 @@ pub fn force_process_exit(status: i32) -> ! {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn relaunch_binary_from_bundle(current_binary: &Path) -> Option<PathBuf> {
+    let macos_directory = current_binary.parent()?;
+    if macos_directory.components().next_back()
+        != Some(std::path::Component::Normal(std::ffi::OsStr::new("MacOS")))
+    {
+        return None;
+    }
+
+    let contents_directory = macos_directory.parent()?;
+    if contents_directory.components().next_back()
+        != Some(std::path::Component::Normal(std::ffi::OsStr::new(
+            "Contents",
+        )))
+    {
+        return None;
+    }
+
+    let info_plist = std::fs::read_to_string(contents_directory.join("Info.plist")).ok()?;
+    let executable = extract_cf_bundle_executable(&info_plist)?;
+    Some(macos_directory.join(executable))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn extract_cf_bundle_executable(info_plist: &str) -> Option<String> {
+    let key_pos = info_plist.find("<key>CFBundleExecutable</key>")?;
+    let rest = &info_plist[key_pos..];
+    let string_start = rest.find("<string>")? + "<string>".len();
+    let rest = &rest[string_start..];
+    let string_end = rest.find("</string>")?;
+    Some(rest[..string_end].trim().to_string())
+}
+
+fn relaunch_binary(app: &AppHandle) -> Option<PathBuf> {
+    let env = app.env();
+    let current_binary = match tauri::process::current_binary(&env) {
+        Ok(path) => path,
+        Err(err) => {
+            warn!("safe relaunch: failed to resolve current binary: {err}");
+            return None;
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    if let Some(bundle_binary) = relaunch_binary_from_bundle(&current_binary) {
+        return Some(bundle_binary);
+    }
+
+    Some(current_binary)
+}
+
+/// Spawn a replacement app process, then terminate the current process without
+/// running C/C++ atexit handlers. Tauri's built-in restart uses
+/// `std::process::exit`, which can abort in ORT/ggml teardown after the new app
+/// has already launched.
+pub fn force_app_relaunch(app: AppHandle, status: i32) -> ! {
+    let env = app.env();
+    if let Some(binary) = relaunch_binary(&app) {
+        if let Err(err) = Command::new(&binary)
+            .args(env.args_os.iter().skip(1))
+            .spawn()
+        {
+            warn!("safe relaunch: failed to spawn {}: {err}", binary.display());
+        }
+    }
+
+    force_process_exit(status);
+}
+
+/// Request a relaunch from async/UI code while allowing IPC replies and logs to
+/// flush briefly before the current process is force-exited.
+pub fn request_app_relaunch(app: AppHandle, reason: &'static str, delay: Duration) {
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        info!("safe relaunch requested: {reason}");
+        force_app_relaunch(app, 0);
+    });
+}
+
 /// Shared quit entry point for tray menu, app menu (Cmd+Q), etc.
 pub fn request_app_quit(app: AppHandle) {
     QUIT_REQUESTED.store(true, Ordering::SeqCst);
@@ -132,4 +222,28 @@ pub fn request_app_quit(app: AppHandle) {
         }
         force_process_exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_cf_bundle_executable;
+
+    #[test]
+    fn extracts_bundle_executable_from_xml_plist() {
+        let plist = r#"
+            <plist version="1.0">
+              <dict>
+                <key>CFBundleName</key>
+                <string>screenpipe</string>
+                <key>CFBundleExecutable</key>
+                <string>screenpipe-app</string>
+              </dict>
+            </plist>
+        "#;
+
+        assert_eq!(
+            extract_cf_bundle_executable(plist).as_deref(),
+            Some("screenpipe-app")
+        );
+    }
 }

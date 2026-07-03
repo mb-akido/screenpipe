@@ -2033,8 +2033,8 @@ async fn main() {
                     process_exit::run_blocking_pre_exit_teardown(app_handle.app_handle().clone());
 
                     if process_exit::PENDING_RESTART.load(std::sync::atomic::Ordering::SeqCst) {
-                        info!("Restart pending — returning from Exit without _exit");
-                        return;
+                        info!("Restart pending — spawning replacement and force-exiting");
+                        process_exit::force_app_relaunch(app_handle.app_handle().clone(), 0);
                     }
 
                     process_exit::force_process_exit(0);
