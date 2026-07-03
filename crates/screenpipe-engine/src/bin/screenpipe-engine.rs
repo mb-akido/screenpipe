@@ -1816,44 +1816,67 @@ async fn main() -> anyhow::Result<()> {
 
     // Auto-enable local data retention for CLI users.
     // The Tauri app does this via auto_start_retention(); for CLI we hit the
-    // same HTTP endpoint after a short delay to let the server bind.
+    // same HTTP endpoint after the server binds. The self-call must present
+    // the local API key: with --api-auth (default on) the auth middleware
+    // rejects even localhost requests, and /retention/configure is not an
+    // exempt path — without the token the call 403s and retention silently
+    // never starts while the DB grows unbounded (#4804).
     {
         let port = config.port;
         let retention_days = record_args.retention_days;
         let retention_mode = record_args.retention_mode;
         let retention_enabled = retention_days > 0;
+        let api_auth_key = config
+            .api_auth
+            .then(|| config.api_auth_key.clone())
+            .flatten();
         tokio::spawn(async move {
             if !retention_enabled {
                 tracing::info!("local retention disabled (--retention-days 0)");
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let client = reqwest::Client::new();
-            let url = format!("http://localhost:{}/retention/configure", port);
-            match client
-                .post(&url)
-                .json(&serde_json::json!({
-                    "enabled": true,
-                    "retention_days": retention_days,
-                    "mode": retention_mode,
-                }))
-                .send()
+            // Retry with backoff: on a large DB the server can take far longer
+            // than a fixed sleep to bind, and a one-shot failure would leave
+            // retention disabled for the entire run.
+            let delays_secs = [5u64, 10, 20, 40, 60];
+            let attempts = delays_secs.len();
+            let mut last_error = String::new();
+            for (i, delay) in delays_secs.into_iter().enumerate() {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                match screenpipe_engine::retention::configure_retention_via_local_api(
+                    port,
+                    retention_days,
+                    retention_mode,
+                    api_auth_key.as_deref(),
+                )
                 .await
-            {
-                Ok(r) if r.status().is_success() => {
-                    tracing::info!(
-                        "local retention auto-enabled ({} days, mode={:?})",
-                        retention_days,
-                        retention_mode
-                    );
-                }
-                Ok(r) => {
-                    tracing::debug!("retention configure returned {}", r.status());
-                }
-                Err(e) => {
-                    tracing::debug!("retention configure failed: {}", e);
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "local retention auto-enabled ({} days, mode={:?})",
+                            retention_days,
+                            retention_mode
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        last_error = e;
+                        tracing::warn!(
+                            "retention configure attempt {}/{} failed: {}",
+                            i + 1,
+                            attempts,
+                            last_error
+                        );
+                    }
                 }
             }
+            tracing::error!(
+                "local retention could NOT be enabled after {} attempts (last error: {}); \
+                 --retention-days {} will have no effect and the database will keep growing",
+                attempts,
+                last_error,
+                retention_days
+            );
         });
     }
 

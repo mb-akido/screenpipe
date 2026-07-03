@@ -241,6 +241,35 @@ pub async fn retention_configure(
     }
 }
 
+/// Configure retention by calling the engine's own HTTP endpoint, presenting
+/// the local API bearer token. Used by the CLI (`screenpipe-engine record`) to
+/// auto-enable retention after the server binds: with `--api-auth` (default
+/// on) the auth middleware rejects even localhost requests without the token,
+/// and `/retention/configure` is not an exempt path — an unauthenticated
+/// self-call gets a 403 and retention silently never starts (#4804).
+pub async fn configure_retention_via_local_api(
+    port: u16,
+    retention_days: u32,
+    mode: RetentionMode,
+    api_auth_key: Option<&str>,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("http://localhost:{}/retention/configure", port);
+    let mut request = client.post(&url).json(&json!({
+        "enabled": true,
+        "retention_days": retention_days,
+        "mode": mode,
+    }));
+    if let Some(key) = api_auth_key {
+        request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
+    }
+    match request.send().await {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => Err(format!("HTTP {}", r.status())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// GET /retention/status — return current retention state.
 #[oasgen]
 pub async fn retention_status(
@@ -612,5 +641,49 @@ mod tests {
         // `now - Duration::days(..)` panicked here; the guard must yield None so
         // the retention loop skips the cycle instead of crashing.
         assert_eq!(retention_cutoff(u32::MAX, now), None);
+    }
+
+    #[tokio::test]
+    async fn configure_via_local_api_sends_bearer_token() {
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        // Stub /retention/configure that records the Authorization header of
+        // each request — the regression in #4804 was the CLI self-call
+        // omitting it and being 403'd by the auth middleware.
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_handler = seen.clone();
+        let app = axum::Router::new().route(
+            "/retention/configure",
+            post(move |headers: axum::http::HeaderMap| {
+                let seen = seen_handler.clone();
+                async move {
+                    seen.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string()),
+                    );
+                    JsonResponse(json!({"success": true}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        configure_retention_via_local_api(port, 7, RetentionMode::All, Some("test-key"))
+            .await
+            .expect("authorized configure succeeds");
+        configure_retention_via_local_api(port, 7, RetentionMode::All, None)
+            .await
+            .expect("configure without key still succeeds against stub");
+
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![Some("Bearer test-key".to_string()), None],
+            "self-call must carry the bearer token exactly when a key is provided"
+        );
     }
 }

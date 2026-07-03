@@ -713,9 +713,10 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub disable_click_capture: bool,
 
-    /// Require authentication for remote API access. When enabled, non-localhost
-    /// requests must include Authorization: Bearer <SCREENPIPE_API_KEY>.
-    /// Localhost requests are always allowed.
+    /// Require authentication for API access. When enabled, all requests —
+    /// including from localhost — must include Authorization: Bearer
+    /// <SCREENPIPE_API_KEY> (get the key with `screenpipe auth token`). Only
+    /// a small exempt list (/health, OAuth callbacks, pipe store) skips auth.
     #[arg(long, default_value_t = true)]
     pub api_auth: bool,
 
