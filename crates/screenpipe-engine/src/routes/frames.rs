@@ -31,8 +31,10 @@ use tokio::time::timeout;
 pub async fn get_frame_data(
     State(state): State<Arc<AppState>>,
     Path(frame_id): Path<i64>,
+    Query(query): Query<FrameDataQuery>,
 ) -> Result<Response<Body>, (StatusCode, JsonResponse<Value>)> {
     let start_time = Instant::now();
+    let allow_fallback = query.fallback;
 
     match timeout(Duration::from_secs(5), async {
         // Frame images are redacted AT REST by the image-PII worker
@@ -143,8 +145,10 @@ pub async fn get_frame_data(
                                 "Snapshot file missing for frame {}, trying nearest frame",
                                 frame_id
                             );
-                            if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
-                                return Ok(fallback);
+                            if allow_fallback {
+                                if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
+                                    return Ok(fallback);
+                                }
                             }
                             return Err((
                                 StatusCode::NOT_FOUND,
@@ -172,8 +176,10 @@ pub async fn get_frame_data(
                             "Frame {} extraction failed ({}), trying nearest frame",
                             frame_id, e
                         );
-                        if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
-                            return Ok(fallback);
+                        if allow_fallback {
+                            if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
+                                return Ok(fallback);
+                            }
                         }
 
                         // No fallback found either
@@ -247,6 +253,18 @@ pub async fn get_frame_data(
             ))
         }
     }
+}
+
+#[derive(Debug, Deserialize, OaSchema)]
+pub struct FrameDataQuery {
+    /// When true, an unavailable frame may serve the nearest available frame image.
+    /// Search thumbnails pass false so text matches never display unrelated pixels.
+    #[serde(default = "default_frame_fallback")]
+    pub fallback: bool,
+}
+
+fn default_frame_fallback() -> bool {
+    true
 }
 
 /// Query parameters for finding the next valid frame
@@ -377,6 +395,7 @@ pub async fn get_next_valid_frame(
     State(state): State<Arc<AppState>>,
     Query(query): Query<NextValidFrameQuery>,
 ) -> Result<JsonResponse<NextValidFrameResponse>, (StatusCode, JsonResponse<Value>)> {
+    const MIN_VIDEO_SIZE: u64 = 1024;
     let forward = query.direction.to_lowercase() != "backward";
 
     // Get candidate frames from database
@@ -398,15 +417,19 @@ pub async fn get_next_valid_frame(
         }
     };
 
-    // Check each frame's file exists on disk
+    // Check each frame's file is usable enough to try. Snapshot frames only
+    // need to exist; video chunks must be non-empty so the UI does not jump to
+    // another frame that will immediately fail extraction too.
     let mut skipped = 0;
-    for (frame_id, file_path, _offset_index, timestamp, _is_snapshot) in candidates {
-        if std::path::Path::new(&file_path).exists() {
-            return Ok(JsonResponse(NextValidFrameResponse {
-                frame_id,
-                timestamp,
-                skipped_count: skipped,
-            }));
+    for (frame_id, file_path, _offset_index, timestamp, is_snapshot) in candidates {
+        if let Ok(meta) = tokio::fs::metadata(&file_path).await {
+            if is_snapshot || meta.len() >= MIN_VIDEO_SIZE {
+                return Ok(JsonResponse(NextValidFrameResponse {
+                    frame_id,
+                    timestamp,
+                    skipped_count: skipped,
+                }));
+            }
         }
         skipped += 1;
     }

@@ -5,7 +5,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { StreamTimeSeriesResponse } from "@/components/rewind/timeline";
 import posthog from "posthog-js";
-import { getApiBaseUrl, appendAuthToken } from "@/lib/api";
+import { frameImageUrl } from "@/components/rewind/frame-image-url";
 
 // Debounce delay for frame loading (ms) — reduced for arrow keys
 const FRAME_LOAD_DEBOUNCE_MS = 80;
@@ -424,17 +424,19 @@ export function useFrameLoading(opts: {
 	// Also used when searchNavFrame is true (instant JPEG for first frame after search nav)
 	const fallbackImageUrl = useMemo(() => {
 		if (!debouncedFrame) return null;
-		// Force HTTP JPEG for search navigation (skip slow video seek)
+		// Force exact HTTP JPEG for search navigation (skip slow video seek).
+		// Exact mode avoids showing a nearby frame whose pixels do not contain
+		// the search text matched on the requested frame.
 		if (searchNavFrame) {
-			return appendAuthToken(`${getApiBaseUrl()}/frames/${debouncedFrame.frameId}`);
+			return frameImageUrl(debouncedFrame.frameId, { fallback: false });
 		}
 		// Snapshot failed to load from disk — need HTTP fallback regardless of video mode
 		if (isSnapshotFrame && snapshotFailed) {
-			return appendAuthToken(`${getApiBaseUrl()}/frames/${debouncedFrame.frameId}`);
+			return frameImageUrl(debouncedFrame.frameId);
 		}
 		if (useVideoMode) return null;
 		if (isSnapshotFrame) return null;
-		return appendAuthToken(`${getApiBaseUrl()}/frames/${debouncedFrame.frameId}`);
+		return frameImageUrl(debouncedFrame.frameId);
 	}, [useVideoMode, debouncedFrame, isSnapshotFrame, snapshotFailed, searchNavFrame]);
 
 	// Preload fallback image — only swap displayed URL when the new image loads successfully
@@ -468,8 +470,11 @@ export function useFrameLoading(opts: {
 		img.onerror = () => {
 			// Preload failed — keep showing previous image if available
 			setIsLoading(false);
-			// For snapshot frames where both direct + HTTP failed, signal unavailable
-			if (isSnapshotFrame && snapshotFailed) {
+			setHasError(true);
+			onFrameLoadError?.();
+			// Signal the timeline to jump past frames whose exact/search image
+			// or HTTP fallback cannot render instead of leaving a stale image.
+			if (searchNavFrame || snapshotFailed || !useVideoMode) {
 				onFrameUnavailable?.();
 			}
 			// Still clear search nav mode on error to avoid getting stuck

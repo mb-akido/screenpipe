@@ -17,6 +17,7 @@ mod tests {
     use screenpipe_engine::{ContentItem, PaginatedResponse};
     use screenpipe_screen::OcrEngine; // Adjust this import based on your actual module structure
     use serde::Deserialize;
+    use std::fs;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt; // for `oneshot` and `ready`
@@ -136,6 +137,86 @@ mod tests {
             }
             other => panic!("expected OCR search result, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_frame_route_exact_mode_does_not_serve_nearest_frame() {
+        let (app, db) = setup_test_app().await;
+        let now = Utc::now();
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "screenpipe-frame-fallback-test-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let missing_path = dir.join("missing.jpg");
+        let valid_path = dir.join("valid.jpg");
+        fs::write(&valid_path, b"valid-nearby-frame").unwrap();
+
+        let missing_id = db
+            .insert_snapshot_frame(
+                "endpoint-test-device",
+                now,
+                missing_path.to_str().unwrap(),
+                Some("SearchFixtureApp"),
+                Some("Frame with matched text"),
+                None,
+                true,
+                Some("test"),
+                Some("autotransformer"),
+                Some("accessibility"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _valid_id = db
+            .insert_snapshot_frame(
+                "endpoint-test-device",
+                now + Duration::seconds(1),
+                valid_path.to_str().unwrap(),
+                Some("SearchFixtureApp"),
+                Some("Nearby frame"),
+                None,
+                true,
+                Some("test"),
+                Some("nearby frame text"),
+                Some("accessibility"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let fallback_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/frames/{missing_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback_response.status(), StatusCode::OK);
+
+        let exact_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/frames/{missing_id}?fallback=false"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_response.status(), StatusCode::NOT_FOUND);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
