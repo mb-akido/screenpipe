@@ -18,8 +18,9 @@ async applyEnterpriseUiVisibility() : Promise<void> {
 /**
  * Frontend-callable gate. The banner awaits this before calling
  * `downloadAndInstall` (Windows: triggers process::exit internally) or
- * `relaunch`. Returns one of `"proceed"`, `"errored"`, or `"pending"`
- * — frontend toasts on the latter two.
+ * `relaunch`. Returns `"proceed"` when a restart may go ahead — including
+ * on an errored boot, where the relaunch IS the recovery (#4726) — or
+ * `"pending"` while a boot is still in progress (frontend toasts).
  */
 async awaitSafeRestart(timeoutSecs: number | null) : Promise<string> {
     return await TAURI_INVOKE("await_safe_restart", { timeoutSecs });
