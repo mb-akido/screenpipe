@@ -616,11 +616,7 @@ const START_PIN_CEILING: Duration = Duration::from_secs(300);
 /// continuously true for longer than `ceiling` (tracked via `since`), it
 /// reads as false so a leaked flag can't pin the status forever. Resets the
 /// timer whenever the raw flag drops.
-fn clamp_start_in_progress(
-    raw: bool,
-    since: &mut Option<Instant>,
-    ceiling: Duration,
-) -> bool {
+fn clamp_start_in_progress(raw: bool, since: &mut Option<Instant>, ceiling: Duration) -> bool {
     if !raw {
         *since = None;
         return false;
@@ -763,6 +759,13 @@ const CAPTURE_STALL_THRESHOLD: u32 = 90;
 
 /// Suppress re-notification for this long after showing one.
 const NOTIFICATION_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
+const AUDIO_DEVICE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+fn should_refresh_audio_device_status(now: Instant, last_refresh: Option<Instant>) -> bool {
+    last_refresh
+        .map(|last| now.saturating_duration_since(last) >= AUDIO_DEVICE_STATUS_REFRESH_INTERVAL)
+        .unwrap_or(true)
+}
 
 /// Starts a background task that periodically checks the health of the sidecar
 /// and updates the tray icon accordingly.
@@ -797,6 +800,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
     // SERVER_RESPAWN_WINDOW so a server that can't come back up can't storm.
     let mut server_respawns: std::collections::VecDeque<Instant> =
         std::collections::VecDeque::new();
+    let mut last_audio_device_status_refresh: Option<Instant> = None;
 
     tokio::spawn(async move {
         loop {
@@ -916,70 +920,74 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // after vision status replaces monitor rows (below).
             let mut devices = parse_devices_from_health(&health_result);
 
-            // Fetch all audio devices (including user-disabled) for tray display
             let api = local_api_context_from_app(&app);
-            if let Ok(res) = api
-                .apply_auth(reqwest::Client::new().get(api.url("/audio/device/status")))
-                .send()
-                .await
-            {
-                if let Ok(devs) = res.json::<Vec<serde_json::Value>>().await {
-                    let mut entries = Vec::new();
-                    for d in &devs {
-                        let name = d["name"].as_str().unwrap_or("").to_string();
-                        let is_running = d["is_running"].as_bool().unwrap_or(false);
-                        let is_user_disabled = d["is_user_disabled"].as_bool().unwrap_or(false);
-                        entries.push(AudioDeviceEntry {
-                            name: name.clone(),
-                            is_running,
-                        });
-
-                        // Add user-paused devices to the tray list so they
-                        // stay visible with active=false (unchecked).
-                        if is_user_disabled {
-                            let already_listed = devices.iter().any(|dev| {
-                                let full = format!(
-                                    "{} ({})",
-                                    dev.name,
-                                    if dev.kind == DeviceKind::AudioInput {
-                                        "input"
-                                    } else {
-                                        "output"
-                                    }
-                                );
-                                full == name
+            // Fetch all audio devices (including user-disabled) for tray display.
+            // CoreAudio device enumeration is expensive on macOS, so keep the
+            // high-frequency health poll but refresh the full device list less often.
+            let now = Instant::now();
+            if should_refresh_audio_device_status(now, last_audio_device_status_refresh) {
+                last_audio_device_status_refresh = Some(now);
+                if let Ok(res) = api
+                    .apply_auth(client.get(api.url("/audio/device/status")))
+                    .send()
+                    .await
+                {
+                    if let Ok(devs) = res.json::<Vec<serde_json::Value>>().await {
+                        let mut entries = Vec::new();
+                        for d in &devs {
+                            let name = d["name"].as_str().unwrap_or("").to_string();
+                            let is_running = d["is_running"].as_bool().unwrap_or(false);
+                            let is_user_disabled = d["is_user_disabled"].as_bool().unwrap_or(false);
+                            entries.push(AudioDeviceEntry {
+                                name: name.clone(),
+                                is_running,
                             });
-                            if !already_listed {
-                                let kind = if name.contains("(input)") {
-                                    DeviceKind::AudioInput
-                                } else if name.contains("(output)") {
-                                    DeviceKind::AudioOutput
-                                } else {
-                                    continue;
-                                };
-                                let display_name =
-                                    name.replace(" (input)", "").replace(" (output)", "");
-                                devices.push(DeviceInfo {
-                                    name: display_name,
-                                    kind,
-                                    active: false,
-                                    last_seen_secs_ago: 0,
-                                    monitor_id: None,
+
+                            // Add user-paused devices to the tray list so they
+                            // stay visible with active=false (unchecked).
+                            if is_user_disabled {
+                                let already_listed = devices.iter().any(|dev| {
+                                    let full = format!(
+                                        "{} ({})",
+                                        dev.name,
+                                        if dev.kind == DeviceKind::AudioInput {
+                                            "input"
+                                        } else {
+                                            "output"
+                                        }
+                                    );
+                                    full == name
                                 });
+                                if !already_listed {
+                                    let kind = if name.contains("(input)") {
+                                        DeviceKind::AudioInput
+                                    } else if name.contains("(output)") {
+                                        DeviceKind::AudioOutput
+                                    } else {
+                                        continue;
+                                    };
+                                    let display_name =
+                                        name.replace(" (input)", "").replace(" (output)", "");
+                                    devices.push(DeviceInfo {
+                                        name: display_name,
+                                        kind,
+                                        active: false,
+                                        last_seen_secs_ago: 0,
+                                        monitor_id: None,
+                                    });
+                                }
                             }
                         }
-                    }
 
-                    set_audio_device_status(entries);
+                        set_audio_device_status(entries);
+                    }
                 }
             }
 
             // Per-monitor vision status — replaces health-derived monitor rows when
             // available so the tray can toggle individual displays.
             match api
-                .apply_auth(
-                    reqwest::Client::new().get(api.url("/vision/device/status")),
-                )
+                .apply_auth(reqwest::Client::new().get(api.url("/vision/device/status")))
                 .send()
                 .await
             {
@@ -993,8 +1001,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                             for d in &devs {
                                 let id = d["id"].as_u64().unwrap_or(0) as u32;
                                 let name = d["name"].as_str().unwrap_or("").to_string();
-                                let user_disabled =
-                                    d["user_disabled"].as_bool().unwrap_or(false);
+                                let user_disabled = d["user_disabled"].as_bool().unwrap_or(false);
                                 vision_entries.push(VisionDeviceEntry {
                                     id,
                                     name: name.clone(),
@@ -1412,6 +1419,25 @@ mod tests {
         Err(anyhow::anyhow!("connection refused"))
     }
 
+    #[test]
+    fn audio_device_status_refreshes_immediately() {
+        assert!(should_refresh_audio_device_status(Instant::now(), None));
+    }
+
+    #[test]
+    fn audio_device_status_waits_for_refresh_interval() {
+        let now = Instant::now();
+        assert!(!should_refresh_audio_device_status(now, Some(now)));
+        assert!(!should_refresh_audio_device_status(
+            now,
+            Some(now - Duration::from_secs(4))
+        ));
+        assert!(should_refresh_audio_device_status(
+            now,
+            Some(now - AUDIO_DEVICE_STATUS_REFRESH_INTERVAL)
+        ));
+    }
+
     // Helper: call decide_status with thresholds exceeded (no debouncing active)
     // Used for tests that don't care about debouncing behavior
     fn decide_no_debounce(
@@ -1636,29 +1662,49 @@ mod tests {
 
     #[test]
     fn test_capture_absent_with_live_server_is_paused() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), false, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            false,
+            false,
+        );
         assert_eq!(status, RecordingStatus::Paused);
     }
 
     #[test]
     fn test_capture_absent_while_starting_stays_starting() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            true,
+            false,
+        );
         assert_eq!(status, RecordingStatus::Starting);
     }
 
     #[test]
     fn test_capture_status_does_not_mask_connection_error() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Stopped, false, Some(false), false, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Stopped,
+            false,
+            Some(false),
+            false,
+            false,
+        );
         assert_eq!(status, RecordingStatus::Stopped);
     }
 
     #[test]
     fn test_running_capture_keeps_recording_status() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), false, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(true),
+            false,
+            false,
+        );
         assert_eq!(status, RecordingStatus::Recording);
     }
 
@@ -1700,8 +1746,13 @@ mod tests {
     // the stale-start-flag path still yields Starting, exactly as before.
     #[test]
     fn test_within_schedule_leaves_starting_untouched() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            true,
+            false,
+        );
         assert_eq!(status, RecordingStatus::Starting);
     }
 
@@ -2075,13 +2126,25 @@ mod tests {
     fn clamp_start_in_progress_passes_within_ceiling_and_resets() {
         let mut since: Option<Instant> = None;
         // raw=false → false, no timer
-        assert!(!clamp_start_in_progress(false, &mut since, Duration::from_secs(60)));
+        assert!(!clamp_start_in_progress(
+            false,
+            &mut since,
+            Duration::from_secs(60)
+        ));
         assert!(since.is_none());
         // raw=true within ceiling → true, timer starts
-        assert!(clamp_start_in_progress(true, &mut since, Duration::from_secs(60)));
+        assert!(clamp_start_in_progress(
+            true,
+            &mut since,
+            Duration::from_secs(60)
+        ));
         assert!(since.is_some());
         // raw drops → false + timer resets (a fresh start later gets a fresh window)
-        assert!(!clamp_start_in_progress(false, &mut since, Duration::from_secs(60)));
+        assert!(!clamp_start_in_progress(
+            false,
+            &mut since,
+            Duration::from_secs(60)
+        ));
         assert!(since.is_none());
     }
 
@@ -2124,35 +2187,63 @@ mod tests {
     #[test]
     fn never_respawns_when_user_stopped() {
         // wants_recording = false → deliberate stop (incl. the tray "stop").
-        assert!(!EngineRespawnCheck { wants_recording: false, ..crash_baseline() }.should_respawn());
+        assert!(!EngineRespawnCheck {
+            wants_recording: false,
+            ..crash_baseline()
+        }
+        .should_respawn());
     }
 
     #[test]
     fn never_respawns_when_not_entitled() {
-        assert!(!EngineRespawnCheck { entitled: false, ..crash_baseline() }.should_respawn());
+        assert!(!EngineRespawnCheck {
+            entitled: false,
+            ..crash_baseline()
+        }
+        .should_respawn());
     }
 
     #[test]
     fn never_respawns_a_never_started_server() {
         // ever_connected = false → boot failure, not a crash; don't fight it.
-        assert!(!EngineRespawnCheck { ever_connected: false, ..crash_baseline() }.should_respawn());
+        assert!(!EngineRespawnCheck {
+            ever_connected: false,
+            ..crash_baseline()
+        }
+        .should_respawn());
     }
 
     #[test]
     fn never_respawns_during_startup_grace_or_restart_grace() {
-        assert!(!EngineRespawnCheck { past_startup_grace: false, ..crash_baseline() }.should_respawn());
-        assert!(!EngineRespawnCheck { in_restart_grace: true, ..crash_baseline() }.should_respawn());
+        assert!(!EngineRespawnCheck {
+            past_startup_grace: false,
+            ..crash_baseline()
+        }
+        .should_respawn());
+        assert!(!EngineRespawnCheck {
+            in_restart_grace: true,
+            ..crash_baseline()
+        }
+        .should_respawn());
     }
 
     #[test]
     fn never_respawns_right_after_wake() {
         // Sleep/wake transiently kills the HTTP server — let it recover itself.
-        assert!(!EngineRespawnCheck { recently_woke: true, ..crash_baseline() }.should_respawn());
+        assert!(!EngineRespawnCheck {
+            recently_woke: true,
+            ..crash_baseline()
+        }
+        .should_respawn());
     }
 
     #[test]
     fn never_respawns_while_a_start_is_in_flight() {
-        assert!(!EngineRespawnCheck { start_in_progress: true, ..crash_baseline() }.should_respawn());
+        assert!(!EngineRespawnCheck {
+            start_in_progress: true,
+            ..crash_baseline()
+        }
+        .should_respawn());
     }
 
     #[test]

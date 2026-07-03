@@ -682,7 +682,7 @@ let DEFAULT_SETTINGS: Settings = {
 			localRetentionEnabled: false,
 			localRetentionDays: 14,
 			localRetentionMode: "media",
-			encryptStore: true,
+			encryptStore: false,
 			hdRecordingDefault: "ask",
 			hdRecordingIntervalMs: 100,
 			fontSize: "16px",
@@ -756,6 +756,14 @@ export const saveAndEncrypt = async (store: Store) => {
 	await commands.reencryptStore().catch(() => {});
 };
 
+export function persistedSettingsEqual(current: unknown, next: unknown): boolean {
+	try {
+		return JSON.stringify(current ?? null) === JSON.stringify(next ?? null);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * #3943: persist settings WITHOUT the cloud auth token in plaintext.
  *
@@ -766,7 +774,7 @@ export const saveAndEncrypt = async (store: Store) => {
  * logout (`setCloudToken(null)`) does — so a save during a transient
  * pre-hydration state can't sign the user out.
  */
-async function setSettingsStripped(store: Store, settings: Settings) {
+async function setSettingsStripped(store: Store, settings: Settings): Promise<boolean> {
 	const token = settings?.user?.token;
 	// Default to "safe to write as-is" when there's no token to protect.
 	let persisted = !token;
@@ -789,7 +797,12 @@ async function setSettingsStripped(store: Store, settings: Settings) {
 		token && persisted
 			? { ...settings, user: { ...settings.user, token: undefined } }
 			: settings;
+	const current = await store.get("settings");
+	if (persistedSettingsEqual(current, toPersist)) {
+		return false;
+	}
 	await store.set("settings", toPersist);
+	return true;
 }
 
 /**
@@ -1041,8 +1054,8 @@ function createSettingsStore() {
 
 		// Save migrations if needed
 		if (needsUpdate) {
-			await setSettingsStripped(store, settings);
-			await saveAndEncrypt(store);
+			const changed = await setSettingsStripped(store, settings);
+			if (changed) await saveAndEncrypt(store);
 		}
 
 		return settings;
@@ -1060,8 +1073,8 @@ function createSettingsStore() {
 			}
 			newSettings = applyProCloudAudioDefaults(newSettings);
 		}
-		await setSettingsStripped(store, newSettings);
-		await saveAndEncrypt(store);
+		const changed = await setSettingsStripped(store, newSettings);
+		if (changed) await saveAndEncrypt(store);
 	};
 
 	const reset = async () => {

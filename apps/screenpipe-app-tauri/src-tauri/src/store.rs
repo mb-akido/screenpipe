@@ -472,6 +472,12 @@ fn encrypt_store_file(path: &Path) {
     }
 }
 
+fn encrypt_store_setting_from_json(json: &serde_json::Value) -> Option<bool> {
+    json.get("settings")
+        .and_then(|s| s.get("encryptStore"))
+        .and_then(|v| v.as_bool())
+}
+
 /// Re-encrypt store.bin on disk. Called after the Tauri store plugin writes plain JSON.
 /// Also syncs the .encrypt-store flag file from the encryptStore setting.
 pub fn reencrypt_store_file(app: &AppHandle) {
@@ -486,11 +492,7 @@ pub fn reencrypt_store_file(app: &AppHandle) {
         let encrypt_enabled = std::fs::read(&store_path)
             .ok()
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
-            .and_then(|json| {
-                json.get("settings")
-                    .and_then(|s| s.get("encryptStore"))
-                    .and_then(|v| v.as_bool())
-            });
+            .and_then(|json| encrypt_store_setting_from_json(&json));
 
         if let Some(encrypt_enabled) = encrypt_enabled {
             if encrypt_enabled && !flag_path.exists() {
@@ -1992,6 +1994,44 @@ mod tests {
         .unwrap();
 
         assert!(settings.auto_update);
+    }
+
+    #[test]
+    fn missing_encrypt_store_setting_does_not_opt_in() {
+        assert_eq!(
+            encrypt_store_setting_from_json(&json!({
+                "settings": {
+                    "aiPresets": []
+                }
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_encrypt_store_true_is_respected() {
+        assert_eq!(
+            encrypt_store_setting_from_json(&json!({
+                "settings": {
+                    "aiPresets": [],
+                    "encryptStore": true
+                }
+            })),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn explicit_encrypt_store_false_is_respected() {
+        assert_eq!(
+            encrypt_store_setting_from_json(&json!({
+                "settings": {
+                    "aiPresets": [],
+                    "encryptStore": false
+                }
+            })),
+            Some(false)
+        );
     }
 
     #[test]

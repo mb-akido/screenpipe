@@ -920,38 +920,47 @@ def stop_daemon(args: argparse.Namespace) -> int:
     return 0
 
 
-def load_samples(out_dir: Path, since_hours: float) -> list[dict[str, Any]]:
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=since_hours)
+def load_run_samples(run_dir: Path, cutoff: dt.datetime | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for path in sorted(out_dir.glob("*/samples.jsonl")):
-        try:
-            for line in path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                ts_s = row.get("ts")
-                if not ts_s:
-                    continue
-                ts = dt.datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
-                if ts >= cutoff and row.get("rss_mb") is not None:
-                    row["_run"] = str(path.parent)
-                    row["_ts_obj"] = ts
-                    rows.append(row)
-        except Exception:
-            continue
+    path = run_dir / "samples.jsonl"
+    if not path.exists():
+        return rows
+    try:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            ts_s = row.get("ts")
+            if not ts_s:
+                continue
+            ts = dt.datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
+            if cutoff and ts < cutoff:
+                continue
+            if row.get("rss_mb") is None:
+                continue
+            row["_run"] = str(path.parent)
+            row["_ts_obj"] = ts
+            rows.append(row)
+    except Exception:
+        return []
     rows.sort(key=lambda r: r["_ts_obj"])
     return rows
 
 
-def analyze(args: argparse.Namespace) -> int:
-    rows = load_samples(args.out_dir, args.since_hours)
-    if not rows:
-        print("no samples found")
-        return 1
+def load_samples(out_dir: Path, since_hours: float) -> list[dict[str, Any]]:
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=since_hours)
+    rows: list[dict[str, Any]] = []
+    for path in sorted(out_dir.glob("*/samples.jsonl")):
+        rows.extend(load_run_samples(path.parent, cutoff))
+    rows.sort(key=lambda r: r["_ts_obj"])
+    return rows
 
+
+def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     first = rows[0]
     last = rows[-1]
     rss_values = [float(r["rss_mb"]) for r in rows]
+    cpu_values = [float(r["pcpu"]) for r in rows if r.get("pcpu") is not None]
     max_row = max(rows, key=lambda r: float(r["rss_mb"]))
     hours = max((last["_ts_obj"] - first["_ts_obj"]).total_seconds() / 3600.0, 1e-6)
     growth = float(last["rss_mb"]) - float(first["rss_mb"])
@@ -961,13 +970,86 @@ def analyze(args: argparse.Namespace) -> int:
     for row in rows:
         by_scenario.setdefault(row.get("scenario") or "unknown", []).append(float(row["rss_mb"]))
 
-    print(f"samples: {len(rows)} from {first['ts']} to {last['ts']}")
-    print(f"rss first/last/max: {first['rss_mb']} MB / {last['rss_mb']} MB / {max_row['rss_mb']} MB")
-    print(f"rss growth: {growth:.1f} MB over {hours:.2f} h ({slope:.1f} MB/h)")
-    print(f"max row: scenario={max_row.get('scenario')} pid={max_row.get('pid')} run={max_row.get('_run')}")
+    largest_rises: list[dict[str, Any]] = []
+    for before, after in zip(rows, rows[1:]):
+        if before.get("pid") != after.get("pid"):
+            continue
+        delta = float(after["rss_mb"]) - float(before["rss_mb"])
+        if delta <= 0:
+            continue
+        largest_rises.append(
+            {
+                "from_ts": before["ts"],
+                "to_ts": after["ts"],
+                "scenario": after.get("scenario") or "unknown",
+                "rss_delta_mb": round(delta, 1),
+            }
+        )
+    largest_rises.sort(key=lambda row: row["rss_delta_mb"], reverse=True)
+
+    return {
+        "samples": len(rows),
+        "start_ts": first["ts"],
+        "end_ts": last["ts"],
+        "duration_hours": round(hours, 4),
+        "rss_first_mb": float(first["rss_mb"]),
+        "rss_last_mb": float(last["rss_mb"]),
+        "rss_max_mb": float(max_row["rss_mb"]),
+        "rss_growth_mb": round(growth, 1),
+        "rss_slope_mb_per_hour": round(slope, 1),
+        "cpu_avg_pct": round(sum(cpu_values) / len(cpu_values), 1) if cpu_values else None,
+        "cpu_max_pct": round(max(cpu_values), 1) if cpu_values else None,
+        "max_row": {
+            "scenario": max_row.get("scenario"),
+            "pid": max_row.get("pid"),
+            "run": max_row.get("_run"),
+            "ts": max_row.get("ts"),
+        },
+        "scenario_ranges": {
+            scenario: {
+                "min_rss_mb": round(min(values), 1),
+                "max_rss_mb": round(max(values), 1),
+                "samples": len(values),
+            }
+            for scenario, values in sorted(by_scenario.items())
+        },
+        "largest_rises": largest_rises[:5],
+    }
+
+
+def print_summary(summary: dict[str, Any]) -> None:
+    print(f"samples: {summary['samples']} from {summary['start_ts']} to {summary['end_ts']}")
+    print(
+        "rss first/last/max: "
+        f"{summary['rss_first_mb']} MB / {summary['rss_last_mb']} MB / {summary['rss_max_mb']} MB"
+    )
+    print(
+        f"rss growth: {summary['rss_growth_mb']:.1f} MB over "
+        f"{summary['duration_hours']:.2f} h ({summary['rss_slope_mb_per_hour']:.1f} MB/h)"
+    )
+    print(f"cpu avg/max: {summary['cpu_avg_pct']}% / {summary['cpu_max_pct']}%")
+    max_row = summary["max_row"]
+    print(f"max row: scenario={max_row.get('scenario')} pid={max_row.get('pid')} run={max_row.get('run')}")
     print("scenario rss ranges:")
-    for scenario, values in sorted(by_scenario.items()):
-        print(f"  {scenario}: min={min(values):.1f} MB max={max(values):.1f} MB n={len(values)}")
+    for scenario, values in summary["scenario_ranges"].items():
+        print(
+            f"  {scenario}: min={values['min_rss_mb']:.1f} MB "
+            f"max={values['max_rss_mb']:.1f} MB n={values['samples']}"
+        )
+    if summary["largest_rises"]:
+        print("largest consecutive rss rises:")
+        for row in summary["largest_rises"]:
+            print(f"  {row['rss_delta_mb']:.1f} MB {row['scenario']} {row['from_ts']} -> {row['to_ts']}")
+
+
+def analyze(args: argparse.Namespace) -> int:
+    rows = load_samples(args.out_dir, args.since_hours)
+    if not rows:
+        print("no samples found")
+        return 1
+
+    summary = summarize_rows(rows)
+    print_summary(summary)
 
     snapshots = [r for r in rows if r.get("snapshot_reason")]
     if snapshots:
@@ -978,10 +1060,74 @@ def analyze(args: argparse.Namespace) -> int:
             for path in paths[:5]:
                 print(f"    {path}")
 
-    if max(rss_values) >= args.rss_threshold_mb or slope >= args.growth_threshold_mb_per_hour:
+    if (
+        summary["rss_max_mb"] >= args.rss_threshold_mb
+        or summary["rss_slope_mb_per_hour"] >= args.growth_threshold_mb_per_hour
+    ):
         print("status: suspect leak")
         return 2
     print("status: no leak threshold crossed")
+    return 0
+
+
+def compare(args: argparse.Namespace) -> int:
+    before_rows = load_run_samples(args.before_run)
+    after_rows = load_run_samples(args.after_run)
+    if not before_rows:
+        print(f"no samples found in before run: {args.before_run}")
+        return 1
+    if not after_rows:
+        print(f"no samples found in after run: {args.after_run}")
+        return 1
+
+    before = summarize_rows(before_rows)
+    after = summarize_rows(after_rows)
+
+    keys = [
+        "rss_growth_mb",
+        "rss_slope_mb_per_hour",
+        "rss_max_mb",
+        "cpu_avg_pct",
+        "cpu_max_pct",
+    ]
+    delta = {
+        key: (
+            None
+            if before.get(key) is None or after.get(key) is None
+            else round(float(after[key]) - float(before[key]), 1)
+        )
+        for key in keys
+    }
+
+    result = {
+        "before_run": str(args.before_run),
+        "after_run": str(args.after_run),
+        "before": before,
+        "after": after,
+        "delta_after_minus_before": delta,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    print("before:")
+    print_summary(before)
+    print("\nafter:")
+    print_summary(after)
+    print("\ndelta after - before:")
+    for key in keys:
+        value = delta[key]
+        print(f"  {key}: {'n/a' if value is None else value}")
+
+    scenario_names = sorted(set(before["scenario_ranges"]) | set(after["scenario_ranges"]))
+    print("scenario max rss deltas:")
+    for scenario in scenario_names:
+        b = before["scenario_ranges"].get(scenario, {}).get("max_rss_mb")
+        a = after["scenario_ranges"].get(scenario, {}).get("max_rss_mb")
+        if b is None or a is None:
+            print(f"  {scenario}: n/a")
+        else:
+            print(f"  {scenario}: {round(float(a) - float(b), 1)} MB")
     return 0
 
 
@@ -1054,6 +1200,12 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_p.add_argument("--rss-threshold-mb", type=float, default=8192.0)
     analyze_p.add_argument("--growth-threshold-mb-per-hour", type=float, default=512.0)
     analyze_p.set_defaults(func=analyze)
+
+    compare_p = sub.add_parser("compare", help="compare two saved pressure runs")
+    compare_p.add_argument("--before-run", type=Path, required=True)
+    compare_p.add_argument("--after-run", type=Path, required=True)
+    compare_p.add_argument("--json", action="store_true")
+    compare_p.set_defaults(func=compare)
 
     return parser
 
