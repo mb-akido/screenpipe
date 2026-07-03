@@ -68,10 +68,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
-use std::{ffi::c_void, ptr};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::OnceLock;
+#[cfg(target_os = "macos")]
+use std::{ffi::c_void, ptr};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tokio::sync::Mutex;
@@ -110,6 +110,62 @@ pub struct Cookie {
     /// `same_site` raw value from Chromium's schema:
     /// `-1` = unspecified, `0` = none, `1` = lax, `2` = strict.
     pub same_site: i32,
+}
+
+/// Sites where a random remembered-device cookie is not enough to make the
+/// owned browser authenticated. If the required cookie is absent, copying the
+/// rest creates a misleading "welcome back" login wall instead of a usable
+/// session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthCookieRequirement {
+    pub service_name: &'static str,
+    pub cookie_name: &'static str,
+}
+
+const AUTH_COOKIE_REQUIREMENTS: &[(&str, AuthCookieRequirement)] = &[(
+    "linkedin.com",
+    AuthCookieRequirement {
+        service_name: "LinkedIn",
+        cookie_name: "li_at",
+    },
+)];
+
+pub fn required_auth_cookie_for_host(host: &str) -> Option<AuthCookieRequirement> {
+    let host = normalize_cookie_host(host);
+    AUTH_COOKIE_REQUIREMENTS
+        .iter()
+        .find_map(|(suffix, requirement)| {
+            if host == *suffix || host.ends_with(&format!(".{suffix}")) {
+                Some(*requirement)
+            } else {
+                None
+            }
+        })
+}
+
+pub fn missing_required_auth_cookie_for_host(
+    host: &str,
+    cookies: &[Cookie],
+) -> Option<AuthCookieRequirement> {
+    let requirement = required_auth_cookie_for_host(host)?;
+    let has_required_cookie = cookies.iter().any(|cookie| {
+        cookie.name == requirement.cookie_name && cookie_domain_matches_host(&cookie.domain, host)
+    });
+    if has_required_cookie {
+        None
+    } else {
+        Some(requirement)
+    }
+}
+
+fn normalize_cookie_host(host: &str) -> String {
+    host.trim_start_matches('.').to_ascii_lowercase()
+}
+
+fn cookie_domain_matches_host(domain: &str, host: &str) -> bool {
+    let domain = normalize_cookie_host(domain);
+    let host = normalize_cookie_host(host);
+    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 /// Windows-only diagnostic state for hosts whose matching real-browser
@@ -991,8 +1047,10 @@ unsafe extern "C" {
         password_data: *mut *mut c_void,
         item_ref: *mut SecKeychainItemRef,
     ) -> OSStatus;
-    fn SecKeychainItemCopyAccess(item_ref: SecKeychainItemRef, access: *mut SecAccessRef)
-        -> OSStatus;
+    fn SecKeychainItemCopyAccess(
+        item_ref: SecKeychainItemRef,
+        access: *mut SecAccessRef,
+    ) -> OSStatus;
     fn SecAccessCopyACLList(access: SecAccessRef, acl_list: *mut CFArrayRef) -> OSStatus;
     fn SecACLCopyContents(
         acl: SecACLRef,
@@ -1004,8 +1062,10 @@ unsafe extern "C" {
         path: *const i8,
         app: *mut SecTrustedApplicationRef,
     ) -> OSStatus;
-    fn SecTrustedApplicationCopyData(app_ref: SecTrustedApplicationRef, data: *mut CFDataRef)
-        -> OSStatus;
+    fn SecTrustedApplicationCopyData(
+        app_ref: SecTrustedApplicationRef,
+        data: *mut CFDataRef,
+    ) -> OSStatus;
 }
 
 #[cfg(target_os = "macos")]
@@ -1041,23 +1101,20 @@ fn safe_storage_likely_prompts_for_host_impl(host: &str) -> bool {
                     Ok(true) => {
                         debug!(
                             source = source.name,
-                            host,
-                            "owned-browser cookies: Safe Storage ACL preflight trusted"
+                            host, "owned-browser cookies: Safe Storage ACL preflight trusted"
                         );
                     }
                     Ok(false) => {
                         info!(
                             source = source.name,
-                            host,
-                            "owned-browser cookies: Safe Storage ACL preflight would prompt"
+                            host, "owned-browser cookies: Safe Storage ACL preflight would prompt"
                         );
                         return true;
                     }
                     Err(e) => {
                         info!(
                             source = source.name,
-                            host,
-                            "owned-browser cookies: Safe Storage ACL preflight unknown — {e}"
+                            host, "owned-browser cookies: Safe Storage ACL preflight unknown — {e}"
                         );
                         return true;
                     }
@@ -1066,8 +1123,7 @@ fn safe_storage_likely_prompts_for_host_impl(host: &str) -> bool {
             Ok(false) => {}
             Err(e) => debug!(
                 source = source.name,
-                host,
-                "owned-browser cookies: Safe Storage ACL preflight row skip — {e}"
+                host, "owned-browser cookies: Safe Storage ACL preflight row skip — {e}"
             ),
         }
     }
@@ -1138,14 +1194,8 @@ fn acl_trusts_current_app(acl: SecACLRef, current_app_data: &[u8]) -> Result<boo
     let mut app_list: CFArrayRef = ptr::null();
     let mut description: CFStringRef = ptr::null();
     let mut prompt_selector = 0u32;
-    let status = unsafe {
-        SecACLCopyContents(
-            acl,
-            &mut app_list,
-            &mut description,
-            &mut prompt_selector,
-        )
-    };
+    let status =
+        unsafe { SecACLCopyContents(acl, &mut app_list, &mut description, &mut prompt_selector) };
     if status != 0 {
         return Err(format!("copy acl contents: status {status}"));
     }
@@ -1379,6 +1429,45 @@ fn decrypt_v10(encrypted: &[u8], key: &[u8; 16]) -> Option<String> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    fn cookie(name: &str, domain: &str) -> Cookie {
+        Cookie {
+            name: name.to_string(),
+            value: "redacted".to_string(),
+            domain: domain.to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            expires_at: None,
+            same_site: -1,
+        }
+    }
+
+    #[test]
+    fn linkedin_requires_li_at_for_reusable_auth() {
+        let cookies = vec![
+            cookie("bcookie", ".linkedin.com"),
+            cookie("lidc", ".linkedin.com"),
+        ];
+        assert_eq!(
+            missing_required_auth_cookie_for_host("www.linkedin.com", &cookies),
+            Some(AuthCookieRequirement {
+                service_name: "LinkedIn",
+                cookie_name: "li_at",
+            })
+        );
+    }
+
+    #[test]
+    fn linkedin_auth_cookie_satisfies_subdomains() {
+        let cookies = vec![cookie("li_at", ".linkedin.com")];
+        assert!(missing_required_auth_cookie_for_host("www.linkedin.com", &cookies).is_none());
+    }
+
+    #[test]
+    fn public_sites_have_no_required_auth_cookie() {
+        assert!(missing_required_auth_cookie_for_host("example.com", &[]).is_none());
+    }
 
     #[test]
     fn host_match_includes_dot_prefix_and_parents() {

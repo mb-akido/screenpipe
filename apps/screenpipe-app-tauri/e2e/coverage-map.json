@@ -203,6 +203,26 @@
       "notes": "Synthetic chat event regression for duplicate sidebar rows."
     },
     {
+      "spec": "chat-automation-card-duplicate.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "real-ui-e2e"],
+      "features": ["chat", "chat-sidebar-dedupe"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Clicks each home automation card and asserts exactly one conversation file is created per card click, preventing duplicate sidebar rows."
+    },
+    {
+      "spec": "chat-newchat-fresh.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "real-ui-e2e"],
+      "features": ["chat", "chat-sidebar-dedupe"],
+      "criticality": "medium",
+      "confidence": "strong",
+      "ux": "synthetic",
+      "notes": "Cmd/Ctrl+N opens a fresh blank chat instead of hopping into the active non-empty chat, then reuses that blank chat on repeated presses."
+    },
+    {
       "spec": "chat-sidebar-stub-dedup.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["chat-ai"],
@@ -461,6 +481,16 @@
       "confidence": "smoke",
       "ux": "command",
       "notes": "Embedded agent browser hides safely without an attached child."
+    },
+    {
+      "spec": "owned-browser-auth-cookie-block.spec.ts",
+      "platforms": ["windows", "macos"],
+      "layers": ["real-ui-e2e", "os-integration"],
+      "features": ["owned-browser", "chat"],
+      "criticality": "high",
+      "confidence": "partial",
+      "ux": "synthetic",
+      "notes": "Emits a native missing-auth-cookie block for LinkedIn and asserts the browser sidebar shows the actionable missing-login card."
     },
     {
       "spec": "permission-recovery.spec.ts",

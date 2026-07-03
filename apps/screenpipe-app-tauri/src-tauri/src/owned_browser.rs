@@ -78,7 +78,6 @@ const READY_EVENT: &str = "owned-browser:ready";
 /// user's real browser. The sidebar answers through the
 /// `owned_browser_resolve_session_access` command.
 const SESSION_ACCESS_REQUEST_EVENT: &str = "owned-browser:session-access-request";
-#[cfg(target_os = "windows")]
 const V20_COOKIE_BLOCK_EVENT: &str = "owned-browser:v20-cookie-blocked";
 const SESSION_ACCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -139,7 +138,6 @@ struct BrowserSessionAccessRequestPayload {
     owner: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct V20CookieBlockPayload {
@@ -151,6 +149,12 @@ struct V20CookieBlockPayload {
     /// "v20" = app-bound encryption blocked decrypt; "locked" = browser running, DB inaccessible
     #[serde(default)]
     reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_cookie_name: Option<String>,
+    #[serde(default)]
+    extension_tried: bool,
     navigation_id: Option<String>,
     /// Owner of the navigation that triggered this block — see
     /// [`OwnedBrowserNavigateEvent::owner`].
@@ -350,16 +354,13 @@ impl OwnedBrowserState {
     }
 
     fn context_for_url(&self, url: &str) -> Option<NavigationContext> {
-        self.recent_navigations
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                guard
-                    .iter()
-                    .rev()
-                    .find(|ctx| ctx.requested_url == url)
-                    .cloned()
-            })
+        self.recent_navigations.lock().ok().and_then(|guard| {
+            guard
+                .iter()
+                .rev()
+                .find(|ctx| ctx.requested_url == url)
+                .cloned()
+        })
     }
 
     fn remember_committed_url_for_context(&self, url: &str, context: &NavigationContext) {
@@ -1163,10 +1164,8 @@ async fn prepare_navigation(
     owner: Option<&str>,
     reveal: bool,
 ) {
-    let context = state.remember_navigation(
-        parsed.as_str().to_string(),
-        owner.map(|s| s.to_string()),
-    );
+    let context =
+        state.remember_navigation(parsed.as_str().to_string(), owner.map(|s| s.to_string()));
     // Record the owner before emitting anything so the provisional state event
     // below — and the native page-load/title callbacks that follow — carry the
     // same tag. `owner` is the chat/session that issued this navigation; the
@@ -1621,9 +1620,7 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) -> Result<(), S
     }
 
     info!(host, "owned-browser cookies: pre-navigate inject starting");
-    let cookies = crate::owned_browser_cookies::cookies_for_host(host).await;
-    #[cfg(target_os = "windows")]
-    let mut cookies = cookies;
+    let mut cookies = crate::owned_browser_cookies::cookies_for_host(host).await;
     if cookies.is_empty() {
         #[cfg(target_os = "windows")]
         {
@@ -1662,6 +1659,9 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) -> Result<(), S
                         v20_count: block.v20_count,
                         sources: block.sources,
                         reason: "v20".to_string(),
+                        service_name: None,
+                        required_cookie_name: None,
+                        extension_tried: true,
                         navigation_id: context.as_ref().map(|ctx| ctx.navigation_id.clone()),
                         owner: context.and_then(|ctx| ctx.owner),
                     };
@@ -1713,6 +1713,77 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) -> Result<(), S
             return Ok(());
         }
     }
+    if let Some(requirement) =
+        crate::owned_browser_cookies::missing_required_auth_cookie_for_host(host, &cookies)
+    {
+        let mut extension_tried = false;
+        if is_extension_connected(app).await {
+            extension_tried = true;
+            match extension_cookies_for_host(app, host).await {
+                Ok(extension_cookies) if !extension_cookies.is_empty() => {
+                    if crate::owned_browser_cookies::missing_required_auth_cookie_for_host(
+                        host,
+                        &extension_cookies,
+                    )
+                    .is_none()
+                    {
+                        info!(
+                            host,
+                            count = extension_cookies.len(),
+                            service = requirement.service_name,
+                            "owned-browser cookies: using extension fallback for required auth cookie"
+                        );
+                        cookies = extension_cookies;
+                    } else {
+                        info!(
+                            host,
+                            count = extension_cookies.len(),
+                            service = requirement.service_name,
+                            cookie = requirement.cookie_name,
+                            "owned-browser cookies: extension fallback also lacks required auth cookie"
+                        );
+                    }
+                }
+                Ok(_) => {
+                    info!(
+                        host,
+                        service = requirement.service_name,
+                        "owned-browser cookies: extension fallback returned no cookies for required auth cookie"
+                    );
+                }
+                Err(e) => {
+                    info!(
+                        host,
+                        service = requirement.service_name,
+                        "owned-browser cookies: extension fallback unavailable for required auth cookie — {e}"
+                    );
+                }
+            }
+        }
+
+        if let Some(requirement) =
+            crate::owned_browser_cookies::missing_required_auth_cookie_for_host(host, &cookies)
+        {
+            let context = browser_state().context_for_url(url.as_str());
+            let payload = V20CookieBlockPayload {
+                url: url.as_str().to_string(),
+                host: host.to_string(),
+                rows: cookies.len(),
+                v20_count: 0,
+                sources: Vec::new(),
+                reason: "missing_auth_cookie".to_string(),
+                service_name: Some(requirement.service_name.to_string()),
+                required_cookie_name: Some(requirement.cookie_name.to_string()),
+                extension_tried,
+                navigation_id: context.as_ref().map(|ctx| ctx.navigation_id.clone()),
+                owner: context.and_then(|ctx| ctx.owner),
+            };
+            if let Err(e) = app.emit(V20_COOKIE_BLOCK_EVENT, payload) {
+                warn!("owned-browser cookies: failed to emit missing auth cookie block event: {e}");
+            }
+            return Ok(());
+        }
+    }
     info!(
         host,
         count = cookies.len(),
@@ -1743,7 +1814,6 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) -> Result<(), S
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExtensionCookie {
@@ -1757,13 +1827,11 @@ struct ExtensionCookie {
     same_site: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
 #[derive(Debug, serde::Deserialize)]
 struct ExtensionCookieResult {
     cookies: Vec<ExtensionCookie>,
 }
 
-#[cfg(target_os = "windows")]
 #[derive(Debug, serde::Deserialize)]
 struct ExtensionCookieResponse {
     success: bool,
@@ -1771,7 +1839,6 @@ struct ExtensionCookieResponse {
     error: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
 async fn is_extension_connected(app: &AppHandle) -> bool {
     let api = crate::recording::local_api_context_from_app(app);
     let client = reqwest::Client::new();
@@ -1788,7 +1855,6 @@ async fn is_extension_connected(app: &AppHandle) -> bool {
     }
 }
 
-#[cfg(target_os = "windows")]
 async fn extension_cookies_for_host(
     app: &AppHandle,
     host: &str,
@@ -1884,6 +1950,9 @@ async fn browser_session_decision_for_url(
                 v20_count: 0,
                 sources: block.sources,
                 reason: "locked".to_string(),
+                service_name: None,
+                required_cookie_name: None,
+                extension_tried: false,
                 navigation_id: context.as_ref().map(|ctx| ctx.navigation_id.clone()),
                 owner: context.and_then(|ctx| ctx.owner),
             };

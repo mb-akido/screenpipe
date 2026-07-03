@@ -124,6 +124,12 @@ interface V20CookieBlockEvent {
   v20_count?: number;
   sources?: string[];
   reason?: string;
+  serviceName?: string | null;
+  service_name?: string | null;
+  requiredCookieName?: string | null;
+  required_cookie_name?: string | null;
+  extensionTried?: boolean;
+  extension_tried?: boolean;
   navigationId?: string | null;
   owner?: string | null;
 }
@@ -135,6 +141,9 @@ interface ActiveV20CookieBlock {
   v20Count: number;
   sources: string[];
   reason: string;
+  serviceName: string | null;
+  requiredCookieName: string | null;
+  extensionTried: boolean;
   navigationId: string;
   owner: string | null;
 }
@@ -527,6 +536,10 @@ export function BrowserSidebar({
       v20Count: payload.v20Count ?? payload.v20_count ?? 0,
       sources: payload.sources ?? [],
       reason: payload.reason ?? "v20",
+      serviceName: payload.serviceName ?? payload.service_name ?? null,
+      requiredCookieName:
+        payload.requiredCookieName ?? payload.required_cookie_name ?? null,
+      extensionTried: payload.extensionTried ?? payload.extension_tried ?? false,
       navigationId: payload.navigationId!,
       owner: payload.owner ?? null,
     };
@@ -559,6 +572,13 @@ export function BrowserSidebar({
   useEffect(() => {
     if (!v20CookieBlock) {
       setExtensionConnected(false);
+      return;
+    }
+    if (
+      v20CookieBlock.reason === "missing_auth_cookie" &&
+      v20CookieBlock.extensionTried
+    ) {
+      setExtensionConnected(true);
       return;
     }
     const retryUrl = v20CookieBlock.url;
@@ -1167,21 +1187,44 @@ export function BrowserSidebar({
           )}
               {v20CookieBlock && (
             <div className="absolute inset-0 z-40 flex items-center justify-center bg-background p-4">
-                <div className="w-full max-w-sm border border-border bg-card p-4 shadow-sm">
+                <div
+                  data-testid="owned-browser-session-block"
+                  className="w-full max-w-sm border border-border bg-card p-4 shadow-sm"
+                >
                   <div className="mb-3 flex items-start gap-3">
                     <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center border border-border bg-muted text-foreground">
                       <KeyRound className="h-4 w-4" />
                     </div>
                     <div className="min-w-0">
                       <div className="text-sm font-medium text-foreground">
-                        Browser login is protected
+                        {v20CookieBlock.reason === "missing_auth_cookie"
+                          ? "Browser login is missing"
+                          : "Browser login is protected"}
                       </div>
                       <div className="mt-1 break-all text-xs text-muted-foreground">
                         {v20CookieBlock.host}
                       </div>
                     </div>
                   </div>
-                  {v20CookieBlock.reason === "locked" ? (
+                  {v20CookieBlock.reason === "missing_auth_cookie" ? (
+                    <>
+                      <p className="text-xs leading-5 text-muted-foreground">
+                        Screenpipe found browser cookies for{" "}
+                        {v20CookieBlock.serviceName ?? "this site"}, but not the
+                        login cookie needed to open it signed in.
+                      </p>
+                      <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                        Connect the Screenpipe Browser Bridge extension, or sign
+                        in once inside the Screenpipe browser.
+                      </p>
+                      {v20CookieBlock.extensionTried && (
+                        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                          The extension is connected, but it did not return an
+                          active login for this site.
+                        </p>
+                      )}
+                    </>
+                  ) : v20CookieBlock.reason === "locked" ? (
                     <>
                       <p className="text-xs leading-5 text-muted-foreground">
                         {v20CookieBlock.sources.length > 0
@@ -1219,10 +1262,15 @@ export function BrowserSidebar({
                     </>
                   )}
                   <div className="mt-4 flex flex-col gap-2">
-                    {extensionConnected ? (
+                    {extensionConnected && !v20CookieBlock.extensionTried ? (
                       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                         <Loader2 className="h-3 w-3 animate-spin" />
                         Extension connected — retrying…
+                      </div>
+                    ) : v20CookieBlock.extensionTried ? (
+                      <div className="text-xs leading-5 text-muted-foreground">
+                        Sign in to this site in your browser or continue without
+                        signing in here.
                       </div>
                     ) : (
                       <Button
