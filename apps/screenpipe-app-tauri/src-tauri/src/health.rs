@@ -591,9 +591,9 @@ fn respawn_engine_if_crashed(
             Err(e) => {
                 warn!("engine auto-respawn failed: {}", e);
                 // Repeated DB-init failures mean a poisoned WAL-index pinned
-                // by a leaked connection — unrecoverable in-process. Escalate
-                // to a (rate-limited) app self-relaunch instead of looping a
-                // doomed respawn every 5 minutes forever (2026-07-02).
+                // by a leaked connection — unrecoverable in-process. Surface
+                // manual recovery instead of looping a doomed respawn every 5
+                // minutes forever (2026-07-02).
                 crate::db_relaunch::note_respawn_failure(&app_for_respawn, &e).await;
             }
         }

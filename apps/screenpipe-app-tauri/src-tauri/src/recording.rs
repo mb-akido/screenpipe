@@ -221,18 +221,14 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
         error!(
             "db wedge auto-recovery: {} restarts within {:?} did not clear the write wedge — \
              in-process restarts can't fix this (poisoned WAL-index pinned by a leaked \
-             connection, or on-disk damage). Escalating to app self-relaunch.",
+             connection, or on-disk damage). Surfacing manual recovery.",
             DB_WEDGE_MAX_RESTARTS, DB_WEDGE_BREAKER_WINDOW
         );
         if notify {
-            // In-process restarts are proven futile for this episode — the one
-            // thing that reliably clears process-pinned SQLite state is a full
-            // app relaunch (what users had to do by hand on 2026-07-02).
-            // Rate-limited; when the relaunch budget is spent it falls back to
-            // the `needs_recovery` notification. Deduped to once per episode
-            // by the breaker.
-            crate::db_relaunch::escalate_relaunch(
-                &app,
+            // In-process restarts are proven futile for this episode. Do not
+            // surprise-relaunch the app on broad DB-shaped errors; surface a
+            // user-visible recovery state instead.
+            crate::db_relaunch::surface_manual_recovery(
                 "db wedge persisted across in-process engine restarts",
             )
             .await;
@@ -271,7 +267,7 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
         let _ = screenpipe_events::send_event(evt.event_name(), evt);
         // A DB-init failure right after a full pool close means the WAL-index
         // is pinned by something outside our teardown — count it toward the
-        // app self-relaunch threshold rather than waiting for the health
+        // manual recovery threshold rather than waiting for the health
         // watchdog to grind through more doomed respawns.
         crate::db_relaunch::note_respawn_failure(&app, &e).await;
     }

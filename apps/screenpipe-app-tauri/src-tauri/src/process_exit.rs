@@ -30,8 +30,7 @@ use tracing::{info, warn};
 pub(crate) fn is_orderly_shutdown_panic(payload: &str) -> bool {
     payload.contains("Tokio 1.x context was found, but it is being shutdown")
         || payload.contains("cannot access a Thread Local Storage value")
-        || payload.contains("thread local")
-            && payload.contains("destroyed")
+        || payload.contains("thread local") && payload.contains("destroyed")
         || payload.contains("use of std::thread::current() is not possible")
 }
 
@@ -212,7 +211,8 @@ pub fn request_app_quit(app: AppHandle) {
             run_pre_exit_teardown(&app).await;
             Ok(())
         })
-        .await {
+        .await
+        {
             TeardownOutcome::Completed => {}
             TeardownOutcome::Failed(err) => warn!("Quit teardown error: {err}"),
             TeardownOutcome::TimedOut => warn!(
