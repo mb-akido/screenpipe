@@ -1218,6 +1218,11 @@ async fn main() {
             // sidecar inherits this env).
             std::env::set_var("SCREENPIPE_DATA_DIR", &data_dir);
 
+            // Enterprise builds can identify org/device health in Sentry and
+            // PostHog without sending the raw license key. No-op on consumer
+            // builds; explicit MDM/support env vars still win when provided.
+            enterprise_sync::configure_telemetry_context(&app_handle);
+
             if data_dir_fell_back {
                 let app_handle_fb = app_handle.clone();
                 tauri::async_runtime::spawn(async move {

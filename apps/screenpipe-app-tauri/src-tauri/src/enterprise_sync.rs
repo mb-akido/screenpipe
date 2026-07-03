@@ -30,7 +30,10 @@ mod imp {
         SnapshotRow, UiEventRow,
     };
     use serde::Deserialize;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     use std::sync::Arc;
+    use tauri::Manager;
     use tracing::{info, warn};
 
     // ─── Local API client over the running screenpipe HTTP server ──────
@@ -484,6 +487,80 @@ mod imp {
 
     // ─── Spawn ─────────────────────────────────────────────────────────
 
+    fn settings_device_id(app: &tauri::AppHandle) -> Option<String> {
+        crate::store::SettingsStore::get(app)
+            .ok()
+            .flatten()
+            .map(|s| s.device_id)
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    fn license_key_from_env_or_config() -> Option<String> {
+        std::env::var("SCREENPIPE_ENTERPRISE_LICENSE_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(crate::commands::get_enterprise_license_key)
+    }
+
+    fn enterprise_license_hash(license_key: &str) -> Option<String> {
+        let trimmed = license_key.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let digest = Sha256::digest(trimmed.as_bytes());
+        let mut suffix = String::with_capacity(16);
+        for byte in digest.iter().take(8) {
+            let _ = write!(&mut suffix, "{:02x}", byte);
+        }
+        Some(format!("ent_{suffix}"))
+    }
+
+    fn set_env_default(name: &str, value: &str) {
+        let has_value = std::env::var(name)
+            .ok()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_value {
+            std::env::set_var(name, value);
+        }
+    }
+
+    /// Populate non-secret enterprise observability tags before Sentry and
+    /// PostHog start. The raw license key stays local; analytics only receive
+    /// a stable hash plus the existing enterprise device id.
+    pub fn configure_telemetry_context(app: &tauri::AppHandle) {
+        let Some(license_key) = license_key_from_env_or_config() else {
+            return;
+        };
+        let Some(org_key) = enterprise_license_hash(&license_key) else {
+            return;
+        };
+
+        let app_data_dir = app.path().app_data_dir().ok();
+        let settings_device_id = settings_device_id(app);
+        let device_id = app_data_dir
+            .as_deref()
+            .map(|dir| resolve_device_id(settings_device_id.as_deref(), dir))
+            .or(settings_device_id);
+
+        set_env_default("SCREENPIPE_ENTERPRISE_LICENSE_HASH", &org_key);
+        set_env_default("SCREENPIPE_CUSTOMER_ID", &org_key);
+        set_env_default("SCREENPIPE_ORG_ID", &org_key);
+
+        if let Some(device_id) = device_id.as_deref() {
+            set_env_default("SCREENPIPE_ENTERPRISE_DEVICE_ID", device_id);
+            set_env_default("SCREENPIPE_DEPLOYMENT_ID", device_id);
+            set_env_default("SCREENPIPE_SUPPORT_ID", &format!("{org_key}:{device_id}"));
+        }
+
+        info!(
+            "enterprise telemetry context configured org={} device={}",
+            org_key,
+            device_id.as_deref().unwrap_or("unknown")
+        );
+    }
+
     /// Spawn the enterprise telemetry sync task. No-op (returns None) when
     /// required env (`SCREENPIPE_ENTERPRISE_LICENSE_KEY`) is missing — this is
     /// the path for a developer running an enterprise build locally without
@@ -494,11 +571,7 @@ mod imp {
         let app_data_dir = app.path().app_data_dir().ok()?;
         // Use the same device id the heartbeat reports under (settings `deviceId`)
         // so a machine is a single enterprise_devices row, not two.
-        let settings_device_id = crate::store::SettingsStore::get(app)
-            .ok()
-            .flatten()
-            .map(|s| s.device_id)
-            .filter(|s| !s.trim().is_empty());
+        let settings_device_id = settings_device_id(app);
         let device_id = resolve_device_id(settings_device_id.as_deref(), &app_data_dir);
         let device_label = hostname::get()
             .ok()
@@ -589,7 +662,10 @@ mod imp {
     /// (version/recording-status on the heartbeat row, uploads on the sync row),
     /// which also double-counted devices toward the seat total. Returns None
     /// when no usable id exists yet (caller mints a fresh one).
-    fn choose_device_id(settings_device_id: Option<&str>, legacy_file_id: Option<&str>) -> Option<String> {
+    fn choose_device_id(
+        settings_device_id: Option<&str>,
+        legacy_file_id: Option<&str>,
+    ) -> Option<String> {
         for cand in [settings_device_id, legacy_file_id] {
             if let Some(c) = cand {
                 let c = c.trim();
@@ -606,7 +682,10 @@ mod imp {
     /// `dev-<uuid>` persisted in app data dir, then a fresh `dev-<uuid>`. We
     /// deliberately don't read the OS hardware UUID — that would let an admin
     /// correlate across orgs, a privacy regression vs a local random uuid.
-    fn resolve_device_id(settings_device_id: Option<&str>, app_data_dir: &std::path::Path) -> String {
+    fn resolve_device_id(
+        settings_device_id: Option<&str>,
+        app_data_dir: &std::path::Path,
+    ) -> String {
         let path = app_data_dir.join("enterprise_device_id");
         let legacy = std::fs::read_to_string(&path).ok();
         if let Some(id) = choose_device_id(settings_device_id, legacy.as_deref()) {
@@ -626,7 +705,7 @@ mod imp {
 
     #[cfg(test)]
     mod device_id_tests {
-        use super::choose_device_id;
+        use super::{choose_device_id, enterprise_license_hash};
 
         #[test]
         fn settings_id_wins_so_sync_matches_heartbeat() {
@@ -640,20 +719,40 @@ mod imp {
 
         #[test]
         fn falls_back_to_legacy_then_none() {
-            assert_eq!(choose_device_id(None, Some("dev-legacy")).as_deref(), Some("dev-legacy"));
+            assert_eq!(
+                choose_device_id(None, Some("dev-legacy")).as_deref(),
+                Some("dev-legacy")
+            );
             assert_eq!(choose_device_id(None, None), None);
         }
 
         #[test]
         fn blank_candidates_are_skipped() {
-            assert_eq!(choose_device_id(Some("   "), Some("dev-legacy")).as_deref(), Some("dev-legacy"));
+            assert_eq!(
+                choose_device_id(Some("   "), Some("dev-legacy")).as_deref(),
+                Some("dev-legacy")
+            );
             assert_eq!(choose_device_id(Some(""), None), None);
+        }
+
+        #[test]
+        fn enterprise_license_hash_is_stable_and_non_secret() {
+            let first = enterprise_license_hash(" sek_live_acme ").unwrap();
+            let second = enterprise_license_hash("sek_live_acme").unwrap();
+
+            assert_eq!(first, second);
+            assert!(first.starts_with("ent_"));
+            assert!(!first.contains("sek_live_acme"));
+            assert_eq!(enterprise_license_hash("   "), None);
         }
     }
 }
 
 #[cfg(feature = "enterprise-build")]
-pub use imp::spawn;
+pub use imp::{configure_telemetry_context, spawn};
+
+#[cfg(not(feature = "enterprise-build"))]
+pub fn configure_telemetry_context(_app: &tauri::AppHandle) {}
 
 /// No-op stub for non-enterprise builds. Returns None so callers can ignore.
 #[cfg(not(feature = "enterprise-build"))]
