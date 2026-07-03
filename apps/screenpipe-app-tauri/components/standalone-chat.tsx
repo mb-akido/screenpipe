@@ -5,7 +5,6 @@
 
 import * as React from "react";
 import { useState, useRef, useEffect, useCallback } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
 import { Settings2, PanelRightClose, PanelRightOpen } from "lucide-react";
@@ -13,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { BrowserSidebar } from "@/components/browser-sidebar";
 import { toast } from "@/components/ui/use-toast";
-import type { AIPreset, JsonValue } from "@/lib/utils/tauri";
+import { AIPreset } from "@/lib/utils/tauri";
 // OpenAI SDK no longer used directly — all providers route through Pi agent
 import posthog from "posthog-js";
 import { commands } from "@/lib/utils/tauri";
@@ -36,7 +35,6 @@ import {
   buildInvalidatedAuthTokenMessage,
 } from "@/lib/chat/auth-errors";
 import { usePipes } from "@/lib/hooks/use-pipes";
-import { connectInlineConnection, type InlineConnectStatus } from "@/lib/connections/inline-connect";
 import {
   computeChatCitationPlan,
 } from "@/lib/source-citations";
@@ -79,8 +77,7 @@ import {
   useChatWindowSyncEvents,
   usePipeGenerationCompletion,
 } from "@/components/chat/standalone/hooks/use-chat-window-events";
-import type { ContentBlock, Message } from "@/lib/chat/types";
-import { AGENT_TOPICS, type AgentEventEnvelope } from "@/lib/events/types";
+import type { Message } from "@/lib/chat/types";
 
 // Session ID is per-conversation — set on mount (new conv) and updated on load/new.
 // Stored as a ref so event listeners always see the current value without stale closures.
@@ -139,7 +136,6 @@ export function StandaloneChat({
     try { return localStorage.getItem("screenpipe_connect_banner_dismissed") !== "true"; } catch { return true; }
   });
   const {
-    allConnectionItems,
     connectionAwareSuggestions,
     connectionSetupSuggestions,
     connections,
@@ -200,8 +196,6 @@ export function StandaloneChat({
   // runs with `[]` deps) can read the latest values instead of stale closures.
   const isLoadingRef = useRef(false);
   const messagesRef = useRef<Message[]>([]);
-  const connectionCardCleanupTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
-  const inlineConnectAbortRef = useRef<AbortController | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -788,8 +782,6 @@ export function StandaloneChat({
     isSettingsLoaded,
     shouldFreezePresetSelection: Boolean(activePipeExecution),
     userToken: settings.user?.token,
-    appItems,
-    allConnectionItems,
     connections,
     piStarting,
     piInfo,
@@ -906,189 +898,6 @@ export function StandaloneChat({
     takeQueuedDisplayById,
     turnIntentLedgerRef,
   });
-
-  const openInlineConnectionCard = useCallback((connectionId: string) => {
-    if (connectionId === "connections") {
-      openConnectionSetup(connectionId);
-      return;
-    }
-
-    const connection = allConnectionItems.find((item) => item.id === connectionId);
-    const connectionName = connection?.name || connectionId;
-    const message: Message = {
-      id: `connection-action-${connectionId}-${Date.now()}`,
-      role: "assistant",
-      content: "",
-      timestamp: Date.now(),
-      contentBlocks: [
-        {
-          type: "connection_action",
-          connectionId,
-          connectionName,
-          icon: connection?.icon || connectionId,
-          description: connection?.description,
-          pendingActionLabel: `continue with ${connectionName}`,
-          pendingActionPrompt: `${connectionName} is connected now. Continue the action we were discussing, but ask me for confirmation before writing to ${connectionName}.`,
-        },
-      ],
-    };
-
-    setMessages((prev) => {
-      const alreadyVisible = prev.some((row) =>
-        row.contentBlocks?.some(
-          (block) => block.type === "connection_action" && block.connectionId === connectionId,
-        ),
-      );
-      return alreadyVisible ? prev : [...prev, message];
-    });
-  }, [allConnectionItems, openConnectionSetup]);
-
-  const answerPiExtensionUiRequest = useCallback(async (
-    requestId: string | undefined,
-    response: JsonValue,
-  ) => {
-    if (!requestId) return;
-    const result = await commands.piExtensionUiResponse(
-      piSessionIdRef.current,
-      requestId,
-      response,
-    );
-    if (result.status === "error") {
-      toast({
-        title: "failed to answer connection request",
-        description: result.error,
-        variant: "destructive",
-      });
-    }
-  }, [piSessionIdRef]);
-
-  const removeConnectionActionByRequestId = useCallback((requestId: string | undefined) => {
-    if (!requestId) return;
-    setMessages((prev) =>
-      prev.flatMap((message) => {
-        const blocks = message.contentBlocks;
-        if (!blocks?.some((block) => block.type === "connection_action" && block.extensionRequestId === requestId)) {
-          return [message];
-        }
-        const nextBlocks = blocks.filter(
-          (block) => block.type !== "connection_action" || block.extensionRequestId !== requestId,
-        );
-        if (!message.content.trim() && nextBlocks.length === 0) return [];
-        return [{ ...message, contentBlocks: nextBlocks }];
-      }),
-    );
-  }, [setMessages]);
-
-  useEffect(() => {
-    return () => {
-      inlineConnectAbortRef.current?.abort();
-      inlineConnectAbortRef.current = null;
-      for (const timer of connectionCardCleanupTimersRef.current) clearTimeout(timer);
-      connectionCardCleanupTimersRef.current = [];
-    };
-  }, []);
-
-  const connectFromInlineCard = useCallback(async (
-    connectionId: string,
-    block?: Extract<ContentBlock, { type: "connection_action" }>,
-  ): Promise<InlineConnectStatus> => {
-    const connection = allConnectionItems.find((item) => item.id === connectionId);
-    if (!connection) {
-      openConnectionSetup(connectionId);
-      await answerPiExtensionUiRequest(block?.extensionRequestId, { cancelled: true });
-      return { status: "unsupported", reason: "opening setup for this connection" };
-    }
-
-    inlineConnectAbortRef.current?.abort();
-    const inlineConnectAbortController = new AbortController();
-    inlineConnectAbortRef.current = inlineConnectAbortController;
-    const result = await connectInlineConnection(connection, inlineConnectAbortController.signal)
-      .finally(() => {
-        if (inlineConnectAbortRef.current === inlineConnectAbortController) {
-          inlineConnectAbortRef.current = null;
-        }
-      });
-    if (result.status === "connected") {
-      await refreshConnectionState();
-      await answerPiExtensionUiRequest(block?.extensionRequestId, { confirmed: true });
-      if (block?.extensionRequestId) {
-        const timer = setTimeout(() => {
-          removeConnectionActionByRequestId(block.extensionRequestId);
-        }, 1400);
-        connectionCardCleanupTimersRef.current.push(timer);
-      }
-      return result;
-    }
-    if (result.status === "unsupported") {
-      openConnectionSetup(connectionId);
-      await answerPiExtensionUiRequest(block?.extensionRequestId, { cancelled: true });
-      return { status: "unsupported", reason: `${result.reason}; opened setup` };
-    }
-    await answerPiExtensionUiRequest(block?.extensionRequestId, { cancelled: true });
-    return result;
-  }, [allConnectionItems, answerPiExtensionUiRequest, openConnectionSetup, refreshConnectionState, removeConnectionActionByRequestId]);
-
-  const declineConnectionAction = useCallback((
-    block: Extract<ContentBlock, { type: "connection_action" }>,
-  ) => {
-    void answerPiExtensionUiRequest(block.extensionRequestId, { cancelled: true });
-  }, [answerPiExtensionUiRequest]);
-
-  useEffect(() => {
-    let disposed = false;
-    const unlisten = listen<AgentEventEnvelope>(AGENT_TOPICS.event, (event) => {
-      if (disposed) return;
-      const payload = event.payload;
-      if (payload.source !== "pi") return;
-      if (payload.sessionId !== piSessionIdRef.current) return;
-      const inner = payload.event;
-      if (inner.type !== "extension_ui_request") return;
-      if (inner.method !== "confirm") return;
-      const title = typeof inner.title === "string" ? inner.title : "";
-      if (!title.startsWith("screenpipe:connect:")) return;
-
-      const [, , connectionId, ...nameParts] = title.split(":");
-      if (!connectionId) return;
-      const connection = allConnectionItems.find((item) => item.id === connectionId);
-      const connectionName = nameParts.join(":") || connection?.name || connectionId;
-      const requestId = typeof inner.id === "string" ? inner.id : "";
-      if (!requestId) return;
-      const requestMessage = (inner as Record<string, unknown>).message;
-      const messageText = typeof requestMessage === "string" ? requestMessage : undefined;
-      const message: Message = {
-        id: `connection-action-${requestId}`,
-        role: "assistant",
-        content: "",
-        timestamp: Date.now(),
-        contentBlocks: [
-          {
-            type: "connection_action",
-            connectionId,
-            connectionName,
-            icon: connection?.icon || connectionId,
-            description: connection?.description,
-            extensionRequestId: requestId,
-            extensionReason: messageText,
-          },
-        ],
-      };
-
-      setMessages((prev) => {
-        const alreadyVisible = prev.some((row) =>
-          row.contentBlocks?.some(
-            (block) =>
-              block.type === "connection_action" &&
-              block.extensionRequestId === requestId,
-          ),
-        );
-        return alreadyVisible ? prev : [...prev, message];
-      });
-    });
-    return () => {
-      disposed = true;
-      void unlisten.then((release) => release());
-    };
-  }, [allConnectionItems, piSessionIdRef, setMessages]);
 
   usePiForegroundEvents({
     activePreset,
@@ -1226,10 +1035,6 @@ export function StandaloneChat({
     sendMessage,
     openFilePreview,
     branchConversation,
-    connectionItems: allConnectionItems,
-    onOpenConnectionSetup: openConnectionSetup,
-    onConnectConnectionAction: connectFromInlineCard,
-    onDeclineConnectionAction: declineConnectionAction,
     scheduleMessage: (message, displayLabel) => {
       piMessageIdRef.current = null;
       sendMessage(message, displayLabel);
@@ -1341,7 +1146,7 @@ export function StandaloneChat({
         }}
         summaryCardsProps={{
           onSendMessage: sendMessage,
-          onOpenConnection: openInlineConnectionCard,
+          onOpenConnection: openConnectionSetup,
           connectionSetupSuggestions,
           autoSuggestions: connectionAwareSuggestions,
           suggestionsRefreshing,
