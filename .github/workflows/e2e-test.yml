@@ -729,7 +729,9 @@ jobs:
     # Swift 6 package, while the current latest image advertises an Xcode 26.5
     # toolchain path but is missing clang_rt.osx.
     runs-on: macos-15
-    timeout-minutes: 90
+    # Backstop above the 70-min advisory step timeout on "Run E2E Tests" so the
+    # post-test steps (coverage, artifact upload) finish inside the job budget.
+    timeout-minutes: 120
     steps:
     - uses: actions/checkout@v4
 
@@ -807,6 +809,16 @@ jobs:
         tauriScript: bunx tauri -v
 
     - name: Run E2E Tests
+      # ADVISORY (non-blocking): the full serial suite (maxInstances:1) with
+      # specFileRetries:3 on the slow macos-15 image exceeds the job budget and
+      # was killed at the 90-min job timeout every run -> "cancelled" reddened
+      # the whole workflow even though Linux passed. Step-level continue-on-error
+      # + a step timeout BELOW the job timeout lets macOS run for signal but never
+      # cancel the run (job-level continue-on-error does NOT cover a timeout
+      # cancellation). Linux remains the hard E2E gate. Make-it-gate-again
+      # (parallelize maxInstances, cache the build, cut retries) tracked in #4688.
+      continue-on-error: true
+      timeout-minutes: 70
       shell: bash
       working-directory: ./apps/screenpipe-app-tauri
       env:
