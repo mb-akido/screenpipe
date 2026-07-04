@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      codex_agentic_ui:
+        description: "Run the temporary Codex agentic UI smoke job instead of the normal Windows integration test."
+        required: false
+        type: boolean
+        default: false
+      codex_base_ref:
+        description: "Base ref for Codex agentic UI diff planning."
+        required: false
+        type: string
+        default: origin/main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha || github.ref }}
@@ -17,7 +28,58 @@ env:
   GIT_LFS_SKIP_SMUDGE: 1
 
 jobs:
+  codex-agentic-ui-smoke:
+    name: Codex Agentic UI Smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.codex_agentic_ui }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: 1.3.10
+
+    - name: Generate agentic UI plan
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path .agentic-ui | Out-Null
+        bun apps/screenpipe-app-tauri/e2e/agentic/cli.ts plan `
+          --base-ref "${{ inputs.codex_base_ref || 'origin/main' }}" `
+          --head-ref HEAD `
+          --out ".agentic-ui/plan.json"
+
+    - name: Run Codex-driven Windows UI check
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+        prompt-file: .github/codex/prompts/agentic-ui-test.md
+        codex-args: '["--output-schema",".github/codex/schemas/agentic-ui-verdict.schema.json","--ephemeral"]'
+        sandbox: danger-full-access
+        safety-strategy: unsafe
+        output-file: .agentic-ui/verdict.json
+
+    - name: Validate Codex verdict
+      shell: pwsh
+      run: |
+        bun apps/screenpipe-app-tauri/e2e/agentic/cli.ts validate `
+          --verdict ".agentic-ui/verdict.json"
+
+    - name: Upload agentic UI artifacts
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: codex-agentic-ui-smoke
+        path: .agentic-ui
+        if-no-files-found: ignore
+
   test-windows:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.codex_agentic_ui) }}
     runs-on: windows-2022
     steps:
     - uses: actions/checkout@v4
