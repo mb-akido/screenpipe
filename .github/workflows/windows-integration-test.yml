@@ -93,6 +93,7 @@ jobs:
         name: codex-agentic-ui-smoke
         path: .agentic-ui
         if-no-files-found: ignore
+        include-hidden-files: true
 
   test-windows:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.codex_agentic_ui) }}

@@ -810,6 +810,10 @@ function generateReport(
   ].join("\n");
 }
 
+function normalizeReportForCheck(value: string): string {
+  return value.replace(/\r\n/g, "\n");
+}
+
 function main(): void {
   const args = parseArgs(process.argv.slice(2));
   const manifest = readJson<CoverageManifest>(manifestPath);
@@ -831,8 +835,8 @@ function main(): void {
     if (!existsSync(args.outPath)) {
       throw new Error(`Coverage report is missing: ${args.outPath}`);
     }
-    const current = readFileSync(args.outPath, "utf8");
-    if (current !== report) {
+    const current = normalizeReportForCheck(readFileSync(args.outPath, "utf8"));
+    if (current !== normalizeReportForCheck(report)) {
       throw new Error(
         `Coverage report is stale. Run: bun e2e/scripts/generate-coverage-report.ts`,
       );

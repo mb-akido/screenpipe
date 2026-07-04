@@ -66,6 +66,7 @@ jobs:
           name: codex-agentic-ui-planner
           path: .agentic-ui
           if-no-files-found: ignore
+          include-hidden-files: true
 
   windows-agentic-ui:
     name: Windows Codex agentic UI
@@ -135,3 +136,4 @@ jobs:
           name: codex-agentic-ui-windows
           path: .agentic-ui
           if-no-files-found: ignore
+          include-hidden-files: true
