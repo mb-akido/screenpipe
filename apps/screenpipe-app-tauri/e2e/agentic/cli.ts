@@ -60,6 +60,10 @@ type AgenticVerdict = {
 };
 
 const SPEC_ROOT = "apps/screenpipe-app-tauri/e2e/specs";
+const WINDOWS_CI_SAFE_SPECS = [
+  "windows-system-integration.spec.ts",
+  "windows-user-journey.spec.ts",
+];
 
 const RULES = [
   {
@@ -259,8 +263,19 @@ function readCoverageDigest(path: string): string[] {
   return interesting.slice(0, 12);
 }
 
+function windowsSafeSpecs(scenarios: AgenticPlan["scenarios"]): string[] {
+  const selected = unique(scenarios.flatMap((scenario) => scenario.specs));
+  const safeSelected = selected.filter((spec) =>
+    WINDOWS_CI_SAFE_SPECS.includes(spec),
+  );
+
+  return safeSelected.length > 0
+    ? safeSelected
+    : existingSpecs(WINDOWS_CI_SAFE_SPECS);
+}
+
 function buildCommands(scenarios: AgenticPlan["scenarios"]): CommandPlan[] {
-  const specs = unique(scenarios.flatMap((scenario) => scenario.specs));
+  const specs = windowsSafeSpecs(scenarios);
   const specArgs = specs.map((spec) => `--spec e2e/specs/${spec}`).join(" ");
 
   return [
@@ -274,7 +289,8 @@ function buildCommands(scenarios: AgenticPlan["scenarios"]): CommandPlan[] {
       id: "windows-selected-e2e",
       os: "windows",
       command: `cd apps/screenpipe-app-tauri && bun run test:e2e ${specArgs}`.trim(),
-      reason: "Runs the Windows-first real UI specs selected from the diff.",
+      reason:
+        "Runs the Windows CI-safe real UI specs selected from the diff; wdio.conf.ts documents that generic cross-platform window specs can hang on hosted Windows.",
     },
   ];
 }
@@ -314,7 +330,8 @@ function plan(argv: string[]): void {
     coverage_digest: readCoverageDigest(coverage),
     notes: [
       "Local smoke mode validates planner, prompt, schema, and workflow wiring.",
-      "The real Codex-controlled app run belongs on windows-latest with safety-strategy=unsafe.",
+      "The real Codex-controlled app run belongs on windows-2022 with safety-strategy=unsafe.",
+      "The Windows command is intentionally narrowed to the Windows-safe specs from wdio.conf.ts; scenario specs remain useful context but should not all be appended on hosted Windows.",
       "Hosted Windows runners may still skip hardware-dependent capture assertions; collect artifacts and Codex notes for review.",
     ],
   };

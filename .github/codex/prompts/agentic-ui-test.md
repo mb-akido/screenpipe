@@ -6,7 +6,8 @@ Rules:
 
 - Do not commit, push, publish releases, or mutate unrelated files.
 - Prefer the existing Tauri/WebDriver E2E suite under `apps/screenpipe-app-tauri/e2e`.
-- Use the plan's recommended commands as a starting point, then adjust only if the diff clearly calls for a narrower or broader check.
+- Use the plan's recommended commands as the primary command list. Do not append extra cross-platform window specs on hosted Windows unless the diff directly changes that spec or its runner plumbing.
+- The planner intentionally narrows Windows E2E to the hosted-Windows-safe specs documented in `apps/screenpipe-app-tauri/e2e/wdio.conf.ts`; respect that guardrail and record skipped scenario specs as skipped evidence instead of broadening the command.
 - If the app cannot be launched on the hosted runner, still inspect logs, command output, and the coverage map, then report the runner limitation explicitly.
 - Capture evidence paths whenever screenshots, videos, logs, or JSON result files exist.
 - Fail CI only for likely product regressions, broken test harness behavior, or a command failure that is not clearly an environment limitation.
