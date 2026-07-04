@@ -96,16 +96,31 @@ jobs:
             --head-ref HEAD `
             --out "$env:AGENTIC_OUT_DIR/plan.json"
 
+      - name: Install Codex CLI
+        shell: pwsh
+        run: npm install -g @openai/codex
+
       - name: Run Codex-driven Windows UI check
-        id: codex
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: .github/codex/prompts/agentic-ui-test.md
-          codex-args: '["--output-schema",".github/codex/schemas/agentic-ui-verdict.schema.json","--ephemeral"]'
-          sandbox: danger-full-access
-          safety-strategy: unsafe
-          output-file: .agentic-ui/verdict.json
+        shell: pwsh
+        env:
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          $codex = (Get-Command codex.cmd -ErrorAction SilentlyContinue).Source
+          if (-not $codex) {
+            $codex = (Get-Command codex -ErrorAction Stop).Source
+          }
+          Get-Content -Raw .github/codex/prompts/agentic-ui-test.md | & $codex exec `
+            --skip-git-repo-check `
+            --cd "$PWD" `
+            --output-last-message ".agentic-ui/verdict.json" `
+            --output-schema ".github/codex/schemas/agentic-ui-verdict.schema.json" `
+            --ephemeral `
+            --ignore-user-config `
+            --sandbox danger-full-access `
+            -
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Validate Codex verdict
         shell: pwsh
