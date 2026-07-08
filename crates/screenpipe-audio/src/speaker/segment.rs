@@ -17,7 +17,6 @@ use super::{embedding::EmbeddingExtractor, embedding_manager::EmbeddingManager};
 const MIN_EMBEDDING_SAMPLES: usize = 1600;
 const MAX_EMBEDDING_SEGMENT_SECONDS: f64 = 2.0;
 const MAX_SAME_SPEAKER_MERGE_GAP_SECONDS: f64 = 0.75;
-const MAX_MERGED_SPEECH_SEGMENT_SECONDS: f64 = 30.0;
 
 // pyannote segmentation 3.0 uses powerset classes: 0 is silence, 1..=3 are
 // single-speaker speech, and higher classes represent overlapping speakers.
@@ -155,21 +154,6 @@ fn create_speech_segments(
     Ok(segments)
 }
 
-fn merged_samples_within_cap(prev_segment: &SpeechSegment, new_segment: &SpeechSegment) -> bool {
-    let merged_samples = prev_segment
-        .samples
-        .len()
-        .saturating_add(new_segment.samples.len());
-
-    if merged_samples == 0 {
-        return true;
-    }
-
-    let sample_rate = prev_segment.sample_rate.max(new_segment.sample_rate).max(1);
-    let max_samples = ((sample_rate as f64) * MAX_MERGED_SPEECH_SEGMENT_SECONDS).ceil() as usize;
-    merged_samples <= max_samples
-}
-
 fn handle_new_segment(
     current_segment: Option<SpeechSegment>,
     new_segment: SpeechSegment,
@@ -179,7 +163,6 @@ fn handle_new_segment(
         let gap_seconds = new_segment.start - prev_segment.end;
         if prev_segment.speaker == new_segment.speaker
             && gap_seconds <= MAX_SAME_SPEAKER_MERGE_GAP_SECONDS
-            && merged_samples_within_cap(&prev_segment, &new_segment)
         {
             // Merge segments
             prev_segment.end = new_segment.end;
@@ -492,10 +475,7 @@ pub fn get_speaker_from_embedding(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        handle_new_segment, is_overlap_class, SpeechSegment, MAX_EMBEDDING_SEGMENT_SECONDS,
-        MAX_MERGED_SPEECH_SEGMENT_SECONDS,
-    };
+    use super::{handle_new_segment, is_overlap_class, SpeechSegment};
 
     fn test_segment(start: f64, end: f64, sample_count: usize, speaker: &str) -> SpeechSegment {
         SpeechSegment {
@@ -520,11 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn same_speaker_merge_flushes_before_audio_payload_grows_unbounded() {
-        let sample_rate = 16_000usize;
-        let samples_per_segment = (sample_rate as f64 * MAX_EMBEDDING_SEGMENT_SECONDS) as usize;
-        let max_retained_samples =
-            (sample_rate as f64 * MAX_MERGED_SPEECH_SEGMENT_SECONDS) as usize;
+    fn metadata_only_same_speaker_merge_retains_no_audio_payload() {
         let segment_count = 50usize;
 
         let mut current_segment = None;
@@ -532,28 +508,20 @@ mod tests {
         let mut start = 0.0;
 
         for _ in 0..segment_count {
-            let end = start + MAX_EMBEDDING_SEGMENT_SECONDS;
-            let segment = test_segment(start, end, samples_per_segment, "speaker-1");
+            let end = start + 2.0;
+            let segment = test_segment(start, end, 0, "speaker-1");
             current_segment = handle_new_segment(current_segment, segment, &mut flushed_segments);
 
             let current_samples = current_segment
                 .as_ref()
                 .map(|segment| segment.samples.len())
                 .unwrap_or_default();
-            assert!(
-                current_samples <= max_retained_samples,
-                "same-speaker merge retained {current_samples} samples in the active segment; cap is {max_retained_samples}"
-            );
+            assert_eq!(current_samples, 0);
 
             start = end + 0.01;
         }
 
-        assert!(
-            !flushed_segments.is_empty(),
-            "long same-speaker runs should flush bounded segments instead of growing one retained audio buffer"
-        );
-        assert!(flushed_segments
-            .iter()
-            .all(|segment| segment.samples.len() <= max_retained_samples));
+        assert!(flushed_segments.is_empty());
+        assert_eq!(current_segment.unwrap().samples.len(), 0);
     }
 }
