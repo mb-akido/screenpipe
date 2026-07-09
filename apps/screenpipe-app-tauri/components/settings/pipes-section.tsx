@@ -2538,9 +2538,13 @@ export function PipesSection() {
                 </span>
               </div>
 
-              {/* Action bar — always visible, brand-aligned (sharp, monochrome).
-                  optimize + remix are the install->create lever. */}
-              <div className="flex items-center gap-1 px-3 pb-2.5 pt-0.5">
+              {/* Keep secondary actions out of the default scan path. They remain
+                  available on hover and keyboard focus, without an empty row. */}
+              <div
+                data-testid="pipe-card-actions"
+                className="max-h-0 overflow-hidden opacity-0 pointer-events-none transition-[max-height,opacity] duration-150 group-hover:max-h-16 group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:max-h-16 group-focus-within:opacity-100 group-focus-within:pointer-events-auto"
+              >
+                <div className="flex items-center gap-1 px-3 pb-2.5 pt-0.5">
                 {/* optimize with ai — opens a chat that reads the pipe's prompt
                     + recent run logs and suggests improvements in plain english */}
                 {!isReceivedTeamPipe(pipe) && (
@@ -2769,6 +2773,7 @@ export function PipesSection() {
                       togglePipe(pipe.config.name, checked)
                     }
                   />
+                </div>
                 </div>
               </div>
 
