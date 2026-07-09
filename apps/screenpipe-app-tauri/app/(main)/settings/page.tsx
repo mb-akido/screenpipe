@@ -76,9 +76,31 @@ const ALL_SETTINGS_FIELDS: IndexedSettingsField[] = [
   ...referralSearchIndex.map((f) => ({ ...f, section: "referral" })),
 ];
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
-import { useSettings } from "@/lib/hooks/use-settings";
+import {
+  createDefaultSettingsObject,
+  type Settings,
+  useSettings,
+} from "@/lib/hooks/use-settings";
 import { commands } from "@/lib/utils/tauri";
 import { toast } from "@/components/ui/use-toast";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  ADVANCED_SETTINGS_RESET_KEYS,
+  isRecommendedSettingsRestartRequired,
+  isSimpleSettingsSection,
+  RECOMMENDED_RECORDING_DEFAULT_KEYS,
+  setRecommendedSettingsRestartRequired,
+} from "@/components/settings/simple-settings-mode";
+import { ApplyRestartBar } from "@/components/settings/apply-restart-bar";
 
 type SettingsSection =
   | "account"
@@ -209,6 +231,14 @@ function SettingsContent() {
   const fromSection = searchParams.get("from");
   const { isSectionHidden, isEnterprise } = useEnterprisePolicy();
   const { isTranslucent } = useSidebarContext();
+  const { settings, updateSettings } = useSettings();
+  const [simpleModeConfirmationOpen, setSimpleModeConfirmationOpen] = useState(false);
+  const [isSwitchingToSimple, setIsSwitchingToSimple] = useState(false);
+  const [recommendedRestartRequired, setRecommendedRestartRequired] = useState(
+    () => isRecommendedSettingsRestartRequired(),
+  );
+  const [isApplyingRecommendedRestart, setIsApplyingRecommendedRestart] = useState(false);
+  const isSimpleSettingsMode = settings.settingsMode !== "advanced";
 
   const [section, setSection] = useQueryState<SettingsSection>("section", {
     defaultValue: "display",
@@ -223,12 +253,83 @@ function SettingsContent() {
   }, [router]);
 
   // Enterprise guard: if the active section is hidden by policy, redirect to the
-  // first visible section. Prevents direct-URL bypass of enterprise restrictions.
+  // first visible section. Simple mode keeps advanced sections out of the
+  // sidebar and search, but intentional deep links (for example, "Manage
+  // notification settings") still open the exact control they refer to.
   useEffect(() => {
     if (!isSectionHidden(section)) return;
-    const fallback = ALL_SETTINGS_SECTIONS.find((s) => !isSectionHidden(s)) ?? "display";
+    const fallback = ALL_SETTINGS_SECTIONS.find((s) =>
+      !isSectionHidden(s) && (!isSimpleSettingsMode || isSimpleSettingsSection(s)),
+    ) ?? "display";
     setSection(fallback as SettingsSection);
-  }, [section, isSectionHidden, setSection]);
+  }, [section, isSectionHidden, isSimpleSettingsMode, setSection]);
+
+  const showSection = (id: SettingsSection) =>
+    !isSectionHidden(id) && (!isSimpleSettingsMode || isSimpleSettingsSection(id));
+
+  const switchToSimpleSettings = async () => {
+    setIsSwitchingToSimple(true);
+    try {
+      // Restore every hidden preference in one atomic store update. Defaults
+      // vary by platform (for example, the keyboard shortcuts), so obtain them
+      // from the same factory used for a new install rather than hard-coding.
+      const defaults = createDefaultSettingsObject();
+      const advancedDefaults = Object.fromEntries(
+        ADVANCED_SETTINGS_RESET_KEYS.map((key) => [key, defaults[key]]),
+      ) as Partial<Settings>;
+      const recommendedRecordingDefaults = Object.fromEntries(
+        RECOMMENDED_RECORDING_DEFAULT_KEYS.map((key) => [key, defaults[key]]),
+      ) as Partial<Settings>;
+      const recordingDefaultsChanged = RECOMMENDED_RECORDING_DEFAULT_KEYS.some(
+        (key) => JSON.stringify(settings[key]) !== JSON.stringify(defaults[key]),
+      );
+      const simpleSettings = {
+        ...advancedDefaults,
+        ...recommendedRecordingDefaults,
+        settingsMode: "simple",
+      } as unknown as Partial<Settings>;
+      await updateSettings(simpleSettings);
+      if (recordingDefaultsChanged) {
+        setRecommendedSettingsRestartRequired(true);
+        setRecommendedRestartRequired(true);
+      }
+      toast({ title: "recommended settings enabled", description: "everything else is using recommended defaults." });
+    } catch (error) {
+      console.error("failed to switch to recommended settings", error);
+      toast({
+        title: "couldn't switch settings view",
+        description: "your settings were left unchanged. please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSwitchingToSimple(false);
+      setSimpleModeConfirmationOpen(false);
+    }
+  };
+
+  const applyRecommendedRecordingDefaults = async () => {
+    setIsApplyingRecommendedRestart(true);
+    try {
+      await commands.stopCapture();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await commands.startCapture();
+      setRecommendedSettingsRestartRequired(false);
+      setRecommendedRestartRequired(false);
+      toast({
+        title: "recording restarted",
+        description: "recommended monitor and audio defaults are now active.",
+      });
+    } catch (error) {
+      console.error("failed to restart recording for recommended settings", error);
+      toast({
+        title: "restart failed",
+        description: "please restart screenpipe manually for the changes to apply.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsApplyingRecommendedRestart(false);
+    }
+  };
 
   const navGroups = [
     {
@@ -240,7 +341,7 @@ function SettingsContent() {
         { id: "recording" as const, label: "Recording", icon: <Video className="h-4 w-4" /> },
         { id: "shortcuts" as const, label: "Shortcuts", icon: <Keyboard className="h-4 w-4" /> },
         { id: "notifications" as const, label: "Notifications", icon: <Bell className="h-4 w-4" /> },
-      ].filter((s) => !isSectionHidden(s.id)),
+      ].filter((s) => showSection(s.id)),
     },
     {
       label: "Data & Privacy",
@@ -249,7 +350,7 @@ function SettingsContent() {
         { id: "privacy" as const, label: "Privacy", icon: <Shield className="h-4 w-4" /> },
         { id: "storage" as const, label: "Storage", icon: <HardDrive className="h-4 w-4" /> },
         { id: "speakers" as const, label: "Speakers", icon: <Mic className="h-4 w-4" /> },
-      ].filter((s) => !isSectionHidden(s.id)),
+      ].filter((s) => showSection(s.id)),
     },
     {
       label: "Account",
@@ -263,7 +364,7 @@ function SettingsContent() {
           : [{ id: "team" as const, label: "Team", icon: <Users className="h-4 w-4" /> }]),
         { id: "account" as const, label: "Account", icon: <User className="h-4 w-4" /> },
         { id: "referral" as const, label: "Get free month", icon: <Gift className="h-4 w-4" /> },
-      ].filter((s) => !isSectionHidden(s.id)),
+      ].filter((s) => showSection(s.id)),
     },
   ];
 
@@ -396,6 +497,59 @@ function SettingsContent() {
           </button>
         </div>
 
+        <div className="px-3 pt-3">
+          <div className={cn(
+            "border p-2.5",
+            isTranslucent ? "vibrant-sidebar-border" : "border-border bg-card/50",
+          )}>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className={cn(
+                "text-[10px] font-medium uppercase tracking-wider",
+                isTranslucent ? "vibrant-sidebar-fg-muted" : "text-muted-foreground",
+              )}>
+                Settings view
+              </span>
+            </div>
+            <div className="grid grid-cols-2 rounded-md border border-border bg-background p-0.5">
+              <button
+                type="button"
+                data-testid="settings-mode-simple"
+                aria-pressed={isSimpleSettingsMode}
+                onClick={() => {
+                  if (!isSimpleSettingsMode) setSimpleModeConfirmationOpen(true);
+                }}
+                className={cn(
+                  "rounded px-2 py-1.5 text-xs font-medium transition-colors",
+                  isSimpleSettingsMode
+                    ? "bg-foreground text-background shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                Recommended
+              </button>
+              <button
+                type="button"
+                data-testid="settings-mode-advanced"
+                aria-pressed={!isSimpleSettingsMode}
+                onClick={() => updateSettings({ settingsMode: "advanced" })}
+                className={cn(
+                  "rounded px-2 py-1.5 text-xs font-medium transition-colors",
+                  !isSimpleSettingsMode
+                    ? "bg-foreground text-background shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                All settings
+              </button>
+            </div>
+            <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+              {isSimpleSettingsMode
+                ? "Everyday controls. Everything else uses recommended defaults."
+                : "Every control, including AI, shortcuts, and notifications."}
+            </p>
+          </div>
+        </div>
+
         {/* Search — input + floating result popover. Nav below stays mounted.
             Uses a Radix Popover Portal so the dropdown renders to <body> and is
             NOT clipped by the sidebar's overflow-x-hidden; width tracks the input
@@ -484,6 +638,36 @@ function SettingsContent() {
         </div>
       </AppSidebar>
 
+      <AlertDialog
+        open={simpleModeConfirmationOpen}
+        onOpenChange={setSimpleModeConfirmationOpen}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Switch to Recommended settings?</AlertDialogTitle>
+            <AlertDialogDescription>
+              AI models, keyboard shortcuts, notifications, usage reporting, and
+              speaker preferences will return to their recommended defaults.
+              Recording will use all monitors and system-default audio devices,
+              then ask you to apply and restart. Your privacy, storage, and account
+              choices will stay as they are.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isSwitchingToSimple}>Keep All settings</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isSwitchingToSimple}
+              onClick={(event) => {
+                event.preventDefault();
+                void switchToSimpleSettings();
+              }}
+            >
+              {isSwitchingToSimple ? "Switching…" : "Use Recommended settings"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Content area — always opaque; only the sidebar gets vibrancy */}
       <div className="flex-1 flex flex-col min-w-0 bg-background">
         {/* Header */}
@@ -494,6 +678,15 @@ function SettingsContent() {
         {/* Scrollable content */}
         <div className="flex-1 overflow-y-auto p-6">
           {renderSection()}
+          {section !== "recording" && (
+            <ApplyRestartBar
+              visible={recommendedRestartRequired}
+              onApply={() => void applyRecommendedRecordingDefaults()}
+              isUpdating={isApplyingRecommendedRestart}
+              message="recommended recording defaults need a restart."
+              testId="recommended-settings-apply-restart"
+            />
+          )}
         </div>
       </div>
     </>

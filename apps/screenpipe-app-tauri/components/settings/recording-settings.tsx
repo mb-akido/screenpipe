@@ -151,6 +151,11 @@ import { defaultOptions } from "tauri-plugin-sentry-api";
 import { useLoginDialog } from "../login-dialog";
 import { BatterySaverSection } from "./battery-saver-section";
 import { ApplyRestartBar } from "./apply-restart-bar";
+import {
+  isRecommendedSettingsRestartRequired,
+  RECOMMENDED_SETTINGS_RESTART_EVENT,
+  setRecommendedSettingsRestartRequired,
+} from "./simple-settings-mode";
 // ScheduleSettings moved to privacy-section
 import { ValidatedInput } from "../ui/validated-input";
 import {
@@ -1990,7 +1995,25 @@ export function RecordingSettings() {
         : `${settings.languages.length} selected`;
 
   // Add new state to track if settings have changed
-  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(
+    () => isRecommendedSettingsRestartRequired(),
+  );
+
+  useEffect(() => {
+    const handleRecommendedRestartRequired = () => {
+      if (isRecommendedSettingsRestartRequired()) {
+        setHasUnsavedChanges(true);
+      }
+    };
+    window.addEventListener(
+      RECOMMENDED_SETTINGS_RESTART_EVENT,
+      handleRecommendedRestartRequired,
+    );
+    return () => window.removeEventListener(
+      RECOMMENDED_SETTINGS_RESTART_EVENT,
+      handleRecommendedRestartRequired,
+    );
+  }, []);
 
   // Optimized debounced validation
   const debouncedValidateSettings = useMemo(
@@ -2330,6 +2353,7 @@ export function RecordingSettings() {
       await (needsServerRestart ? commands.spawnScreenpipe(null) : commands.startCapture());
       await new Promise((resolve) => setTimeout(resolve, 1000));
       setPendingChanges({});
+      setRecommendedSettingsRestartRequired(false);
 
       toast({
         title: "Settings updated successfully",

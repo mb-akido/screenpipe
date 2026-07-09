@@ -54,6 +54,28 @@ describe('Settings sections', () => {
     await openSettings();
   });
 
+  it('starts in Recommended view, then can reveal the full settings surface', async () => {
+    const simpleMode = await $('[data-testid="settings-mode-simple"]');
+    expect(await simpleMode.getAttribute('aria-pressed')).toBe('true');
+
+    // Everyday controls stay close at hand; power-user sections are hidden
+    // from both the sidebar and settings search until All settings is selected.
+    for (const id of ['display', 'general', 'recording', 'privacy', 'storage', 'account']) {
+      expect(await $(`[data-testid="settings-nav-${id}"]`).isExisting()).toBe(true);
+    }
+    for (const id of ['ai', 'shortcuts', 'notifications', 'usage', 'speakers', 'team', 'referral']) {
+      expect(await $(`[data-testid="settings-nav-${id}"]`).isExisting()).toBe(false);
+    }
+
+    const filepath = await saveScreenshot('settings-simple-mode');
+    expect(existsSync(filepath)).toBe(true);
+
+    const advancedMode = await $('[data-testid="settings-mode-advanced"]');
+    await advancedMode.click();
+    await $('[data-testid="settings-nav-ai"]').waitForExist({ timeout: 5_000 });
+    expect(await advancedMode.getAttribute('aria-pressed')).toBe('true');
+  });
+
   // ─── Happy paths ──────────────────────────────────────────────────────────
 
   it('renders General settings without a crash', async () => {
@@ -262,5 +284,63 @@ describe('Settings sections', () => {
         }
       });
     }
+  });
+
+  it('confirms before returning to Recommended view and hiding advanced controls', async () => {
+    const recordingNav = await $('[data-testid="settings-nav-recording"]');
+    await recordingNav.click();
+
+    const useAllMonitors = await $('#useAllMonitors');
+    await useAllMonitors.waitForExist({ timeout: 8_000 });
+    if ((await useAllMonitors.getAttribute('data-state')) === 'checked') {
+      await useAllMonitors.click();
+    }
+
+    const useSystemDefaultAudio = await $('#useSystemDefaultAudio');
+    await useSystemDefaultAudio.waitForExist({ timeout: 8_000 });
+    if ((await useSystemDefaultAudio.getAttribute('data-state')) === 'checked') {
+      await useSystemDefaultAudio.click();
+    }
+
+    const generalNav = await $('[data-testid="settings-nav-general"]');
+    await generalNav.click();
+    await $('[data-testid="section-settings-general"]').waitForExist({ timeout: 8_000 });
+
+    const simpleMode = await $('[data-testid="settings-mode-simple"]');
+    await simpleMode.click();
+
+    const dialog = await $('[role="alertdialog"]');
+    await dialog.waitForExist({ timeout: 5_000 });
+    expect((await dialog.getText()).toLowerCase()).toContain('recommended defaults');
+
+    const applySimpleMode = await $('button=Use Recommended settings');
+    await applySimpleMode.click();
+    await browser.waitUntil(
+      async () => !(await $('[role="alertdialog"]').isExisting()),
+      { timeout: 5_000, timeoutMsg: 'Recommended confirmation dialog did not close' },
+    );
+    await browser.pause(500);
+    await $('[data-testid="settings-nav-ai"]').waitForExist({ reverse: true, timeout: 8_000 });
+    expect(await simpleMode.getAttribute('aria-pressed')).toBe('true');
+
+    // The restart requirement survives settings navigation/reload until the
+    // running capture session has actually picked up the restored defaults.
+    await browser.execute(() => window.location.reload());
+    await browser.pause(2_000);
+    const applyRestart = await $('[data-testid="recommended-settings-apply-restart"]');
+    await applyRestart.waitForDisplayed({ timeout: 8_000 });
+    const restartScreenshot = await saveScreenshot('settings-recommended-apply-restart');
+    expect(existsSync(restartScreenshot)).toBe(true);
+    await applyRestart.click();
+    await applyRestart.waitForExist({ reverse: true, timeout: 15_000 });
+
+    const recommendedRecordingNav = await $('[data-testid="settings-nav-recording"]');
+    await recommendedRecordingNav.click();
+    const recommendedAllMonitors = await $('#useAllMonitors');
+    const recommendedDefaultAudio = await $('#useSystemDefaultAudio');
+    await recommendedAllMonitors.waitForExist({ timeout: 8_000 });
+    await recommendedDefaultAudio.waitForExist({ timeout: 8_000 });
+    expect(await recommendedAllMonitors.getAttribute('data-state')).toBe('checked');
+    expect(await recommendedDefaultAudio.getAttribute('data-state')).toBe('checked');
   });
 });

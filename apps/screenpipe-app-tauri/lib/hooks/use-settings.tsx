@@ -82,6 +82,7 @@ export type AIPreset = {
 );
 
 export type UpdateChannel = "stable" | "beta";
+export type SettingsMode = "simple" | "advanced";
 
 // Chat history types
 export interface ChatMessage {
@@ -207,6 +208,9 @@ export interface ChatHistoryStore {
 
 // Extend SettingsStore with fields added before Rust types are regenerated
 export type Settings = SettingsStore & {
+	/** Controls how much of the settings surface is shown. Simple is the
+	 * recommended default; Advanced exposes every power-user control. */
+	settingsMode?: SettingsMode;
 	deviceId?: string;
 	updateChannel?: UpdateChannel;
 	chatHistory?: ChatHistoryStore;
@@ -574,6 +578,7 @@ const applyProCloudAudioDefaults = (settings: Settings): Settings => {
 };
 
 let DEFAULT_SETTINGS: Settings = {
+			settingsMode: "simple",
 			aiPresets: makeDefaultPresets(false) as any,
 			deviceId: crypto.randomUUID(),
 			deepgramApiKey: "",
