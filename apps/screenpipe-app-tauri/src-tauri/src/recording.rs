@@ -186,6 +186,32 @@ const DB_WEDGE_BREAKER_WINDOW: Duration = Duration::from_secs(600);
 /// Coalesce a burst of persistent-failure signals before acting.
 const DB_WEDGE_DEBOUNCE: Duration = Duration::from_secs(15);
 
+/// Result of revalidating a persistent-failure signal after the debounce.
+#[derive(Debug, PartialEq, Eq)]
+enum DbWedgeRecoveryDecision {
+    Restart,
+    SkipNoServer,
+    SkipSupersededGeneration,
+    SkipRecovered,
+}
+
+fn db_wedge_recovery_decision(
+    signaled_health: &screenpipe_db::WriteQueueHealth,
+    signaled_recovery_epoch: u64,
+    current_health: Option<&screenpipe_db::WriteQueueHealth>,
+) -> DbWedgeRecoveryDecision {
+    let Some(current_health) = current_health else {
+        return DbWedgeRecoveryDecision::SkipNoServer;
+    };
+    if !signaled_health.is_same_instance(current_health) {
+        return DbWedgeRecoveryDecision::SkipSupersededGeneration;
+    }
+    if current_health.fatal_run_recovery_epoch() != signaled_recovery_epoch {
+        return DbWedgeRecoveryDecision::SkipRecovered;
+    }
+    DbWedgeRecoveryDecision::Restart
+}
+
 /// Build the `PersistentFailureHook` the DB layer fires when writes wedge
 /// persistently. The hook itself is sync (`Fn()`), so it spawns the async
 /// restart. Captures an `AppHandle` (cheap clone, Send+Sync) and the shared
@@ -193,22 +219,66 @@ const DB_WEDGE_DEBOUNCE: Duration = Duration::from_secs(15);
 pub fn make_db_wedge_recovery_hook(
     app: tauri::AppHandle,
     breaker: DbWedgeBreaker,
+    health: screenpipe_db::WriteQueueHealth,
 ) -> screenpipe_db::PersistentFailureHook {
     std::sync::Arc::new(move || {
         let app = app.clone();
         let breaker = breaker.clone();
-        tokio::spawn(async move {
-            recover_from_db_wedge(app, breaker).await;
+        let health = health.clone();
+        let recovery_epoch = health.fatal_run_recovery_epoch();
+        // The hook fires on the dedicated *server* runtime. Recovery removes
+        // that server from state, which intentionally lets its runtime exit;
+        // running this task there would cancel it halfway through respawn.
+        // Dispatch onto Tauri's process-lifetime runtime instead.
+        tauri::async_runtime::spawn(async move {
+            recover_from_db_wedge(app, breaker, health, recovery_epoch).await;
         });
     })
 }
 
-async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
+async fn recover_from_db_wedge(
+    app: tauri::AppHandle,
+    breaker: DbWedgeBreaker,
+    signaled_health: screenpipe_db::WriteQueueHealth,
+    signaled_recovery_epoch: u64,
+) {
     // Debounce: let a burst of signals coalesce and any in-flight work settle.
     tokio::time::sleep(DB_WEDGE_DEBOUNCE).await;
 
+    let recording_state = app.state::<RecordingState>();
+
+    // Serialize the exact-generation claim, teardown, and respawn with every
+    // explicit full stop/start. This closes the debounce TOCTOU where a stale
+    // task could validate server A, a manual restart could install server B,
+    // and the stale task would then tear B down.
+    let _lifecycle_guard = recording_state.server_lifecycle.lock().await;
+
+    // Lock in the documented order and atomically remove only the server
+    // generation that raised this signal. Once it is removed, no other full
+    // lifecycle path can replace it until this recovery releases the outer
+    // lifecycle guard.
+    let mut capture_guard = recording_state.capture.lock().await;
+    let mut server_guard = recording_state.server.lock().await;
+    let current_health = server_guard
+        .as_ref()
+        .map(|core| core.db.write_queue_health());
+    let decision = db_wedge_recovery_decision(
+        &signaled_health,
+        signaled_recovery_epoch,
+        current_health.as_ref(),
+    );
+    if decision != DbWedgeRecoveryDecision::Restart {
+        info!(
+            "db wedge auto-recovery: restart cancelled after debounce ({:?})",
+            decision
+        );
+        return;
+    }
+
     // Circuit breaker: a DB that stays broken after a restart is on-disk
     // corruption a restart can't repair, so cap auto-restarts per window.
+    // Decide while the exact generation is still claimed; a skipped stale
+    // signal must not consume restart budget.
     let action = {
         let mut state = breaker.lock().unwrap();
         state.decide(
@@ -218,6 +288,8 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
         )
     };
     if let WedgeAction::GiveUp { notify } = action {
+        drop(server_guard);
+        drop(capture_guard);
         error!(
             "db wedge auto-recovery: {} restarts within {:?} did not clear the write wedge — \
              in-process restarts can't fix this (poisoned WAL-index pinned by a leaked \
@@ -236,18 +308,31 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
         return;
     }
 
+    let capture = capture_guard.take();
+    let server = server_guard
+        .take()
+        .expect("restart decision requires a current server generation");
+
     warn!(
         "db wedge auto-recovery: persistent write failure detected — restarting recording to \
          rebuild all DB pools + the shared WAL-index"
     );
-    if let Err(e) = stop_screenpipe(app.state::<RecordingState>(), app.clone()).await {
-        warn!(
-            "db wedge auto-recovery: stop_screenpipe failed (continuing to spawn): {}",
-            e
-        );
-    }
 
-    // stop_screenpipe rebuilds the engine's read/write pools on respawn, but the
+    *recording_state.interrupted_meeting.lock().await = None;
+    if let Some(session) = capture {
+        session.stop().await;
+    }
+    server.shutdown().await;
+    // Keep the state guards until shutdown completes. The dedicated server
+    // runtime exits when it can lock `server` and observe None; releasing the
+    // guard earlier can drop that runtime mid-shutdown and cancel the pool/task
+    // cleanup this recovery depends on.
+    drop(server_guard);
+    drop(capture_guard);
+    recording_state.is_starting.store(false, Ordering::SeqCst);
+    recording_state.last_spawn_epoch.store(0, Ordering::SeqCst);
+
+    // The teardown above rebuilds the engine's read/write pools on respawn, but the
     // secret-store pool is a process-lifetime cache (min_connections=1, no idle
     // reaping) that would otherwise keep a connection — and the poisoned `-shm`
     // WAL-index — open across the restart. SQLite only rebuilds `-shm` once the
@@ -256,7 +341,10 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
     // Pools recreate lazily on the next secret access after spawn reopens.
     screenpipe_secrets::close_all_secret_pools().await;
 
-    if let Err(e) = spawn_screenpipe(app.state::<RecordingState>(), app.clone(), None).await {
+    // Preserve the latest user capture intent. In particular, stop_capture can
+    // run during the debounce/teardown: the server still needs rebuilding, but
+    // the new server must come back without resurrecting recording.
+    if let Err(e) = spawn_screenpipe_inner(&recording_state, app.clone()).await {
         // The restart failed to bring the engine back up (e.g. the port never
         // rebound). Nothing else will retry until the DB layer fires the hook
         // again — and if the server is fully down it never will — so recording
@@ -285,10 +373,14 @@ pub(crate) struct InterruptedMeeting {
 
 /// Two-phase state: server (long-lived) + capture (togglable).
 ///
-/// **Lock ordering**: `capture` may be locked independently (it's self-contained).
-/// When both locks are needed (e.g. `start_capture`), always lock `capture` first,
-/// then `server`. Never hold `server` while waiting on `capture`.
+/// **Lock ordering**: acquire `server_lifecycle` first for a full stop/start,
+/// then `capture`, then `server`. `capture` may be locked independently (it's
+/// self-contained). Never hold `server` while waiting on `capture`.
 pub struct RecordingState {
+    /// Serializes full server stop/start cycles. DB-wedge recovery holds this
+    /// across its generation check, teardown, and respawn so a delayed hook
+    /// cannot tear down a server that a manual restart just replaced.
+    pub server_lifecycle: Arc<Mutex<()>>,
     /// Long-lived server core (DB, HTTP, pipes). None until first start.
     pub server: Arc<Mutex<Option<ServerCore>>>,
     /// Current capture session. None when recording is stopped/paused.
@@ -344,8 +436,12 @@ impl RecordingState {
 
     /// Whether capture is currently intended to be running.
     pub fn capture_intended(&self) -> bool {
-        self.wants_recording.load(Ordering::SeqCst)
+        capture_intended_now(&self.wants_recording)
     }
+}
+
+fn capture_intended_now(wants_recording: &AtomicBool) -> bool {
+    wants_recording.load(Ordering::SeqCst)
 }
 
 // ---------------------------------------------------------------------------
@@ -723,11 +819,16 @@ pub async fn stop_screenpipe(
     state: State<'_, RecordingState>,
     _app: tauri::AppHandle,
 ) -> Result<(), String> {
-    info!("stop_screenpipe: stopping capture and server");
-
     // Deliberate stop → clear the intent so the health watchdog leaves the
     // server down instead of auto-respawning it.
     state.set_capture_intent(false);
+
+    let _lifecycle_guard = state.server_lifecycle.lock().await;
+    stop_screenpipe_inner(&state).await
+}
+
+async fn stop_screenpipe_inner(state: &RecordingState) -> Result<(), String> {
+    info!("stop_screenpipe: stopping capture and server");
 
     // Stop capture first
     {
@@ -810,12 +911,23 @@ pub async fn spawn_screenpipe(
     app: tauri::AppHandle,
     _override_args: Option<Vec<String>>,
 ) -> Result<(), String> {
-    info!("spawn_screenpipe: starting server + capture");
-
     // Mark recording as intended-ON up front (even if the start below fails or
     // is deferred by cooldown) so the health watchdog will keep trying to bring
     // a crashed/failed server back instead of treating it as a user stop.
     state.set_capture_intent(true);
+
+    let _lifecycle_guard = state.server_lifecycle.lock().await;
+    spawn_screenpipe_inner(&state, app).await
+}
+
+async fn spawn_screenpipe_inner(
+    state: &RecordingState,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    info!(
+        "spawn_screenpipe: starting server (capture intended: {})",
+        state.capture_intended()
+    );
 
     // --- Cooldown enforcement ---
     let now_epoch = std::time::SystemTime::now()
@@ -994,6 +1106,11 @@ pub async fn spawn_screenpipe(
                 .and_then(|core| core.local_api_key.clone());
             if probe_server_health(&health_url, api_key.as_deref()).await {
                 info!("Server already running and healthy on port {}", port);
+                if !state.capture_intended() {
+                    info!("Capture is deliberately stopped; leaving healthy server running");
+                    state.is_starting.store(false, Ordering::SeqCst);
+                    return Ok(());
+                }
                 // Server is fine — just ensure capture is running
                 drop(server_guard);
                 let capture_guard = state.capture.lock().await;
@@ -1069,7 +1186,7 @@ pub async fn spawn_screenpipe(
     let permissions_check = do_permissions_check(false);
     let disable_audio = store.recording.disable_audio;
 
-    if !permissions_check.screen_recording.permitted() {
+    if state.capture_intended() && !permissions_check.screen_recording.permitted() {
         warn!(
             "Screen recording permission not granted: {:?}. Cannot start server.",
             permissions_check.screen_recording
@@ -1086,7 +1203,7 @@ pub async fn spawn_screenpipe(
         );
     }
 
-    if !disable_audio && !permissions_check.microphone.permitted() {
+    if state.capture_intended() && !disable_audio && !permissions_check.microphone.permitted() {
         warn!(
             "Microphone permission not granted: {:?}. Audio recording will not work.",
             permissions_check.microphone
@@ -1094,8 +1211,8 @@ pub async fn spawn_screenpipe(
     }
 
     info!(
-        "Permissions OK. Starting server + capture. Audio disabled: {}, mic: {:?}",
-        disable_audio, permissions_check.microphone
+        "Permissions OK. Starting server. Capture intended: {}, audio disabled: {}, mic: {:?}",
+        state.capture_intended(), disable_audio, permissions_check.microphone
     );
 
     let (data_dir, fell_back) = config::resolve_data_dir(&store.data_dir);
@@ -1134,6 +1251,7 @@ pub async fn spawn_screenpipe(
 
     let server_arc = state.server.clone();
     let capture_arc = state.capture.clone();
+    let wants_recording = state.wants_recording.clone();
     let cloud_token_arc = state.cloud_token.clone();
     // Wire the DB-wedge auto-recovery hook onto every (re)created DB. Captured into
     // the dedicated server thread so the freshly-built `ServerCore` gets the hook
@@ -1209,38 +1327,51 @@ pub async fn spawn_screenpipe(
 
                 // Wire the persistent-failure hook so a wedged DB auto-restarts
                 // recording (rebuilding every pool + the shared WAL-index).
+                let db_health = server.db.write_queue_health();
                 server
                     .db
                     .set_persistent_failure_hook(make_db_wedge_recovery_hook(
                         app_for_db_wedge.clone(),
                         db_wedge_breaker.clone(),
+                        db_health,
                     ));
 
-                // Phase 2: Start capture
-                let capture = match CaptureSession::start(&server, &recording_config, true).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to start capture session: {}", e);
-                        // Server started but capture failed — store server anyway
-                        // so pipes/search still work
-                        {
-                            let mut guard = server_arc.lock().await;
-                            *guard = Some(server);
+                // Phase 2: Start capture only if it is still intended. Hold
+                // the capture slot across the check + construction + assign:
+                // stop_capture clears the intent before waiting on this lock,
+                // so a stop racing a full server spawn either prevents capture
+                // from starting or waits and then tears down the new session.
+                let mut capture_guard = capture_arc.lock().await;
+                let capture = if capture_intended_now(&wants_recording) {
+                    match CaptureSession::start(&server, &recording_config, true).await {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            error!("Failed to start capture session: {}", e);
+                            // Server started but capture failed — store server anyway
+                            // so pipes/search still work.
+                            {
+                                let mut guard = server_arc.lock().await;
+                                *guard = Some(server);
+                            }
+                            let _ = result_tx.send(Err(e));
+                            return;
                         }
-                        let _ = result_tx.send(Err(e));
-                        return;
                     }
+                } else {
+                    None
                 };
 
-                info!("Server + capture started successfully on dedicated runtime");
                 {
                     let mut guard = server_arc.lock().await;
                     *guard = Some(server);
                 }
-                {
-                    let mut guard = capture_arc.lock().await;
-                    *guard = Some(capture);
+                if let Some(capture) = capture {
+                    *capture_guard = Some(capture);
+                    info!("Server + capture started successfully on dedicated runtime");
+                } else {
+                    info!("Server started with capture deliberately stopped");
                 }
+                drop(capture_guard);
                 let _ = result_tx.send(Ok(()));
 
                 // Keep runtime alive as long as server exists
@@ -1437,7 +1568,12 @@ async fn kill_process_on_port(port: u16) {
 
 #[cfg(test)]
 mod db_wedge_tests {
-    use super::{DbWedgeState, WedgeAction};
+    use super::{
+        capture_intended_now, db_wedge_recovery_decision, DbWedgeRecoveryDecision, DbWedgeState,
+        WedgeAction,
+    };
+    use screenpipe_db::WriteQueueHealth;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     const WINDOW: Duration = Duration::from_secs(600);
@@ -1501,6 +1637,50 @@ mod db_wedge_tests {
             assert_eq!(s.decide(t, WINDOW, MAX), WedgeAction::Restart);
             t += WINDOW + Duration::from_secs(1);
         }
+    }
+
+    #[test]
+    fn debounce_recheck_restarts_only_the_same_unrecovered_generation() {
+        let signaled = WriteQueueHealth::default();
+        let same_generation = signaled.clone();
+        let epoch = signaled.fatal_run_recovery_epoch();
+
+        assert_eq!(
+            db_wedge_recovery_decision(&signaled, epoch, Some(&same_generation)),
+            DbWedgeRecoveryDecision::Restart
+        );
+        assert_eq!(
+            db_wedge_recovery_decision(&signaled, epoch.wrapping_add(1), Some(&same_generation)),
+            DbWedgeRecoveryDecision::SkipRecovered
+        );
+    }
+
+    #[test]
+    fn debounce_recheck_ignores_stale_generation_signals() {
+        let signaled = WriteQueueHealth::default();
+        let replacement = WriteQueueHealth::default();
+        let epoch = signaled.fatal_run_recovery_epoch();
+
+        assert_eq!(
+            db_wedge_recovery_decision(&signaled, epoch, None),
+            DbWedgeRecoveryDecision::SkipNoServer
+        );
+        assert_eq!(
+            db_wedge_recovery_decision(&signaled, epoch, Some(&replacement)),
+            DbWedgeRecoveryDecision::SkipSupersededGeneration
+        );
+    }
+
+    #[test]
+    fn stop_during_debounce_is_honored_when_recovery_respawns() {
+        let wants_recording = AtomicBool::new(true);
+
+        // The hook does not cache capture intent when it fires. A tray stop
+        // during the debounce clears the shared flag, and the server thread
+        // reads that latest value immediately before constructing capture.
+        wants_recording.store(false, Ordering::SeqCst);
+
+        assert!(!capture_intended_now(&wants_recording));
     }
 }
 
