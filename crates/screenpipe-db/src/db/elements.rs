@@ -46,7 +46,15 @@ impl DatabaseManager {
                 crate::text_normalizer::sanitize_fts5_query(query)
             };
             conditions.push(
-                "f.id IN (SELECT rowid FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
+                "f.id IN (SELECT rowid FROM (\
+                    SELECT frames_fts.rowid FROM frames_fts \
+                    JOIN frames native_frame ON native_frame.id = frames_fts.rowid \
+                    WHERE frames_fts MATCH ? \
+                      AND COALESCE(native_frame.vision_context_mode, 'augment') != 'replace' \
+                    UNION \
+                    SELECT frame_vision_fts.rowid FROM frame_vision_fts \
+                    WHERE frame_vision_fts MATCH ?\
+                ) LIMIT 5000)",
             );
             fts_match
         } else {
@@ -79,6 +87,38 @@ impl DatabaseManager {
             Order::Ascending => "ASC",
             Order::Descending => "DESC",
         };
+        let search_text = r#"CASE
+                WHEN f.vision_context_mode = 'replace'
+                     AND COALESCE(f.vision_description, '') != ''
+                    THEN f.vision_description
+                WHEN COALESCE(f.vision_description, '') = ''
+                    THEN COALESCE(f.full_text, f.accessibility_text, '')
+                WHEN COALESCE(f.full_text, f.accessibility_text, '') = ''
+                    THEN f.vision_description
+                ELSE COALESCE(f.full_text, f.accessibility_text, '')
+                     || char(10) || 'Visual context: ' || f.vision_description
+            END"#;
+        let search_text_json = r#"CASE
+                WHEN COALESCE(f.vision_description, '') != ''
+                     AND (f.vision_context_mode = 'replace'
+                          OR COALESCE(f.full_text, f.accessibility_text, '') = '')
+                    THEN '[]'
+                ELSE COALESCE(f.text_json, '')
+            END"#;
+        let search_tree = r#"CASE
+                WHEN COALESCE(f.vision_description, '') != ''
+                     AND (f.vision_context_mode = 'replace'
+                          OR COALESCE(f.full_text, f.accessibility_text, '') = '')
+                    THEN NULL
+                ELSE f.accessibility_tree_json
+            END"#;
+        let search_source = r#"CASE
+                WHEN COALESCE(f.vision_description, '') = '' THEN f.text_source
+                WHEN f.vision_context_mode = 'replace'
+                     OR COALESCE(f.full_text, f.accessibility_text, '') = ''
+                    THEN 'vision'
+                ELSE 'vision_hybrid'
+            END"#;
 
         let sql = if let Some(cap) = max_per_app {
             // Use ROW_NUMBER() to limit results per app, ensuring diversity.
@@ -93,10 +133,10 @@ SELECT id, timestamp, url, app_name, window_name, ocr_text, text_json, accessibi
         f.browser_url as url,
         COALESCE(f.app_name, '') as app_name,
         COALESCE(f.window_name, '') as window_name,
-        COALESCE(f.full_text, f.accessibility_text, '') as ocr_text,
-        COALESCE(f.text_json, '') as text_json,
-        f.accessibility_tree_json,
-        f.text_source,
+        {search_text} as ocr_text,
+        {search_text_json} as text_json,
+        {search_tree} as accessibility_tree_json,
+        {search_source} as text_source,
         ROW_NUMBER() OVER (
             PARTITION BY COALESCE(f.app_name, '')
             ORDER BY f.timestamp {order_dir}, {relevance} DESC
@@ -111,7 +151,11 @@ LIMIT ? OFFSET ?
                 order_dir = order_dir,
                 relevance = relevance_case,
                 where_clause = where_clause,
-                cap = cap
+                cap = cap,
+                search_text = search_text,
+                search_text_json = search_text_json,
+                search_tree = search_tree,
+                search_source = search_source,
             )
         } else {
             format!(
@@ -122,16 +166,22 @@ SELECT
     f.browser_url as url,
     COALESCE(f.app_name, '') as app_name,
     COALESCE(f.window_name, '') as window_name,
-    COALESCE(f.full_text, f.accessibility_text, '') as ocr_text,
-    COALESCE(f.text_json, '') as text_json,
-    f.accessibility_tree_json,
-    f.text_source
+    {search_text} as ocr_text,
+    {search_text_json} as text_json,
+    {search_tree} as accessibility_tree_json,
+    {search_source} as text_source
 FROM frames f
 WHERE {}
 ORDER BY f.timestamp {}, {} DESC
 LIMIT ? OFFSET ?
 "#,
-                where_clause, order_dir, relevance_case
+                where_clause,
+                order_dir,
+                relevance_case,
+                search_text = search_text,
+                search_text_json = search_text_json,
+                search_tree = search_tree,
+                search_source = search_source,
             )
         };
 
@@ -156,6 +206,7 @@ LIMIT ? OFFSET ?
 
         // Bind search condition for frames_fts
         if !query.is_empty() {
+            query_builder = query_builder.bind(&search_condition);
             query_builder = query_builder.bind(&search_condition);
         }
 
@@ -411,7 +462,7 @@ LIMIT ? OFFSET ?
             }
         }
 
-        // Use single frames_fts for text search
+        // Search native and sparse visual FTS with replace-mode exclusion.
         let search_condition = if !query.is_empty() {
             let fts_match = if fuzzy_match {
                 crate::text_normalizer::expand_search_query(query)
@@ -419,7 +470,15 @@ LIMIT ? OFFSET ?
                 crate::text_normalizer::sanitize_fts5_query(query)
             };
             conditions.push(
-                "f.id IN (SELECT rowid FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
+                "f.id IN (SELECT rowid FROM (\
+                    SELECT frames_fts.rowid FROM frames_fts \
+                    JOIN frames native_frame ON native_frame.id = frames_fts.rowid \
+                    WHERE frames_fts MATCH ? \
+                      AND COALESCE(native_frame.vision_context_mode, 'augment') != 'replace' \
+                    UNION \
+                    SELECT frame_vision_fts.rowid FROM frame_vision_fts \
+                    WHERE frame_vision_fts MATCH ?\
+                ) LIMIT 5000)",
             );
             fts_match
         } else {
@@ -498,6 +557,7 @@ LIMIT ? OFFSET ?
         }
 
         if !query.is_empty() {
+            query_builder = query_builder.bind(&search_condition);
             query_builder = query_builder.bind(&search_condition);
         }
 
@@ -617,7 +677,115 @@ mod tests {
     const INSERT_EL: &str = "INSERT INTO elements \
         (frame_id, source, role, text, parent_id, depth, left_bound, top_bound, \
          width_bound, height_bound, confidence, sort_order, properties, on_screen) \
-        VALUES (1, ?, ?, ?, NULL, 1, 0.1, 0.2, 0.3, 0.4, NULL, ?, ?, 1)";
+         VALUES (1, ?, ?, ?, NULL, 1, 0.1, 0.2, 0.3, 0.4, NULL, ?, ?, 1)";
+
+    #[tokio::test]
+    async fn keyword_search_uses_visual_index_and_honors_replace_mode() {
+        let db = mem_db().await;
+        sqlx::query("INSERT INTO video_chunks (id, file_path) VALUES (1, '/tmp/x.mp4')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO frames \
+             (id, video_chunk_id, offset_index, timestamp, full_text, accessibility_text, \
+              text_source, text_json, app_name, window_name) \
+             VALUES (1, 1, 0, '2026-07-10T00:00:00Z', 'native settings', \
+                     'native settings', 'accessibility', '[]', 'Canvas', 'Board')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.store_vision_description(1, "kanban workflow", "local", "test", "augment")
+            .await
+            .unwrap();
+
+        let flat = db
+            .search_with_text_positions(
+                "kanban",
+                10,
+                0,
+                None,
+                None,
+                false,
+                Order::Descending,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].text_source.as_deref(), Some("vision_hybrid"));
+        assert!(flat[0].text.contains("Visual context: kanban workflow"));
+        assert_eq!(
+            db.search_for_grouping(
+                "kanban",
+                10,
+                0,
+                None,
+                None,
+                false,
+                Order::Descending,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+
+        db.store_vision_description(1, "visual diagram", "local", "test", "replace")
+            .await
+            .unwrap();
+        assert!(db
+            .search_with_text_positions(
+                "native",
+                10,
+                0,
+                None,
+                None,
+                false,
+                Order::Descending,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .search_for_grouping(
+                "native",
+                10,
+                0,
+                None,
+                None,
+                false,
+                Order::Descending,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        let visual = db
+            .search_with_text_positions(
+                "diagram",
+                10,
+                0,
+                None,
+                None,
+                false,
+                Order::Descending,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(visual.len(), 1);
+        assert_eq!(visual[0].text_source.as_deref(), Some("vision"));
+        assert_eq!(visual[0].text, "visual diagram");
+    }
 
     #[tokio::test]
     async fn element_queries_select_and_roundtrip_properties() {

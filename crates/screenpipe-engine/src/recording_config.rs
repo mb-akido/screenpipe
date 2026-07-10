@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::vision_indexer::{image_redaction_policy_id, VisionIndexingConfig};
 use crate::vision_manager::VisionManagerConfig;
 
 /// Unified recording configuration used by both the CLI binary and the Tauri embedded server.
@@ -34,6 +35,10 @@ pub struct RecordingConfig {
     /// capture alive. This skips visual-diff images, full screenshot capture,
     /// JPEG writes, and OCR fallback.
     pub disable_screenshots: bool,
+    /// Optional asynchronous semantic indexing of redaction-ready screenshots.
+    /// This is separate from native accessibility/OCR capture, so a model
+    /// cannot slow recording down.
+    pub vision_indexing: VisionIndexingConfig,
     /// Disable the timeline / rewind feature. Skips timeline-only backend work
     /// (hot frame cache warm-up + per-frame/audio buffering into the hot cache
     /// that only the timeline streaming endpoint consumes).
@@ -270,6 +275,11 @@ impl RecordingConfig {
         screenpipe_config::set_record_while_locked(settings.record_while_locked);
         let (screenpipe_aec_enabled, windows_input_aec_enabled, macos_input_vpio_enabled) =
             settings.effective_aec_flags();
+        let vision_indexing_mode = if settings.disable_vision || settings.disable_screenshots {
+            "off"
+        } else {
+            &settings.vision_indexing_mode
+        };
 
         Self {
             audio_chunk_duration: settings.audio_chunk_duration.max(0) as u64,
@@ -279,6 +289,21 @@ impl RecordingConfig {
                 || settings.audio_capture_mode.eq_ignore_ascii_case("disabled"),
             disable_vision: settings.disable_vision,
             disable_screenshots: settings.disable_screenshots,
+            vision_indexing: VisionIndexingConfig::from_settings(
+                vision_indexing_mode,
+                &settings.vision_indexing_context_mode,
+                settings.vision_indexing_endpoint.clone(),
+                settings.vision_indexing_api_key.clone(),
+                settings.vision_indexing_model.clone(),
+                settings.vision_indexing_interval_ms,
+                settings.vision_indexing_cloud_consent,
+                settings.vision_indexing_max_cloud_jobs_per_day,
+                settings.async_image_pii_redaction,
+                Some(image_redaction_policy_id(
+                    &settings.pii_backend,
+                    &settings.pii_redaction_labels,
+                )),
+            ),
             disable_timeline: settings.disable_timeline,
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
@@ -523,6 +548,7 @@ impl RecordingConfig {
             languages: self.languages.clone(),
             video_quality: self.video_quality.clone(),
             disable_screenshots: self.disable_screenshots,
+            vision_indexing: self.vision_indexing.clone(),
             idle_capture_interval_ms: self.idle_capture_interval_ms,
             visual_check_interval_ms: self.visual_check_interval_ms,
             visual_change_threshold: self.visual_change_threshold,
@@ -776,6 +802,26 @@ mod tests {
         assert_eq!(vision.min_capture_interval_ms, Some(120));
         assert_eq!(vision.capture_on_keystroke, Some(true));
         assert_eq!(vision.capture_on_clipboard, Some(true));
+    }
+
+    #[test]
+    fn visual_indexing_fails_closed_without_screenshot_capture() {
+        for (disable_vision, disable_screenshots) in [(true, false), (false, true)] {
+            let settings = screenpipe_config::RecordingSettings {
+                disable_vision,
+                disable_screenshots,
+                vision_indexing_mode: "cloud".to_string(),
+                vision_indexing_endpoint: Some("https://vision.example/v1".to_string()),
+                vision_indexing_model: Some("model".to_string()),
+                vision_indexing_cloud_consent: true,
+                async_image_pii_redaction: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                build(&settings).vision_indexing.mode,
+                crate::vision_indexer::VisionIndexingMode::Off
+            );
+        }
     }
 
     fn langs(items: &[&str]) -> Vec<String> {

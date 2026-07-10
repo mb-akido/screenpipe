@@ -50,6 +50,7 @@ mod sync_api;
 pub mod sync_provider;
 pub mod telemetry_context;
 pub mod ui_recorder;
+pub mod vision_indexer;
 // Exposed publicly so the commercial `screenpipe-sdk` (screenpipe/sdk repo)
 // can wrap `start_ffmpeg_process` / `write_frame_to_ffmpeg` /
 // `finish_ffmpeg_process` without re-implementing the encoder pipeline.

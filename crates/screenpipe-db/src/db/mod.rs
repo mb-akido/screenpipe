@@ -367,6 +367,7 @@ mod audio;
 mod display_layout;
 mod elements;
 mod frames;
+pub use frames::VisionIndexCandidate;
 mod maintenance;
 mod meetings;
 mod memories;

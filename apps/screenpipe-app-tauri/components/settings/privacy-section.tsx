@@ -61,6 +61,7 @@ import {
   debounce,
   FieldValidationResult,
 } from "@/lib/utils/validation";
+import { getVisionIndexingDisabledUpdates } from "@/lib/utils/vision-indexing-settings";
 
 const formatCount = (count: number): string => {
   if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
@@ -646,11 +647,15 @@ export function PrivacySection() {
   })();
 
   const handlePiiModeChange = (next: PiiMode) => {
+    const imageRedactionEnabled = next === "smart";
     handleSettingsChange(
       {
         usePiiRemoval: next !== "off",
         asyncPiiRedaction: next === "smart",
-        asyncImagePiiRedaction: next === "smart",
+        asyncImagePiiRedaction: imageRedactionEnabled,
+        ...(!imageRedactionEnabled
+          ? getVisionIndexingDisabledUpdates(settings)
+          : {}),
       },
       true,
     );
@@ -681,6 +686,7 @@ export function PrivacySection() {
         usePiiRemoval: true,
         asyncPiiRedaction: text,
         asyncImagePiiRedaction: image,
+        ...(!image ? getVisionIndexingDisabledUpdates(settings) : {}),
       },
       true,
     );
@@ -1539,8 +1545,9 @@ export function PrivacySection() {
                             Images
                           </span>
                           <span className="text-muted-foreground">
-                            {" "}— black out PII in screenshot frames (on-device
-                            vision model)
+                            {piiBackend === "tinfoil"
+                              ? " — black out PII in screenshot frames using your configured cloud enclave"
+                              : " — black out PII in screenshot frames using an on-device vision model"}
                           </span>
                         </span>
                       </label>

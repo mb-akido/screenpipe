@@ -11,9 +11,9 @@
 //!
 //! Destructive-only model: the worker overwrites the source JPG in
 //! place (atomic rename via a tempfile sibling) and stamps
-//! `frames.image_redacted_at`. There's no separate "is processed" flag
-//! and no version-tracking column — the timestamp IS the gate. See
-//! the 20260507 drop-duplicates migration for the schema reduction.
+//! `frames.image_redacted_at`. Optional downstream consumers can additionally
+//! require the strict success marker and current policy ID; missing/non-image
+//! terminal skips never receive those fields.
 //!
 //! Why a separate worker (vs. the text path):
 //! - Image inference is per-frame, not batched.
@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -51,6 +52,9 @@ pub struct ImageWorkerConfig {
     pub min_age_seconds: i64,
     /// Per-frame redaction policy (allow-list + score floor).
     pub policy: ImageRedactionPolicy,
+    /// Deterministic image-policy identifier shared with post-redaction
+    /// consumers. A success is eligible only under the same policy.
+    pub policy_id: Option<String>,
 }
 
 impl Default for ImageWorkerConfig {
@@ -60,6 +64,7 @@ impl Default for ImageWorkerConfig {
             idle_between_frames: Duration::from_millis(20),
             min_age_seconds: 60,
             policy: ImageRedactionPolicy::default(),
+            policy_id: None,
         }
     }
 }
@@ -227,7 +232,7 @@ impl ImageWorker {
         if !path.exists() {
             debug!(frame = id, path = %path.display(), "frame jpg missing — marking redacted to skip");
             // Still mark redacted so we don't re-pick this row every poll.
-            self.mark_redacted(id).await?;
+            self.mark_processed(id, false, None).await?;
             return Ok(Some(FrameRedactionOutcome::default()));
         }
 
@@ -253,7 +258,7 @@ impl ImageWorker {
                 path = %path.display(),
                 "frames.name is not a still-image path (likely mp4 chunk) — marking redacted to skip"
             );
-            self.mark_redacted(id).await?;
+            self.mark_processed(id, false, None).await?;
             return Ok(Some(FrameRedactionOutcome::default()));
         }
 
@@ -261,7 +266,9 @@ impl ImageWorker {
         let outcome =
             redact_frame(path, &regions, &self.cfg.policy).map_err(anyhow::Error::from)?;
 
-        self.mark_redacted(id).await?;
+        let redacted_bytes = std::fs::read(path)?;
+        let content_hash = format!("{:x}", Sha256::digest(&redacted_bytes));
+        self.mark_processed(id, true, Some(&content_hash)).await?;
 
         let mut s = self.status.lock().await;
         s.frames_redacted_total += 1;
@@ -272,15 +279,29 @@ impl ImageWorker {
         Ok(Some(outcome))
     }
 
-    async fn mark_redacted(&self, frame_id: i64) -> Result<(), sqlx::Error> {
+    async fn mark_processed(
+        &self,
+        frame_id: i64,
+        succeeded: bool,
+        content_hash: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             UPDATE frames
-               SET image_redacted_at = strftime('%s','now')
+               SET image_redacted_at = strftime('%s','now'),
+                   image_redaction_succeeded_at = CASE
+                     WHEN ?2 THEN strftime('%s','now')
+                     ELSE NULL
+                   END,
+                   image_redaction_policy_id = CASE WHEN ?2 THEN ?3 ELSE NULL END,
+                   image_redaction_content_hash = CASE WHEN ?2 THEN ?4 ELSE NULL END
              WHERE id = ?1
             "#,
         )
         .bind(frame_id)
+        .bind(succeeded)
+        .bind(self.cfg.policy_id.as_deref())
+        .bind(content_hash)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -308,7 +329,10 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 name TEXT,
-                image_redacted_at INTEGER
+                image_redacted_at INTEGER,
+                image_redaction_succeeded_at INTEGER,
+                image_redaction_policy_id TEXT,
+                image_redaction_content_hash TEXT
             );
             "#,
         )
@@ -365,12 +389,19 @@ mod tests {
         let w = ImageWorker::new(pool.clone(), Arc::new(StubRedactor), cfg);
         let outcome = w.process_one().await.unwrap();
         assert!(outcome.is_some());
-        let row = sqlx::query("SELECT image_redacted_at FROM frames LIMIT 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row = sqlx::query(
+            "SELECT image_redacted_at, image_redaction_succeeded_at FROM frames LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let when: Option<i64> = row.get(0);
         assert!(when.is_some(), "must mark redacted_at to skip");
+        let succeeded: Option<i64> = row.get(1);
+        assert!(
+            succeeded.is_none(),
+            "missing files must never be eligible for visual indexing"
+        );
     }
 
     /// `frames.name` can hold an mp4 chunk path on the legacy capture
@@ -400,11 +431,60 @@ mod tests {
             mp4_path.exists(),
             "mp4 chunk file should be untouched by the redact worker"
         );
-        let row = sqlx::query("SELECT image_redacted_at FROM frames LIMIT 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row = sqlx::query(
+            "SELECT image_redacted_at, image_redaction_succeeded_at FROM frames LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let when: Option<i64> = row.get(0);
         assert!(when.is_some(), "must mark redacted_at to skip");
+        let succeeded: Option<i64> = row.get(1);
+        assert!(
+            succeeded.is_none(),
+            "non-image files must never be eligible for visual indexing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_image_pass_sets_the_strict_success_marker() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("frame.jpg");
+        image::RgbImage::new(20, 20).save(&image_path).unwrap();
+        sqlx::query("INSERT INTO frames (timestamp, name) VALUES (datetime('now', '-1 hour'), ?1)")
+            .bind(image_path.to_string_lossy().into_owned())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let worker = ImageWorker::new(
+            pool.clone(),
+            Arc::new(StubRedactor),
+            ImageWorkerConfig {
+                policy_id: Some("test-policy".to_string()),
+                ..Default::default()
+            },
+        );
+        worker.process_one().await.unwrap();
+
+        let succeeded: Option<i64> =
+            sqlx::query_scalar("SELECT image_redaction_succeeded_at FROM frames LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(succeeded.is_some());
+        let policy_id: Option<String> =
+            sqlx::query_scalar("SELECT image_redaction_policy_id FROM frames LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(policy_id.as_deref(), Some("test-policy"));
+        let content_hash: Option<String> =
+            sqlx::query_scalar("SELECT image_redaction_content_hash FROM frames LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content_hash.as_deref().map(str::len), Some(64));
     }
 }

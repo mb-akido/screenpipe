@@ -267,6 +267,22 @@ export type Settings = SettingsStore & {
 	openaiCompatibleHeaders?: Record<string, string>;
 	/** Send raw WAV audio instead of MP3 to OpenAI-compatible endpoint */
 	openaiCompatibleRawAudio?: boolean;
+	/** Optional screenshot VLM indexing: off, local OpenAI-compatible endpoint, or cloud endpoint. */
+	visionIndexingMode?: "off" | "local" | "cloud";
+	/** Search native text plus visual descriptions, or visual descriptions only; native text remains stored. */
+	visionIndexingContextMode?: "augment" | "replace";
+	/** OpenAI-compatible VLM base URL (local mode is restricted to loopback by the engine). */
+	visionIndexingEndpoint?: string;
+	/** API key for the configured vision endpoint. */
+	visionIndexingApiKey?: string;
+	/** Model name sent to the configured vision endpoint. */
+	visionIndexingModel?: string;
+	/** Minimum per-monitor background visual-indexing interval in milliseconds. */
+	visionIndexingIntervalMs?: number;
+	/** Explicit acknowledgement before cloud mode can upload redaction-processed screenshots. */
+	visionIndexingCloudConsent?: boolean;
+    /** Maximum outbound cloud VLM requests per UTC day; local mode ignores it. */
+	visionIndexingMaxCloudJobsPerDay?: number;
 	/** Let Pi / Claude Code call the confidential cloud enclave
 	 * (Gemma 4 E4B inside an attested Tinfoil CVM) to analyze audio,
 	 * video frames, and images from screenpipe data. Default true. When
@@ -656,6 +672,14 @@ let DEFAULT_SETTINGS: Settings = {
 			lockVaultShortcut: "Super+Shift+L",
 			disableVision: false,
 			disableScreenshots: false,
+			visionIndexingMode: "off",
+			visionIndexingContextMode: "augment",
+			visionIndexingEndpoint: "http://127.0.0.1:8000/v1",
+			visionIndexingApiKey: "",
+			visionIndexingModel: "google/gemma-4-E4B",
+			visionIndexingIntervalMs: 10000,
+			visionIndexingCloudConsent: false,
+			visionIndexingMaxCloudJobsPerDay: 100,
 			useAllMonitors: true,
 			showShortcutOverlay: true,
 			chatHistory: {

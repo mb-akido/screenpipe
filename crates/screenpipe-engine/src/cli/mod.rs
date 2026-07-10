@@ -2031,6 +2031,113 @@ pub enum VisionCommand {
         #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
     },
+    /// Configure and benchmark opt-in screenshot VLM indexing
+    Index {
+        #[command(subcommand)]
+        subcommand: VisionIndexCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum VisionIndexCommand {
+    /// Show the persisted visual-indexing configuration (API keys stay masked)
+    Status {
+        /// Data directory. Default: $HOME/.screenpipe
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<String>,
+        /// Output format
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
+        output: OutputFormat,
+    },
+    /// Persist local/cloud VLM indexing settings for the next capture restart
+    Configure {
+        /// Indexing location: off, local (loopback only), or cloud (HTTPS + consent)
+        #[arg(long, value_enum)]
+        mode: CliVisionIndexingMode,
+        /// Search a11y/OCR plus visual descriptions, or visual descriptions only
+        #[arg(long, value_enum)]
+        context: Option<CliVisionIndexingContext>,
+        /// OpenAI-compatible base URL, e.g. http://127.0.0.1:8000/v1
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Model identifier exposed by the configured VLM endpoint
+        #[arg(long)]
+        model: Option<String>,
+        /// API key for the endpoint. Prefer SCREENPIPE_VISION_INDEXING_API_KEY in automation.
+        #[arg(long, env = "SCREENPIPE_VISION_INDEXING_API_KEY")]
+        api_key: Option<String>,
+        /// Remove a persisted API key
+        #[arg(long)]
+        clear_api_key: bool,
+        /// Minimum per-monitor interval between VLM jobs (10000-300000 ms)
+        #[arg(long)]
+        interval_ms: Option<u64>,
+        /// Maximum outbound cloud VLM requests per UTC day (1-100000; ignored locally)
+        #[arg(long)]
+        max_cloud_jobs_per_day: Option<u32>,
+        /// Acknowledge that cloud mode sends redaction-processed screenshots to the endpoint
+        #[arg(long)]
+        cloud_consent: bool,
+        /// Data directory. Default: $HOME/.screenpipe
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<String>,
+        /// Output format
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
+        output: OutputFormat,
+    },
+    /// Benchmark the configured endpoint using one explicit JPEG image
+    Benchmark {
+        /// JPEG screenshot to send to the explicitly configured endpoint
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        image: PathBuf,
+        /// Number of endpoint calls to make
+        #[arg(long, default_value_t = 10)]
+        requests: usize,
+        /// Maximum simultaneous requests (1-64)
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Allow cloud benchmark mode to send this explicit image as-is (outside production redaction/budget gates)
+        #[arg(long)]
+        allow_direct_image_upload: bool,
+        /// Data directory. Default: $HOME/.screenpipe
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<String>,
+        /// Output format
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
+        output: OutputFormat,
+    },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum CliVisionIndexingMode {
+    Off,
+    Local,
+    Cloud,
+}
+
+impl CliVisionIndexingMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Local => "local",
+            Self::Cloud => "cloud",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum CliVisionIndexingContext {
+    Augment,
+    Replace,
+}
+
+impl CliVisionIndexingContext {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Augment => "augment",
+            Self::Replace => "replace",
+        }
+    }
 }
 
 #[derive(Subcommand)]

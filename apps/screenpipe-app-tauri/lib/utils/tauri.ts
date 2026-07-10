@@ -2806,6 +2806,28 @@ disableVision: boolean;
  */
 disableScreenshots?: boolean;
 /**
+ * Optional visual-language-model indexing for captured screenshots.
+ * Values: `"off"` (default), `"local"`, or `"cloud"`.
+ */
+visionIndexingMode?: string;
+/**
+ * `"augment"` searches accessibility/OCR plus the separate visual index;
+ * `"replace"` searches visual descriptions while retaining native text.
+ */
+visionIndexingContextMode?: string;
+/** OpenAI-compatible chat-completions base URL for the selected VLM. */
+visionIndexingEndpoint?: string | null;
+/** API key for the selected VLM endpoint. */
+visionIndexingApiKey?: string | null;
+/** VLM model identifier. */
+visionIndexingModel?: string | null;
+/** Minimum milliseconds between background VLM jobs for one monitor. */
+visionIndexingIntervalMs?: number;
+/** Explicit acknowledgement before cloud mode uploads redaction-processed screenshots. */
+visionIndexingCloudConsent?: boolean;
+/** Maximum outbound cloud VLM requests per UTC day; local mode ignores it. */
+visionIndexingMaxCloudJobsPerDay?: number;
+/**
  * Disable the timeline / rewind feature. When true, the engine skips
  * timeline-only work: warming the hot frame cache from the DB at startup
  * and buffering captured frames/audio into the in-memory hot cache that

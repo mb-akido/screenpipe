@@ -31,6 +31,7 @@ export const searchIndex: SettingsField[] = [
   { label: "Smart recording", keywords: ["smart recording", "beta", "meeting", "piggyback", "per-process", "meeting audio"], conditional: true },
   { label: "Screen context capture", keywords: ["screen", "video", "accessibility"] },
   { label: "Screenshot images", keywords: ["screenshot", "pixels", "ocr", "jpeg"] },
+  { label: "Visual indexing", keywords: ["vision", "vlm", "local model", "cloud model", "semantic search", "dayflow"], conditional: true },
   { label: "Use all monitors", keywords: ["monitor", "display"], conditional: true },
   // conditional: monitor picker only renders when "Use all monitors" is off — paired right under that toggle.
   { label: "Monitors", conditional: true },
@@ -160,6 +161,13 @@ import {
   validateUrl,
   FieldValidationResult
 } from "@/lib/utils/validation";
+import {
+  getVisionIndexingDisabledUpdates,
+  getVisionIndexingEndpointUpdates,
+  getVisionIndexingModeUpdates,
+  validateVisionIndexingSettings,
+  type VisionIndexingMode,
+} from "@/lib/utils/vision-indexing-settings";
 import { AudioEqualizer } from "@/app/shortcut-reminder/audio-equalizer";
 
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
@@ -1903,6 +1911,7 @@ export function RecordingSettings() {
   const [platformReady, setPlatformReady] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [showOpenAIApiKey, setShowOpenAIApiKey] = useState(false);
+  const [showVisionApiKey, setShowVisionApiKey] = useState(false);
   const [isRefreshingSubscription, setIsRefreshingSubscription] = useState(false);
   const { checkLogin } = useLoginDialog();
   const overlayData = useOverlayData();
@@ -1994,7 +2003,7 @@ export function RecordingSettings() {
 
   // Optimized debounced validation
   const debouncedValidateSettings = useMemo(
-    () => debounce((newSettings: Partial<SettingsStore>) => {
+    () => debounce((newSettings: Partial<Settings>) => {
       const errors: Record<string, string> = {};
       
       // Validate numeric fields
@@ -2017,6 +2026,8 @@ export function RecordingSettings() {
           errors.deepgramApiKey = "API key seems too short";
         }
       }
+
+      Object.assign(errors, validateVisionIndexingSettings(newSettings));
       
       setValidationErrors(errors);
     }, 300),
@@ -2052,6 +2063,9 @@ export function RecordingSettings() {
   const aecDetails = AEC_MODE_DETAILS[aecMode];
   const screenContextEnabled = !settings.disableVision;
   const screenshotImagesEnabled = screenContextEnabled && !(settings.disableScreenshots ?? false);
+  const visionIndexingMode = settings.visionIndexingMode ?? "off";
+  const visionIndexingEnabled = visionIndexingMode !== "off";
+  const visionImageRedactionBackend = settings.piiBackend === "tinfoil" ? "tinfoil" : "local";
 
   const handleAecModeChange = useCallback((mode: AecMode) => {
     handleSettingsChange(getAecModeSettings(mode), true);
@@ -3763,7 +3777,20 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <p className="text-xs text-muted-foreground">Capture app/window context, accessibility text, screenshot images, and OCR fallback</p>
                 </div>
               </div>
-              <ManagedSwitch settingKey="disableVision" id="disableVision" checked={!settings.disableVision} onCheckedChange={(checked) => handleSettingsChange({ disableVision: !checked }, true)} />
+              <ManagedSwitch
+                settingKey="disableVision"
+                id="disableVision"
+                checked={!settings.disableVision}
+                onCheckedChange={(checked) =>
+                  handleSettingsChange(
+                    {
+                      disableVision: !checked,
+                      ...(!checked ? getVisionIndexingDisabledUpdates(settings) : {}),
+                    },
+                    true,
+                  )
+                }
+              />
             </div>
           </CardContent>
         </Card>
@@ -3783,9 +3810,247 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   settingKey="disableScreenshots"
                   id="disableScreenshots"
                   checked={!(settings.disableScreenshots ?? false)}
-                  onCheckedChange={(checked) => handleSettingsChange({ disableScreenshots: !checked }, true)}
+                  onCheckedChange={(checked) =>
+                    handleSettingsChange(
+                      {
+                        disableScreenshots: !checked,
+                        ...(!checked ? getVisionIndexingDisabledUpdates(settings) : {}),
+                      },
+                      true,
+                    )
+                  }
                 />
               </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* VLM indexing is deliberately separate from capture. A background
+            reconciler sees a frame only after image redaction has completed. */}
+        {screenshotImagesEnabled && (
+          <Card className="border-border bg-card">
+            <CardContent className="space-y-3 px-3 py-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex min-w-0 items-start space-x-2.5">
+                  <Eye className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-medium text-foreground">Visual indexing</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Turn selected screenshots into short visual descriptions for canvas apps,
+                      remote desktops, and other screens that text capture misses. A background
+                      worker indexes only redaction-ready images; capture never calls the model.
+                    </p>
+                  </div>
+                </div>
+                <Select
+                  value={visionIndexingMode}
+                  onValueChange={(value) =>
+                    handleSettingsChange(
+                      getVisionIndexingModeUpdates(
+                        settings,
+                        value as VisionIndexingMode,
+                      ),
+                      true,
+                    )
+                  }
+                >
+                  <SelectTrigger className="h-8 w-[180px] shrink-0 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="off">Off</SelectItem>
+                    <SelectItem value="local">Local VLM</SelectItem>
+                    <SelectItem value="cloud">Cloud VLM</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {visionIndexingEnabled && (
+                <div className="space-y-2.5 border-t border-border pt-3">
+                  <div className="flex items-start gap-2 rounded border border-border bg-muted/40 px-2.5 py-2 text-[11px] text-muted-foreground">
+                    <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      {visionImageRedactionBackend === "tinfoil"
+                        ? "Required privacy step: your configured cloud enclave processes original pixels before the visual indexer receives the processed screenshot. Generated descriptions are not redacted again; your selected Image PII labels define this boundary."
+                        : "Required privacy step: the local Image PII removal worker processes each screenshot first and may download about 100 MB on first use. Generated descriptions are not redacted again; your selected Image PII labels define this boundary."}
+                    </span>
+                  </div>
+                  {validationErrors.asyncImagePiiRedaction && (
+                    <p className="text-[11px] text-destructive">
+                      {validationErrors.asyncImagePiiRedaction}
+                    </p>
+                  )}
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="space-y-1">
+                      <span className="text-xs font-medium text-foreground">Search scope</span>
+                      <Select
+                        value={settings.visionIndexingContextMode ?? "augment"}
+                        onValueChange={(value) =>
+                          handleSettingsChange(
+                            {
+                              visionIndexingContextMode: value as "augment" | "replace",
+                            },
+                            true,
+                          )
+                        }
+                      >
+                        <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="augment">Native + visual</SelectItem>
+                          <SelectItem value="replace">Visual descriptions only</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <span className="block text-[11px] text-muted-foreground">
+                        {settings.visionIndexingContextMode === "replace"
+                          ? "For frames with a visual description, search uses that description while native accessibility/OCR text remains stored unchanged."
+                          : "Recommended: search native screen text and the separate visual index together."}
+                      </span>
+                    </label>
+
+                    <label className="space-y-1">
+                      <span className="text-xs font-medium text-foreground">Maximum cadence</span>
+                      <Select
+                        value={String(settings.visionIndexingIntervalMs ?? 10000)}
+                        onValueChange={(value) =>
+                          handleSettingsChange({ visionIndexingIntervalMs: Number(value) }, true)
+                        }
+                      >
+                        <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="10000">Every 10 seconds (recommended)</SelectItem>
+                          <SelectItem value="30000">Every 30 seconds</SelectItem>
+                          <SelectItem value="60000">Every minute</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <span className="block text-[11px] text-muted-foreground">
+                        The background worker coalesces each monitor to its newest eligible redacted frame.
+                      </span>
+                    </label>
+                  </div>
+
+                  <label className="block space-y-1">
+                    <span className="text-xs font-medium text-foreground">OpenAI-compatible endpoint</span>
+                    <Input
+                      className="h-8 text-xs font-mono"
+                      placeholder={visionIndexingMode === "local" ? "http://127.0.0.1:8000/v1" : "https://your-provider.example/v1"}
+                      value={settings.visionIndexingEndpoint ?? ""}
+                      onChange={(event) =>
+                        handleSettingsChange(
+                          getVisionIndexingEndpointUpdates(
+                            settings.visionIndexingEndpoint,
+                            event.target.value,
+                          ),
+                          true,
+                        )
+                      }
+                    />
+                    <span className="block text-[11px] text-muted-foreground">
+                      {visionIndexingMode === "local"
+                        ? "Only screenshots processed by Image PII removal are sent to localhost / loopback. vLLM and Ollama both expose this API shape."
+                        : "Must be HTTPS. You choose the provider, model, credentials, and retention terms."}
+                    </span>
+                    {validationErrors.visionIndexingEndpoint && (
+                      <span className="block text-[11px] text-destructive">
+                        {validationErrors.visionIndexingEndpoint}
+                      </span>
+                    )}
+                  </label>
+
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="space-y-1">
+                      <span className="text-xs font-medium text-foreground">Model</span>
+                      <Input
+                        className="h-8 text-xs font-mono"
+                        placeholder={visionIndexingMode === "local" ? "google/gemma-4-E4B" : "gemini-3.1-flash-lite"}
+                        value={settings.visionIndexingModel ?? ""}
+                        onChange={(event) =>
+                          handleSettingsChange({ visionIndexingModel: event.target.value }, true)
+                        }
+                      />
+                      <span className="block text-[11px] text-muted-foreground">
+                        Local starting point: Gemma 4 E4B; test GUI-Owl 1.5 4B for UI grounding and Qwen3.6-27B only for escalations.
+                      </span>
+                      {validationErrors.visionIndexingModel && (
+                        <span className="block text-[11px] text-destructive">
+                          {validationErrors.visionIndexingModel}
+                        </span>
+                      )}
+                    </label>
+
+                    <label className="space-y-1">
+                      <span className="text-xs font-medium text-foreground">API key {visionIndexingMode === "local" ? "(optional)" : ""}</span>
+                      <div className="relative">
+                        <Input
+                          className="h-8 pr-8 text-xs font-mono"
+                          type={showVisionApiKey ? "text" : "password"}
+                          value={settings.visionIndexingApiKey ?? ""}
+                          onChange={(event) =>
+                            handleSettingsChange({ visionIndexingApiKey: event.target.value }, true)
+                          }
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="absolute right-0 top-0 h-8 w-8"
+                          onClick={() => setShowVisionApiKey((visible) => !visible)}
+                          aria-label={showVisionApiKey ? "hide vision API key" : "show vision API key"}
+                        >
+                          {showVisionApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                        </Button>
+                      </div>
+                    </label>
+                  </div>
+
+                  {visionIndexingMode === "cloud" && (
+                    <div className="space-y-2.5">
+                      <label className="flex cursor-pointer items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={settings.visionIndexingCloudConsent ?? false}
+                          onChange={(event) =>
+                            handleSettingsChange({ visionIndexingCloudConsent: event.target.checked }, true)
+                          }
+                        />
+                        <span>
+                          {visionImageRedactionBackend === "tinfoil"
+                            ? "I understand my configured cloud enclave processes the original pixels first, then the processed screenshots leave this device for my VLM provider. Generated descriptions are not redacted again. Visual indexing never falls back to an unprocessed screenshot. Changing provider clears this acknowledgement and API key."
+                            : "I understand screenshots processed by local Image PII removal will leave this device for my VLM provider. Generated descriptions are not redacted again. Visual indexing never falls back to an unprocessed screenshot. Changing provider clears this acknowledgement and API key."}
+                        </span>
+                      </label>
+                      {validationErrors.visionIndexingCloudConsent && (
+                        <p className="text-[11px] text-destructive">
+                          {validationErrors.visionIndexingCloudConsent}
+                        </p>
+                      )}
+                      <label className="block space-y-1">
+                        <span className="text-xs font-medium text-foreground">Cloud daily budget</span>
+                        <Select
+                          value={String(settings.visionIndexingMaxCloudJobsPerDay ?? 100)}
+                          onValueChange={(value) =>
+                            handleSettingsChange(
+                              { visionIndexingMaxCloudJobsPerDay: Number(value) },
+                              true,
+                            )
+                          }
+                        >
+                          <SelectTrigger className="h-8 w-[220px] text-xs"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="25">25 cloud requests / day</SelectItem>
+                            <SelectItem value="100">100 cloud requests / day (recommended)</SelectItem>
+                            <SelectItem value="250">250 cloud requests / day</SelectItem>
+                            <SelectItem value="500">500 cloud requests / day</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <span className="block text-[11px] text-muted-foreground">
+                          A persisted cap across restarts. Provider image-token accounting varies, so benchmark your selected model before increasing it.
+                        </span>
+                      </label>
+                    </div>
+                  )}
+                </div>
+              )}
             </CardContent>
           </Card>
         )}

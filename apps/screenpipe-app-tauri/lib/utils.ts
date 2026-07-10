@@ -2,7 +2,13 @@ import { stat } from "@tauri-apps/plugin-fs";
 import { platform } from "@tauri-apps/plugin-os";
 import { twMerge } from "tailwind-merge";
 type ContentItem =
-	| { type: "OCR"; content: { text: string; text_source?: "accessibility" | "ocr" | null } }
+	| {
+			type: "OCR";
+			content: {
+				text: string;
+				text_source?: "accessibility" | "ocr" | "vision" | "vision_hybrid" | null;
+			};
+	  }
 	| { type: "Audio"; content: { transcription: string } }
 	| { type: "UI"; content: { text: string } }
 	| { type: "Input"; content: Record<string, unknown> };
@@ -269,4 +275,3 @@ export const queryParser = {
 export const querySerializer = createSerializer(queryParser);
 
 export type QueryParser = inferParserType<typeof queryParser>;
-

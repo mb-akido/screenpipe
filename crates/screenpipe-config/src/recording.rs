@@ -236,6 +236,63 @@ pub struct RecordingSettings {
     #[serde(rename = "disableScreenshots", default)]
     pub disable_screenshots: bool,
 
+    /// Optional visual-language-model indexing for captured screenshots.
+    ///
+    /// Values: `"off"` (default), `"local"`, or `"cloud"`. The engine
+    /// validates the endpoint for the selected mode before the background
+    /// reconciler starts. Local mode only accepts loopback endpoints.
+    #[serde(
+        rename = "visionIndexingMode",
+        default = "default_vision_indexing_mode"
+    )]
+    pub vision_indexing_mode: String,
+
+    /// How VLM observations join the screen-text index.
+    ///
+    /// `"augment"` searches accessibility/OCR and the separate visual index.
+    /// `"replace"` searches the visual description for indexed frames. Native
+    /// text is retained unchanged in both modes.
+    #[serde(
+        rename = "visionIndexingContextMode",
+        default = "default_vision_indexing_context_mode"
+    )]
+    pub vision_indexing_context_mode: String,
+
+    /// OpenAI-compatible chat-completions base URL for the VLM.
+    /// Local examples: Ollama or vLLM on `http://127.0.0.1:<port>/v1`.
+    #[serde(rename = "visionIndexingEndpoint", default)]
+    pub vision_indexing_endpoint: Option<String>,
+
+    /// API key for a cloud or authenticated local OpenAI-compatible VLM.
+    /// `store.bin` is kept mode 0600 and can be encrypted by the desktop app.
+    #[serde(rename = "visionIndexingApiKey", default)]
+    pub vision_indexing_api_key: Option<String>,
+
+    /// VLM model identifier sent to the configured endpoint.
+    #[serde(rename = "visionIndexingModel", default)]
+    pub vision_indexing_model: Option<String>,
+
+    /// Minimum interval between VLM jobs for one monitor. The background
+    /// reconciler coalesces newer ready frames to this bounded-cost cadence.
+    #[serde(
+        rename = "visionIndexingIntervalMs",
+        default = "default_vision_indexing_interval_ms"
+    )]
+    pub vision_indexing_interval_ms: u64,
+
+    /// Explicit acknowledgement required before cloud mode sends an image
+    /// processed by the configured redaction policy to a remote endpoint.
+    #[serde(rename = "visionIndexingCloudConsent", default)]
+    pub vision_indexing_cloud_consent: bool,
+
+    /// Durable per-day cost guard for remote VLM indexing. Local mode ignores
+    /// this; cloud mode stops after this many outbound VLM requests.
+    #[serde(
+        rename = "visionIndexingMaxCloudJobsPerDay",
+        default = "default_vision_indexing_max_cloud_jobs_per_day"
+    )]
+    pub vision_indexing_max_cloud_jobs_per_day: u32,
+
     /// Disable the timeline / rewind feature. When true, the engine skips
     /// timeline-only work: warming the hot frame cache from the DB at startup
     /// and buffering captured frames/audio into the in-memory hot cache that
@@ -710,6 +767,15 @@ impl Default for RecordingSettings {
             vocabulary: vec![],
             disable_vision: false,
             disable_screenshots: false,
+            vision_indexing_mode: default_vision_indexing_mode(),
+            vision_indexing_context_mode: default_vision_indexing_context_mode(),
+            vision_indexing_endpoint: None,
+            vision_indexing_api_key: None,
+            vision_indexing_model: None,
+            vision_indexing_interval_ms: default_vision_indexing_interval_ms(),
+            vision_indexing_cloud_consent: false,
+            vision_indexing_max_cloud_jobs_per_day: default_vision_indexing_max_cloud_jobs_per_day(
+            ),
             disable_timeline: false,
             monitor_ids: vec![],
             use_all_monitors: true,
@@ -804,6 +870,28 @@ fn default_experimental_meeting_piggyback() -> bool {
 
 fn default_max_snapshot_width() -> u32 {
     1920
+}
+
+fn default_vision_indexing_mode() -> String {
+    "off".to_string()
+}
+
+fn default_vision_indexing_context_mode() -> String {
+    "augment".to_string()
+}
+
+fn default_vision_indexing_interval_ms() -> u64 {
+    // Dayflow samples roughly every 10 seconds. Match that as the safe upper
+    // bound for a VLM job while preserving screenpipe's richer event-driven
+    // capture for the local timeline.
+    10_000
+}
+
+fn default_vision_indexing_max_cloud_jobs_per_day() -> u32 {
+    // Conservative default that does not assume a deployment size.
+    // The runtime checks persisted DB history, so app restarts do not reset
+    // the allowance.
+    100
 }
 
 fn default_extraction_thread_priority() -> String {

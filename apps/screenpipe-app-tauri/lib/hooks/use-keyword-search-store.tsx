@@ -25,7 +25,7 @@ export interface SearchMatch {
 	// "accessibility" (OS-native tree, primary) or "ocr" (fallback for
 	// terminals/canvas/weak a11y). Null for legacy rows captured before
 	// the field was tracked.
-	text_source?: "accessibility" | "ocr" | null;
+	text_source?: "accessibility" | "ocr" | "vision" | "vision_hybrid" | null;
 }
 
 export interface SearchMatchGroup {

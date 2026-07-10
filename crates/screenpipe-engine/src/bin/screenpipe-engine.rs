@@ -2163,8 +2163,15 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 "starting async image-PII reconciliation worker (destructive overwrite of source JPGs)"
             );
+            let policy_id = screenpipe_engine::vision_indexer::image_redaction_policy_id_for_model(
+                &config.pii_backend,
+                detector.name(),
+                detector.version(),
+                &config.pii_redaction_labels,
+            );
             let cfg = ImageWorkerConfig {
                 policy: ImageRedactionPolicy::from_labels(&config.pii_redaction_labels),
+                policy_id: Some(policy_id),
                 ..Default::default()
             };
             let _img_handle = ImageWorker::new(db.pool.clone(), detector, cfg).spawn();

@@ -60,6 +60,7 @@ impl DatabaseManager {
             {fts_join}
             WHERE 1=1
                 {fts_condition}
+                AND COALESCE(f.vision_context_mode, 'augment') != 'replace'
                 AND (?2 IS NULL OR f.timestamp >= ?2)
                 AND (?3 IS NULL OR f.timestamp <= ?3)
                 AND f.accessibility_text IS NOT NULL AND f.accessibility_text != ''
@@ -145,6 +146,7 @@ impl DatabaseManager {
             LEFT JOIN video_chunks vc ON f.video_chunk_id = vc.id
             WHERE e.source = 'accessibility'
               AND e.on_screen = ?1
+              AND COALESCE(f.vision_context_mode, 'augment') != 'replace'
               {fts_match}
               AND (?2 IS NULL OR f.timestamp >= ?2)
               AND (?3 IS NULL OR f.timestamp <= ?3)
@@ -201,6 +203,7 @@ impl DatabaseManager {
             JOIN frames f ON f.id = e.frame_id
             WHERE e.source = 'accessibility'
               AND e.on_screen = ?1
+              AND COALESCE(f.vision_context_mode, 'augment') != 'replace'
               {fts_match}
               AND (?2 IS NULL OR f.timestamp >= ?2)
               AND (?3 IS NULL OR f.timestamp <= ?3)

@@ -4,6 +4,17 @@
 
 use super::*;
 
+/// A screenshot that has completed the existing image-redaction pipeline and
+/// can therefore be considered by the independent visual-indexing worker.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct VisionIndexCandidate {
+    pub frame_id: i64,
+    pub snapshot_path: String,
+    pub captured_at: DateTime<Utc>,
+    pub device_name: String,
+    pub redacted_content_hash: String,
+}
+
 impl DatabaseManager {
     pub async fn insert_video_chunk(
         &self,
@@ -820,6 +831,247 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Persist one VLM-generated visual description for a frame.
+    ///
+    /// The caption stays separate from native accessibility/OCR text. A sparse
+    /// dedicated FTS table makes it searchable without racing or re-running the
+    /// text-redaction worker.
+    pub async fn store_vision_description(
+        &self,
+        frame_id: i64,
+        description: &str,
+        mode: &str,
+        model: &str,
+        context_mode: &str,
+    ) -> Result<(), sqlx::Error> {
+        let description = description.trim();
+        if description.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            r#"UPDATE frames
+               SET vision_description = ?2,
+                   vision_indexing_mode = ?3,
+                   vision_context_mode = ?5,
+                   vision_model = ?4,
+                   vision_indexed_at = strftime('%s', 'now'),
+                   vision_index_considered_at = strftime('%s', 'now')
+             WHERE id = ?1"#,
+        )
+        .bind(frame_id)
+        .bind(description)
+        .bind(mode)
+        .bind(model)
+        .bind(context_mode)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Apply the selected read-time context policy to every visual row. The
+    /// caption and native FTS stay untouched. The sparse visual/hybrid FTS is
+    /// atomically refreshed so replace mode cannot retain native tokens.
+    pub async fn set_vision_context_mode_for_indexed_frames(
+        &self,
+        context_mode: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"UPDATE frames
+                  SET vision_context_mode = ?1
+                WHERE vision_description IS NOT NULL
+                  AND vision_description != ''
+                  AND COALESCE(vision_context_mode, '') != ?1"#,
+        )
+        .bind(context_mode)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Permanently coalesce or finish sampled candidates. Persisting this
+    /// state ensures a large backlog from one monitor cannot starve another
+    /// monitor after a restart or fill every bounded reconciliation page.
+    pub async fn mark_vision_candidates_considered(
+        &self,
+        frame_ids: &[i64],
+    ) -> Result<(), sqlx::Error> {
+        if frame_ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.begin_immediate_with_retry().await?;
+        for frame_id in frame_ids {
+            sqlx::query(
+                r#"UPDATE frames
+                      SET vision_index_considered_at = strftime('%s', 'now')
+                    WHERE id = ?1 AND vision_index_considered_at IS NULL"#,
+            )
+            .bind(frame_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Return recent screenshot rows that are ready for visual indexing.
+    ///
+    /// Readiness is fail-closed: the image worker must have successfully
+    /// completed a still-image redaction pass (its broader processed marker is
+    /// also set for missing/non-image paths and is intentionally insufficient),
+    /// the current snapshot path must still be live and match the path it
+    /// processed, and cloud mode never retries a frame after a reserved
+    /// outbound request. The caller still verifies/reads the file after this
+    /// query because retention or compaction can remove it concurrently.
+    pub async fn latest_redacted_vision_candidates(
+        &self,
+        mode: &str,
+        redaction_policy_id: &str,
+        limit: u32,
+    ) -> Result<Vec<VisionIndexCandidate>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT id AS frame_id,
+                      snapshot_path,
+                      timestamp AS captured_at,
+                      COALESCE(device_name, '') AS device_name,
+                      image_redaction_content_hash AS redacted_content_hash
+                 FROM frames
+                WHERE image_redaction_succeeded_at IS NOT NULL
+                  AND image_redaction_policy_id = ?3
+                  AND image_redaction_content_hash IS NOT NULL
+                  AND image_redaction_content_hash != ''
+                  AND snapshot_path IS NOT NULL
+                  AND snapshot_path != ''
+                  AND (LOWER(snapshot_path) LIKE '%.jpg'
+                       OR LOWER(snapshot_path) LIKE '%.jpeg')
+                  AND COALESCE(name, '') = snapshot_path
+                  AND vision_index_considered_at IS NULL
+                  AND (?1 != 'cloud' OR vision_cloud_request_attempted_at IS NULL)
+                ORDER BY id DESC
+                LIMIT ?2"#,
+        )
+        .bind(mode)
+        .bind(i64::from(limit))
+        .bind(redaction_policy_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Recent successful rows seed the reconciliation worker's per-monitor
+    /// cadence after an app restart, avoiding a redundant immediate reindex.
+    pub async fn recent_vision_indexed_frames(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<VisionIndexCandidate>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT id AS frame_id,
+                      snapshot_path,
+                      timestamp AS captured_at,
+                      COALESCE(device_name, '') AS device_name,
+                      COALESCE(image_redaction_content_hash, '') AS redacted_content_hash
+                 FROM frames
+                WHERE vision_indexed_at IS NOT NULL
+                  AND snapshot_path IS NOT NULL
+                  AND snapshot_path != ''
+                ORDER BY id DESC
+                LIMIT ?1"#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Reserve one outbound cloud VLM request under a persisted UTC-day cap.
+    ///
+    /// The reservation happens immediately before the HTTP request rather than
+    /// after a successful caption: providers can bill a request that times out
+    /// or returns malformed output. `BEGIN IMMEDIATE` makes the count and
+    /// reservation atomic with other application writers, and the `NULL` guard
+    /// prevents accidental duplicate sends for one frame from bypassing the
+    /// cap.
+    pub async fn reserve_cloud_vision_request(
+        &self,
+        frame_id: i64,
+        start_timestamp: i64,
+        max_requests: u32,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let already_attempted: bool = sqlx::query_scalar(
+            "SELECT vision_cloud_request_attempted_at IS NOT NULL FROM frames WHERE id = ?1",
+        )
+        .bind(frame_id)
+        .fetch_optional(&mut **tx.conn())
+        .await?
+        .unwrap_or(true);
+        if already_attempted {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "INSERT INTO vision_cloud_daily_usage (day_start_utc, request_count) \
+             VALUES (?1, 0) ON CONFLICT(day_start_utc) DO NOTHING",
+        )
+        .bind(start_timestamp)
+        .execute(&mut **tx.conn())
+        .await?;
+
+        let reserved = sqlx::query(
+            "UPDATE vision_cloud_daily_usage \
+             SET request_count = request_count + 1 \
+             WHERE day_start_utc = ?1 AND request_count < ?2",
+        )
+        .bind(start_timestamp)
+        .bind(i64::from(max_requests))
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
+        if reserved == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let affected = sqlx::query(
+            r#"
+            UPDATE frames
+            SET vision_cloud_request_attempted_at = strftime('%s', 'now')
+            WHERE id = ?1 AND vision_cloud_request_attempted_at IS NULL
+            "#,
+        )
+        .bind(frame_id)
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(sqlx::Error::Protocol(
+                "cloud vision request reservation lost its frame row".to_string(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Count successfully indexed frames since a UTC day boundary. This is
+    /// useful for diagnostics; the cloud budget itself counts attempted
+    /// requests via [`Self::reserve_cloud_vision_request`].
+    pub async fn count_vision_indexed_since(
+        &self,
+        mode: &str,
+        start_timestamp: i64,
+    ) -> Result<u32, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM frames \
+             WHERE vision_indexing_mode = ?1 AND vision_indexed_at >= ?2",
+        )
+        .bind(mode)
+        .bind(start_timestamp)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.try_into().unwrap_or(u32::MAX))
+    }
+
     /// Batch insert frames and their OCR text in a single transaction.
     /// This dramatically reduces write lock contention in the hot path by acquiring
     /// the lock once per capture cycle instead of 2× per window result.
@@ -1442,5 +1694,342 @@ impl DatabaseManager {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn mem_db() -> DatabaseManager {
+        DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .expect("in-memory db")
+    }
+
+    async fn seed_frame(db: &DatabaseManager) {
+        sqlx::query("INSERT INTO video_chunks (id, file_path) VALUES (1, '/tmp/x.mp4')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO frames \
+                (id, video_chunk_id, offset_index, timestamp, name, snapshot_path, \
+                 full_text, text_source, text_json, device_name, app_name, window_name, \
+                 accessibility_text, image_redacted_at) \
+             VALUES \
+                (1, 1, 0, '2026-07-10T00:00:00Z', '/tmp/frame.jpg', '/tmp/frame.jpg', \
+                 'native Settings text', 'accessibility', '[]', 'device', 'Canvas', 'Flow', \
+                 'native Settings text', 1)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn search_frames(
+        db: &DatabaseManager,
+        query: &str,
+        content_type: ContentType,
+    ) -> Vec<SearchResult> {
+        db.search(
+            query,
+            content_type,
+            10,
+            0,
+            None, // start_time
+            None, // end_time
+            None, // app_name
+            None, // window_name
+            None, // min_length
+            None, // max_length
+            None, // speaker_ids
+            None, // frame_name
+            None, // browser_url
+            None, // focused
+            None, // speaker_name
+            None, // device_name
+            None, // machine_id
+            None, // on_screen
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn count_frames(db: &DatabaseManager, query: &str, content_type: ContentType) -> usize {
+        db.count_search_results(
+            query,
+            content_type,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn visual_descriptions_are_provenanced_and_searchable() {
+        let db = mem_db().await;
+        seed_frame(&db).await;
+
+        db.store_vision_description(
+            1,
+            "A canvas workflow editor with an approval step.",
+            "local",
+            "test-vlm",
+            "augment",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.set_vision_context_mode_for_indexed_frames("replace")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.set_vision_context_mode_for_indexed_frames("augment")
+                .await
+                .unwrap(),
+            1
+        );
+        let context_mode: String =
+            sqlx::query_scalar("SELECT vision_context_mode FROM frames WHERE id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(context_mode, "augment");
+
+        let row: (String, String, String, String, String, String, Option<i64>) = sqlx::query_as(
+            "SELECT vision_description, full_text, text_source, vision_indexing_mode, vision_context_mode, vision_model, vision_indexed_at \
+             FROM frames WHERE id = 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "A canvas workflow editor with an approval step.");
+        assert_eq!(row.1, "native Settings text");
+        assert_eq!(row.2, "accessibility");
+        assert_eq!(row.3, "local");
+        assert_eq!(row.4, "augment");
+        assert_eq!(row.5, "test-vlm");
+        assert!(row.6.is_some());
+
+        let fts_matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM frame_vision_fts WHERE frame_vision_fts MATCH 'approval'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(fts_matches, 1);
+
+        let search_results = search_frames(&db, "approval", ContentType::OCR).await;
+        assert_eq!(search_results.len(), 1);
+        let SearchResult::OCR(result) = &search_results[0] else {
+            panic!("visual match must use the OCR/screen result shape")
+        };
+        assert_eq!(result.text_source.as_deref(), Some("vision_hybrid"));
+        assert!(result.ocr_text.contains("native Settings text"));
+        assert!(result.ocr_text.contains("Visual context:"));
+        assert!(result.ocr_text.contains("canvas workflow editor"));
+        assert_eq!(
+            search_frames(&db, "Settings approval", ContentType::OCR)
+                .await
+                .len(),
+            1,
+            "augment queries may span native and visual columns"
+        );
+        assert_eq!(
+            count_frames(&db, "Settings approval", ContentType::OCR).await,
+            1
+        );
+        assert_eq!(
+            db.count_search_results(
+                "approval",
+                ContentType::OCR,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        // Accessibility-only search stays on native text and must not leak
+        // visual-only matches into its result set.
+        assert!(search_frames(&db, "approval", ContentType::Accessibility)
+            .await
+            .is_empty());
+
+        // Reindexing swaps only the sparse visual FTS entry; native screen text
+        // and its redaction watermark are never touched.
+        db.store_vision_description(1, "FormerVisual", "local", "test-vlm", "augment")
+            .await
+            .unwrap();
+        db.store_vision_description(1, "Preferences", "local", "test-vlm", "augment")
+            .await
+            .unwrap();
+        let state: (String, Option<i64>) =
+            sqlx::query_as("SELECT full_text, full_text_redacted_at FROM frames WHERE id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(state.0, "native Settings text");
+        assert!(state.1.is_none());
+        let old_matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM frame_vision_fts WHERE frame_vision_fts MATCH 'FormerVisual'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let new_matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM frame_vision_fts WHERE frame_vision_fts MATCH 'Preferences'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(old_matches, 0);
+        assert_eq!(new_matches, 1);
+
+        db.store_vision_description(
+            1,
+            "Visual-only diagram state",
+            "local",
+            "test-vlm",
+            "replace",
+        )
+        .await
+        .unwrap();
+        let replace_row: (String, String, String) = sqlx::query_as(
+            "SELECT full_text, text_source, vision_context_mode FROM frames WHERE id = 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(replace_row.0, "native Settings text");
+        assert_eq!(replace_row.1, "accessibility");
+        assert_eq!(replace_row.2, "replace");
+
+        assert!(search_frames(&db, "Settings", ContentType::OCR)
+            .await
+            .is_empty());
+        assert!(search_frames(&db, "Settings", ContentType::All)
+            .await
+            .is_empty());
+        assert_eq!(count_frames(&db, "Settings", ContentType::All).await, 0);
+        let visual_only = search_frames(&db, "diagram", ContentType::OCR).await;
+        let SearchResult::OCR(visual_only) = &visual_only[0] else {
+            panic!("replace-mode visual match must use screen result shape")
+        };
+        assert_eq!(visual_only.ocr_text, "Visual-only diagram state");
+        assert_eq!(visual_only.text_source.as_deref(), Some("vision"));
+        assert_eq!(visual_only.text_json, "[]");
+        assert!(search_frames(&db, "Settings diagram", ContentType::OCR)
+            .await
+            .is_empty());
+        assert_eq!(
+            search_frames(&db, "diagram", ContentType::All).await.len(),
+            1
+        );
+        assert_eq!(count_frames(&db, "diagram", ContentType::All).await, 1);
+
+        let indexed_today = db.count_vision_indexed_since("local", 0).await.unwrap();
+        assert_eq!(indexed_today, 1);
+
+        // The cloud budget reserves an outbound request before the HTTP call,
+        // so a provider timeout cannot turn into unbounded billable retries.
+        assert!(db.reserve_cloud_vision_request(1, 0, 1).await.unwrap());
+        sqlx::query(
+            "INSERT INTO frames (id, video_chunk_id, offset_index, timestamp, full_text) \
+             VALUES (2, 1, 1, '2026-07-10T00:00:00Z', 'another frame')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM frames WHERE id = 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(!db.reserve_cloud_vision_request(2, 0, 1).await.unwrap());
+        let orphaned_fts_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM frame_vision_fts WHERE frame_vision_fts MATCH 'diagram'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(orphaned_fts_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn vision_candidates_require_a_current_redaction_ready_snapshot() {
+        let db = mem_db().await;
+        sqlx::query("INSERT INTO video_chunks (id, file_path) VALUES (1, '/tmp/x.mp4')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO frames
+                (id, video_chunk_id, offset_index, timestamp, name, snapshot_path,
+                 device_name, image_redacted_at, image_redaction_succeeded_at,
+                 image_redaction_policy_id, image_redaction_content_hash)
+               VALUES
+                (1, 1, 0, '2026-07-10T00:00:01Z', '/tmp/1_m0.jpg', '/tmp/1_m0.jpg', 'd', 1, 1, 'current', 'hash-1'),
+                (2, 1, 1, '2026-07-10T00:00:02Z', '/tmp/2_m0.jpg', '/tmp/2_m0.jpg', 'd', NULL, NULL, NULL, NULL),
+                (3, 1, 2, '2026-07-10T00:00:03Z', '/tmp/old.jpg', '/tmp/3_m0.jpg', 'd', 1, 1, 'current', 'hash-3'),
+                (4, 1, 3, '2026-07-10T00:00:04Z', '/tmp/4_m0.mp4', '/tmp/4_m0.mp4', 'd', 1, 1, 'current', 'hash-4'),
+                (5, 1, 4, '2026-07-10T00:00:05Z', '/tmp/5_m0.jpg', '/tmp/5_m0.jpg', 'd', 1, NULL, NULL, NULL),
+                (6, 1, 5, '2026-07-10T00:00:06Z', '/tmp/6_m0.jpg', '/tmp/6_m0.jpg', 'd', 1, 1, 'old-run', 'hash-6')"#,
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let ready = db
+            .latest_redacted_vision_candidates("local", "current", 10)
+            .await
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].frame_id, 1);
+
+        sqlx::query("UPDATE frames SET vision_cloud_request_attempted_at = 1 WHERE id = 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .latest_redacted_vision_candidates("cloud", "current", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        sqlx::query("UPDATE frames SET vision_cloud_request_attempted_at = NULL WHERE id = 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.mark_vision_candidates_considered(&[1]).await.unwrap();
+        assert!(db
+            .latest_redacted_vision_candidates("local", "current", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

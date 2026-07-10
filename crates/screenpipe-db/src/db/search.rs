@@ -468,13 +468,31 @@ impl DatabaseManager {
         }
         let fts_query = frame_fts_parts.join(" ");
         let has_fts = !fts_query.trim().is_empty();
+        let search_text = r#"CASE
+                WHEN frames.vision_context_mode = 'replace'
+                     AND COALESCE(frames.vision_description, '') != ''
+                    THEN frames.vision_description
+                WHEN COALESCE(frames.vision_description, '') = ''
+                    THEN COALESCE(frames.full_text, frames.accessibility_text, '')
+                WHEN COALESCE(frames.full_text, frames.accessibility_text, '') = ''
+                    THEN frames.vision_description
+                ELSE COALESCE(frames.full_text, frames.accessibility_text, '')
+                     || char(10) || 'Visual context: ' || frames.vision_description
+            END"#;
 
         let sql = format!(
             r#"
+        {fts_cte}
         SELECT
             frames.id as frame_id,
-            COALESCE(frames.full_text, frames.accessibility_text, '') as ocr_text,
-            frames.text_json,
+            {search_text} as ocr_text,
+            CASE
+                WHEN COALESCE(frames.vision_description, '') != ''
+                     AND (frames.vision_context_mode = 'replace'
+                          OR COALESCE(frames.full_text, frames.accessibility_text, '') = '')
+                    THEN '[]'
+                ELSE frames.text_json
+            END as text_json,
             frames.timestamp,
             frames.name as frame_name,
             COALESCE(frames.snapshot_path, video_chunks.file_path) as file_path,
@@ -486,18 +504,24 @@ impl DatabaseManager {
             GROUP_CONCAT(tags.name, ',') as tags,
             frames.browser_url,
             frames.focused,
-            frames.text_source
+            CASE
+                WHEN COALESCE(frames.vision_description, '') = ''
+                    THEN frames.text_source
+                WHEN frames.vision_context_mode = 'replace'
+                     OR COALESCE(frames.full_text, frames.accessibility_text, '') = ''
+                    THEN 'vision'
+                ELSE 'vision_hybrid'
+            END as text_source
         FROM frames
         LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
         LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
         LEFT JOIN tags ON vision_tags.tag_id = tags.id
         {fts_join}
         WHERE 1=1
-            {fts_condition}
             AND (?2 IS NULL OR frames.timestamp >= ?2)
             AND (?3 IS NULL OR frames.timestamp <= ?3)
-            AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) >= ?4)
-            AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
+            AND (?4 IS NULL OR LENGTH({search_text}) >= ?4)
+            AND (?5 IS NULL OR LENGTH({search_text}) <= ?5)
             AND (?6 IS NULL OR COALESCE(video_chunks.device_name, frames.device_name) LIKE '%' || ?6 || '%')
             AND (?7 IS NULL OR frames.machine_id = ?7)
             AND (?8 IS NULL OR frames.focused = ?8)
@@ -514,13 +538,24 @@ impl DatabaseManager {
         ORDER BY frames.timestamp DESC
         LIMIT ?10 OFFSET ?11
         "#,
-            fts_join = if has_fts {
-                "JOIN frames_fts ON frames.id = frames_fts.rowid"
+            fts_cte = if has_fts {
+                r#"WITH matched_frames AS (
+                    SELECT frames_fts.rowid
+                    FROM frames_fts
+                    JOIN frames native_frame ON native_frame.id = frames_fts.rowid
+                    WHERE frames_fts MATCH ?1
+                      AND COALESCE(native_frame.vision_context_mode, 'augment') != 'replace'
+                    UNION
+                    SELECT frame_vision_fts.rowid
+                    FROM frame_vision_fts
+                    WHERE frame_vision_fts MATCH ?1
+                )"#
             } else {
                 ""
             },
-            fts_condition = if has_fts {
-                "AND frames_fts MATCH ?1"
+            search_text = search_text,
+            fts_join = if has_fts {
+                "JOIN matched_frames ON frames.id = matched_frames.rowid"
             } else {
                 ""
             },
@@ -1508,9 +1543,62 @@ impl DatabaseManager {
 
         let fts_query = fts_parts.join(" ");
         let has_fts = !fts_query.trim().is_empty();
+        let vision_search_text = r#"CASE
+                WHEN frames.vision_context_mode = 'replace'
+                     AND COALESCE(frames.vision_description, '') != ''
+                    THEN frames.vision_description
+                WHEN COALESCE(frames.vision_description, '') = ''
+                    THEN COALESCE(frames.full_text, frames.accessibility_text, '')
+                WHEN COALESCE(frames.full_text, frames.accessibility_text, '') = ''
+                    THEN frames.vision_description
+                ELSE COALESCE(frames.full_text, frames.accessibility_text, '')
+                     || char(10) || 'Visual context: ' || frames.vision_description
+            END"#;
 
         let sql = match content_type {
-            ContentType::OCR | ContentType::Accessibility => format!(
+            ContentType::OCR => format!(
+                r#"{fts_cte}
+                   SELECT COUNT(DISTINCT frames.id)
+                   FROM frames
+                   {fts_join}
+                   WHERE 1=1
+                       AND (?2 IS NULL OR frames.timestamp >= ?2)
+                       AND (?3 IS NULL OR frames.timestamp <= ?3)
+                       AND (?4 IS NULL OR LENGTH({search_text}) >= ?4)
+                       AND (?5 IS NULL OR LENGTH({search_text}) <= ?5)
+                       AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
+                       AND (?7 IS NULL OR frames.focused = ?7)
+                       AND (json_array_length(?8) = 0 OR frames.id IN (
+                           SELECT vt.vision_id
+                           FROM vision_tags vt
+                           JOIN tags t ON vt.tag_id = t.id
+                           WHERE t.name IN (SELECT value FROM json_each(?8))
+                           GROUP BY vt.vision_id
+                           HAVING COUNT(DISTINCT t.name) = json_array_length(?8)
+                       ))"#,
+                fts_cte = if has_fts {
+                    r#"WITH matched_frames AS (
+                        SELECT frames_fts.rowid
+                        FROM frames_fts
+                        JOIN frames native_frame ON native_frame.id = frames_fts.rowid
+                        WHERE frames_fts MATCH ?1
+                          AND COALESCE(native_frame.vision_context_mode, 'augment') != 'replace'
+                        UNION
+                        SELECT frame_vision_fts.rowid
+                        FROM frame_vision_fts
+                        WHERE frame_vision_fts MATCH ?1
+                    )"#
+                } else {
+                    ""
+                },
+                search_text = vision_search_text,
+                fts_join = if has_fts {
+                    "JOIN matched_frames ON frames.id = matched_frames.rowid"
+                } else {
+                    ""
+                },
+            ),
+            ContentType::Accessibility => format!(
                 r#"SELECT COUNT(DISTINCT frames.id)
                    FROM frames
                    {fts_join}
@@ -1530,7 +1618,9 @@ impl DatabaseManager {
                            GROUP BY vt.vision_id
                            HAVING COUNT(DISTINCT t.name) = json_array_length(?8)
                        ))
-                       {a11y_filter}"#,
+                       AND COALESCE(frames.vision_context_mode, 'augment') != 'replace'
+                       AND frames.accessibility_text IS NOT NULL
+                       AND frames.accessibility_text != ''"#,
                 fts_join = if has_fts {
                     "JOIN frames_fts ON frames.id = frames_fts.rowid"
                 } else {
@@ -1541,11 +1631,6 @@ impl DatabaseManager {
                 } else {
                     ""
                 },
-                a11y_filter = if content_type == ContentType::Accessibility {
-                    "AND frames.accessibility_text IS NOT NULL AND frames.accessibility_text != ''"
-                } else {
-                    ""
-                }
             ),
             ContentType::Audio => format!(
                 r#"SELECT COUNT(DISTINCT audio_transcriptions.id)

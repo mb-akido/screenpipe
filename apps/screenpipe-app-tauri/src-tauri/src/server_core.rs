@@ -1004,6 +1004,13 @@ impl ServerCore {
                     labels: pii_labels.clone(),
                     ..Default::default()
                 })) as Arc<dyn ImageRedactor>;
+                let redaction_policy_id =
+                    screenpipe_engine::vision_indexer::image_redaction_policy_id_for_model(
+                        "tinfoil",
+                        detector.name(),
+                        detector.version(),
+                        &pii_labels,
+                    );
                 info!(
                     model = detector.name(),
                     version = detector.version(),
@@ -1015,6 +1022,7 @@ impl ServerCore {
                     detector,
                     ImageWorkerConfig {
                         policy: ImageRedactionPolicy::from_labels(&pii_labels),
+                        policy_id: Some(redaction_policy_id.clone()),
                         ..Default::default()
                     },
                 )
@@ -1035,12 +1043,19 @@ impl ServerCore {
                                 version = detector.version(),
                                 "starting async image-PII worker (backend=local)"
                             );
+                            let redaction_policy_id = screenpipe_engine::vision_indexer::image_redaction_policy_id_for_model(
+                                "local",
+                                detector.name(),
+                                detector.version(),
+                                &labels,
+                            );
                             let detector_arc = Arc::new(detector) as Arc<dyn ImageRedactor>;
                             let _ = ImageWorker::new(
                                 pool,
                                 detector_arc,
                                 ImageWorkerConfig {
                                     policy: ImageRedactionPolicy::from_labels(&labels),
+                                    policy_id: Some(redaction_policy_id.clone()),
                                     ..Default::default()
                                 },
                             )

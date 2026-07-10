@@ -12,7 +12,7 @@ use screenpipe_screen::PipelineMetrics;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -49,6 +49,9 @@ pub struct VisionManagerConfig {
     pub video_quality: String,
     /// Skip screenshot pixels/JPEG/OCR while keeping accessibility-tree capture.
     pub disable_screenshots: bool,
+    /// Background semantic screenshot indexing. `off` leaves the existing
+    /// accessibility/OCR capture path untouched.
+    pub vision_indexing: crate::vision_indexer::VisionIndexingConfig,
 
     /// Mitsukeru fork: overrides for `EventDrivenCaptureConfig`.
     /// Each field is applied only when `Some(_)`. None = follow active PowerProfile.
@@ -119,6 +122,9 @@ pub struct VisionManager {
     /// them on reconcile, so a paused display stays paused until the user
     /// resumes it — mirrors the audio manager's user-disabled device set.
     user_disabled: Arc<DashSet<u32>>,
+    /// Background visual indexer task. It reconciles only screenshots that the
+    /// image-redaction worker has already completed; capture never calls it.
+    vision_indexer_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl VisionManager {
@@ -155,6 +161,12 @@ impl VisionManager {
             FocusAwareController::new(tracker)
         };
 
+        let vision_indexer_task = crate::vision_indexer::spawn_vision_indexer(
+            config.vision_indexing.clone(),
+            db.clone(),
+            &vision_handle,
+        );
+
         Self {
             config,
             db,
@@ -171,6 +183,7 @@ impl VisionManager {
             high_fps_controller: None,
             stale_allowlist_fallback: Arc::new(AtomicBool::new(false)),
             user_disabled: Arc::new(DashSet::new()),
+            vision_indexer_task: Mutex::new(vision_indexer_task),
         }
     }
 
@@ -716,6 +729,12 @@ impl VisionManager {
     /// Shutdown the VisionManager
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down VisionManager");
+        if let Some(task) = self.vision_indexer_task.lock().await.take() {
+            task.abort();
+            // Await cancellation so a replacement manager cannot overlap an
+            // old endpoint/API-key configuration or outlive DB shutdown.
+            let _ = task.await;
+        }
         // Signal the frame-linker actor to stop. Drops of the cloned
         // senders held by recorder/capture loops will also close the
         // channel; either path exits the actor cleanly.
@@ -752,6 +771,18 @@ mod tests {
             languages: vec![Language::English],
             video_quality: "balanced".to_string(),
             disable_screenshots: false,
+            vision_indexing: crate::vision_indexer::VisionIndexingConfig::from_settings(
+                "off",
+                "augment",
+                None,
+                None,
+                None,
+                10_000,
+                false,
+                100,
+                false,
+                Some("test-policy".to_string()),
+            ),
             idle_capture_interval_ms: None,
             visual_check_interval_ms: None,
             visual_change_threshold: None,

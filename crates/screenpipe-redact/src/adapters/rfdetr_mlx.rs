@@ -30,8 +30,8 @@ use crate::RedactError;
 #[cfg(all(feature = "mlx-mac", target_os = "macos", target_arch = "aarch64"))]
 use crate::SpanLabel;
 
-const NAME: &str = "rfdetr-mlx";
-const VERSION: u32 = 9; // tracks rfdetr_v9 weights
+pub const RFDETR_MLX_NAME: &str = "rfdetr-mlx";
+pub const RFDETR_MLX_VERSION: u32 = 9; // tracks rfdetr_v9 weights
 
 /// Minimum macOS major version that's safe for MLX at runtime.
 ///
@@ -108,13 +108,13 @@ impl RfdetrMlxConfig {
 
     /// HuggingFace download URL for the safetensors weights. Pinned to
     /// `main` so a model bump goes through a deliberate code change
-    /// (URL + expected SHA-256 + [`VERSION`] all bumped together).
+    /// (URL + expected SHA-256 + [`RFDETR_MLX_VERSION`] all bumped together).
     pub const HF_DOWNLOAD_URL: &'static str =
         "https://huggingface.co/screenpipe/pii-image-redactor/resolve/main/rfdetr_v9.safetensors";
 
     /// Expected SHA-256 of the canonical `rfdetr_v9.safetensors`.
     /// Verified after every download. If a future training run
-    /// produces a new best, bump [`VERSION`], re-publish to HF,
+    /// produces a new best, bump [`RFDETR_MLX_VERSION`], re-publish to HF,
     /// update this constant.
     pub const EXPECTED_SHA256: &'static str =
         "6afe6974653a68a2d56efe74c13adfa6b54dd8d0cf43b8eb0603c85e0884b6e6";
@@ -408,10 +408,10 @@ mod imp {
     #[async_trait]
     impl ImageRedactor for RfdetrMlxRedactor {
         fn name(&self) -> &str {
-            NAME
+            RFDETR_MLX_NAME
         }
         fn version(&self) -> u32 {
-            VERSION
+            RFDETR_MLX_VERSION
         }
         async fn detect(&self, image_path: &Path) -> Result<Vec<ImageRegion>, RedactError> {
             self.infer(image_path).await
@@ -442,10 +442,10 @@ impl RfdetrMlxRedactor {
 #[async_trait]
 impl ImageRedactor for RfdetrMlxRedactor {
     fn name(&self) -> &str {
-        NAME
+        RFDETR_MLX_NAME
     }
     fn version(&self) -> u32 {
-        VERSION
+        RFDETR_MLX_VERSION
     }
     async fn detect(&self, _image_path: &Path) -> Result<Vec<ImageRegion>, RedactError> {
         Err(RedactError::Unavailable(
