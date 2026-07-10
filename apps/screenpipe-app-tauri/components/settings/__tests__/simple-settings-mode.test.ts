@@ -76,18 +76,18 @@ describe("recommended settings view", () => {
     expect(classifyRecommendedDeviceTier({ cpuCores: 10, totalMemoryGb: 32 })).toBe("high");
   });
 
-  it("uses a conservative local profile on low-resource devices", () => {
+  it("uses cloud transcription with conservative capture on low-resource devices", () => {
     const profile = getRecommendedRecordingDefaults({
       settings: makeSettings(),
       defaults: makeSettings(),
-      hardware: { cpuCores: 4, totalMemoryGb: 8, recommendedEngine: "parakeet" },
-      hasCloudTranscriptionAccess: false,
+      hardware: { cpuCores: 4, totalMemoryGb: 8 },
     });
 
     expect(profile).toMatchObject({
       powerMode: "battery_saver",
       audioCaptureMode: "meetings-only",
-      audioTranscriptionEngine: "whisper-tiny",
+      audioTranscriptionEngine: "screenpipe-cloud",
+      meetingLiveTranscriptionProvider: "screenpipe-cloud",
       transcriptionMode: "batch",
       useAllMonitors: false,
       monitorIds: ["default"],
@@ -97,30 +97,28 @@ describe("recommended settings view", () => {
     });
   });
 
-  it("uses all displays and the platform recommendation on high-resource devices", () => {
+  it("keeps cloud transcription while using all displays on high-resource devices", () => {
     const profile = getRecommendedRecordingDefaults({
       settings: makeSettings(),
       defaults: makeSettings(),
-      hardware: { cpuCores: 10, totalMemoryGb: 32, recommendedEngine: "parakeet" },
-      hasCloudTranscriptionAccess: false,
+      hardware: { cpuCores: 10, totalMemoryGb: 32 },
     });
 
     expect(profile).toMatchObject({
       powerMode: "auto",
-      audioTranscriptionEngine: "parakeet",
+      audioTranscriptionEngine: "screenpipe-cloud",
       useAllMonitors: true,
       videoQuality: "balanced",
     });
   });
 
-  it("prefers cloud transcription for an entitled signed-in user", () => {
+  it("uses cloud transcription without changing the profile by account tier", () => {
     const profile = getRecommendedRecordingDefaults({
       settings: makeSettings({
         user: { id: "user_123", token: "token_123" } as Settings["user"],
       }),
       defaults: makeSettings(),
       hardware: { cpuCores: 4, totalMemoryGb: 8 },
-      hasCloudTranscriptionAccess: true,
     });
 
     expect(profile.audioTranscriptionEngine).toBe("screenpipe-cloud");
@@ -132,7 +130,6 @@ describe("recommended settings view", () => {
       settings: makeSettings({ disableAudio: true, disableVision: true }),
       defaults: makeSettings(),
       hardware: { cpuCores: 4, totalMemoryGb: 8 },
-      hasCloudTranscriptionAccess: false,
     });
 
     expect(profile).not.toHaveProperty("disableAudio");

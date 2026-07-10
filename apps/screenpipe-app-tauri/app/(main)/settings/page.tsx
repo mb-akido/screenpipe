@@ -103,7 +103,6 @@ import {
   setRecommendedSettingsRestartRequired,
 } from "@/components/settings/simple-settings-mode";
 import { ApplyRestartBar } from "@/components/settings/apply-restart-bar";
-import { hasAppEntitlement } from "@/lib/app-entitlement";
 
 type SettingsSection =
   | "account"
@@ -285,7 +284,6 @@ function SettingsContent() {
         settings,
         defaults,
         hardware,
-        hasCloudTranscriptionAccess: hasAppEntitlement(settings.user as any),
       });
       const recordingDefaultsChanged = RECOMMENDED_RECORDING_DEFAULT_KEYS.some(
         (key) =>
@@ -668,7 +666,7 @@ function SettingsContent() {
               AI models, keyboard shortcuts, notifications, usage reporting, and
               speaker preferences will return to their recommended defaults.
               Recording will use a low-resource profile for this computer: meeting-only
-              audio, the best default transcription engine, automatic power and capture
+              audio, Screenpipe Cloud transcription, automatic power and capture
               quality, and system-default audio devices. High-spec computers use all
               monitors; lower-spec computers use the primary monitor. You&apos;ll be asked
               to apply and restart. Privacy, storage, account, and recording on/off

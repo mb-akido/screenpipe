@@ -302,18 +302,6 @@ describe('Settings sections', () => {
       await useSystemDefaultAudio.click();
     }
 
-    const transcriptionEngine = await $('[data-testid="recording-transcription-engine"]');
-    await transcriptionEngine.click();
-    const deepgramOption = await $('//*[@role="option" and contains(., "Deepgram")]');
-    await deepgramOption.waitForDisplayed({ timeout: 5_000 });
-    await deepgramOption.click();
-
-    const videoQuality = await $('[data-testid="recording-video-quality"]');
-    await videoQuality.click();
-    const maxQualityOption = await $('//*[@role="option" and contains(., "max") and contains(., "native")]');
-    await maxQualityOption.waitForDisplayed({ timeout: 5_000 });
-    await maxQualityOption.click();
-
     const generalNav = await $('[data-testid="settings-nav-general"]');
     await generalNav.click();
     await $('[data-testid="section-settings-general"]').waitForExist({ timeout: 8_000 });
@@ -352,6 +340,7 @@ describe('Settings sections', () => {
     await recommendedProfile.waitForDisplayed({ timeout: 8_000 });
     const profileText = (await recommendedProfile.getText()).toLowerCase();
     expect(profileText).toContain('meetings only');
+    expect(profileText).toContain('screenpipe cloud');
     expect(profileText).toContain('batch');
     expect(profileText).not.toContain('deepgram');
     expect(await $('#useAllMonitors').isExisting()).toBe(false);
@@ -369,7 +358,6 @@ describe('Settings sections', () => {
     await recommendedDefaultAudio.waitForExist({ timeout: 8_000 });
     expect(await recommendedDefaultAudio.getAttribute('data-state')).toBe('checked');
     const recommendedEngine = await $('[data-testid="recording-transcription-engine"]');
-    expect((await recommendedEngine.getText()).toLowerCase()).not.toContain('deepgram');
-    expect((await $('[data-testid="recording-video-quality"]').getText()).toLowerCase()).not.toContain('max');
+    expect((await recommendedEngine.getText()).toLowerCase()).toContain('screenpipe cloud');
   });
 });

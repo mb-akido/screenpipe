@@ -84,7 +84,6 @@ type RecommendedDeviceTier = "high" | "mid" | "low";
 type RecommendedHardwareCapability = {
   cpuCores: number;
   totalMemoryGb: number;
-  recommendedEngine?: string;
 };
 
 export function classifyRecommendedDeviceTier(
@@ -102,51 +101,34 @@ export function classifyRecommendedDeviceTier(
 }
 
 /**
- * Build the same conservative, hardware-aware profile used for new installs.
+ * Build the same conservative, resource-aware profile used for new installs.
  * Privacy and capture opt-outs are intentionally absent: Recommended should
  * tune resource use and reliability, not silently re-enable data collection.
+ * Transcription stays on Screenpipe Cloud for every device; hardware only
+ * changes local capture cost (power, displays, and video quality).
  */
 export function getRecommendedRecordingDefaults({
   settings,
   defaults,
   hardware,
-  hasCloudTranscriptionAccess,
 }: {
   settings: Settings;
   defaults: Settings;
   hardware?: RecommendedHardwareCapability | null;
-  hasCloudTranscriptionAccess: boolean;
 }): Partial<Settings> {
   const storedTier = settings.deviceTier;
   const tier: RecommendedDeviceTier =
     storedTier === "high" || storedTier === "mid" || storedTier === "low"
       ? storedTier
       : classifyRecommendedDeviceTier(hardware);
-  const hasCloudAuth = Boolean(settings.user?.token || settings.user?.id);
-  const fallbackHighTierEngine =
-    settings.platform === "macos"
-      ? "whisper-large-v3-turbo-quantized"
-      : "parakeet";
-  const localEngine =
-    tier === "low" || tier === "mid"
-      ? "whisper-tiny"
-      : hardware?.recommendedEngine || fallbackHighTierEngine;
-  const audioTranscriptionEngine =
-    hasCloudTranscriptionAccess && hasCloudAuth
-      ? "screenpipe-cloud"
-      : localEngine;
-
   return {
     powerMode: tier === "low" ? "battery_saver" : "auto",
     keepComputerAwake: false,
     audioCaptureMode: "meetings-only",
-    audioTranscriptionEngine,
+    audioTranscriptionEngine: "screenpipe-cloud",
     transcriptionMode: "batch",
     meetingLiveTranscriptionEnabled: true,
-    meetingLiveTranscriptionProvider:
-      audioTranscriptionEngine === "screenpipe-cloud"
-        ? "screenpipe-cloud"
-        : "selected-engine",
+    meetingLiveTranscriptionProvider: "screenpipe-cloud",
     audioChunkDuration: defaults.audioChunkDuration,
     batchMaxDurationSecs: defaults.batchMaxDurationSecs,
     filterMusic: false,
