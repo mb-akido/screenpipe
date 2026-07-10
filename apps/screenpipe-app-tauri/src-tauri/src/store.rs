@@ -947,6 +947,15 @@ pub struct SettingsStore {
     /// Better quality but sends activity context to the cloud (zero data retention).
     #[serde(rename = "enhancedAI", default)]
     pub enhanced_ai: bool,
+    /// Explicit consumer opt-in for on-demand remote diagnostic log requests.
+    /// Enterprise builds enforce remote log collection separately; this stored
+    /// value remains false unless a consumer chooses to enable it.
+    #[serde(rename = "remoteLogCollectionEnabled", default)]
+    pub remote_log_collection_enabled: bool,
+    /// Account that granted remote log collection consent on this device.
+    /// Consumer collection is allowed only while this matches the current user.
+    #[serde(rename = "remoteLogCollectionUserId", default)]
+    pub remote_log_collection_user_id: Option<String>,
     /// Timeline overlay mode: "fullscreen" (floating panel above everything) or
     /// "window" (normal resizable window with title bar).
     #[serde(rename = "overlayMode", default = "default_overlay_mode")]
@@ -1386,6 +1395,8 @@ Rules:
             auto_update: false,
             auto_update_pipes: true,
             enhanced_ai: false,
+            remote_log_collection_enabled: false,
+            remote_log_collection_user_id: None,
             #[cfg(target_os = "macos")]
             overlay_mode: "fullscreen".to_string(),
             #[cfg(not(target_os = "macos"))]
@@ -1997,6 +2008,41 @@ mod tests {
         .unwrap();
 
         assert!(settings.auto_update);
+    }
+
+    #[test]
+    fn remote_log_collection_defaults_to_disabled() {
+        assert!(!SettingsStore::default().remote_log_collection_enabled);
+        assert!(SettingsStore::default()
+            .remote_log_collection_user_id
+            .is_none());
+    }
+
+    #[test]
+    fn missing_remote_log_collection_deserializes_disabled() {
+        let settings: SettingsStore = serde_json::from_value(json!({
+            "aiPresets": []
+        }))
+        .unwrap();
+
+        assert!(!settings.remote_log_collection_enabled);
+        assert!(settings.remote_log_collection_user_id.is_none());
+    }
+
+    #[test]
+    fn explicit_remote_log_collection_true_is_respected() {
+        let settings: SettingsStore = serde_json::from_value(json!({
+            "aiPresets": [],
+            "remoteLogCollectionEnabled": true,
+            "remoteLogCollectionUserId": "user_123"
+        }))
+        .unwrap();
+
+        assert!(settings.remote_log_collection_enabled);
+        assert_eq!(
+            settings.remote_log_collection_user_id.as_deref(),
+            Some("user_123")
+        );
     }
 
     #[test]

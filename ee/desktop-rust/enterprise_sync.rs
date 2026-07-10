@@ -84,6 +84,7 @@ pub const DEFAULT_INGEST_URL: &str = "https://screenpipe.com/api/enterprise/inge
 
 /// Cursor file in app data dir.
 pub const CURSOR_FILENAME: &str = "enterprise_sync_cursor.json";
+const PENDING_LOG_ACK_FILENAME: &str = "enterprise_log_request_ack.json";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -1214,57 +1215,6 @@ fn stall_log_identifier(device_id: &str) -> String {
     format!("enterprise-auto-{safe}").chars().take(128).collect()
 }
 
-/// UTF-8-boundary-safe tail of `s`, at most `max_bytes`.
-fn tail_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut start = s.len() - max_bytes;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    &s[start..]
-}
-
-/// Read recent `*.log` content from `dirs`, newest file first, bounded total.
-async fn collect_log_text(dirs: &[PathBuf]) -> String {
-    const MAX_TOTAL: usize = 256 * 1024;
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for dir in dirs {
-        if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let path = entry.path();
-                if path.extension().map(|e| e == "log").unwrap_or(false) {
-                    let modified = entry
-                        .metadata()
-                        .await
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    files.push((modified, path));
-                }
-            }
-        }
-    }
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-
-    let mut out = String::new();
-    for (_, path) in files {
-        if out.len() >= MAX_TOTAL {
-            break;
-        }
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            let budget = MAX_TOTAL - out.len();
-            out.push_str(&format!("\n=== {} ===\n{}", name, tail_str(&content, budget)));
-        }
-    }
-    if out.is_empty() {
-        out.push_str("[no log files found]");
-    }
-    out
-}
-
 /// Best-effort: ship the device's app logs to support via the same public
 /// endpoint the in-app "send logs" button uses. No UI required, so it works on
 /// "run hidden" managed devices. Returns the uploaded storage path on success.
@@ -1308,7 +1258,16 @@ async fn submit_device_logs(
     };
 
     // 2. upload the log bytes
-    let body = collect_log_text(&cfg.log_dirs).await;
+    // Managed collection used to bypass the manual feedback redaction path.
+    // Both managed and opted-in builds now share one fail-closed filesystem,
+    // size, timeout, and redaction boundary.
+    let body = match crate::diagnostic_logs::collect_redacted_from_dirs(&cfg.log_dirs).await {
+        Ok(body) => body,
+        Err(e) => {
+            warn!("enterprise sync: device-log redaction failed: {e}");
+            return None;
+        }
+    };
     if let Err(e) = http
         .put(&signed_url)
         .header("Content-Type", "text/plain")
@@ -1347,8 +1306,7 @@ async fn submit_device_logs(
 /// data). Thin wrapper over [`submit_device_logs`] with the stall reason.
 async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
     let feedback = format!(
-        "auto: enterprise device recording but not landing data in org storage (license {}, device {}, mode {})",
-        cfg.license_key,
+        "auto: enterprise device recording but not landing data in org storage (device {}, mode {})",
         cfg.device_id,
         cfg.upload_mode.label()
     );
@@ -1368,6 +1326,100 @@ pub struct LogRequestsResponse {
     pub requested_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingLogAck {
+    device_id: String,
+    control_plane_base: String,
+    requested_at: String,
+    path: String,
+}
+
+impl PendingLogAck {
+    fn file_path(cfg: &EnterpriseSyncConfig) -> PathBuf {
+        cfg.cursor_path.with_file_name(PENDING_LOG_ACK_FILENAME)
+    }
+
+    fn load(cfg: &EnterpriseSyncConfig) -> Option<Self> {
+        let path = Self::file_path(cfg);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                warn!("log-requests: pending ack read failed: {error}");
+                return None;
+            }
+        };
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(pending)
+                if pending.device_id == cfg.device_id
+                    && Some(pending.control_plane_base.as_str())
+                        == control_plane_base(&cfg.ingest_url).as_deref() =>
+            {
+                Some(pending)
+            }
+            Ok(_) => {
+                warn!(
+                    "log-requests: discarding pending ack for a different device or control plane"
+                );
+                Self::clear(cfg);
+                None
+            }
+            Err(error) => {
+                warn!("log-requests: pending ack is invalid: {error}");
+                None
+            }
+        }
+    }
+
+    fn save(&self, cfg: &EnterpriseSyncConfig) -> std::io::Result<()> {
+        let path = Self::file_path(cfg);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let raw = serde_json::to_vec(self).expect("pending log ack is serializable");
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(tmp, path)
+    }
+
+    fn clear(cfg: &EnterpriseSyncConfig) {
+        let path = Self::file_path(cfg);
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!("log-requests: pending ack cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+async fn acknowledge_log_request(
+    cfg: &EnterpriseSyncConfig,
+    http: &reqwest::Client,
+    url: &str,
+    requested_at: &str,
+    path: &str,
+) -> bool {
+    let ack = match http
+        .post(url)
+        .header("X-License-Key", &cfg.license_key)
+        .header("X-Device-Id", &cfg.device_id)
+        .json(&serde_json::json!({ "requested_at": requested_at, "path": path }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            warn!("log-requests: ack failed: {e}");
+            return false;
+        }
+    };
+    if !ack.status().is_success() {
+        warn!("log-requests: ack {} -> {}", url, ack.status());
+        return false;
+    }
+    true
+}
+
 /// Poll the control plane for an admin "collect logs" request and fulfill it by
 /// uploading the device's logs, then ack so the server clears the command.
 ///
@@ -1383,9 +1435,22 @@ async fn fulfill_log_requests(
     cfg: &EnterpriseSyncConfig,
     http: &reqwest::Client,
     already_handled: Option<&str>,
+    pending_ack: &mut Option<PendingLogAck>,
 ) -> Option<String> {
     let base = control_plane_base(&cfg.ingest_url)?;
     let url = format!("{base}/api/enterprise/log-requests");
+
+    // If the upload succeeded but its ack failed, retry only the ack. Repeating
+    // the upload would create duplicate support entries and waste bandwidth on
+    // exactly the unhealthy machines this path is meant to diagnose.
+    if let Some(pending) = pending_ack.clone() {
+        if acknowledge_log_request(cfg, http, &url, &pending.requested_at, &pending.path).await {
+            PendingLogAck::clear(cfg);
+            *pending_ack = None;
+            return Some(pending.requested_at);
+        }
+        return None;
+    }
 
     let resp = match http
         .get(&url)
@@ -1421,22 +1486,30 @@ async fn fulfill_log_requests(
 
     info!("enterprise sync: admin requested device logs — collecting + uploading");
     let feedback = format!(
-        "admin-requested enterprise diagnostic logs (license {}, device {}, mode {})",
-        cfg.license_key,
+        "admin-requested enterprise diagnostic logs (device {}, mode {})",
         cfg.device_id,
         cfg.upload_mode.label()
     );
-    let path = submit_device_logs(cfg, http, &feedback).await;
+    let path = submit_device_logs(cfg, http, &feedback).await?;
+
+    let pending = PendingLogAck {
+        device_id: cfg.device_id.clone(),
+        control_plane_base: base,
+        requested_at: requested_at.clone(),
+        path: path.clone(),
+    };
+    if let Err(error) = pending.save(cfg) {
+        warn!("log-requests: pending ack persistence failed: {error}");
+    }
+    *pending_ack = Some(pending);
 
     // Ack: echo requested_at back so the server's (requested_at > fulfilled_at)
     // gate flips to done and the dashboard shows it collected.
-    let _ = http
-        .post(&url)
-        .header("X-License-Key", &cfg.license_key)
-        .header("X-Device-Id", &cfg.device_id)
-        .json(&serde_json::json!({ "requested_at": requested_at, "path": path }))
-        .send()
-        .await;
+    if !acknowledge_log_request(cfg, http, &url, &requested_at, &path).await {
+        return None;
+    }
+    PendingLogAck::clear(cfg);
+    *pending_ack = None;
     Some(requested_at)
 }
 
@@ -1446,9 +1519,14 @@ async fn run_log_request_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut last_log_req: Option<String> = None;
+    // Persisted before the first ack attempt so an app restart cannot turn a
+    // lost ack into a duplicate timestamped support upload.
+    let mut pending_ack = PendingLogAck::load(&cfg);
 
     loop {
-        if let Some(handled) = fulfill_log_requests(&cfg, &http, last_log_req.as_deref()).await {
+        if let Some(handled) =
+            fulfill_log_requests(&cfg, &http, last_log_req.as_deref(), &mut pending_ack).await
+        {
             last_log_req = Some(handled);
         }
 
@@ -1744,14 +1822,84 @@ mod tests {
         assert!(empty.requested_at.is_none());
     }
 
-    #[test]
-    fn tail_str_is_char_boundary_safe() {
-        assert_eq!(tail_str("hello", 100), "hello");
-        assert_eq!(tail_str("hello", 2), "lo");
-        // multi-byte: never split a char
-        let s = "aé"; // 'é' is 2 bytes
-        let t = tail_str(s, 1); // would land mid-'é' → step forward to boundary
-        assert!(s.ends_with(t) || t.is_empty());
+    #[tokio::test]
+    async fn log_request_ack_requires_successful_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/enterprise/log-requests"))
+            .and(wiremock::matchers::header("X-License-Key", "sek_test"))
+            .and(wiremock::matchers::header("X-Device-Id", "dev-test"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&dir, format!("{}/api/enterprise/ingest", server.uri()));
+        cfg.device_id = "dev-test".to_string();
+        let url = format!("{}/api/enterprise/log-requests", server.uri());
+
+        let ok = acknowledge_log_request(
+            &cfg,
+            &reqwest::Client::new(),
+            &url,
+            "2026-07-10T00:00:00Z",
+            "logs/machine/dev-test/request.log",
+        )
+        .await;
+
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn log_request_ack_succeeds_on_2xx() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/enterprise/log-requests"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let cfg = test_cfg(&dir, format!("{}/api/enterprise/ingest", server.uri()));
+        let url = format!("{}/api/enterprise/log-requests", server.uri());
+
+        let ok = acknowledge_log_request(
+            &cfg,
+            &reqwest::Client::new(),
+            &url,
+            "2026-07-10T00:00:00Z",
+            "logs/machine/dev-test/request.log",
+        )
+        .await;
+
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn pending_log_ack_retries_without_polling_or_reuploading() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/enterprise/log-requests"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let cfg = test_cfg(&dir, format!("{}/api/enterprise/ingest", server.uri()));
+        let mut pending = Some(PendingLogAck {
+            device_id: cfg.device_id.clone(),
+            control_plane_base: server.uri(),
+            requested_at: "2026-07-10T00:00:00Z".to_string(),
+            path: "logs/machine/dev-test/request.log".to_string(),
+        });
+        pending.as_ref().unwrap().save(&cfg).unwrap();
+        assert_eq!(PendingLogAck::load(&cfg), pending);
+
+        let handled = fulfill_log_requests(&cfg, &reqwest::Client::new(), None, &mut pending).await;
+
+        assert_eq!(handled.as_deref(), Some("2026-07-10T00:00:00Z"));
+        assert!(pending.is_none());
+        assert!(PendingLogAck::load(&cfg).is_none());
     }
 
     fn frame(id: i64, ts: &str, app: &str, text: &str) -> FrameRow {

@@ -44,6 +44,7 @@ mod capture_session;
 mod chatgpt_oauth;
 #[allow(deprecated)]
 mod commands;
+mod diagnostic_logs;
 mod disk_usage;
 mod e2e_seed;
 mod embedded_server;
@@ -81,6 +82,7 @@ mod power_awake;
 mod process_exit;
 mod recording;
 mod remote_sync_commands;
+mod remote_support_logs;
 mod secrets;
 mod server;
 mod server_core;
@@ -1967,6 +1969,11 @@ async fn main() {
             // Runs forever in background; only takes effect on enterprise-
             // telemetry builds with SCREENPIPE_ENTERPRISE_LICENSE_KEY env set.
             let _enterprise_shutdown_tx = enterprise_sync::spawn(&app_handle);
+
+            // Standard builds: account-bound, explicit opt-in support logs.
+            // Enterprise builds compile this as a no-op because their managed
+            // license-authenticated collector above is mandatory.
+            remote_support_logs::spawn(&app_handle);
 
             // Disable removed Storage cloud backends if old settings enabled them.
             let app_handle_clone = app_handle.clone();

@@ -3213,6 +3213,17 @@ autoUpdatePipes?: boolean;
  */
 enhancedAI?: boolean;
 /**
+ * Explicit consumer opt-in for on-demand remote diagnostic log requests.
+ * Enterprise builds enforce remote log collection separately; this stored
+ * value remains false unless a consumer chooses to enable it.
+ */
+remoteLogCollectionEnabled?: boolean;
+/**
+ * Account that granted remote log collection consent on this device.
+ * Consumer collection is allowed only while this matches the current user.
+ */
+remoteLogCollectionUserId?: string | null;
+/**
  * Timeline overlay mode: "fullscreen" (floating panel above everything) or
  * "window" (normal resizable window with title bar).
  */

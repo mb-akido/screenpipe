@@ -177,12 +177,24 @@ fn chunk_by_lines(text: &str, max: usize) -> Vec<String> {
     chunks
 }
 
-async fn redact_one(pipeline: &Pipeline, chunk: &str) -> String {
-    match pipeline.redact(chunk).await {
+async fn redact_one(primary: &Pipeline, fallback: &Pipeline, chunk: &str) -> String {
+    match primary.redact(chunk).await {
         Ok(out) => out.redacted,
         Err(e) => {
-            warn!("feedback redaction chunk failed ({e}); leaving chunk unredacted-by-model");
-            chunk.to_string()
+            // Never return the raw chunk. The unattended remote-support flow
+            // calls this same boundary, so a transient enclave/model failure
+            // must degrade to deterministic local redaction, not silently turn
+            // into an unredacted upload.
+            warn!("feedback redaction chunk failed ({e}); falling back to local regex");
+            match fallback.redact(chunk).await {
+                Ok(out) => out.redacted,
+                Err(fallback_error) => {
+                    warn!(
+                        "feedback regex fallback failed ({fallback_error}); omitting unsafe chunk"
+                    );
+                    "[redaction failed; diagnostic chunk omitted]\n".to_string()
+                }
+            }
         }
     }
 }
@@ -215,10 +227,10 @@ pub async fn redact_pii_for_feedback(
 
     for chunk in &chunks {
         if start.elapsed() < ENCLAVE_BUDGET {
-            out.push_str(&redact_one(cloud, chunk).await);
+            out.push_str(&redact_one(cloud, regex, chunk).await);
             cloud_chunks += 1;
         } else {
-            out.push_str(&redact_one(regex, chunk).await);
+            out.push_str(&redact_one(regex, regex, chunk).await);
         }
     }
 
