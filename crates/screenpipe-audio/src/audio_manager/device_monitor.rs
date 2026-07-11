@@ -513,7 +513,59 @@ pub(crate) fn decide_pinned_input_fallback(inputs: PinnedFallbackInputs<'_>) -> 
 
 lazy_static::lazy_static! {
   pub static ref DEVICE_MONITOR: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+  static ref DEVICE_MONITOR_OWNER: Mutex<Option<DeviceMonitorOwnership>> = Mutex::new(None);
   static ref DEVICE_MONITOR_LIFECYCLE: Mutex<()> = Mutex::new(());
+}
+
+/// Stable identity for one `AudioManager` clone family.
+///
+/// A monitor start may replace a monitor belonging to an older manager, but a
+/// later stop from that older manager must not take the replacement's slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeviceMonitorOwnerId(u64);
+
+impl DeviceMonitorOwnerId {
+    pub(crate) fn next() -> Self {
+        static NEXT_OWNER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let owner_id = NEXT_OWNER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(
+            owner_id, 0,
+            "audio device monitor owner identity space exhausted"
+        );
+        Self(owner_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceMonitorOwnership {
+    owner_id: DeviceMonitorOwnerId,
+    task_id: tokio::task::Id,
+}
+
+fn take_device_monitor_for_owner(
+    slot: &mut Option<JoinHandle<()>>,
+    ownership: &mut Option<DeviceMonitorOwnership>,
+    owner_id: DeviceMonitorOwnerId,
+) -> Option<JoinHandle<()>> {
+    let current = ownership.as_ref()?;
+    if current.owner_id != owner_id {
+        return None;
+    }
+
+    let matches = slot
+        .as_ref()
+        .is_some_and(|handle| current.task_id == handle.id());
+
+    // Once this owner has attempted cleanup, its metadata is no longer valid.
+    // In particular, a public caller may have taken or replaced the legacy
+    // handle slot without access to the private metadata.
+    ownership.take();
+
+    if matches {
+        slot.take()
+    } else {
+        None
+    }
 }
 
 /// Track the last known system default devices to detect changes
@@ -583,7 +635,8 @@ impl SystemDefaultTracker {
     }
 }
 
-pub async fn start_device_monitor(
+pub(crate) async fn start_device_monitor_for_owner(
+    owner_id: DeviceMonitorOwnerId,
     audio_manager: Arc<AudioManager>,
     device_manager: Arc<DeviceManager>,
 ) -> Result<()> {
@@ -593,9 +646,11 @@ pub async fn start_device_monitor(
     // initial device sync owns any transition that predates this fresh start.
     let mut microphone_permission =
         screenpipe_events::subscribe_to_permission_state(PermissionKind::Microphone);
-    stop_device_monitor_inner().await?;
+    // Starts deliberately replace any previous owner while the lifecycle lock
+    // is held. Stops, in contrast, are always owner-scoped.
+    stop_current_device_monitor_inner().await?;
 
-    *DEVICE_MONITOR.lock().await = Some(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut disconnected_devices: HashSet<String> = HashSet::new();
         let mut default_tracker = SystemDefaultTracker::new();
 
@@ -1769,6 +1824,7 @@ pub async fn start_device_monitor(
                                 // grants permission.
                                 if e_str.contains("declined TCCs")
                                     || e_str.contains("Screen recording permission denied")
+                                    || e_str.contains("Microphone permission denied")
                                 {
                                     warn!("device check: permission not granted (will retry): {e}");
                                     continue;
@@ -1832,8 +1888,29 @@ pub async fn start_device_monitor(
                 _ = super::piggyback_listeners::sweep_wake_notified() => {}
             }
         }
-    }));
+    });
+    let ownership = DeviceMonitorOwnership {
+        owner_id,
+        task_id: handle.id(),
+    };
+    let mut slot = DEVICE_MONITOR.lock().await;
+    let mut current_owner = DEVICE_MONITOR_OWNER.lock().await;
+    *current_owner = Some(ownership);
+    *slot = Some(handle);
     Ok(())
+}
+
+/// Start the process-wide device monitor for `audio_manager`.
+///
+/// Kept as the public compatibility entrypoint. `AudioManager` lifecycle code
+/// uses the owner-scoped helper directly so delayed cleanup cannot affect a
+/// replacement manager.
+pub async fn start_device_monitor(
+    audio_manager: Arc<AudioManager>,
+    device_manager: Arc<DeviceManager>,
+) -> Result<()> {
+    let owner_id = audio_manager.device_monitor_owner_id();
+    start_device_monitor_for_owner(owner_id, audio_manager, device_manager).await
 }
 
 /// Side-effecting wrapper around [`decide_pinned_input_fallback`]. Snapshots
@@ -2066,8 +2143,7 @@ async fn run_pinned_input_fallback_sweep(
     }
 }
 
-async fn stop_device_monitor_inner() -> Result<()> {
-    let handle = DEVICE_MONITOR.lock().await.take();
+async fn stop_device_monitor_handle(handle: Option<JoinHandle<()>>) -> Result<()> {
     if let Some(handle) = handle {
         handle.abort();
         match tokio::time::timeout(Duration::from_secs(2), handle).await {
@@ -2086,9 +2162,37 @@ async fn stop_device_monitor_inner() -> Result<()> {
     Ok(())
 }
 
+async fn stop_current_device_monitor_inner() -> Result<()> {
+    let mut slot = DEVICE_MONITOR.lock().await;
+    let mut owner = DEVICE_MONITOR_OWNER.lock().await;
+    let handle = slot.take();
+    owner.take();
+    drop(owner);
+    drop(slot);
+    stop_device_monitor_handle(handle).await
+}
+
+async fn stop_device_monitor_inner(owner_id: DeviceMonitorOwnerId) -> Result<()> {
+    let handle = {
+        let mut slot = DEVICE_MONITOR.lock().await;
+        let mut owner = DEVICE_MONITOR_OWNER.lock().await;
+        take_device_monitor_for_owner(&mut slot, &mut owner, owner_id)
+    };
+    stop_device_monitor_handle(handle).await
+}
+
+pub(crate) async fn stop_device_monitor_for_owner(owner_id: DeviceMonitorOwnerId) -> Result<()> {
+    let _lifecycle = DEVICE_MONITOR_LIFECYCLE.lock().await;
+    stop_device_monitor_inner(owner_id).await
+}
+
+/// Stop whichever process-wide device monitor is currently installed.
+///
+/// This preserves the legacy public API's explicit global-stop semantics.
+/// `AudioManager` cleanup must use [`stop_device_monitor_for_owner`] instead.
 pub async fn stop_device_monitor() -> Result<()> {
     let _lifecycle = DEVICE_MONITOR_LIFECYCLE.lock().await;
-    stop_device_monitor_inner().await
+    stop_current_device_monitor_inner().await
 }
 
 /// Sliding-window cooldown tracker for central handler restarts.
@@ -2136,6 +2240,71 @@ mod tests {
         /// Default for builders that don't exercise the fail-over-to-any-available
         /// path (most fallback tests only care about the system-default target).
         static ref EMPTY_AVAILABLE_INPUTS: HashSet<String> = HashSet::new();
+    }
+
+    #[tokio::test]
+    async fn stale_owner_stop_does_not_take_current_monitor_slot() {
+        let stale_owner = DeviceMonitorOwnerId(41);
+        let current_owner = DeviceMonitorOwnerId(42);
+        let current_handle = tokio::spawn(std::future::pending::<()>());
+        let current_task_id = current_handle.id();
+        let mut slot = Some(current_handle);
+        let mut ownership = Some(DeviceMonitorOwnership {
+            owner_id: current_owner,
+            task_id: current_task_id,
+        });
+
+        assert!(take_device_monitor_for_owner(&mut slot, &mut ownership, stale_owner).is_none());
+        assert_eq!(
+            ownership.as_ref().map(|current| current.owner_id),
+            Some(current_owner),
+            "a stale manager cleanup must leave the replacement monitor installed"
+        );
+        assert_eq!(
+            slot.as_ref().map(JoinHandle::id),
+            Some(current_task_id),
+            "a stale manager cleanup must leave the public handle slot untouched"
+        );
+
+        let current_handle =
+            take_device_monitor_for_owner(&mut slot, &mut ownership, current_owner)
+                .expect("the matching owner must still be able to take its monitor");
+        assert!(ownership.is_none());
+        current_handle.abort();
+        let _ = current_handle.await;
+    }
+
+    #[tokio::test]
+    async fn owner_cleanup_does_not_take_a_handle_replaced_through_the_public_slot() {
+        let owner_id = DeviceMonitorOwnerId(43);
+        let original_handle = tokio::spawn(std::future::pending::<()>());
+        let original_task_id = original_handle.id();
+        original_handle.abort();
+        let _ = original_handle.await;
+
+        // Model a legacy caller replacing the public DEVICE_MONITOR handle
+        // directly. Private owner metadata must not grant cleanup authority
+        // over a task it did not install.
+        let replacement_handle = tokio::spawn(std::future::pending::<()>());
+        let replacement_task_id = replacement_handle.id();
+        let mut slot = Some(replacement_handle);
+        let mut ownership = Some(DeviceMonitorOwnership {
+            owner_id,
+            task_id: original_task_id,
+        });
+
+        assert!(take_device_monitor_for_owner(&mut slot, &mut ownership, owner_id).is_none());
+        assert_eq!(slot.as_ref().map(JoinHandle::id), Some(replacement_task_id));
+        assert!(
+            ownership.is_none(),
+            "stale private metadata must be cleared"
+        );
+
+        let replacement_handle = slot
+            .take()
+            .expect("replacement handle must remain installed");
+        replacement_handle.abort();
+        let _ = replacement_handle.await;
     }
 
     #[test]

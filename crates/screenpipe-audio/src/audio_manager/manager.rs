@@ -16,13 +16,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{broadcast, oneshot, Mutex, RwLock},
+    sync::{broadcast, oneshot, watch, Mutex, RwLock},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
 use whisper_rs::WhisperContext;
 
 use screenpipe_db::DatabaseManager;
+use screenpipe_events::{PermissionKind, PermissionState};
 
 /// True if `e` is the VPIO-relevant kind of stream death: a receive-timeout
 /// (the stream was created but delivered no data). A zero-fill hijack
@@ -41,8 +42,8 @@ fn is_vpio_relevant_stream_death(e: &anyhow::Error) -> bool {
 }
 
 use super::{
-    start_device_monitor, stop_device_monitor, AudioCaptureMode, AudioManagerOptions,
-    TranscriptionMode,
+    start_device_monitor_for_owner, stop_device_monitor_for_owner, AudioCaptureMode,
+    AudioManagerOptions, DeviceMonitorOwnerId, TranscriptionMode,
 };
 use crate::{
     core::{
@@ -100,6 +101,28 @@ fn log_audio_process_error(e: &anyhow::Error) {
     }
 }
 
+fn microphone_permission_allows_input_start_from(
+    permission: &watch::Receiver<Option<PermissionState>>,
+) -> bool {
+    *permission.borrow() != Some(PermissionState::Lost)
+}
+
+fn input_start_blocked_by_permission_from(
+    device: &AudioDevice,
+    permission: &watch::Receiver<Option<PermissionState>>,
+) -> bool {
+    device.device_type == crate::core::device::DeviceType::Input
+        && !microphone_permission_allows_input_start_from(permission)
+}
+
+/// The engine seeds no synthetic startup state, so `None` preserves existing
+/// first-start behavior. Once a runtime loss has been observed, every input
+/// start path stays closed until the matching restoration is published.
+fn input_start_blocked_by_permission(device: &AudioDevice) -> bool {
+    let permission = screenpipe_events::subscribe_to_permission_state(PermissionKind::Microphone);
+    input_start_blocked_by_permission_from(device, &permission)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AudioManagerStatus {
     Running,
@@ -121,6 +144,40 @@ struct MeetingEventData {
 
 type RecordingHandlesMap = DashMap<AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>>;
 const MEETING_AUDIO_FRAME_BUFFER: usize = 512;
+
+/// Shared cleanup authority for an [`AudioManager`] clone family.
+///
+/// `AudioManager` is intentionally cheap to clone because its operational state
+/// lives behind `Arc`s. Cleanup therefore cannot live on `AudioManager::drop`:
+/// dropping any temporary clone (including the device monitor's worker clone)
+/// would tear down every shared stream. This guard runs its action only when the
+/// final cleanup-owning clone is gone.
+struct CleanupAction {
+    on_last_drop: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl Drop for CleanupAction {
+    fn drop(&mut self) {
+        if let Some(action) = self.on_last_drop.take() {
+            action();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LastOwnerCleanup {
+    _action: Arc<CleanupAction>,
+}
+
+impl LastOwnerCleanup {
+    fn new(action: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            _action: Arc::new(CleanupAction {
+                on_last_drop: Some(Box::new(action)),
+            }),
+        }
+    }
+}
 
 /// Wall-clock milliseconds since the Unix epoch (0 if the clock predates it).
 /// Local to the audio manager so the receiver-loop stamping and the piggyback
@@ -184,6 +241,14 @@ pub struct AudioManager {
     /// in this set; the sweep resumes it on meeting end / fallback. Same
     /// `std::sync::RwLock` discipline as `session_devices`.
     suspended_devices: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Stable across this manager's clones. Device-monitor shutdown is scoped
+    /// to this identity so delayed cleanup from a replaced manager cannot stop
+    /// the current manager's monitor.
+    device_monitor_owner_id: DeviceMonitorOwnerId,
+    /// Shared by public/owner clones. The device-monitor worker deliberately
+    /// drops this lease so it cannot keep itself alive or trigger global
+    /// cleanup when the worker is aborted during monitor replacement.
+    _cleanup_guard: Option<LastOwnerCleanup>,
 }
 
 /// Result of checking / restarting the two central handler tasks.
@@ -345,7 +410,53 @@ impl AudioManager {
         let (transcription_sender, transcription_receiver) =
             crossbeam::channel::bounded(channel_config.transcription_capacity);
 
-        let recording_handles = DashMap::new();
+        let device_manager = Arc::new(device_manager);
+        let recording_handles: Arc<RecordingHandlesMap> = Arc::new(DashMap::new());
+        let recording_receiver_handle: Arc<RwLock<Option<JoinHandle<()>>>> =
+            Arc::new(RwLock::new(None));
+        let transcription_receiver_handle: Arc<RwLock<Option<JoinHandle<()>>>> =
+            Arc::new(RwLock::new(None));
+        let meeting_streaming_handle: Arc<RwLock<Option<JoinHandle<()>>>> =
+            Arc::new(RwLock::new(None));
+        let reconciliation_handle: Arc<RwLock<Option<JoinHandle<()>>>> =
+            Arc::new(RwLock::new(None));
+        let device_monitor_owner_id = DeviceMonitorOwnerId::next();
+        // `AudioManager` may be dropped by a synchronous owner or another
+        // thread. Capture the construction runtime instead of consulting the
+        // drop thread, which may not have entered any Tokio runtime.
+        let cleanup_runtime = tokio::runtime::Handle::current();
+
+        let cleanup_guard = {
+            let rec = recording_handles.clone();
+            let recording = recording_receiver_handle.clone();
+            let transcript = transcription_receiver_handle.clone();
+            let meeting_streaming = meeting_streaming_handle.clone();
+            let reconciliation = reconciliation_handle.clone();
+            let cleanup_device_manager = device_manager.clone();
+
+            LastOwnerCleanup::new(move || {
+                cleanup_runtime.spawn(async move {
+                    // Abort reconciliation first to stop MLX usage before engine is dropped.
+                    if let Some(handle) = reconciliation.write().await.take() {
+                        handle.abort();
+                    }
+                    if let Some(handle) = meeting_streaming.write().await.take() {
+                        handle.abort();
+                    }
+                    let _ = stop_device_monitor_for_owner(device_monitor_owner_id).await;
+                    let _ = cleanup_device_manager.stop_all_devices().await;
+                    if let Some(handle) = recording.write().await.take() {
+                        handle.abort();
+                    }
+                    if let Some(handle) = transcript.write().await.take() {
+                        handle.abort();
+                    }
+                    for handle in rec.iter() {
+                        handle.value().lock().await.abort();
+                    }
+                });
+            })
+        };
 
         let meeting_detector = options.meeting_detector.clone();
         let (meeting_audio_tx, _) = broadcast::channel(MEETING_AUDIO_FRAME_BUFFER);
@@ -354,7 +465,7 @@ impl AudioManager {
 
         let manager = Self {
             options: Arc::new(RwLock::new(options)),
-            device_manager: Arc::new(device_manager),
+            device_manager,
             segmentation_manager,
             status: Arc::new(status),
             db,
@@ -363,10 +474,10 @@ impl AudioManager {
             recording_receiver: Arc::new(recording_receiver),
             transcription_receiver: Arc::new(transcription_receiver),
             transcription_sender: Arc::new(transcription_sender),
-            recording_handles: Arc::new(recording_handles),
-            recording_receiver_handle: Arc::new(RwLock::new(None)),
-            transcription_receiver_handle: Arc::new(RwLock::new(None)),
-            meeting_streaming_handle: Arc::new(RwLock::new(None)),
+            recording_handles,
+            recording_receiver_handle,
+            transcription_receiver_handle,
+            meeting_streaming_handle,
             metrics: Arc::new(AudioPipelineMetrics::new()),
             meeting_detector: Arc::new(RwLock::new(meeting_detector)),
             meeting_audio_tap,
@@ -374,11 +485,13 @@ impl AudioManager {
             on_transcription_insert: None,
             engine: Arc::new(RwLock::new(None)),
             engine_builds: EngineBuildCoordinator::new(),
-            reconciliation_handle: Arc::new(RwLock::new(None)),
+            reconciliation_handle,
             drm_stopped_devices: Arc::new(RwLock::new(Vec::new())),
             user_disabled_devices: Arc::new(RwLock::new(HashSet::new())),
             session_devices: Arc::new(std::sync::RwLock::new(HashSet::new())),
             suspended_devices: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            device_monitor_owner_id,
+            _cleanup_guard: Some(cleanup_guard),
         };
 
         Ok(manager)
@@ -466,6 +579,20 @@ impl AudioManager {
         self.start_internal().await
     }
 
+    /// Clone shared operational state for a background worker without giving
+    /// that worker ownership of final-manager cleanup. In particular, aborting
+    /// an old device monitor during replacement must not enqueue a cleanup task
+    /// that races with and stops the replacement monitor.
+    fn clone_for_device_monitor(&self) -> Self {
+        let mut worker = self.clone();
+        worker._cleanup_guard = None;
+        worker
+    }
+
+    pub(crate) fn device_monitor_owner_id(&self) -> DeviceMonitorOwnerId {
+        self.device_monitor_owner_id
+    }
+
     async fn start_internal(&self) -> Result<()> {
         *self.status.write().await = AudioManagerStatus::Running;
         let mut transcription_receiver_handle = self.transcription_receiver_handle.write().await;
@@ -473,7 +600,7 @@ impl AudioManager {
 
         let mut recording_receiver_handle = self.recording_receiver_handle.write().await;
         *recording_receiver_handle = Some(self.start_audio_receiver_handler().await?);
-        let self_arc = Arc::new(self.clone());
+        let self_arc = Arc::new(self.clone_for_device_monitor());
 
         {
             let mut meeting_streaming_handle = self.meeting_streaming_handle.write().await;
@@ -565,7 +692,12 @@ impl AudioManager {
             *self.reconciliation_handle.write().await = Some(handle);
         }
 
-        start_device_monitor(self_arc.clone(), self.device_manager.clone()).await?;
+        start_device_monitor_for_owner(
+            self.device_monitor_owner_id,
+            self_arc.clone(),
+            self.device_manager.clone(),
+        )
+        .await?;
 
         // Seed known speakers from DB on startup
         seed_speakers_from_db(&self.db, &self.segmentation_manager).await;
@@ -594,7 +726,7 @@ impl AudioManager {
     async fn stop_internal(&self) -> Result<()> {
         *self.status.write().await = AudioManagerStatus::Stopped;
 
-        stop_device_monitor().await?;
+        stop_device_monitor_for_owner(self.device_monitor_owner_id).await?;
 
         // Stop producers FIRST: abort per-device recording tasks and the OS audio streams.
         // This must happen before killing the consumer so any audio already queued in the
@@ -776,6 +908,12 @@ impl AudioManager {
             return Ok(());
         }
 
+        if input_start_blocked_by_permission(device) {
+            return Err(anyhow!(
+                "Microphone permission denied while starting {device}"
+            ));
+        }
+
         // Don't restart devices that are paused due to DRM content detection.
         // The monitor watcher will call start_output_devices() when DRM clears.
         if self
@@ -824,6 +962,16 @@ impl AudioManager {
             }
         }
 
+        // Permission can change while CoreAudio is opening the stream. Do not
+        // publish a newly-opened input into the recording pipeline if a later
+        // Lost edge arrived during that await.
+        if input_start_blocked_by_permission(device) {
+            let _ = self.device_manager.stop_device(device).await;
+            return Err(anyhow!(
+                "Microphone permission denied while starting {device}"
+            ));
+        }
+
         if !self.recording_handles.contains_key(device) {
             if let Some(is_running) = self.device_manager.is_running_mut(device) {
                 is_running.store(true, Ordering::Relaxed);
@@ -833,12 +981,30 @@ impl AudioManager {
                 .insert(device.clone(), Arc::new(Mutex::new(handle)));
         }
 
+        // Close the second await window (`record_device`) as well. If the
+        // permission was revoked while the recording task was attached, tear
+        // the fresh stream back down and leave reconnect ownership with the
+        // permission-restoration path.
+        if input_start_blocked_by_permission(device) {
+            let _ = self.stop_device_recording(device).await;
+            return Err(anyhow!(
+                "Microphone permission denied while starting {device}"
+            ));
+        }
+
         if !self.enabled_devices().await.contains(&device.to_string()) {
             self.options
                 .write()
                 .await
                 .enabled_devices
                 .insert(device.to_string());
+        }
+
+        if input_start_blocked_by_permission(device) {
+            let _ = self.stop_device_recording(device).await;
+            return Err(anyhow!(
+                "Microphone permission denied while starting {device}"
+            ));
         }
 
         Ok(())
@@ -855,6 +1021,11 @@ impl AudioManager {
     ) -> Result<()> {
         if self.options.read().await.is_disabled {
             return Ok(());
+        }
+        if input_start_blocked_by_permission(device) {
+            return Err(anyhow!(
+                "Microphone permission denied while starting {device}"
+            ));
         }
         // Insert BEFORE starting: the audio-receiver drop-gate bypass must see
         // this device from the very first chunk. Rolled back on failure below.
@@ -880,6 +1051,16 @@ impl AudioManager {
                 return Err(e);
             }
         }
+        if input_start_blocked_by_permission(device) {
+            self.session_devices
+                .write()
+                .unwrap()
+                .remove(&device.to_string());
+            let _ = self.device_manager.stop_device(device).await;
+            return Err(anyhow!(
+                "Microphone permission denied while starting {device}"
+            ));
+        }
         if !self.recording_handles.contains_key(device) {
             if let Some(is_running) = self.device_manager.is_running_mut(device) {
                 is_running.store(true, Ordering::Relaxed);
@@ -897,6 +1078,12 @@ impl AudioManager {
                     return Err(e);
                 }
             }
+        }
+        if input_start_blocked_by_permission(device) {
+            let _ = self.stop_session_device(device).await;
+            return Err(anyhow!(
+                "Microphone permission denied while starting {device}"
+            ));
         }
         Ok(())
     }
@@ -1486,7 +1673,7 @@ impl AudioManager {
             h.value().lock().await.abort();
         }
 
-        let _ = stop_device_monitor().await;
+        let _ = stop_device_monitor_for_owner(self.device_monitor_owner_id).await;
 
         Ok(())
     }
@@ -2057,34 +2244,6 @@ async fn run_meeting_speaker_constraint_loop(
     }
 }
 
-impl Drop for AudioManager {
-    fn drop(&mut self) {
-        let rec = self.recording_handles.clone();
-        let recording = self.recording_receiver_handle.clone();
-        let transcript = self.transcription_receiver_handle.clone();
-        let reconciliation = self.reconciliation_handle.clone();
-        let device_manager = self.device_manager.clone();
-
-        tokio::spawn(async move {
-            // Abort reconciliation first to stop MLX usage before engine is dropped
-            if let Some(handle) = reconciliation.write().await.take() {
-                handle.abort();
-            }
-            let _ = stop_device_monitor().await;
-            let _ = device_manager.stop_all_devices().await;
-            if let Some(handle) = recording.write().await.take() {
-                handle.abort();
-            }
-            if let Some(handle) = transcript.write().await.take() {
-                handle.abort();
-            }
-            for h in rec.iter() {
-                h.value().lock().await.abort();
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2106,6 +2265,70 @@ mod tests {
             config,
             identity: Arc::new(()),
         }
+    }
+
+    #[test]
+    fn cleanup_guard_runs_only_after_the_final_owner_drops() {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_cleanup = cleanup_calls.clone();
+        let owner = LastOwnerCleanup::new(move || {
+            calls_for_cleanup.fetch_add(1, Ordering::SeqCst);
+        });
+        let temporary_clone = owner.clone();
+
+        drop(temporary_clone);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
+
+        drop(owner);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_guard_uses_captured_runtime_when_dropped_off_runtime() {
+        let runtime = tokio::runtime::Handle::current();
+        let cleanup_ran = Arc::new(Notify::new());
+        let cleanup_ran_from_task = cleanup_ran.clone();
+        let owner = LastOwnerCleanup::new(move || {
+            runtime.spawn(async move {
+                cleanup_ran_from_task.notify_one();
+            });
+        });
+
+        std::thread::spawn(move || drop(owner))
+            .join()
+            .expect("off-runtime drop thread must not panic");
+
+        tokio::time::timeout(Duration::from_secs(1), cleanup_ran.notified())
+            .await
+            .expect("cleanup must run on the construction runtime");
+    }
+
+    #[test]
+    fn input_start_gate_tracks_latest_microphone_state_without_blocking_output() {
+        let input = AudioDevice::new("Test Microphone".to_string(), DeviceType::Input);
+        let output = AudioDevice::new("Test Speakers".to_string(), DeviceType::Output);
+        let (permission_tx, permission_rx) = watch::channel(None);
+
+        assert!(!input_start_blocked_by_permission_from(
+            &input,
+            &permission_rx
+        ));
+
+        permission_tx.send_replace(Some(PermissionState::Lost));
+        assert!(input_start_blocked_by_permission_from(
+            &input,
+            &permission_rx
+        ));
+        assert!(
+            !input_start_blocked_by_permission_from(&output, &permission_rx),
+            "microphone loss must not block output recovery"
+        );
+
+        permission_tx.send_replace(Some(PermissionState::Restored));
+        assert!(!input_start_blocked_by_permission_from(
+            &input,
+            &permission_rx
+        ));
     }
 
     #[tokio::test]

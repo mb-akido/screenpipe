@@ -210,6 +210,24 @@ fn capture_intended_now(wants_recording: &AtomicBool) -> bool {
     wants_recording.load(Ordering::SeqCst)
 }
 
+fn should_restart_capture_after_permission_restore(
+    capture_intended: bool,
+    _capture_running: bool,
+) -> bool {
+    // A prior recovery attempt may have stopped the old session before its
+    // replacement failed. Intent remains the authority: a later retry must be
+    // able to recreate capture from an empty slot.
+    capture_intended
+}
+
+fn should_start_server_with_vision_blocked(
+    capture_intended: bool,
+    vision_disabled: bool,
+    screen_permission_granted: bool,
+) -> bool {
+    capture_intended && !vision_disabled && !screen_permission_granted
+}
+
 // ---------------------------------------------------------------------------
 // Device listing (unchanged)
 // ---------------------------------------------------------------------------
@@ -340,6 +358,84 @@ pub async fn stop_capture(
         debug!("No capture session running");
     }
     Ok(())
+}
+
+/// Rebuild only the capture layer after screen-recording or accessibility is
+/// restored. The DB, HTTP server, pipes, and other long-lived ServerCore state
+/// stay alive.
+///
+/// The capture lock is held from the intent/running check through replacement,
+/// so a user stop cannot be followed by a stale recovery task resurrecting
+/// recording. `wants_recording` remains true throughout this internal restart;
+/// if a concurrent user stop clears it while teardown is running, the fresh
+/// session is not constructed.
+pub(crate) async fn restart_capture_for_permission_restore(
+    app: &tauri::AppHandle,
+) -> Result<bool, String> {
+    let state = app.state::<RecordingState>();
+
+    // Serialize against full server stop/start. Unlike a normal capture toggle,
+    // permission recovery may retry after the previous session is already gone.
+    let _lifecycle_guard = state.server_lifecycle.lock().await;
+
+    if !state.capture_intended() {
+        return Ok(false);
+    }
+
+    // Resolve every fallible prerequisite we can before disturbing a healthy
+    // existing session. The lifecycle guard keeps this ServerCore in place
+    // until the replacement attempt completes.
+    let config = build_config(app)?;
+    {
+        let server_guard = state.server.lock().await;
+        if server_guard.is_none() {
+            return Err("Server not running — cannot restart capture".to_string());
+        }
+    }
+
+    let mut capture_guard = state.capture.lock().await;
+
+    if !should_restart_capture_after_permission_restore(
+        state.capture_intended(),
+        capture_guard.is_some(),
+    ) {
+        return Ok(false);
+    }
+
+    if capture_guard.is_some() {
+        remember_active_meeting_for_capture_restart(&state).await;
+    }
+    if let Some(session) = capture_guard.take() {
+        session.stop().await;
+    }
+
+    // stop_capture clears this before waiting for the same capture lock. Honor
+    // that latest user intent instead of rebuilding a session they just stopped.
+    if !state.capture_intended() {
+        return Ok(false);
+    }
+
+    restore_interrupted_meeting_for_capture_restart(&state).await?;
+
+    // Intent can change while meeting state is restored. A tray stop clears it
+    // before waiting for this capture lock, so never recreate capture afterward.
+    if !state.capture_intended() {
+        return Ok(false);
+    }
+
+    let server_guard = state.server.lock().await;
+    let server = server_guard
+        .as_ref()
+        .ok_or_else(|| "Server not running — cannot restart capture".to_string())?;
+    let session = CaptureSession::start(server, &config, false).await?;
+    let blocked_permissions = session.blocked_permissions().to_vec();
+    drop(server_guard);
+
+    *capture_guard = Some(session);
+    drop(capture_guard);
+
+    crate::permission_ui::show_capture_recovery_if_blocked(app, &blocked_permissions);
+    Ok(true)
 }
 
 /// Whether capture is currently paused. Reads `capture_intended` which is
@@ -964,21 +1060,16 @@ async fn spawn_screenpipe_inner(
     // Permissions check
     let permissions_check = do_permissions_check(false);
     let disable_audio = store.recording.disable_audio;
+    let disable_vision = store.recording.disable_vision;
 
-    if state.capture_intended() && !permissions_check.screen_recording.permitted() {
+    if should_start_server_with_vision_blocked(
+        state.capture_intended(),
+        disable_vision,
+        permissions_check.screen_recording.permitted(),
+    ) {
         warn!(
-            "Screen recording permission not granted: {:?}. Cannot start server.",
+            "Screen recording permission not granted: {:?}. Starting ServerCore with vision capture blocked.",
             permissions_check.screen_recording
-        );
-        state.is_starting.store(false, Ordering::SeqCst);
-        state.is_starting_capture.store(false, Ordering::SeqCst);
-        // Flip the tray state machine to a terminal Error so the
-        // recording status indicator stops showing "Starting…" forever
-        // when the user has clicked "click to record" with TCC denied.
-        crate::health::set_recording_status(crate::health::RecordingStatus::Error);
-        return Err(
-            "Screen recording permission required. Please grant permission and restart the app."
-                .to_string(),
         );
     }
 
@@ -990,7 +1081,7 @@ async fn spawn_screenpipe_inner(
     }
 
     info!(
-        "Permissions OK. Starting server. Capture intended: {}, audio disabled: {}, mic: {:?}",
+        "Permission preflight complete. Starting server. Capture intended: {}, audio disabled: {}, mic: {:?}",
         state.capture_intended(), disable_audio, permissions_check.microphone
     );
 
@@ -1359,7 +1450,10 @@ async fn kill_process_on_port(port: u16) {
 
 #[cfg(test)]
 mod capture_intent_tests {
-    use super::capture_intended_now;
+    use super::{
+        capture_intended_now, should_restart_capture_after_permission_restore,
+        should_start_server_with_vision_blocked,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -1372,6 +1466,26 @@ mod capture_intent_tests {
         wants_recording.store(false, Ordering::SeqCst);
 
         assert!(!capture_intended_now(&wants_recording));
+    }
+
+    #[test]
+    fn permission_restore_recovers_an_intended_capture_even_when_slot_is_empty() {
+        assert!(should_restart_capture_after_permission_restore(true, true));
+        assert!(should_restart_capture_after_permission_restore(true, false));
+        assert!(!should_restart_capture_after_permission_restore(
+            false, true
+        ));
+        assert!(!should_restart_capture_after_permission_restore(
+            false, false
+        ));
+    }
+
+    #[test]
+    fn missing_screen_permission_keeps_server_start_available() {
+        assert!(should_start_server_with_vision_blocked(true, false, false));
+        assert!(!should_start_server_with_vision_blocked(true, true, false));
+        assert!(!should_start_server_with_vision_blocked(true, false, true));
+        assert!(!should_start_server_with_vision_blocked(false, false, false));
     }
 }
 

@@ -148,6 +148,10 @@ static STATE: Lazy<Mutex<State>> = Lazy::new(|| Mutex::new(State::all_granted())
 /// poll can read `denied`, an AV callback can report `granted`, and the stale
 /// poll can then overwrite it with a second loss/restoration cycle.
 static TRANSITION_GATE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+/// Keeps keychain snapshots ordered without making a potentially blocking
+/// keychain prompt stall TCC observations or native microphone callbacks.
+/// Reconciles coalesce while one keychain probe is already in flight.
+static KEYCHAIN_PROBE_GATE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Start the monitor. Idempotent — calling twice returns early; the first
 /// call wins. Returns the join handle of the polling task (first call) or
@@ -164,8 +168,15 @@ pub fn start_tauri() -> Option<JoinHandle<()>> {
 }
 
 fn start_with_context(probe_context: ProbeContext) -> Option<JoinHandle<()>> {
-    let _transition_guard = TRANSITION_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    // Reserve the keychain lane before publishing `started`. Once `started` is
+    // visible, focus/poll reconciles may run, but they will coalesce their
+    // keychain work behind this startup baseline instead of racing it.
+    let _keychain_guard = KEYCHAIN_PROBE_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     {
+        let _transition_guard = TRANSITION_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if state.started {
             return None;
@@ -179,10 +190,17 @@ fn start_with_context(probe_context: ProbeContext) -> Option<JoinHandle<()>> {
         state.screen = LastKnown::new(perms.screen_recording.is_granted());
         state.mic = LastKnown::new(perms.microphone.is_granted());
         state.accessibility = LastKnown::new(perms.accessibility.is_granted());
-        // For keychain, avoid probing the keychain key until encryption is actually
-        // requested by the app (via encrypted settings/explicit opt-in). Otherwise
-        // macOS can show a keychain permission modal before onboarding.
-        state.keychain = LastKnown::new(keychain_accessible());
+    }
+
+    // Keychain access can synchronously wait on macOS security UI. Probe it
+    // without TRANSITION_GATE so eager TCC reports keep flowing while the user
+    // responds. KEYCHAIN_PROBE_GATE still keeps keychain snapshots ordered.
+    let keychain_granted = keychain_accessible();
+
+    {
+        let _transition_guard = TRANSITION_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.keychain = LastKnown::new(keychain_granted);
         info!(
             screen = state.screen.granted,
             mic = state.mic.granted,
@@ -203,6 +221,14 @@ fn start_with_context(probe_context: ProbeContext) -> Option<JoinHandle<()>> {
 /// Skipped silently during the wake grace period to avoid spurious
 /// lost→restored flashes after sleep/wake.
 pub fn report_state(kind: PermissionKind, now_granted: bool, reason: Option<&str>) {
+    // There are no eager keychain producers today, but keep this public API's
+    // ordering correct if one is added: a report that arrives during a slow
+    // snapshot must apply after that snapshot, not be overwritten by it.
+    let _keychain_guard = (kind == PermissionKind::Keychain).then(|| {
+        KEYCHAIN_PROBE_GATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    });
     let _transition_guard = TRANSITION_GATE.lock().unwrap_or_else(|e| e.into_inner());
     report_state_inner(kind, now_granted, reason);
 }
@@ -250,48 +276,90 @@ fn report_state_inner(kind: PermissionKind, now_granted: bool, reason: Option<&s
 /// Calls before [`start`] are ignored: `start` must first seed the baseline so
 /// an already-granted launch cannot be mistaken for a new grant.
 pub fn reconcile_now(reason: &str) {
-    let _transition_guard = match TRANSITION_GATE.try_lock() {
+    // Keep the TCC snapshot and its three reports under one transition gate.
+    // A native callback therefore cannot land between the OS reads and replay
+    // a stale poll result afterward.
+    {
+        let _transition_guard = match TRANSITION_GATE.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                debug!(
+                    reason,
+                    "permission reconcile coalesced with in-flight observation"
+                );
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+
+        let probe_context = {
+            let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.started {
+                debug!(reason, "permission reconcile skipped before monitor start");
+                return;
+            }
+            state.probe_context
+        };
+
+        let perms = check_permissions_for(probe_context);
+        report_state_inner(
+            PermissionKind::ScreenRecording,
+            granted(perms.screen_recording),
+            Some(reason),
+        );
+        report_state_inner(
+            PermissionKind::Microphone,
+            granted(perms.microphone),
+            Some(reason),
+        );
+        report_state_inner(
+            PermissionKind::Accessibility,
+            granted(perms.accessibility),
+            Some(reason),
+        );
+    }
+
+    reconcile_keychain(reason);
+}
+
+fn reconcile_keychain(reason: &str) {
+    reconcile_keychain_with(
+        &KEYCHAIN_PROBE_GATE,
+        &TRANSITION_GATE,
+        reason,
+        keychain_accessible,
+        |now_accessible| {
+            report_state_inner(PermissionKind::Keychain, now_accessible, Some(reason));
+        },
+    );
+}
+
+fn reconcile_keychain_with<Probe, Apply>(
+    keychain_gate: &Mutex<()>,
+    transition_gate: &Mutex<()>,
+    reason: &str,
+    probe: Probe,
+    apply: Apply,
+) where
+    Probe: FnOnce() -> bool,
+    Apply: FnOnce(bool),
+{
+    let _keychain_guard = match keychain_gate.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::WouldBlock) => {
-            debug!(
-                reason,
-                "permission reconcile coalesced with in-flight observation"
-            );
+            debug!(reason, "keychain permission reconcile already in flight");
             return;
         }
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
     };
 
-    let probe_context = {
-        let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.started {
-            debug!(reason, "permission reconcile skipped before monitor start");
-            return;
-        }
-        state.probe_context
-    };
+    // Never hold TRANSITION_GATE across this call: macOS keychain access may
+    // synchronously wait for the user, while microphone/screen callbacks must
+    // remain able to update their authoritative transition state.
+    let now_accessible = probe();
 
-    let perms = check_permissions_for(probe_context);
-    report_state_inner(
-        PermissionKind::ScreenRecording,
-        granted(perms.screen_recording),
-        Some(reason),
-    );
-    report_state_inner(
-        PermissionKind::Microphone,
-        granted(perms.microphone),
-        Some(reason),
-    );
-    report_state_inner(
-        PermissionKind::Accessibility,
-        granted(perms.accessibility),
-        Some(reason),
-    );
-    report_state_inner(
-        PermissionKind::Keychain,
-        keychain_accessible(),
-        Some(reason),
-    );
+    let _transition_guard = transition_gate.lock().unwrap_or_else(|e| e.into_inner());
+    apply(now_accessible);
 }
 
 /// Notify the monitor that the system just woke from sleep. Suppresses
@@ -466,6 +534,32 @@ mod tests {
                 now + WAKE_GRACE + Duration::from_millis(1),
             ),
             Observation::Transition(PermissionState::Restored)
+        );
+    }
+
+    #[test]
+    fn keychain_probe_does_not_hold_transition_gate() {
+        let keychain_gate = Mutex::new(());
+        let transition_gate = Mutex::new(());
+
+        reconcile_keychain_with(
+            &keychain_gate,
+            &transition_gate,
+            "test",
+            || {
+                let probe_guard = transition_gate
+                    .try_lock()
+                    .expect("TCC reports must remain unblocked during keychain access");
+                drop(probe_guard);
+                true
+            },
+            |now_accessible| {
+                assert!(now_accessible);
+                assert!(matches!(
+                    transition_gate.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            },
         );
     }
 }

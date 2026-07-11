@@ -63,6 +63,39 @@ async function expectDeniedPermissionRow(testId: string): Promise<void> {
       }
     });
 
+    it("opens automatically from an in-process typed permission loss", async () => {
+      const handles = await browser.getWindowHandles();
+      if (handles.includes(RECOVERY_HANDLE)) {
+        await browser.switchToWindow(RECOVERY_HANDLE);
+        await closeWindow("PermissionRecovery");
+        await browser.switchToWindow("home");
+      }
+
+      await browser.waitUntil(
+        async () => !(await invokeOrThrow<boolean>("e2e_permission_recovery_visible")),
+        {
+          timeout: t(5_000),
+          interval: 50,
+          timeoutMsg: "permission recovery window did not become hidden before simulation",
+        },
+      );
+
+      await invokeOrThrow("e2e_simulate_permission_loss", {
+        permission: "microphone",
+      });
+
+      await browser.waitUntil(
+        async () => await invokeOrThrow<boolean>("e2e_permission_recovery_visible"),
+        {
+          timeout: t(5_000),
+          interval: 50,
+          timeoutMsg: "typed permission loss did not open permission recovery",
+        },
+      );
+      await waitForWindowHandle(RECOVERY_HANDLE, t(5_000));
+      await expectSingleWindowHandle(RECOVERY_HANDLE);
+    });
+
     it("opens the recovery window with rows for missing macOS permissions", async function () {
       const permissions = await getPermissions(false);
       const screenOk = permissionIsOk(permissions.screenRecording);
@@ -71,7 +104,7 @@ async function expectDeniedPermissionRow(testId: string): Promise<void> {
 
       // Fully permissioned local machines auto-resume and close this surface,
       // which is correct behavior but not the CI scenario this spec targets.
-      if (screenOk && micOk) {
+      if (screenOk && micOk && accessibilityOk) {
         this.skip();
       }
 
@@ -111,7 +144,8 @@ async function expectDeniedPermissionRow(testId: string): Promise<void> {
       const permissions = await getPermissions(false);
       if (
         permissionIsOk(permissions.screenRecording) &&
-        permissionIsOk(permissions.microphone)
+        permissionIsOk(permissions.microphone) &&
+        permissionIsOk(permissions.accessibility)
       ) {
         this.skip();
       }

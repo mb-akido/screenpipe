@@ -961,6 +961,42 @@ pub fn e2e_shortcut_reminder_visible(app_handle: tauri::AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+/// E2E helper: feed one typed permission-loss observation through the same
+/// in-process Tauri consumer used in production. This deliberately does not
+/// publish to `screenpipe-events`; it verifies the consumer/presentation path
+/// without mutating the host's real macOS TCC database.
+#[tauri::command]
+#[specta::specta]
+pub fn e2e_simulate_permission_loss(permission: String) -> Result<(), String> {
+    if !cfg!(feature = "e2e") {
+        return Err("e2e_simulate_permission_loss is only available in e2e builds".to_string());
+    }
+
+    let kind = match permission.as_str() {
+        "screen_recording" => screenpipe_events::PermissionKind::ScreenRecording,
+        "microphone" => screenpipe_events::PermissionKind::Microphone,
+        "accessibility" => screenpipe_events::PermissionKind::Accessibility,
+        _ => return Err(format!("unsupported permission kind: {permission}")),
+    };
+    crate::permission_lifecycle::enqueue_permission_loss_for_e2e(kind)
+}
+
+/// E2E helper paired with `e2e_simulate_permission_loss`: window handles stay
+/// alive after hide on macOS, so WebDriver needs the real Tauri visibility bit
+/// to distinguish an automatic open from a pre-existing hidden webview.
+#[tauri::command]
+#[specta::specta]
+pub fn e2e_permission_recovery_visible(app_handle: tauri::AppHandle) -> bool {
+    if !cfg!(feature = "e2e") {
+        return false;
+    }
+
+    app_handle
+        .get_webview_window("permission-recovery")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
 #[derive(serde::Serialize, specta::Type)]
 pub struct E2eAgentStreamResult {
     pub emitted_deltas: u32,
@@ -1974,6 +2010,7 @@ pub async fn complete_onboarding(app_handle: tauri::AppHandle) -> Result<(), Str
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     close_window(app_handle.clone(), ShowRewindWindow::Onboarding).await?;
     show_window(app_handle.clone(), ShowRewindWindow::Home { page: None }).await?;
+    crate::permission_lifecycle::present_current_critical_permissions(&app_handle);
 
     Ok(())
 }

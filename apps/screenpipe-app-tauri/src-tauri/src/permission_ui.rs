@@ -16,29 +16,55 @@ use crate::store::OnboardingStore;
 use crate::window::ShowRewindWindow;
 
 pub fn show_capture_recovery_if_blocked(app: &AppHandle, blocked: &[PermissionKind]) {
-    let onboarding_completed = OnboardingStore::get(app)
-        .ok()
-        .flatten()
-        .is_some_and(|store| store.is_completed);
-
-    if !should_show_capture_recovery(onboarding_completed, blocked) {
-        if !blocked.is_empty() {
-            debug!(?blocked, "capture permission UI suppressed during onboarding");
-        }
-        return;
-    }
-
-    info!(?blocked, "capture blocked by missing permissions; showing recovery UI");
-    if let Err(error) = ShowRewindWindow::PermissionRecovery.show(app) {
-        warn!(%error, "failed to show permission recovery window");
-    }
+    let _ = show_permission_recovery_if_allowed(app, blocked, "capture blocked");
 }
 
-fn should_show_capture_recovery(
-    onboarding_completed: bool,
-    blocked: &[PermissionKind],
+/// Surface a runtime loss directly from the in-process typed permission
+/// consumer. Returns true when presentation was allowed and the window opened,
+/// which lets the caller retain the previous permission-loss telemetry without
+/// routing control through a WebSocket or React listener.
+pub fn show_runtime_permission_recovery(app: &AppHandle, kind: PermissionKind) -> bool {
+    show_permission_recovery_if_allowed(app, &[kind], "runtime permission lost")
+}
+
+fn show_permission_recovery_if_allowed(
+    app: &AppHandle,
+    permissions: &[PermissionKind],
+    reason: &'static str,
 ) -> bool {
-    onboarding_completed && !blocked.is_empty()
+    let onboarding_completed = permission_presentation_allowed(app);
+
+    if !should_show_permission_recovery(onboarding_completed, permissions) {
+        if !permissions.is_empty() {
+            debug!(
+                ?permissions,
+                reason, "permission UI suppressed during onboarding"
+            );
+        }
+        return false;
+    }
+
+    info!(?permissions, reason, "showing permission recovery UI");
+    if let Err(error) = ShowRewindWindow::PermissionRecovery.show(app) {
+        warn!(%error, "failed to show permission recovery window");
+        return false;
+    }
+
+    true
+}
+
+pub(crate) fn permission_presentation_allowed(app: &AppHandle) -> bool {
+    OnboardingStore::get(app)
+        .ok()
+        .flatten()
+        .is_some_and(|store| store.is_completed)
+}
+
+fn should_show_permission_recovery(
+    onboarding_completed: bool,
+    permissions: &[PermissionKind],
+) -> bool {
+    onboarding_completed && !permissions.is_empty()
 }
 
 #[cfg(test)]
@@ -47,12 +73,12 @@ mod tests {
 
     #[test]
     fn empty_capture_outcome_does_not_show_recovery() {
-        assert!(!should_show_capture_recovery(true, &[]));
+        assert!(!should_show_permission_recovery(true, &[]));
     }
 
     #[test]
     fn onboarding_suppresses_capture_recovery() {
-        assert!(!should_show_capture_recovery(
+        assert!(!should_show_permission_recovery(
             false,
             &[PermissionKind::ScreenRecording]
         ));
@@ -60,7 +86,7 @@ mod tests {
 
     #[test]
     fn completed_onboarding_surfaces_blocked_capture() {
-        assert!(should_show_capture_recovery(
+        assert!(should_show_permission_recovery(
             true,
             &[PermissionKind::Accessibility]
         ));

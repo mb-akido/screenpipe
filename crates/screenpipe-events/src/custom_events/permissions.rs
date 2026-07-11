@@ -9,10 +9,10 @@
 //! Polling provides the fallback; capture errors, desktop focus, and native
 //! authorization callbacks provide lower-latency observations where available.
 //!
-//! The Tauri app subscribes via `/ws/events` and opens the recovery modal.
-//! CLI users can tail these events with `screenpipe events --follow`.
-//! In-process control-plane consumers subscribe to the typed per-permission
-//! state channel exposed here instead of filtering the high-volume global bus.
+//! CLI users can tail the serialized events with `screenpipe events --follow`.
+//! In-process control-plane consumers, including the Tauri shell and audio
+//! recovery, subscribe to the typed per-permission state channel exposed here
+//! instead of depending on the non-replaying `/ws/events` transport.
 
 use anyhow::Result;
 use once_cell::sync::Lazy;

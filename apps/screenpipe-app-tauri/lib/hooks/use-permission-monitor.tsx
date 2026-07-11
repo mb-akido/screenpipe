@@ -4,69 +4,18 @@
 
 "use client";
 
-import { useEffect, useRef } from "react";
-import { usePathname } from "next/navigation";
+import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { commands } from "@/lib/utils/tauri";
-import posthog from "posthog-js";
-
-interface PermissionLostPayload {
-  screen_recording: boolean;
-  microphone: boolean;
-  accessibility: boolean;
-  browser_automation?: boolean;
-  // Diagnostic context from the engine emission site ("poll", or the raw
-  // ScreenCaptureKit error string for the eager path). Lets us tell a real
-  // revoke from an un-graced transient in telemetry. May be absent.
-  reason?: string | null;
-}
 
 /**
- * Hook that listens for permission-lost events from the Rust backend
- * and automatically shows the permission recovery window.
- * Only triggers for CRITICAL permissions (screen, mic, accessibility).
- * Browser automation is optional and never triggers the recovery modal (#2510).
+ * Keep the frontend side of deferred full-server recovery alive. Permission
+ * presentation no longer depends on a mounted WebView: Rust consumes the
+ * engine's typed permission state in-process and opens recovery directly.
  */
 export function usePermissionMonitor() {
-  const hasShownRef = useRef(false);
-  const pathname = usePathname();
-
   useEffect(() => {
     if (typeof window === "undefined") return;
-
-    const skipPaths = ["/shortcut-reminder", "/onboarding", "/permission-recovery"];
-    if (skipPaths.some((p) => pathname?.startsWith(p))) return;
-
-    const unlisten = listen<PermissionLostPayload>("permission-lost", async (event) => {
-      const { screen_recording, microphone, accessibility, browser_automation, reason } = event.payload;
-
-      if (hasShownRef.current) return;
-
-      console.log("Permission lost event received:", { screen_recording, microphone, accessibility, browser_automation });
-
-      // Browser automation is optional — never trigger the modal for it (#2510)
-      if (!screen_recording && !microphone && !accessibility) return;
-
-      hasShownRef.current = true;
-
-      posthog.capture("permission_lost", {
-        screen_recording_lost: screen_recording,
-        microphone_lost: microphone,
-        accessibility_lost: accessibility,
-        browser_automation_lost: browser_automation,
-        reason: reason ?? null,
-      });
-
-      try {
-        await commands.showWindow("PermissionRecovery");
-      } catch (error) {
-        console.error("Failed to show permission recovery window:", error);
-      }
-
-      setTimeout(() => {
-        hasShownRef.current = false;
-      }, 300000);
-    });
 
     // Listen for deferred restart requests from the cooldown logic in recording.rs.
     // When a restart is blocked by cooldown, the backend schedules a deferred check
@@ -81,10 +30,9 @@ export function usePermissionMonitor() {
     });
 
     return () => {
-      unlisten.then((fn) => fn());
       unlistenRestart.then((fn) => fn());
     };
-  }, [pathname]);
+  }, []);
 }
 
 /**

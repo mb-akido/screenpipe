@@ -933,8 +933,8 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // The old health-based degraded→permission-lost heuristic was removed:
             // it was slow (60s startup + 120s restart grace + 10s debounce) and
             // frequently missed transitions because CGPreflightScreenCaptureAccess
-            // returns stale results. The app now subscribes to `permission_lost`
-            // / `permission_restored` events via /ws/events (see engine_events.rs).
+            // returns stale results. The app now consumes retained typed
+            // permission state in-process (see permission_lifecycle.rs).
 
             // Parse device info from health response; monitor allowlist applied
             // after vision status replaces monitor rows (below).

@@ -416,6 +416,14 @@ async e2eOwnedBrowserVisible() : Promise<boolean> {
     return await TAURI_INVOKE("e2e_owned_browser_visible");
 },
 /**
+ * E2E helper paired with `e2e_simulate_permission_loss`: window handles stay
+ * alive after hide on macOS, so WebDriver needs the real Tauri visibility bit
+ * to distinguish an automatic open from a pre-existing hidden webview.
+ */
+async e2ePermissionRecoveryVisible() : Promise<boolean> {
+    return await TAURI_INVOKE("e2e_permission_recovery_visible");
+},
+/**
  * E2E helper: report whether the shortcut reminder overlay is visibly shown.
  *
  * The reminder window is hidden rather than destroyed, so WebDriver can keep a
@@ -423,6 +431,20 @@ async e2eOwnedBrowserVisible() : Promise<boolean> {
  */
 async e2eShortcutReminderVisible() : Promise<boolean> {
     return await TAURI_INVOKE("e2e_shortcut_reminder_visible");
+},
+/**
+ * E2E helper: feed one typed permission-loss observation through the same
+ * in-process Tauri consumer used in production. This deliberately does not
+ * publish to `screenpipe-events`; it verifies the consumer/presentation path
+ * without mutating the host's real macOS TCC database.
+ */
+async e2eSimulatePermissionLoss(permission: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("e2e_simulate_permission_loss", { permission }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 async enableKeychainEncryption() : Promise<Result<KeychainStatus, string>> {
     try {
@@ -857,8 +879,9 @@ async installRegistrySkill(repo: string, gitRef: string, path: string, name: str
 }
 },
 /**
- * Whether capture is currently paused. The frontend polls this alongside
- * per-device status so the UI stays in sync with the tray indicator.
+ * Whether capture is currently paused. Reads `capture_intended` which is
+ * flipped immediately in stop_capture/start_capture — no health-monitor
+ * delay. The frontend polls this so the UI stays in sync with the tray.
  */
 async isCapturePaused() : Promise<boolean> {
     return await TAURI_INVOKE("is_capture_paused");

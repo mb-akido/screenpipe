@@ -81,7 +81,7 @@ export default function PermissionRecoveryPage() {
   // "denied" only if the user previously opted in but access is now refused.
   const [keychainStatus, setKeychainStatus] = useState<"granted" | "denied" | "checking">("checking");
   const { isMac: isMacOS } = usePlatform();
-  const restartTriggeredRef = useRef(false);
+  const closeTriggeredRef = useRef(false);
 
   const checkPermissions = useCallback(async () => {
     try {
@@ -117,16 +117,19 @@ export default function PermissionRecoveryPage() {
     checkPermissions();
     if (isMacOS) checkKeychain();
     const interval = setInterval(() => {
-      if (restartTriggeredRef.current) return;
+      if (closeTriggeredRef.current) return;
       checkPermissions();
       if (isMacOS) checkKeychain();
     }, 3000);
     return () => clearInterval(interval);
   }, [checkPermissions, checkKeychain, isMacOS]);
 
-  // Auto-close and restart when critical permissions are restored
+  // Auto-close when critical permissions are restored. The Rust backend owns
+  // recovery: audio cycles microphone inputs, while screen/accessibility
+  // restorations coalesce into a capture-only rebuild. Do not tear down the
+  // DB, HTTP server, or pipes from this presentation component.
   useEffect(() => {
-    if (!permissions || restartTriggeredRef.current) return;
+    if (!permissions || closeTriggeredRef.current) return;
 
     const screenOk = permissions.screenRecording === "granted" || permissions.screenRecording === "notNeeded";
     const micOk = permissions.microphone === "granted" || permissions.microphone === "notNeeded";
@@ -136,15 +139,9 @@ export default function PermissionRecoveryPage() {
       permissions.accessibility === "notNeeded";
 
     if (screenOk && micOk && accessibilityOk) {
-      restartTriggeredRef.current = true;
+      closeTriggeredRef.current = true;
       setTimeout(async () => {
-        try {
-          await commands.stopScreenpipe();
-          await commands.spawnScreenpipe(null);
-          await commands.closeWindow("PermissionRecovery");
-        } catch {
-          try { await commands.closeWindow("PermissionRecovery"); } catch {}
-        }
+        try { await commands.closeWindow("PermissionRecovery"); } catch {}
       }, 1000);
     }
   }, [permissions, isMacOS]);

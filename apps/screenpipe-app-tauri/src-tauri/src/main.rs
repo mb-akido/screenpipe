@@ -193,6 +193,23 @@ fn should_skip_onboarding() -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenPermissionStartupPlan {
+    StartNormally,
+    StartServerWithVisionBlocked,
+}
+
+fn screen_permission_startup_plan(
+    vision_disabled: bool,
+    screen_permission_granted: bool,
+) -> ScreenPermissionStartupPlan {
+    if !vision_disabled && !screen_permission_granted {
+        ScreenPermissionStartupPlan::StartServerWithVisionBlocked
+    } else {
+        ScreenPermissionStartupPlan::StartNormally
+    }
+}
+
 // check if the server is running
 #[tauri::command]
 #[specta::specta]
@@ -806,7 +823,7 @@ async fn main() {
             // windows or starting ServerCore. A first-launch grant can happen
             // while DB/audio boot is still slow; it must remain a real
             // denied→granted transition independent of HTTP readiness.
-            crate::permission_lifecycle::start_monitor();
+            crate::permission_lifecycle::start(app.handle().clone());
 
             // Create macOS app menu with Settings
             #[cfg(target_os = "macos")]
@@ -1504,27 +1521,17 @@ async fn main() {
                             let disable_audio = store_clone.recording.disable_audio;
                             let disable_vision = store_clone.recording.disable_vision;
 
-                            // Only block server start on missing screen-recording
-                            // perms when vision is actually requested. With
-                            // `disable_vision = true` (set by E2E seed
-                            // `no-recording`, or by user choice in the future)
-                            // the SCK code path is never exercised, so we can
-                            // boot the server + HTTP API + DB without TCC.
-                            if !disable_vision && !permissions_check.screen_recording.permitted() {
-                                warn!("Screen recording permission not granted: {:?}. Server will not start.", permissions_check.screen_recording);
-                                // Flip the recording state to a terminal Error
-                                // value so the tray stops showing "Starting…"
-                                // forever. Without this the user sees a
-                                // perpetual spinner with no signal that
-                                // anything is wrong; clearing only `is_starting`
-                                // leaves RECORDING_INFO at its default Starting
-                                // value and the health poll has no
-                                // ever_connected signal to recover from.
-                                crate::health::set_recording_status(
-                                    crate::health::RecordingStatus::Error,
-                                );
-                                is_starting_clone.store(false, std::sync::atomic::Ordering::SeqCst);
-                                return;
+                            // ServerCore is permission-independent. Keep it alive
+                            // so search, pipes, and the local API still work while
+                            // CaptureSession skips vision. When the user grants
+                            // access, the typed permission consumer rebuilds only
+                            // capture instead of restarting the DB/server.
+                            if screen_permission_startup_plan(
+                                disable_vision,
+                                permissions_check.screen_recording.permitted(),
+                            ) == ScreenPermissionStartupPlan::StartServerWithVisionBlocked
+                            {
+                                warn!("Screen recording permission not granted: {:?}. Starting ServerCore with vision capture blocked.", permissions_check.screen_recording);
                             }
 
                             if !disable_audio && !permissions_check.microphone.permitted() {
@@ -1719,10 +1726,10 @@ async fn main() {
                 }
             });
 
-            // Forward engine events (including permission UI notifications)
-            // over /ws/events once the embedded server is ready. The producer's
-            // transition state already runs independently of this bridge, and
-            // in-process recovery consumes the typed permission state channel.
+            // Start the generic engine-event WebSocket bridge once the embedded
+            // server is ready. Permission control does not depend on this
+            // non-replaying connection: in-process recovery consumes the typed
+            // retained state channel started above.
             let app_handle_clone = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 // Wait for the server core to be ready so we have port + API key.
@@ -2026,4 +2033,29 @@ async fn main() {
 #[cfg(test)]
 pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     define_specta_builder!()
+}
+
+#[cfg(test)]
+mod startup_permission_tests {
+    use super::{screen_permission_startup_plan, ScreenPermissionStartupPlan};
+
+    #[test]
+    fn missing_requested_screen_permission_starts_server_with_partial_capture() {
+        assert_eq!(
+            screen_permission_startup_plan(false, false),
+            ScreenPermissionStartupPlan::StartServerWithVisionBlocked
+        );
+    }
+
+    #[test]
+    fn granted_or_disabled_vision_needs_no_capture_blocker() {
+        assert_eq!(
+            screen_permission_startup_plan(false, true),
+            ScreenPermissionStartupPlan::StartNormally
+        );
+        assert_eq!(
+            screen_permission_startup_plan(true, false),
+            ScreenPermissionStartupPlan::StartNormally
+        );
+    }
 }

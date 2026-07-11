@@ -1586,6 +1586,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 }
                 // Show the main window
                 show_main_window(app.clone());
+                crate::permission_lifecycle::present_current_critical_permissions(&app);
             });
         }
         "onboarding" => {

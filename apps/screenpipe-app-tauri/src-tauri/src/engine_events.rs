@@ -6,8 +6,8 @@
 //!
 //! This module owns the connection (reconnect/backoff, ping/pong, URL
 //! construction); it does NOT contain any event-specific logic. Each event
-//! family lives in its own handler module (`engine_events::permission`,
-//! `engine_events::audio_device`, …) so the file named for one concern
+//! family lives in its own handler module (`engine_events::audio_device`,
+//! `engine_events::audio_health`, …) so the file named for one concern
 //! doesn't grow into a junk drawer.
 //!
 //! To add a new event family: create a sibling handler module with a
@@ -20,7 +20,6 @@
 
 mod audio_device;
 mod audio_health;
-mod permission;
 mod power;
 
 pub use power::is_power_capture_paused;
@@ -64,7 +63,9 @@ async fn run(app: AppHandle, server_port: u16, api_key: Option<String>) {
 
 async fn connect(app: &AppHandle, port: u16, api_key: Option<&str>) -> Result<(), String> {
     // The /ws/events endpoint streams all events (meetings, workflows,
-    // permissions, audio devices, …). We dispatch by event name client-side.
+    // permissions, audio devices, …). Every frame is retained on the generic
+    // `engine:event` bridge below; only event families that need additional
+    // Tauri policy receive a specialized dispatch arm.
     use crate::recording::LocalApiContext;
     let ctx = LocalApiContext {
         port,
@@ -126,7 +127,6 @@ fn dispatch(app: &AppHandle, text: &str) {
         },
     );
     match name {
-        "permission_lost" | "permission_restored" => permission::handle(app, name, &data),
         "audio_device_fallback_engaged"
         | "audio_device_fallback_cleared"
         | "audio_device_fallback_unavailable"
