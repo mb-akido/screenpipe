@@ -75,6 +75,7 @@ mod engine_events;
 mod monitor_events;
 mod owned_browser_cookies;
 mod permission_lifecycle;
+mod permission_ui;
 mod permissions;
 mod pi;
 mod pi_command_queue;
@@ -1420,6 +1421,7 @@ async fn main() {
                 // DB-wedge auto-recovery hook wiring — captured into the server
                 // thread so the freshly-built `ServerCore`'s DB gets the hook.
                 let app_for_db_wedge = app_handle.clone();
+                let app_for_capture_ui = app_handle.clone();
                 let db_wedge_breaker = recording_state.db_wedge_breaker.clone();
 
                 // Pipe output callback. Stage 5: legacy `pipe_event`
@@ -1607,6 +1609,10 @@ async fn main() {
                             } else {
                                 None
                             };
+                            let blocked_permissions = capture
+                                .as_ref()
+                                .map(|session| session.blocked_permissions().to_vec())
+                                .unwrap_or_default();
 
                             {
                                 let mut guard = server_arc.lock().await;
@@ -1619,6 +1625,10 @@ async fn main() {
                                 info!("Server started without capture");
                             }
                             drop(capture_guard);
+                            crate::permission_ui::show_capture_recovery_if_blocked(
+                                &app_for_capture_ui,
+                                &blocked_permissions,
+                            );
                             is_starting_clone
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
                             drop(lifecycle_guard);

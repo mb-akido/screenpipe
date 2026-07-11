@@ -126,9 +126,7 @@ fn dispatch(app: &AppHandle, text: &str) {
         },
     );
     match name {
-        "permission_lost" | "permission_restored" | "permission_needed" => {
-            permission::handle(app, name, &data)
-        }
+        "permission_lost" | "permission_restored" => permission::handle(app, name, &data),
         "audio_device_fallback_engaged"
         | "audio_device_fallback_cleared"
         | "audio_device_fallback_unavailable"

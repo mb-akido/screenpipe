@@ -26,7 +26,7 @@ use screenpipe_engine::{
     vision_manager::{start_monitor_watcher, stop_monitor_watcher, VisionManager},
     RecordingConfig,
 };
-use screenpipe_events::{publish_permission_event, PermissionEvent, PermissionKind};
+use screenpipe_events::PermissionKind;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -45,6 +45,9 @@ pub struct CaptureSession {
     ui_recorder_handle: Option<screenpipe_engine::UiRecorderHandle>,
     audio_manager: Arc<screenpipe_audio::audio_manager::AudioManager>,
     audio_disabled: bool,
+    /// Capture components skipped because their OS permission was unavailable.
+    /// The app layer decides how to present this after startup completes.
+    blocked_permissions: Vec<PermissionKind>,
     /// Cleared on stop so `/vision/device/*` stops pointing at a shut-down manager.
     vision_manager_handle: Option<
         Arc<arc_swap::ArcSwap<Option<Arc<screenpipe_engine::vision_manager::VisionManager>>>>,
@@ -70,6 +73,7 @@ impl CaptureSession {
         info!("Starting capture session");
 
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let mut blocked_permissions = Vec::new();
         reconfigure_audio_manager(server, config).await?;
 
         // --- Capture trigger sender (set by VisionManager, consumed by UI recorder) ---
@@ -97,10 +101,7 @@ impl CaptureSession {
         if !config.disable_vision && !screen_recording_permitted {
             warn!("Screen recording permission not yet granted — skipping VisionManager to avoid native TCC dialog; will start on next spawn_screenpipe after onboarding grants access");
             crate::health::set_recording_status(crate::health::RecordingStatus::Starting);
-            // Emit permission_needed event so frontend can trigger onboarding/permission flow
-            let _ = publish_permission_event(PermissionEvent::needed(
-                PermissionKind::ScreenRecording,
-            ));
+            blocked_permissions.push(PermissionKind::ScreenRecording);
         }
 
         if !config.disable_vision && screen_recording_permitted {
@@ -207,10 +208,7 @@ impl CaptureSession {
 
         let ui_recorder_handle = if !accessibility_permitted {
             warn!("Accessibility permission not yet granted — skipping UI event recording to avoid native TCC dialog; will start on next spawn_screenpipe after onboarding grants access");
-            // Emit permission_needed event so frontend can trigger onboarding/permission flow
-            let _ = publish_permission_event(PermissionEvent::needed(
-                PermissionKind::Accessibility,
-            ));
+            blocked_permissions.push(PermissionKind::Accessibility);
             None
         } else {
             let ui_config = config.to_ui_recorder_config();
@@ -286,8 +284,13 @@ impl CaptureSession {
             ui_recorder_handle,
             audio_manager: server.audio_manager.clone(),
             audio_disabled: config.disable_audio,
+            blocked_permissions,
             vision_manager_handle,
         })
+    }
+
+    pub fn blocked_permissions(&self) -> &[PermissionKind] {
+        &self.blocked_permissions
     }
 
     /// Stop all capture pipelines. The server stays alive.

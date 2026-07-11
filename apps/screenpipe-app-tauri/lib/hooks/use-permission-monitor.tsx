@@ -21,10 +21,6 @@ interface PermissionLostPayload {
   reason?: string | null;
 }
 
-interface PermissionNeededPayload {
-  kind: "screen_recording" | "microphone" | "accessibility" | "keychain";
-}
-
 /**
  * Hook that listens for permission-lost events from the Rust backend
  * and automatically shows the permission recovery window.
@@ -84,30 +80,9 @@ export function usePermissionMonitor() {
       }
     });
 
-    // Listen for permission_needed events emitted when capture is blocked
-    // waiting for user to grant permission via onboarding.
-    // This signals that the app should show the permission flow UI.
-    const unlistenNeeded = listen<PermissionNeededPayload>("permission_needed", async (event) => {
-      const { kind } = event.payload;
-      console.log("Permission needed event received:", kind);
-
-      posthog.capture("permission_needed", { kind });
-
-      // If we're not on onboarding or permission-recovery, show the recovery window
-      // to guide user through the permission flow
-      if (!skipPaths.some((p) => pathname?.startsWith(p))) {
-        try {
-          await commands.showWindow("PermissionRecovery");
-        } catch (error) {
-          console.error("Failed to show permission recovery window:", error);
-        }
-      }
-    });
-
     return () => {
       unlisten.then((fn) => fn());
       unlistenRestart.then((fn) => fn());
-      unlistenNeeded.then((fn) => fn());
     };
   }, [pathname]);
 }

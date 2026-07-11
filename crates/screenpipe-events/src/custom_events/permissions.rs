@@ -42,9 +42,6 @@ pub enum PermissionKind {
 pub enum PermissionState {
     Lost,
     Restored,
-    /// Permission is required but not yet granted (emitted at startup when
-    /// capture is blocked waiting for user to grant via onboarding).
-    Needed,
 }
 
 /// Published to the event bus as `"permission_lost"` or `"permission_restored"`.
@@ -87,11 +84,7 @@ impl PermissionStateBus {
         }
     }
 
-    fn publish_transition(&self, kind: PermissionKind, state: PermissionState) -> bool {
-        if state == PermissionState::Needed {
-            return false;
-        }
-
+    fn publish(&self, kind: PermissionKind, state: PermissionState) -> bool {
         self.sender(kind).send_if_modified(|current| {
             if *current == Some(state) {
                 return false;
@@ -131,33 +124,23 @@ impl PermissionEvent {
         }
     }
 
-    pub fn needed(kind: PermissionKind) -> Self {
-        Self {
-            kind,
-            state: PermissionState::Needed,
-            reason: None,
-        }
-    }
-
     /// Event name to publish on the bus. Split by state so subscribers can
     /// filter cheaply (same convention as `meeting_started` / `meeting_ended`).
     pub fn event_name(&self) -> &'static str {
         match self.state {
             PermissionState::Lost => "permission_lost",
             PermissionState::Restored => "permission_restored",
-            PermissionState::Needed => "permission_needed",
         }
     }
 }
 
 /// Publish one permission event through both supported delivery paths.
 ///
-/// Runtime `Lost`/`Restored` transitions also update the typed watch state for
-/// reliable, low-overhead in-process policy consumers such as audio recovery.
-/// `Needed` is a startup UI notification, so it only uses the existing event
-/// transport and cannot overwrite a newer authoritative runtime transition.
+/// Runtime transitions update the typed watch state for reliable, low-overhead
+/// in-process policy consumers such as audio recovery, then retain the existing
+/// serialized transport for `/ws/events` and CLI followers.
 pub fn publish_permission_event(event: PermissionEvent) -> Result<()> {
-    PERMISSION_STATES.publish_transition(event.kind, event.state);
+    PERMISSION_STATES.publish(event.kind, event.state);
     crate::send_event(event.event_name(), event)
 }
 
@@ -184,7 +167,7 @@ mod tests {
     #[test]
     fn state_published_without_subscribers_is_baselined_for_new_subscribers() {
         let bus = PermissionStateBus::new();
-        assert!(bus.publish_transition(PermissionKind::Microphone, PermissionState::Restored));
+        assert!(bus.publish(PermissionKind::Microphone, PermissionState::Restored));
 
         let receiver = bus.subscribe(PermissionKind::Microphone);
         assert!(!receiver.has_changed().unwrap());
@@ -196,7 +179,7 @@ mod tests {
         let bus = PermissionStateBus::new();
         let mut receiver = bus.subscribe(PermissionKind::Microphone);
 
-        assert!(bus.publish_transition(PermissionKind::Microphone, PermissionState::Restored));
+        assert!(bus.publish(PermissionKind::Microphone, PermissionState::Restored));
         assert!(receiver.has_changed().unwrap());
         assert_eq!(
             *receiver.borrow_and_update(),
@@ -204,7 +187,7 @@ mod tests {
         );
         assert!(!receiver.has_changed().unwrap());
 
-        assert!(!bus.publish_transition(PermissionKind::Microphone, PermissionState::Restored));
+        assert!(!bus.publish(PermissionKind::Microphone, PermissionState::Restored));
         assert!(!receiver.has_changed().unwrap());
         assert_eq!(*receiver.borrow(), Some(PermissionState::Restored));
     }
@@ -214,7 +197,7 @@ mod tests {
         let bus = PermissionStateBus::new();
         let microphone = bus.subscribe(PermissionKind::Microphone);
 
-        assert!(bus.publish_transition(PermissionKind::ScreenRecording, PermissionState::Restored));
+        assert!(bus.publish(PermissionKind::ScreenRecording, PermissionState::Restored));
         assert!(!microphone.has_changed().unwrap());
     }
 
@@ -228,7 +211,7 @@ mod tests {
             PermissionState::Lost,
             PermissionState::Restored,
         ] {
-            assert!(bus.publish_transition(PermissionKind::Microphone, state));
+            assert!(bus.publish(PermissionKind::Microphone, state));
         }
 
         assert_eq!(
@@ -236,22 +219,6 @@ mod tests {
             Some(PermissionState::Restored)
         );
         assert!(!receiver.has_changed().unwrap());
-    }
-
-    #[test]
-    fn needed_notification_does_not_overwrite_runtime_state() {
-        let bus = PermissionStateBus::new();
-        let mut receiver = bus.subscribe(PermissionKind::Microphone);
-
-        assert!(bus.publish_transition(PermissionKind::Microphone, PermissionState::Restored));
-        assert_eq!(
-            *receiver.borrow_and_update(),
-            Some(PermissionState::Restored)
-        );
-
-        assert!(!bus.publish_transition(PermissionKind::Microphone, PermissionState::Needed));
-        assert!(!receiver.has_changed().unwrap());
-        assert_eq!(*receiver.borrow(), Some(PermissionState::Restored));
     }
 
     #[tokio::test]

@@ -2208,15 +2208,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_then_needed_before_monitor_tick_does_not_recover() {
-        let (sender, mut receiver) = watch::channel(None);
-        sender.send_replace(Some(PermissionState::Restored));
-        sender.send_replace(Some(PermissionState::Needed));
-
-        assert!(!take_microphone_restoration(&mut receiver));
-    }
-
-    #[test]
     fn default_input_appearing_after_permission_grant_is_a_change_once() {
         let mut tracker = SystemDefaultTracker::new();
         assert_eq!(tracker.check_input_changed_from_current(None), None);

@@ -573,9 +573,13 @@ pub async fn start_capture(
         .ok_or_else(|| "Server not running — cannot start capture".to_string())?;
     let config = build_config(&app)?;
     let session = CaptureSession::start(server, &config, false).await?;
+    let blocked_permissions = session.blocked_permissions().to_vec();
     drop(server_guard);
 
     *capture_guard = Some(session);
+    drop(capture_guard);
+
+    crate::permission_ui::show_capture_recovery_if_blocked(&app, &blocked_permissions);
 
     info!("Capture session started");
     Ok(())
@@ -1032,6 +1036,7 @@ async fn spawn_screenpipe_inner(
     // the dedicated server thread so the freshly-built `ServerCore` gets the hook
     // before it starts writing.
     let app_for_db_wedge = app.clone();
+    let app_for_capture_ui = app.clone();
     let db_wedge_breaker = state.db_wedge_breaker.clone();
 
     // Pipe output callback. Stage 5: legacy `pipe_event` topic dropped.
@@ -1135,6 +1140,10 @@ async fn spawn_screenpipe_inner(
                 } else {
                     None
                 };
+                let blocked_permissions = capture
+                    .as_ref()
+                    .map(|session| session.blocked_permissions().to_vec())
+                    .unwrap_or_default();
 
                 {
                     let mut guard = server_arc.lock().await;
@@ -1147,6 +1156,10 @@ async fn spawn_screenpipe_inner(
                     info!("Server started with capture deliberately stopped");
                 }
                 drop(capture_guard);
+                crate::permission_ui::show_capture_recovery_if_blocked(
+                    &app_for_capture_ui,
+                    &blocked_permissions,
+                );
                 let _ = result_tx.send(Ok(()));
 
                 // Keep runtime alive as long as server exists
@@ -1218,9 +1231,12 @@ async fn start_capture_internal(
 
     let config = build_config(app)?;
     let session = CaptureSession::start(server, &config, false).await?;
+    let blocked_permissions = session.blocked_permissions().to_vec();
     drop(server_guard);
 
     *capture_guard = Some(session);
+    drop(capture_guard);
+    crate::permission_ui::show_capture_recovery_if_blocked(app, &blocked_permissions);
     state.is_starting.store(false, Ordering::SeqCst);
 
     info!("Capture started on existing server");
