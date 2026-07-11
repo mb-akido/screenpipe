@@ -2057,7 +2057,8 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
 // pool isn't enough; the only safe place is the main thread, where AppKit's
 // pasteboard observers are already serialized.
 //
-// We hop onto the main queue via `dispatch_sync`. The clipboard worker is a
+// We hop onto the main queue via `dispatch_sync` (bounded — see
+// `CLIPBOARD_MAIN_QUEUE_TIMEOUT` below). The clipboard worker is a
 // dedicated `std::thread` (not a tokio worker), so blocking it for the
 // duration of a sync hop is fine. Main-thread cost is microseconds per read
 // (one `string(forType:)` call); it doesn't compete meaningfully with the
@@ -2076,6 +2077,18 @@ const CLIPBOARD_INFLIGHT_FILE: &str = "clipboard-read-inflight";
 // capture after a single crash and required `rm` to recover. We auto-delete
 // it on startup so upgraded installs recover without manual intervention.
 const CLIPBOARD_LEGACY_DISABLED_FILE: &str = "clipboard-disabled-after-crash";
+
+// The main queue only drains when something runs a CFRunLoop/NSApplication
+// (or calls `dispatch_main`) on the real OS main thread. That holds for the
+// Tauri app (tao's event loop), but NOT for the headless `screenpipe` CLI
+// binary — its `#[tokio::main]` main thread parks in tokio's executor and
+// never services GCD's main queue — nor for `cargo test`, whose harness
+// main thread just blocks on a channel recv waiting on worker threads. An
+// unbounded `dispatch_sync` in either of those contexts deadlocks the
+// clipboard-capture thread forever on the first read. Bound the wait so we
+// instead skip that one read and log a warning.
+#[cfg(not(test))]
+const CLIPBOARD_MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 
 static CLIPBOARD_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2112,27 +2125,61 @@ fn get_clipboard() -> Option<String> {
         return None;
     }
 
-    let dir = screenpipe_core::paths::default_screenpipe_data_dir();
-    let inflight = dir.join(CLIPBOARD_INFLIGHT_FILE);
-    // Best-effort marker — if write fails (e.g., disk full) we proceed; the worst
-    // case is we don't detect a crash next startup.
-    let _ = std::fs::write(&inflight, std::process::id().to_string());
+    // `cargo test` never services the GCD main queue (see
+    // `CLIPBOARD_MAIN_QUEUE_TIMEOUT`), so the dispatch hop below would
+    // always time out here — turning every round-trip test into a
+    // vacuous `None`. Read directly instead. This reintroduces the
+    // off-main-thread cache-invalidation race the dispatch hop exists to
+    // avoid, but only between our own test threads (no other app is
+    // touching the pasteboard mid-test-run) — and the tests serialize
+    // against each other with `CLIPBOARD_TEST_LOCK` to close that off too.
+    #[cfg(test)]
+    {
+        read_pasteboard()
+    }
 
-    // dispatch_sync onto the main queue — the only thread where NSPasteboard
-    // is documented to behave. AppKit serializes pasteboard observers on
-    // main, so this side-steps the cache-invalidation race entirely.
-    let result = cidre::dispatch::Queue::main().sync_once(|| {
-        let mut clipboard = arboard::Clipboard::new().ok()?;
-        let text = clipboard.get_text().ok()?;
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    });
+    #[cfg(not(test))]
+    {
+        let dir = screenpipe_core::paths::default_screenpipe_data_dir();
+        let inflight = dir.join(CLIPBOARD_INFLIGHT_FILE);
+        // Best-effort marker — if write fails (e.g., disk full) we proceed; the worst
+        // case is we don't detect a crash next startup.
+        let _ = std::fs::write(&inflight, std::process::id().to_string());
 
-    let _ = std::fs::remove_file(&inflight);
-    result
+        // dispatch_sync (bounded) onto the main queue — the only thread
+        // where NSPasteboard is documented to behave. AppKit serializes
+        // pasteboard observers on main, so this side-steps the
+        // cache-invalidation race entirely — as long as the main queue is
+        // actually being drained (see `CLIPBOARD_MAIN_QUEUE_TIMEOUT`).
+        let (tx, rx) = std::sync::mpsc::channel();
+        cidre::dispatch::Queue::main().async_once(move || {
+            let _ = tx.send(read_pasteboard());
+        });
+        let result = match rx.recv_timeout(CLIPBOARD_MAIN_QUEUE_TIMEOUT) {
+            Ok(text) => text,
+            Err(_) => {
+                warn!(
+                    timeout_secs = CLIPBOARD_MAIN_QUEUE_TIMEOUT.as_secs(),
+                    "clipboard capture: main-queue dispatch timed out — \
+                     is a run loop servicing it? skipping this read"
+                );
+                None
+            }
+        };
+
+        let _ = std::fs::remove_file(&inflight);
+        result
+    }
+}
+
+fn read_pasteboard() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2570,8 +2617,23 @@ mod tests {
         assert!(!is_own_process((std::process::id() as i32) + 1));
     }
 
+    // The real system pasteboard is a single shared resource. `cargo test`
+    // runs these on concurrent threads by default, and unlike production
+    // (which serializes every read through one main-queue dispatch), the
+    // `#[cfg(test)]` path in `get_clipboard` reads directly — so without
+    // this lock, two clipboard tests racing on set/read against the same
+    // pasteboard stomp on each other (flaky `None` vs the other test's text).
+    static CLIPBOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clipboard_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CLIPBOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn test_get_clipboard_returns_option() {
+        let _guard = clipboard_test_guard();
         // Should not panic regardless of clipboard state
         let result = get_clipboard();
         // Result is either Some(non-empty string) or None
@@ -2585,6 +2647,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_no_subprocess() {
+        let _guard = clipboard_test_guard();
         // Verify arboard doesn't spawn pbpaste by checking it completes fast.
         // pbpaste fork+exec takes >1ms; native NSPasteboard is <0.5ms.
         let start = std::time::Instant::now();
@@ -2603,6 +2666,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_set_and_read() {
+        let _guard = clipboard_test_guard();
         // Round-trip: set clipboard text, then read it back
         let test_text = "screenpipe_clipboard_test_12345";
         {
@@ -2615,6 +2679,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_empty_returns_none() {
+        let _guard = clipboard_test_guard();
         // Set clipboard to empty string, should return None
         {
             let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
@@ -2626,6 +2691,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_unicode() {
+        let _guard = clipboard_test_guard();
         let unicode_text = "日本語テスト 🎉 émojis ñ";
         {
             let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
@@ -2639,6 +2705,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_large_content() {
+        let _guard = clipboard_test_guard();
         // 100KB of text — should not OOM or hang
         let large_text: String = "x".repeat(100_000);
         {
