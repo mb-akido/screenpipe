@@ -586,11 +586,11 @@
       "spec": "window-activation.spec.ts",
       "platforms": ["macos"],
       "layers": ["window-lifecycle", "tauri-command", "real-ui-e2e"],
-      "features": ["window-lifecycle", "chat"],
-      "criticality": "medium",
-      "confidence": "conditional",
+      "features": ["window-lifecycle", "chat", "microphone-permission", "capture-restart"],
+      "criticality": "high",
+      "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "macOS-only show_window_activated focus coverage."
+      "notes": "macOS activation plus a blocking focus-burst regression that rejects false microphone-grant capture restarts."
     },
     {
       "spec": "window-lifecycle.spec.ts",

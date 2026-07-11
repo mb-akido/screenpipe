@@ -25,6 +25,7 @@
     "coverage:all:check": "bun run e2e:coverage:check && bun run coverage:core:check && bun ../../coverage/scripts/generate-unified-coverage-report.ts --check",
     "test:e2e:audio-fallback:macos": "SCREENPIPE_E2E_SEED=onboarding,no-recording,cloud-audio-fallback bun run wdio run e2e/wdio.conf.ts --spec e2e/specs/audio-fallback.spec.ts",
     "test:e2e:audio-fallback-reverify:macos": "SCREENPIPE_E2E_SEED=onboarding,no-recording,cloud-audio-fallback bun run wdio run e2e/wdio.conf.ts --spec e2e/specs/zz-audio-fallback-reverify.spec.ts",
+    "test:e2e:mic-focus:macos": "SCREENPIPE_DISABLE_TELEMETRY=1 SCREENPIPE_E2E_SEED=onboarding,no-recording,mic-focus-repro SCREENPIPE_PORT=3042 SCREENPIPE_FOCUS_PORT=11436 bun run wdio run e2e/wdio.conf.ts --spec e2e/specs/window-activation.spec.ts",
     "test:e2e:onboarding-redirect": "SCREENPIPE_E2E_SEED=no-recording bun run wdio run e2e/wdio.conf.ts --spec e2e/specs/onboarding-redirect.spec.ts",
     "test:e2e:hd:macos": "SCREENPIPE_E2E_SEED=onboarding bun run wdio run e2e/wdio.conf.ts --spec e2e/specs/hd-recording-pipeline.spec.ts",
     "test:e2e:search-bugs": "SCREENPIPE_E2E_SEED=onboarding,no-recording,search-fixture SCREENPIPE_PORT=3041 bun run wdio run e2e/wdio.conf.ts --spec e2e/specs/search/search-bugs-4645.spec.ts",

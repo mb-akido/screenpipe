@@ -653,6 +653,8 @@ async fn main() {
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
     let suggestions_state = suggestions::SuggestionsState::new();
     let pipe_suggestions_state = pipe_suggestions_scheduler::PipeSuggestionsState::new();
+    #[cfg(target_os = "macos")]
+    permissions::initialize_mic_grant_recovery();
     #[allow(clippy::single_match)]
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -661,18 +663,23 @@ async fn main() {
         .on_window_event(|window, event| match event {
             #[cfg(target_os = "macos")]
             tauri::WindowEvent::Focused(true) => {
+                #[cfg(feature = "e2e")]
+                let mic_focus_repro = get_e2e_seed_flags()
+                    .iter()
+                    .any(|flag| flag == "mic-focus-repro");
+                #[cfg(feature = "e2e")]
+                if mic_focus_repro {
+                    info!("e2e mic-focus observation");
+                }
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    if !permissions::check_microphone_permission().permitted() {
-                        return;
+                    let status = permissions::check_microphone_permission_for_recovery();
+                    permissions::handle_mic_permission_observation(app, status, "focus return")
+                        .await;
+                    #[cfg(feature = "e2e")]
+                    if mic_focus_repro {
+                        info!("e2e mic-focus handled");
                     }
-                    if !health::get_audio_device_status().is_empty() {
-                        return;
-                    }
-                    info!(
-                        "Microphone permission newly granted (focus return) — restarting capture for audio reinit"
-                    );
-                    permissions::restart_capture_on_mic_grant(app).await;
                 });
             }
             tauri::WindowEvent::CloseRequested { api, .. } => {
@@ -752,10 +759,11 @@ async fn main() {
             MacosLauncher::LaunchAgent,
             None,
         ))
-        // single-instance plugin uses zbus::blocking on Linux which panics
-        // inside an existing tokio runtime (nested block_on), so skip it on Linux
-        ;
-    #[cfg(not(target_os = "linux"))]
+    // The single-instance plugin uses zbus::blocking on Linux which panics
+    // inside an existing tokio runtime (nested block_on). E2E uses its own
+    // focus port and data dir, and must coexist with a developer's app.
+    ;
+    #[cfg(all(not(target_os = "linux"), not(feature = "e2e")))]
     let app = app.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
         // Defer off event stack: plugin may invoke this from run loop (nounwind).
         let app_for_closure = app.clone();

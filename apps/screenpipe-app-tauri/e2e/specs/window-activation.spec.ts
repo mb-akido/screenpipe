@@ -14,7 +14,9 @@
  * WKWebView first responder path executed.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { E2E_DATA_DIR, E2E_SEED_FLAGS } from "../helpers/app-launcher.js";
 import { saveScreenshot } from "../helpers/screenshot-utils.js";
 import { openHomeWindow, waitForAppReady, t } from "../helpers/test-utils.js";
 import {
@@ -30,6 +32,21 @@ type MainLabel = (typeof MAIN_LABELS)[number];
 
 async function showWindowActivated(window: "Main" | "Chat"): Promise<void> {
   await invokeOrThrow("show_window_activated", { window });
+}
+
+async function showHomeActivated(): Promise<void> {
+  await invokeOrThrow("show_window_activated", {
+    window: { Home: { page: null } },
+  });
+}
+
+function countAppLog(marker: string): number {
+  return readdirSync(E2E_DATA_DIR)
+    .filter((name) => name.startsWith("screenpipe-app.") && name.endsWith(".log"))
+    .reduce((count, name) => {
+      const content = readFileSync(resolve(E2E_DATA_DIR, name), "utf8");
+      return count + content.split(marker).length - 1;
+    }, 0);
 }
 
 async function waitForAnyMainHandle(timeoutMs = t(12_000)): Promise<MainLabel> {
@@ -146,6 +163,56 @@ async function waitForAnyMainHandle(timeoutMs = t(12_000)): Promise<MainLabel> {
 
       const filepath = await saveScreenshot("window-activated-chat-focused");
       expect(existsSync(filepath)).toBe(true);
+    });
+
+    it("does not mistake repeated focus for a new microphone grant", async function () {
+      if (!E2E_SEED_FLAGS.split(",").includes("mic-focus-repro")) {
+        this.skip();
+      }
+
+      const focusMarker = "e2e mic-focus observation";
+      const handledMarker = "e2e mic-focus handled";
+      const permissionGrantMarker =
+        "Microphone permission newly granted (focus return)";
+      const captureStopMarker = "Stopping capture session (server stays alive)";
+      const screenStreamMarker = "persistent SCK stream started";
+      const modelMarker = "transcription engine runtime: Parakeet";
+      const focusBefore = countAppLog(focusMarker);
+      const handledBefore = countAppLog(handledMarker);
+      const permissionGrantsBefore = countAppLog(permissionGrantMarker);
+      const captureStopsBefore = countAppLog(captureStopMarker);
+      const screenStreamsBefore = countAppLog(screenStreamMarker);
+      const modelsBefore = countAppLog(modelMarker);
+
+      for (let index = 0; index < 4; index += 1) {
+        await showWindowActivated("Chat");
+        await waitForWindowHandle("chat", t(15_000));
+        await browser.switchToWindow("chat");
+
+        await showHomeActivated();
+        await waitForWindowHandle("home", t(15_000));
+        await browser.switchToWindow("home");
+      }
+
+      await browser.waitUntil(
+        async () => {
+          const observed = countAppLog(focusMarker) - focusBefore;
+          const handled = countAppLog(handledMarker) - handledBefore;
+          return observed >= 8 && handled >= observed;
+        },
+        {
+          timeout: t(15_000),
+          interval: 250,
+          timeoutMsg: "native focus churn did not finish in the app window handler",
+        },
+      );
+
+      expect(
+        countAppLog(permissionGrantMarker) - permissionGrantsBefore,
+      ).toBe(0);
+      expect(countAppLog(captureStopMarker) - captureStopsBefore).toBe(0);
+      expect(countAppLog(screenStreamMarker) - screenStreamsBefore).toBe(0);
+      expect(countAppLog(modelMarker) - modelsBefore).toBe(0);
     });
   },
 );

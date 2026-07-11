@@ -825,6 +825,11 @@ jobs:
         projectPath: "./apps/screenpipe-app-tauri"
         tauriScript: bunx tauri -v
 
+    - name: Run microphone focus restart E2E
+      shell: bash
+      working-directory: ./apps/screenpipe-app-tauri
+      run: bun run test:e2e:mic-focus:macos
+
     - name: Run E2E Tests
       # ADVISORY (non-blocking): the full serial suite (maxInstances:1) with
       # specFileRetries:3 on the slow macos-15 image exceeds the job budget and

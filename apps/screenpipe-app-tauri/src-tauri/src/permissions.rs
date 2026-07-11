@@ -5,8 +5,6 @@
 use crate::tray::QUIT_REQUESTED;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-#[allow(unused_imports)] // used on macOS
-use std::sync::atomic::Ordering;
 use tracing::{debug, error, info, warn};
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -88,13 +86,30 @@ pub async fn request_permission(app: tauri::AppHandle, permission: OSPermission)
                 };
                 match status {
                     AVAuthorizationStatus::Authorized => {
-                        // Already granted, nothing to do
+                        handle_mic_permission_observation(
+                            app.clone(),
+                            OSPermissionStatus::Granted,
+                            "permission request",
+                        )
+                        .await;
                     }
                     AVAuthorizationStatus::NotDetermined => {
                         // First time — show the system prompt
+                        handle_mic_permission_observation(
+                            app.clone(),
+                            OSPermissionStatus::Empty,
+                            "permission request",
+                        )
+                        .await;
                         request_av_permission(app.clone(), AVMediaType::Audio);
                     }
                     _ => {
+                        handle_mic_permission_observation(
+                            app.clone(),
+                            OSPermissionStatus::Denied,
+                            "permission request",
+                        )
+                        .await;
                         open_permission_settings(OSPermission::Microphone);
                     }
                 }
@@ -136,13 +151,15 @@ fn request_av_permission(app: tauri::AppHandle, media_type: nokhwa_bindings_maco
         use tauri_nspanel::block::ConcreteBlock;
 
         let callback = move |granted: BOOL| {
-            if is_audio && granted != NO {
-                info!(
-                    "Microphone permission granted via AV callback — restarting capture for audio reinit"
-                );
+            if is_audio {
                 let app = app_for_callback.clone();
+                let status = if granted != NO {
+                    OSPermissionStatus::Granted
+                } else {
+                    OSPermissionStatus::Denied
+                };
                 tauri::async_runtime::spawn(async move {
-                    restart_capture_on_mic_grant(app).await;
+                    handle_mic_permission_observation(app, status, "AV callback").await;
                 });
             }
         };
@@ -155,24 +172,160 @@ fn request_av_permission(app: tauri::AppHandle, media_type: nokhwa_bindings_maco
     });
 }
 
-/// Guards concurrent/duplicate `restart_capture_on_mic_grant` invocations —
-/// both the window-focus handler in main.rs and the direct AVCaptureDevice
-/// grant callback in `request_av_permission` above can trigger it. Always
-/// reset on drop (success, early-return, or a give-up) so a *later* trigger
-/// (e.g. the user refocusing the window) can retry. A latch that is set once
-/// and never reset would permanently disable mic-grant recovery for the rest
-/// of the process the first time an attempt didn't land (found during the
-/// Intel-Mac CI smoke-test investigation, screenpipe#4978).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MicGrantRecoveryPhase {
+    Unknown,
+    NotGranted,
+    Pending(u64),
+    InFlight(u64),
+    GrantedIdle,
+}
+
+/// Tracks a single microphone permission transition independently from capture
+/// health. The audio-device cache can be empty during boot or a failed health
+/// poll, so it must not be used as proof that permission was newly granted.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct MicGrantRecovery {
+    phase: MicGrantRecoveryPhase,
+    next_generation: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MicGrantRecovery {
+    const fn new() -> Self {
+        Self {
+            phase: MicGrantRecoveryPhase::Unknown,
+            next_generation: 0,
+        }
+    }
+
+    fn prime(&mut self, granted: bool) {
+        if self.phase == MicGrantRecoveryPhase::Unknown {
+            self.phase = if granted {
+                MicGrantRecoveryPhase::GrantedIdle
+            } else {
+                MicGrantRecoveryPhase::NotGranted
+            };
+        }
+    }
+
+    /// Observe current TCC state. Returns an attempt token only for a real
+    /// not-granted -> granted edge, or for a retry of that same failed edge.
+    fn observe(&mut self, granted: bool) -> Option<u64> {
+        if !granted {
+            self.phase = MicGrantRecoveryPhase::NotGranted;
+            return None;
+        }
+
+        match self.phase {
+            MicGrantRecoveryPhase::Unknown => {
+                // The first observation establishes a baseline. An app that
+                // launches with permission already granted must not restart.
+                self.phase = MicGrantRecoveryPhase::GrantedIdle;
+                None
+            }
+            MicGrantRecoveryPhase::NotGranted => {
+                self.next_generation = self.next_generation.wrapping_add(1).max(1);
+                let token = self.next_generation;
+                self.phase = MicGrantRecoveryPhase::InFlight(token);
+                Some(token)
+            }
+            MicGrantRecoveryPhase::Pending(token) => {
+                self.phase = MicGrantRecoveryPhase::InFlight(token);
+                Some(token)
+            }
+            MicGrantRecoveryPhase::InFlight(_) | MicGrantRecoveryPhase::GrantedIdle => None,
+        }
+    }
+
+    /// Finish only the matching attempt. If permission was revoked or another
+    /// transition superseded it, a stale completion cannot mark recovery done.
+    fn finish(&mut self, token: u64, success: bool) -> bool {
+        if self.phase != MicGrantRecoveryPhase::InFlight(token) {
+            return false;
+        }
+        self.phase = if success {
+            MicGrantRecoveryPhase::GrantedIdle
+        } else {
+            MicGrantRecoveryPhase::Pending(token)
+        };
+        true
+    }
+}
+
 #[cfg(target_os = "macos")]
-static MIC_GRANT_RESTART_IN_FLIGHT: std::sync::atomic::AtomicBool =
+static MIC_GRANT_RECOVERY: std::sync::Mutex<MicGrantRecovery> =
+    std::sync::Mutex::new(MicGrantRecovery::new());
+
+#[cfg(target_os = "macos")]
+static MIC_GRANT_RESTART_WORKER_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
-struct ResetGuard<'a>(&'a std::sync::atomic::AtomicBool);
+fn with_mic_grant_recovery<T>(f: impl FnOnce(&mut MicGrantRecovery) -> T) -> T {
+    let mut tracker = MIC_GRANT_RECOVERY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut tracker)
+}
+
+/// Establish the launch-time permission baseline before any window can emit a
+/// focus event. Already-granted launches are idle, not grant transitions.
 #[cfg(target_os = "macos")]
-impl Drop for ResetGuard<'_> {
+pub(crate) fn initialize_mic_grant_recovery() {
+    let granted = matches!(
+        check_microphone_permission_for_recovery(),
+        OSPermissionStatus::Granted
+    );
+    with_mic_grant_recovery(|tracker| tracker.prime(granted));
+}
+
+#[cfg(target_os = "macos")]
+fn finish_mic_grant_attempt(token: u64, success: bool) {
+    with_mic_grant_recovery(|tracker| {
+        tracker.finish(token, success);
+    });
+}
+
+/// Defaults an interrupted or failed recovery attempt back to Pending so a
+/// later focus observation can retry the same permission edge.
+#[cfg(target_os = "macos")]
+struct MicGrantAttemptGuard {
+    token: u64,
+    finished: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MicGrantAttemptGuard {
+    fn try_new(token: u64) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        MIC_GRANT_RESTART_WORKER_ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(Self {
+            token,
+            finished: false,
+        })
+    }
+
+    fn succeed(mut self) {
+        finish_mic_grant_attempt(self.token, true);
+        self.finished = true;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MicGrantAttemptGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        use std::sync::atomic::Ordering;
+
+        if !self.finished {
+            finish_mic_grant_attempt(self.token, false);
+        }
+        MIC_GRANT_RESTART_WORKER_ACTIVE.store(false, Ordering::SeqCst);
     }
 }
 
@@ -196,27 +349,36 @@ const BOOT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// path and the auto-update restart gate already use for this exact class of
 /// race (found during the Intel-Mac CI smoke-test investigation, screenpipe#4978).
 #[cfg(target_os = "macos")]
-pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
+pub(crate) async fn handle_mic_permission_observation(
+    app: tauri::AppHandle,
+    status: OSPermissionStatus,
+    source: &'static str,
+) {
+    let granted = matches!(status, OSPermissionStatus::Granted);
+    let token = with_mic_grant_recovery(|tracker| tracker.observe(granted));
+    let Some(token) = token else {
+        return;
+    };
+
+    info!("Microphone permission newly granted ({})", source);
+    let Some(attempt) = MicGrantAttemptGuard::try_new(token) else {
+        debug!("mic-grant capture restart worker already active; leaving transition pending");
+        finish_mic_grant_attempt(token, false);
+        return;
+    };
+    if restart_capture_after_mic_grant(app).await {
+        attempt.succeed();
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn restart_capture_after_mic_grant(app: tauri::AppHandle) -> bool {
     use tauri::Manager;
 
-    if MIC_GRANT_RESTART_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
     {
-        debug!("start_capture after mic grant: already in flight, skipping duplicate trigger");
-        return;
-    }
-    let _guard = ResetGuard(&MIC_GRANT_RESTART_IN_FLIGHT);
-
-    let need_stop = {
         let state = app.state::<crate::recording::RecordingState>();
-        let is_running = state.capture.lock().await.is_some();
-        is_running
-    };
-    if need_stop {
-        let state = app.state::<crate::recording::RecordingState>();
-        if let Err(e) = crate::recording::stop_capture(state, app.clone()).await {
-            warn!("stop_capture before mic-grant audio reinit: {}", e);
+        if !crate::recording::mic_permission_capture_restart_needed(&state, &app) {
+            return true;
         }
     }
 
@@ -229,7 +391,7 @@ pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
                     .error
                     .unwrap_or_default()
             );
-            return;
+            return false;
         }
         crate::health::BootReadiness::Pending => {
             error!(
@@ -238,7 +400,7 @@ pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
                 BOOT_WAIT_TIMEOUT.as_secs(),
                 crate::health::get_boot_phase_snapshot().phase
             );
-            return;
+            return false;
         }
         crate::health::BootReadiness::Ready => {}
     }
@@ -252,22 +414,22 @@ pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
     let mut last_err: Option<String> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let state = app.state::<crate::recording::RecordingState>();
-        match crate::recording::start_capture(state, app.clone()).await {
+        match crate::recording::restart_capture_for_mic_permission(state, app.clone()).await {
             Ok(()) => {
                 if attempt > 1 {
                     info!(
-                        "start_capture after mic grant: succeeded on attempt {}/{}",
+                        "capture recovery after mic grant: succeeded on attempt {}/{}",
                         attempt, MAX_ATTEMPTS
                     );
                 }
-                return;
+                return true;
             }
             Err(e) => {
-                let transient = e.contains("Server not running")
-                    || e.contains("Server not responding");
+                let transient =
+                    e.contains("Server not running") || e.contains("Server not responding");
                 if !transient {
-                    warn!("start_capture after mic grant: {}", e);
-                    return;
+                    warn!("capture recovery after mic grant: {}", e);
+                    return false;
                 }
                 last_err = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS)).await;
@@ -275,11 +437,12 @@ pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
         }
     }
     error!(
-        "start_capture after mic grant: gave up after {} attempts post-boot-ready ({}ms): {}",
+        "capture recovery after mic grant: gave up after {} attempts post-boot-ready ({}ms): {}",
         MAX_ATTEMPTS,
         MAX_ATTEMPTS as u64 * BACKOFF_MS,
         last_err.unwrap_or_else(|| "unknown error".to_string())
     );
+    false
 }
 
 // Accessibility permission APIs using ApplicationServices framework
@@ -366,6 +529,25 @@ impl OSPermissionsCheck {
 #[specta::specta]
 pub fn check_microphone_permission() -> OSPermissionStatus {
     core_to_os_status(screenpipe_core::permissions::check_microphone())
+}
+
+/// Internal probe for mic-grant recovery. E2E can model an already-granted
+/// launch without changing the permission value exposed to the frontend.
+#[cfg(target_os = "macos")]
+pub(crate) fn check_microphone_permission_for_recovery() -> OSPermissionStatus {
+    #[cfg(all(feature = "e2e", target_os = "macos"))]
+    if std::env::var("SCREENPIPE_E2E_SEED")
+        .ok()
+        .is_some_and(|flags| {
+            flags
+                .split(',')
+                .any(|flag| flag.trim() == "mic-focus-repro")
+        })
+    {
+        return OSPermissionStatus::Granted;
+    }
+
+    check_microphone_permission()
 }
 
 /// Check only screen recording permission (no dialog trigger)
@@ -1239,53 +1421,88 @@ pub fn request_arc_automation_permission(_app: tauri::AppHandle) -> bool {
 // keeps the synchronous TCC/AV check helpers used by the onboarding UI
 // and the preflight startup check.
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod mic_grant_restart_tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
 
-    // Regression for the mic-grant-restart guard: previously it was a
-    // fire-once-per-process AtomicBool (`MIC_FOCUS_CAPTURE_RESTART` in
-    // main.rs) that was set true and never reset, so if the first attempt
-    // didn't land (e.g. the boot-wait timed out), no later window-focus
-    // event could ever retry for the rest of the process's life (found during
-    // the Intel-Mac CI smoke-test investigation, screenpipe#4978).
     #[test]
-    fn guard_resets_after_scope_so_a_later_call_can_retry() {
-        let flag = AtomicBool::new(false);
+    fn already_granted_launch_is_a_baseline_not_a_transition() {
+        let mut tracker = MicGrantRecovery::new();
+        tracker.prime(true);
 
-        assert!(
-            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok(),
-            "first entry should acquire the guard"
-        );
-        {
-            let _guard = ResetGuard(&flag);
-            assert!(flag.load(Ordering::SeqCst));
-        } // guard drops here — must release the flag
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "guard must reset the flag on drop so a later trigger (e.g. the \
-             user refocusing the window) can retry"
-        );
-
-        // A later trigger can now acquire the guard again.
-        assert!(flag
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok());
+        assert_eq!(tracker.observe(true), None);
+        assert_eq!(tracker.observe(true), None);
+        assert_eq!(tracker.phase, MicGrantRecoveryPhase::GrantedIdle);
     }
 
     #[test]
-    fn concurrent_entry_is_rejected_while_first_is_in_flight() {
-        let flag = AtomicBool::new(false);
-        flag.store(true, Ordering::SeqCst);
-        let _guard = ResetGuard(&flag);
+    fn not_granted_to_granted_starts_exactly_one_attempt() {
+        let mut tracker = MicGrantRecovery::new();
+        tracker.prime(false);
 
-        // A second caller (e.g. the direct AVCaptureDevice grant callback
-        // firing at the same time as a window-focus event) must be rejected
-        // while the first is still in flight.
-        assert!(flag
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err());
+        let token = tracker
+            .observe(true)
+            .expect("grant edge should start recovery");
+        assert_eq!(
+            tracker.observe(true),
+            None,
+            "duplicate focus/callback must dedupe"
+        );
+        assert!(tracker.finish(token, true));
+        assert_eq!(
+            tracker.observe(true),
+            None,
+            "success must latch this grant edge"
+        );
+    }
+
+    #[test]
+    fn failed_attempt_is_retryable_without_creating_a_new_edge() {
+        let mut tracker = MicGrantRecovery::new();
+        tracker.prime(false);
+
+        let token = tracker.observe(true).unwrap();
+        assert!(tracker.finish(token, false));
+        assert_eq!(tracker.phase, MicGrantRecoveryPhase::Pending(token));
+        assert_eq!(tracker.observe(true), Some(token));
+    }
+
+    #[test]
+    fn completed_recovery_rearms_only_after_permission_is_lost() {
+        let mut tracker = MicGrantRecovery::new();
+        tracker.prime(false);
+
+        let first_token = tracker.observe(true).unwrap();
+        assert!(tracker.finish(first_token, true));
+        assert_eq!(tracker.observe(true), None);
+
+        assert_eq!(tracker.observe(false), None);
+        let second_token = tracker.observe(true).unwrap();
+        assert_ne!(first_token, second_token);
+    }
+
+    #[test]
+    fn first_unknown_observation_is_safe_even_without_explicit_priming() {
+        let mut tracker = MicGrantRecovery::new();
+
+        assert_eq!(tracker.observe(true), None);
+        assert_eq!(tracker.phase, MicGrantRecoveryPhase::GrantedIdle);
+    }
+
+    #[test]
+    fn revoke_during_attempt_invalidates_stale_completion() {
+        let mut tracker = MicGrantRecovery::new();
+        tracker.prime(false);
+        let stale_token = tracker.observe(true).unwrap();
+
+        assert_eq!(tracker.observe(false), None);
+        let current_token = tracker.observe(true).unwrap();
+        assert_ne!(stale_token, current_token);
+        assert!(!tracker.finish(stale_token, true));
+        assert_eq!(
+            tracker.phase,
+            MicGrantRecoveryPhase::InFlight(current_token)
+        );
+        assert!(tracker.finish(current_token, true));
     }
 }

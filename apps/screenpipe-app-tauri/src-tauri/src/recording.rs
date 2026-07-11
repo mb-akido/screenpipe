@@ -210,6 +210,45 @@ fn capture_intended_now(wants_recording: &AtomicBool) -> bool {
     wants_recording.load(Ordering::SeqCst)
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MicGrantCaptureRestartDecision {
+    Restart,
+    SkipPaused,
+    SkipAudioDisabled,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mic_grant_capture_restart_decision(
+    capture_intended: bool,
+    audio_disabled: bool,
+) -> MicGrantCaptureRestartDecision {
+    if !capture_intended {
+        MicGrantCaptureRestartDecision::SkipPaused
+    } else if audio_disabled {
+        MicGrantCaptureRestartDecision::SkipAudioDisabled
+    } else {
+        MicGrantCaptureRestartDecision::Restart
+    }
+}
+
+/// Cheap preflight used before waiting for the backend to finish booting.
+/// The locked recovery path re-evaluates this decision before changing capture.
+#[cfg(target_os = "macos")]
+pub(crate) fn mic_permission_capture_restart_needed(
+    state: &RecordingState,
+    app: &tauri::AppHandle,
+) -> bool {
+    let store = SettingsStore::get(app).ok().flatten().unwrap_or_default();
+    matches!(
+        mic_grant_capture_restart_decision(
+            state.capture_intended(),
+            store.recording.disable_audio,
+        ),
+        MicGrantCaptureRestartDecision::Restart
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Device listing (unchanged)
 // ---------------------------------------------------------------------------
@@ -330,21 +369,41 @@ pub async fn stop_capture(
     // — which would resurrect capture the user deliberately stopped.
     state.set_capture_intent(false);
 
-    remember_active_meeting_for_capture_restart(&state).await;
+    // Serialize with permission recovery and full server restarts. Intent is
+    // cleared before waiting so an in-flight recovery sees the user's stop and
+    // never starts capture again on their behalf.
+    let _lifecycle_guard = state.server_lifecycle.lock().await;
 
-    let mut capture_guard = state.capture.lock().await;
-    if let Some(session) = capture_guard.take() {
-        session.stop().await;
-        info!("Capture session stopped");
-    } else {
-        debug!("No capture session running");
+    if state.capture_intended() {
+        info!("Capture stop was superseded by a later start request");
+        return Ok(());
     }
+
+    stop_capture_session(&state).await;
     Ok(())
 }
 
-/// Whether capture is currently paused. Reads `capture_intended` which is
-/// flipped immediately in stop_capture/start_capture — no health-monitor
-/// delay. The frontend polls this so the UI stays in sync with the tray.
+async fn stop_capture_session(state: &RecordingState) {
+    let mut capture_guard = state.capture.lock().await;
+    if capture_guard.is_none() {
+        debug!("No capture session running");
+        return;
+    }
+
+    // Keep the capture session alive until the active meeting is saved. A
+    // duplicate stop that arrives after this one will see no capture and must
+    // not clear the meeting snapshot needed by the next start.
+    remember_active_meeting_for_capture_restart(state).await;
+
+    let session = capture_guard
+        .take()
+        .expect("capture presence checked while holding the capture lock");
+    session.stop().await;
+    info!("Capture session stopped");
+}
+
+/// Whether capture is currently paused. The frontend polls this alongside
+/// per-device status so the UI stays in sync with the tray indicator.
 #[tauri::command]
 #[specta::specta]
 pub fn is_capture_paused(state: State<'_, RecordingState>) -> bool {
@@ -488,6 +547,43 @@ async fn probe_server_health(health_url: &str, api_key: Option<&str>) -> bool {
     false
 }
 
+async fn ensure_server_healthy(
+    state: &RecordingState,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    // `state.server.is_some()` only means ServerCore was constructed once; it
+    // does NOT mean the HTTP serve task is still alive. Long-running sessions
+    // can lose the HTTP server across sleep/wake while ServerCore stays in
+    // state. Starting capture on a corpse leaves the timeline UI showing
+    // "connection error" forever — escalate to a full restart instead.
+    let (port, api_key) = {
+        let server_guard = state.server.lock().await;
+        let Some(ref core) = *server_guard else {
+            return Err("Server not running — cannot start capture".to_string());
+        };
+        (core.port, core.local_api_key.clone())
+    };
+
+    if probe_server_health(
+        &format!("http://localhost:{}/health", port),
+        api_key.as_deref(),
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    warn!(
+        "Server unresponsive on port {} — requesting full restart",
+        port
+    );
+    let _ = app.emit("request-server-restart", ());
+    Err(format!(
+        "Server not responding on port {} — full restart requested",
+        port
+    ))
+}
+
 /// Start recording. Requires the server to be running.
 #[tauri::command]
 #[specta::specta]
@@ -503,6 +599,24 @@ pub async fn start_capture(
     // — record it so the health watchdog will respawn a crashed engine instead
     // of treating the absence of capture as a deliberate stop.
     state.set_capture_intent(true);
+
+    // Serialize with user stops, permission recovery, and full server
+    // restarts. Intent is set before waiting so an in-flight recovery can
+    // observe the latest user choice before it decides whether to restart.
+    let _lifecycle_guard = state.server_lifecycle.lock().await;
+
+    start_capture_locked(&state, &app).await
+}
+
+/// Start capture while the caller holds `server_lifecycle`.
+async fn start_capture_locked(
+    state: &RecordingState,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    if !state.capture_intended() {
+        info!("Capture start was superseded by a later stop request");
+        return Ok(());
+    }
 
     // Race guard: short-circuit duplicate invocations.
     //
@@ -535,50 +649,75 @@ pub async fn start_capture(
         return Ok(());
     }
 
-    // `state.server.is_some()` only means ServerCore was constructed once; it
-    // does NOT mean the HTTP serve task is still alive. Long-running sessions
-    // can lose the HTTP server across sleep/wake while ServerCore stays in
-    // state. Starting capture on a corpse leaves the timeline UI showing
-    // "connection error" forever — escalate to a full restart instead.
-    let (port, api_key) = {
-        let server_guard = state.server.lock().await;
-        let Some(ref core) = *server_guard else {
-            return Err("Server not running — cannot start capture".to_string());
-        };
-        (core.port, core.local_api_key.clone())
-    };
+    ensure_server_healthy(state, app).await?;
 
-    let healthy = probe_server_health(
-        &format!("http://localhost:{}/health", port),
-        api_key.as_deref(),
-    )
-    .await;
-    if !healthy {
-        warn!(
-            "Server unresponsive on port {} — requesting full restart",
-            port
-        );
-        let _ = app.emit("request-server-restart", ());
-        return Err(format!(
-            "Server not responding on port {} — full restart requested",
-            port
-        ));
-    }
-
-    restore_interrupted_meeting_for_capture_restart(&state).await?;
+    restore_interrupted_meeting_for_capture_restart(state).await?;
 
     let server_guard = state.server.lock().await;
     let server = server_guard
         .as_ref()
         .ok_or_else(|| "Server not running — cannot start capture".to_string())?;
-    let config = build_config(&app)?;
+    let config = build_config(app)?;
     let session = CaptureSession::start(server, &config, false).await?;
     drop(server_guard);
+
+    if !state.capture_intended() {
+        info!("Capture was paused while startup was in flight; discarding the new session");
+        session.stop().await;
+        return Ok(());
+    }
 
     *capture_guard = Some(session);
 
     info!("Capture session started");
     Ok(())
+}
+
+/// Rebuild capture after a real macOS microphone permission grant without
+/// changing the user's recording intent. The full stop/start is serialized
+/// with explicit tray commands, and a stop that arrives while recovery is in
+/// flight wins before capture can be started again.
+#[cfg(target_os = "macos")]
+pub(crate) async fn restart_capture_for_mic_permission(
+    state: State<'_, RecordingState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let _lifecycle_guard = state.server_lifecycle.lock().await;
+    let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
+
+    match mic_grant_capture_restart_decision(
+        state.capture_intended(),
+        store.recording.disable_audio,
+    ) {
+        MicGrantCaptureRestartDecision::SkipPaused => {
+            info!("Microphone permission granted while capture is paused; deferring audio initialization until the next explicit start");
+            return Ok(());
+        }
+        MicGrantCaptureRestartDecision::SkipAudioDisabled => {
+            info!("Microphone permission granted while audio recording is disabled; no capture restart needed");
+            return Ok(());
+        }
+        MicGrantCaptureRestartDecision::Restart => {}
+    }
+
+    require_app_entitlement(&store)?;
+
+    // Do not tear down a healthy capture just to discover afterward that its
+    // long-lived HTTP server is already unavailable.
+    ensure_server_healthy(&state, &app).await?;
+
+    info!("Restarting capture after microphone permission grant");
+    stop_capture_session(&state).await;
+
+    // `stop_capture` and `stop_screenpipe` clear intent before waiting for the
+    // lifecycle lock. Re-read after teardown so a concurrent user stop always
+    // wins and recovery cannot silently turn recording back on.
+    if !state.capture_intended() {
+        info!("Capture was paused during microphone recovery; leaving it stopped");
+        return Ok(());
+    }
+
+    start_capture_locked(&state, &app).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,7 +1482,9 @@ async fn kill_process_on_port(port: u16) {
 
 #[cfg(test)]
 mod capture_intent_tests {
-    use super::capture_intended_now;
+    use super::{
+        capture_intended_now, mic_grant_capture_restart_decision, MicGrantCaptureRestartDecision,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -1356,6 +1497,34 @@ mod capture_intent_tests {
         wants_recording.store(false, Ordering::SeqCst);
 
         assert!(!capture_intended_now(&wants_recording));
+    }
+
+    #[test]
+    fn mic_grant_never_restarts_capture_while_paused() {
+        assert_eq!(
+            mic_grant_capture_restart_decision(false, false),
+            MicGrantCaptureRestartDecision::SkipPaused
+        );
+        assert_eq!(
+            mic_grant_capture_restart_decision(false, true),
+            MicGrantCaptureRestartDecision::SkipPaused
+        );
+    }
+
+    #[test]
+    fn mic_grant_skips_restart_when_audio_is_disabled() {
+        assert_eq!(
+            mic_grant_capture_restart_decision(true, true),
+            MicGrantCaptureRestartDecision::SkipAudioDisabled
+        );
+    }
+
+    #[test]
+    fn mic_grant_restarts_only_active_audio_capture() {
+        assert_eq!(
+            mic_grant_capture_restart_decision(true, false),
+            MicGrantCaptureRestartDecision::Restart
+        );
     }
 }
 
