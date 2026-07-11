@@ -80,11 +80,13 @@ pub struct OCRContent {
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
     pub device_name: String,
-    /// Origin of `text`. `"accessibility"` (OS-native tree, primary path) or
-    /// `"ocr"` (fallback for terminals, canvas apps, weak a11y). `None` for
-    /// legacy rows captured before the field was tracked. The variant is
-    /// historically called OCR but most captures are accessibility-derived
-    /// — read this field to know which path produced the text.
+    /// Origin of `text`. Verbatim captured text: `"accessibility"` (OS-native
+    /// tree, primary path) or `"ocr"` (fallback for terminals, canvas apps,
+    /// weak a11y). AI-written from the opt-in visual indexing worker:
+    /// `"vision_hybrid"` (native text plus a `Visual context:` section) or
+    /// `"vision"` (visual description only, replace mode). `None` for legacy
+    /// rows captured before the field was tracked. Quote as verbatim only for
+    /// accessibility/ocr; the vision variants may paraphrase or truncate.
     pub text_source: Option<String>,
 }
 

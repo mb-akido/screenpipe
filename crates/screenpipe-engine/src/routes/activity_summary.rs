@@ -392,15 +392,20 @@ struct SummaryCore {
     total_active_minutes: f64,
 }
 
-/// Strip a wrapping markdown code fence (``` or ```json) from AI-written
-/// visual descriptions. Small local VLMs emit fenced JSON despite prose
-/// prompts; the fence is noise in summary snippets.
+/// Strip a wrapping markdown code fence from AI-written visual descriptions.
+/// Small local VLMs emit fenced output despite prose prompts, and the tag
+/// varies (```json, ```JSON, ``` json, ```markdown) — the fence and its
+/// language tag are noise in summary snippets.
 fn strip_code_fences(text: &str) -> String {
     let trimmed = text.trim();
-    let without_open = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
+    let without_open = trimmed.strip_prefix("```").map_or(trimmed, |rest| {
+        // Drop an optional language tag on the opening fence line (any case,
+        // e.g. "json", "JSON", "markdown") up to the first newline.
+        match rest.split_once('\n') {
+            Some((tag, body)) if tag.trim().chars().all(|c| c.is_ascii_alphanumeric()) => body,
+            _ => rest,
+        }
+    });
     let without_close = without_open
         .trim_end()
         .strip_suffix("```")
@@ -971,10 +976,18 @@ async fn load_snippets(
     for index in evenly_spaced_indices(screen_candidates.len(), screen_limit as usize) {
         let key_text = screen_candidates[index];
         let text = key_text.text.trim();
+        // Carry the "visual" provenance through to snippets. Without this the
+        // AI-written descriptions get relabeled "screen" and a consumer would
+        // quote them as verbatim on-screen text — the exact confusion the
+        // key_texts `source` marker exists to prevent.
+        let snippet_source = match key_text.source.as_deref() {
+            Some("visual") => "screen_visual",
+            _ => "screen",
+        };
         push_snippet(
             &mut snippets,
             ActivitySnippet {
-                source: "screen".to_string(),
+                source: snippet_source.to_string(),
                 text: truncate_text(text, max_snippet_chars),
                 app_name: Some(key_text.app_name.clone()).filter(|s| !s.is_empty()),
                 window_name: Some(key_text.window_name.clone()).filter(|s| !s.is_empty()),
@@ -2000,6 +2013,18 @@ mod db_tests {
             "key_texts missing the accessibility text: {:?}",
             core.key_texts.iter().map(|k| &k.text).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn strip_code_fences_handles_case_and_tag_variants() {
+        assert_eq!(strip_code_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_code_fences("```JSON\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_code_fences("```markdown\nhello\n```"), "hello");
+        assert_eq!(strip_code_fences("```\nplain\n```"), "plain");
+        // No language tag on the fence line, single line — leave body intact.
+        assert_eq!(strip_code_fences("```inline text```"), "inline text");
+        // Not fenced — unchanged.
+        assert_eq!(strip_code_fences("a canvas app"), "a canvas app");
     }
 
     #[tokio::test]

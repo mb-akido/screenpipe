@@ -2077,14 +2077,28 @@ export function RecordingSettings() {
   );
   // Local mode ships with an empty model on purpose (a hardcoded name the
   // server doesn't host would fail every job silently) — adopt the first
-  // detected model so the common ollama path configures itself.
+  // detected model so the common ollama path configures itself. Never runs
+  // once the user opts into manual entry, or when they already picked a
+  // model, so it can't clobber a deliberate choice.
   useEffect(() => {
     if (visionIndexingProvider !== "local") return;
+    if (visionModelManualEntry) return;
     if ((settings.visionIndexingModel ?? "").trim()) return;
     if (visionModels.length === 0) return;
     handleSettingsChange({ visionIndexingModel: visionModels[0] }, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visionIndexingProvider, visionModels, settings.visionIndexingModel]);
+  }, [visionIndexingProvider, visionModelManualEntry, visionModels, settings.visionIndexingModel]);
+
+  // Signed-out selection of screenpipe cloud stores an empty key; if the user
+  // signs in afterward, install the account token so indexing can authenticate
+  // without them re-picking the provider.
+  useEffect(() => {
+    if (visionIndexingProvider !== "screenpipe-cloud") return;
+    if (!screenpipeCloudToken) return;
+    if ((settings.visionIndexingApiKey ?? "").trim()) return;
+    handleSettingsChange({ visionIndexingApiKey: screenpipeCloudToken }, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visionIndexingProvider, screenpipeCloudToken, settings.visionIndexingApiKey]);
 
   const handleAecModeChange = useCallback((mode: AecMode) => {
     handleSettingsChange(getAecModeSettings(mode), true);
@@ -3897,6 +3911,25 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[11px]">
                       Sign in to your screenpipe account to use screenpipe cloud.
                     </p>
+                  )}
+
+                  {/* Consent can be cleared out from under a cloud provider —
+                      e.g. pasting the screenpipe cloud URL into Custom, which
+                      derives this provider but resets consent. Without this the
+                      engine silently disables indexing with no UI signal. */}
+                  {visionIndexingProvider === "screenpipe-cloud" && !(settings.visionIndexingCloudConsent ?? false) && (
+                    <div className="flex items-center justify-between gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[11px]">
+                      <span>Indexing is paused — confirm sending privacy-scrubbed screenshots to screenpipe cloud.</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-6 shrink-0 text-[11px]"
+                        onClick={() => handleSettingsChange({ visionIndexingCloudConsent: true }, true)}
+                      >
+                        Turn on
+                      </Button>
+                    </div>
                   )}
 
                   {visionIndexingProvider === "local" && (

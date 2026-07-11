@@ -594,7 +594,13 @@ struct ChatMessage {
 
 fn extract_message_content(content: &Value) -> Option<String> {
     match content {
-        Value::String(value) => Some(value.clone()),
+        // Reject empty/whitespace content so the benchmark and production
+        // agree: a reasoning model that spends its whole token budget on the
+        // hidden `reasoning` field returns content="" with finish_reason
+        // "length". Production already drops that in process_candidate; if the
+        // String branch returned Some(""), the benchmark would count the same
+        // response as a success and green-light a model that indexes nothing.
+        Value::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
         Value::Array(parts) => {
             let text = parts
                 .iter()
@@ -806,6 +812,20 @@ mod tests {
         assert_eq!(
             extract_message_content(&json!([{"type":"text","text":"one"},{"text":"two"}])),
             Some("one\ntwo".to_string())
+        );
+    }
+
+    #[test]
+    fn content_parser_rejects_empty_string_like_reasoning_only_response() {
+        // A reasoning model that burns its budget on the hidden `reasoning`
+        // field returns content="". Both string and array branches must reject
+        // it so the benchmark can't count it as a success while production
+        // (process_candidate) rejects the same response.
+        assert_eq!(extract_message_content(&json!("")), None);
+        assert_eq!(extract_message_content(&json!("   \n ")), None);
+        assert_eq!(
+            extract_message_content(&json!([{"type":"text","text":"  "}])),
+            None
         );
     }
 
