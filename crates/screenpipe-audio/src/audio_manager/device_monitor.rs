@@ -9,7 +9,12 @@ use std::{
 };
 
 use anyhow::Result;
-use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
+use screenpipe_events::{PermissionKind, PermissionState};
+use tokio::{
+    sync::{watch, Mutex},
+    task::JoinHandle,
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -245,6 +250,17 @@ fn session_input_permission_recovery_targets(session: &HashSet<String>) -> Vec<A
         .collect();
     targets.sort_by_key(ToString::to_string);
     targets
+}
+
+/// Consume the newest microphone permission edge, recovering only when the
+/// latest state is restored. A watch channel deliberately coalesces rapid
+/// transitions: restored→lost before this loop runs must not restart a stream
+/// while permission is denied, while loss→restored requests one recovery.
+fn take_microphone_restoration(receiver: &mut watch::Receiver<Option<PermissionState>>) -> bool {
+    match receiver.has_changed() {
+        Ok(true) => *receiver.borrow_and_update() == Some(PermissionState::Restored),
+        Ok(false) | Err(_) => false,
+    }
 }
 
 fn should_log_recovery_attempt(attempts: u32) -> bool {
@@ -497,6 +513,7 @@ pub(crate) fn decide_pinned_input_fallback(inputs: PinnedFallbackInputs<'_>) -> 
 
 lazy_static::lazy_static! {
   pub static ref DEVICE_MONITOR: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+  static ref DEVICE_MONITOR_LIFECYCLE: Mutex<()> = Mutex::new(());
 }
 
 /// Track the last known system default devices to detect changes
@@ -570,14 +587,17 @@ pub async fn start_device_monitor(
     audio_manager: Arc<AudioManager>,
     device_manager: Arc<DeviceManager>,
 ) -> Result<()> {
-    stop_device_monitor().await?;
+    let _lifecycle = DEVICE_MONITOR_LIFECYCLE.lock().await;
+    // Subscribe before stopping the previous monitor so there is no blind
+    // window between consumers. The watch API marks older state as seen;
+    // initial device sync owns any transition that predates this fresh start.
+    let mut microphone_permission =
+        screenpipe_events::subscribe_to_permission_state(PermissionKind::Microphone);
+    stop_device_monitor_inner().await?;
 
     *DEVICE_MONITOR.lock().await = Some(tokio::spawn(async move {
         let mut disconnected_devices: HashSet<String> = HashSet::new();
         let mut default_tracker = SystemDefaultTracker::new();
-        // A request that predates this monitor is stale: start-up enumerates
-        // current devices and the initial sync below owns any needed recovery.
-        let _ = crate::input_permission_recovery::take();
 
         // Track devices that repeatedly fail to start so we don't spam errors
         // every 2 seconds. After a failure, back off for increasing durations.
@@ -637,7 +657,7 @@ pub async fn start_device_monitor(
 
         loop {
             if audio_manager.status().await == AudioManagerStatus::Running {
-                if crate::input_permission_recovery::take() {
+                if take_microphone_restoration(&mut microphone_permission) {
                     input_recovery_backoff.reset();
 
                     let enabled = audio_manager.enabled_devices().await;
@@ -2046,12 +2066,29 @@ async fn run_pinned_input_fallback_sweep(
     }
 }
 
-pub async fn stop_device_monitor() -> Result<()> {
-    if let Some(handle) = DEVICE_MONITOR.lock().await.take() {
+async fn stop_device_monitor_inner() -> Result<()> {
+    let handle = DEVICE_MONITOR.lock().await.take();
+    if let Some(handle) = handle {
         handle.abort();
+        match tokio::time::timeout(Duration::from_secs(2), handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if !error.is_cancelled() {
+                    warn!("audio device monitor stopped with join error: {}", error);
+                }
+            }
+            Err(_) => warn!(
+                "audio device monitor did not finish cancellation within 2s; continuing shutdown"
+            ),
+        }
     }
 
     Ok(())
+}
+
+pub async fn stop_device_monitor() -> Result<()> {
+    let _lifecycle = DEVICE_MONITOR_LIFECYCLE.lock().await;
+    stop_device_monitor_inner().await
 }
 
 /// Sliding-window cooldown tracker for central handler restarts.
@@ -2130,6 +2167,53 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(targets, vec!["Meeting Microphone (input)"]);
+    }
+
+    #[test]
+    fn fresh_monitor_does_not_replay_an_old_restoration() {
+        let (sender, _initial) = watch::channel(Some(PermissionState::Restored));
+        let mut receiver = sender.subscribe();
+
+        assert!(!take_microphone_restoration(&mut receiver));
+    }
+
+    #[test]
+    fn microphone_restoration_is_consumed_once() {
+        let (sender, mut receiver) = watch::channel(None);
+        sender.send_replace(Some(PermissionState::Restored));
+
+        assert!(take_microphone_restoration(&mut receiver));
+        assert!(!take_microphone_restoration(&mut receiver));
+    }
+
+    #[test]
+    fn restore_then_loss_before_monitor_tick_does_not_recover() {
+        let (sender, mut receiver) = watch::channel(None);
+        sender.send_replace(Some(PermissionState::Restored));
+        sender.send_replace(Some(PermissionState::Lost));
+
+        assert!(!take_microphone_restoration(&mut receiver));
+    }
+
+    #[test]
+    fn rapid_edges_ending_restored_coalesce_to_one_recovery() {
+        let (sender, mut receiver) = watch::channel(None);
+        sender.send_replace(Some(PermissionState::Lost));
+        sender.send_replace(Some(PermissionState::Restored));
+        sender.send_replace(Some(PermissionState::Lost));
+        sender.send_replace(Some(PermissionState::Restored));
+
+        assert!(take_microphone_restoration(&mut receiver));
+        assert!(!take_microphone_restoration(&mut receiver));
+    }
+
+    #[test]
+    fn restore_then_needed_before_monitor_tick_does_not_recover() {
+        let (sender, mut receiver) = watch::channel(None);
+        sender.send_replace(Some(PermissionState::Restored));
+        sender.send_replace(Some(PermissionState::Needed));
+
+        assert!(!take_microphone_restoration(&mut receiver));
     }
 
     #[test]

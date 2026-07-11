@@ -1712,7 +1712,7 @@ async fn main() {
             // Forward engine events (including permission UI notifications)
             // over /ws/events once the embedded server is ready. The producer's
             // transition state already runs independently of this bridge, and
-            // audio recovery uses its lightweight in-process latch.
+            // in-process recovery consumes the typed permission state channel.
             let app_handle_clone = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 // Wait for the server core to be ready so we have port + API key.

@@ -26,7 +26,7 @@ use screenpipe_engine::{
     vision_manager::{start_monitor_watcher, stop_monitor_watcher, VisionManager},
     RecordingConfig,
 };
-use screenpipe_events::{send_event, PermissionEvent, PermissionKind};
+use screenpipe_events::{publish_permission_event, PermissionEvent, PermissionKind};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -98,10 +98,9 @@ impl CaptureSession {
             warn!("Screen recording permission not yet granted — skipping VisionManager to avoid native TCC dialog; will start on next spawn_screenpipe after onboarding grants access");
             crate::health::set_recording_status(crate::health::RecordingStatus::Starting);
             // Emit permission_needed event so frontend can trigger onboarding/permission flow
-            let _ = send_event(
-                PermissionEvent::needed(PermissionKind::ScreenRecording).event_name(),
-                PermissionEvent::needed(PermissionKind::ScreenRecording),
-            );
+            let _ = publish_permission_event(PermissionEvent::needed(
+                PermissionKind::ScreenRecording,
+            ));
         }
 
         if !config.disable_vision && screen_recording_permitted {
@@ -209,10 +208,9 @@ impl CaptureSession {
         let ui_recorder_handle = if !accessibility_permitted {
             warn!("Accessibility permission not yet granted — skipping UI event recording to avoid native TCC dialog; will start on next spawn_screenpipe after onboarding grants access");
             // Emit permission_needed event so frontend can trigger onboarding/permission flow
-            let _ = send_event(
-                PermissionEvent::needed(PermissionKind::Accessibility).event_name(),
-                PermissionEvent::needed(PermissionKind::Accessibility),
-            );
+            let _ = publish_permission_event(PermissionEvent::needed(
+                PermissionKind::Accessibility,
+            ));
             None
         } else {
             let ui_config = config.to_ui_recorder_config();

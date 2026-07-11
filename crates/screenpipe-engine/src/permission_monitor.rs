@@ -46,7 +46,9 @@ use screenpipe_core::permissions::{
     check_accessibility, check_microphone, check_permissions, check_screen_recording_tauri,
     PermissionStatus, PermissionsCheck,
 };
-use screenpipe_events::{send_event, PermissionEvent, PermissionKind, PermissionState};
+use screenpipe_events::{
+    publish_permission_event, PermissionEvent, PermissionKind, PermissionState,
+};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
@@ -236,17 +238,7 @@ fn report_state_inner(kind: PermissionKind, now_granted: bool, reason: Option<&s
         PermissionEvent::lost(kind, reason.map(str::to_owned))
     };
 
-    request_audio_recovery(evt.kind, evt.state);
-    let _ = send_event(evt.event_name(), evt);
-}
-
-fn request_audio_recovery(kind: PermissionKind, state: PermissionState) {
-    if kind == PermissionKind::Microphone && state == PermissionState::Restored {
-        // Recovery policy remains in screenpipe-audio. This zero-allocation
-        // latch avoids adding a receiver to the high-volume global event bus
-        // just to observe this rare transition.
-        screenpipe_audio::input_permission_recovery::request();
-    }
+    let _ = publish_permission_event(evt);
 }
 
 /// Re-check all permissions immediately and feed the result through the same
@@ -475,18 +467,5 @@ mod tests {
             ),
             Observation::Transition(PermissionState::Restored)
         );
-    }
-
-    #[test]
-    fn only_microphone_restoration_requests_audio_recovery() {
-        let _ = screenpipe_audio::input_permission_recovery::take();
-
-        request_audio_recovery(PermissionKind::ScreenRecording, PermissionState::Restored);
-        request_audio_recovery(PermissionKind::Microphone, PermissionState::Lost);
-        assert!(!screenpipe_audio::input_permission_recovery::take());
-
-        request_audio_recovery(PermissionKind::Microphone, PermissionState::Restored);
-        assert!(screenpipe_audio::input_permission_recovery::take());
-        assert!(!screenpipe_audio::input_permission_recovery::take());
     }
 }

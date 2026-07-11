@@ -100,38 +100,3 @@ pub mod stream_invalidation {
         }
     }
 }
-
-/// Lightweight handoff from the engine's authoritative permission transition
-/// tracker to the audio device monitor. This avoids subscribing another
-/// receiver to the high-volume global event bus merely to observe the rare
-/// microphone-restored event.
-pub mod input_permission_recovery {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static REQUESTED: AtomicBool = AtomicBool::new(false);
-
-    /// Request input-only stream recovery. Repeated transitions coalesce until
-    /// the active audio device monitor consumes the request.
-    pub fn request() {
-        REQUESTED.store(true, Ordering::Release);
-    }
-
-    /// Check and clear the pending request.
-    pub fn take() -> bool {
-        REQUESTED.swap(false, Ordering::AcqRel)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn requests_coalesce_until_consumed() {
-            let _ = take();
-            request();
-            request();
-            assert!(take());
-            assert!(!take());
-        }
-    }
-}
