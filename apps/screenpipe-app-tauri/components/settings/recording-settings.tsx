@@ -1913,7 +1913,6 @@ export function RecordingSettings() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [showOpenAIApiKey, setShowOpenAIApiKey] = useState(false);
   const [showVisionApiKey, setShowVisionApiKey] = useState(false);
-  const [showVisionAdvanced, setShowVisionAdvanced] = useState(false);
   const [visionModelManualEntry, setVisionModelManualEntry] = useState(false);
   const [isRefreshingSubscription, setIsRefreshingSubscription] = useState(false);
   const { checkLogin } = useLoginDialog();
@@ -3894,18 +3893,10 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     </p>
                   )}
 
-                  {visionIndexingProvider === "screenpipe-cloud" && (
-                    <div className="space-y-2.5">
-                      {!screenpipeCloudToken && (
-                        <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[11px]">
-                          Sign in to your screenpipe account to use screenpipe cloud.
-                        </p>
-                      )}
-                      <p className="text-[11px] text-muted-foreground">
-                        Screenshots are scrubbed of personal info on this device, then described
-                        privately in a sealed enclave. Uses your screenpipe credits.
-                      </p>
-                    </div>
+                  {visionIndexingProvider === "screenpipe-cloud" && !screenpipeCloudToken && (
+                    <p className="rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[11px]">
+                      Sign in to your screenpipe account to use screenpipe cloud.
+                    </p>
                   )}
 
                   {visionIndexingProvider === "local" && (
@@ -4057,138 +4048,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     </div>
                   )}
 
-                  <button
-                    type="button"
-                    className="flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-                    onClick={() => setShowVisionAdvanced((visible) => !visible)}
-                    aria-expanded={showVisionAdvanced}
-                  >
-                    <ChevronDown
-                      className={cn(
-                        "h-3.5 w-3.5 transition-transform",
-                        !showVisionAdvanced && "-rotate-90",
-                      )}
-                    />
-                    Advanced
-                  </button>
-
-                  {showVisionAdvanced && (
-                    <div className="space-y-2.5">
-                      <div className="grid gap-2 sm:grid-cols-2">
-                        <label className="space-y-1">
-                          <span className="text-xs font-medium text-foreground">Search scope</span>
-                          <Select
-                            value={settings.visionIndexingContextMode ?? "augment"}
-                            onValueChange={(value) =>
-                              handleSettingsChange(
-                                {
-                                  visionIndexingContextMode: value as "augment" | "replace",
-                                },
-                                true,
-                              )
-                            }
-                          >
-                            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="augment">Screen text + descriptions</SelectItem>
-                              <SelectItem value="replace">Descriptions only</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </label>
-
-                        <label className="space-y-1">
-                          <span className="text-xs font-medium text-foreground">How often</span>
-                          <Select
-                            value={String(settings.visionIndexingIntervalMs ?? 10000)}
-                            onValueChange={(value) =>
-                              handleSettingsChange({ visionIndexingIntervalMs: Number(value) }, true)
-                            }
-                          >
-                            <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="10000">Every 10 seconds (recommended)</SelectItem>
-                              <SelectItem value="30000">Every 30 seconds</SelectItem>
-                              <SelectItem value="60000">Every minute</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </label>
-                      </div>
-
-                      {visionIndexingProvider === "local" && (
-                        <div className="grid gap-2 sm:grid-cols-2">
-                          <label className="space-y-1">
-                            <span className="text-xs font-medium text-foreground">Local server address</span>
-                            <Input
-                              className="h-8 text-xs font-mono"
-                              placeholder="http://127.0.0.1:11434/v1"
-                              value={settings.visionIndexingEndpoint ?? ""}
-                              onChange={(event) =>
-                                handleSettingsChange(
-                                  getVisionIndexingEndpointUpdates(
-                                    settings.visionIndexingEndpoint,
-                                    event.target.value,
-                                  ),
-                                  true,
-                                )
-                              }
-                            />
-                            {validationErrors.visionIndexingEndpoint && (
-                              <span className="block text-[11px] text-destructive">
-                                {validationErrors.visionIndexingEndpoint}
-                              </span>
-                            )}
-                          </label>
-
-                          <label className="space-y-1">
-                            <span className="text-xs font-medium text-foreground">API key (optional)</span>
-                            <div className="relative">
-                              <Input
-                                className="h-8 pr-8 text-xs font-mono"
-                                type={showVisionApiKey ? "text" : "password"}
-                                value={settings.visionIndexingApiKey ?? ""}
-                                onChange={(event) =>
-                                  handleSettingsChange({ visionIndexingApiKey: event.target.value }, true)
-                                }
-                              />
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon"
-                                className="absolute right-0 top-0 h-8 w-8"
-                                onClick={() => setShowVisionApiKey((visible) => !visible)}
-                                aria-label={showVisionApiKey ? "hide vision API key" : "show vision API key"}
-                              >
-                                {showVisionApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                              </Button>
-                            </div>
-                          </label>
-                        </div>
-                      )}
-
-                      {visionIndexingMode === "cloud" && (
-                        <label className="block space-y-1">
-                          <span className="text-xs font-medium text-foreground">Daily limit</span>
-                          <Select
-                            value={String(settings.visionIndexingMaxCloudJobsPerDay ?? 100)}
-                            onValueChange={(value) =>
-                              handleSettingsChange(
-                                { visionIndexingMaxCloudJobsPerDay: Number(value) },
-                                true,
-                              )
-                            }
-                          >
-                            <SelectTrigger className="h-8 w-[220px] text-xs"><SelectValue /></SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="25">25 screenshots / day</SelectItem>
-                              <SelectItem value="100">100 screenshots / day (recommended)</SelectItem>
-                              <SelectItem value="250">250 screenshots / day</SelectItem>
-                              <SelectItem value="500">500 screenshots / day</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </label>
-                      )}
-                    </div>
-                  )}
                 </div>
               )}
             </CardContent>
