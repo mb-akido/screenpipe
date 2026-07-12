@@ -660,7 +660,7 @@ async fn main() {
     // inside `.setup()`: a `block_on` there nests runtimes under
     // #[tokio::main] and panics ("Cannot start a runtime from within a
     // runtime"), killing the app at launch.
-    let _ = crate::auth_token::migrate_plaintext_token(
+    let initial_cloud_token = crate::auth_token::migrate_plaintext_token(
         &screenpipe_core::paths::default_screenpipe_data_dir(),
     )
     .await;
@@ -674,7 +674,7 @@ async fn main() {
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
         wants_recording: Arc::new(AtomicBool::new(false)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
-        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token))),
         db_wedge_breaker: recording::new_db_wedge_breaker(),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));

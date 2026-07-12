@@ -545,7 +545,7 @@ pub fn get_cloud_token() -> Option<String> {
         .and_then(|t| t.as_str())
         // The same file historically held the LOCAL api key (`sp-<uuid8>`,
         // engine auth_key.rs) — never serve a non-JWT value as a cloud login.
-        .filter(|s| crate::auth_token::looks_like_jwt(s))
+        .filter(|s| crate::auth_token::is_cloud_session_token(s))
         .map(String::from)
 }
 
@@ -572,7 +572,11 @@ pub async fn set_cloud_token(
     token: Option<String>,
     state: tauri::State<'_, crate::recording::RecordingState>,
 ) -> Result<(), String> {
-    let normalized = token.filter(|t| !t.is_empty());
+    let supplied_non_empty = token.as_ref().is_some_and(|value| !value.is_empty());
+    let normalized = crate::auth_token::normalize_cloud_token(token);
+    if supplied_non_empty && normalized.is_none() {
+        return Err("invalid_cloud_session_token".to_string());
+    }
     let should_clear_pi_auth = normalized.is_none();
     // Unblock cloud calls for THIS session first — the ArcSwap + cache are the
     // runtime source of truth, so a failed durable write below never breaks an
