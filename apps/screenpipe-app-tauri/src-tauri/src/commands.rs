@@ -1975,10 +1975,9 @@ pub async fn complete_onboarding(app_handle: tauri::AppHandle) -> Result<(), Str
         app_handle.manage(updated_store);
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    close_window(app_handle.clone(), ShowRewindWindow::Onboarding).await?;
-    show_window(app_handle.clone(), ShowRewindWindow::Home { page: None }).await?;
-
+    // The onboarding page owns the transition to Home after its completion
+    // analytics and reminder state are persisted. Closing this webview here
+    // destroys that post-completion work before the command promise resolves.
     Ok(())
 }
 

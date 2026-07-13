@@ -30,6 +30,8 @@ pub type SharedPipeManager = Arc<Mutex<PipeManager>>;
 #[derive(Deserialize)]
 pub struct EnableRequest {
     pub enabled: bool,
+    #[serde(default)]
+    pub defer_first_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -117,7 +119,10 @@ pub async fn enable_pipe(
     Json(body): Json<EnableRequest>,
 ) -> Json<Value> {
     let mgr = pm.lock().await;
-    match mgr.enable_pipe(&id, body.enabled).await {
+    match mgr
+        .enable_pipe_with_deferred_first_run(&id, body.enabled, body.defer_first_run)
+        .await
+    {
         Ok(()) => Json(json!({ "success": true })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }

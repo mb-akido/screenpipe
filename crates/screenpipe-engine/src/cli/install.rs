@@ -166,7 +166,7 @@ async fn install_one(
     let _ = parse_frontmatter(&source_md)?;
 
     let name = manager
-        .install_pipe_from_store(&source_md, slug, version)
+        .install_pipe_from_store(&source_md, slug, version, false)
         .await?;
 
     // Best-effort install-count increment (fire-and-forget).

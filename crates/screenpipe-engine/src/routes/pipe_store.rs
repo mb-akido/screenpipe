@@ -55,6 +55,8 @@ pub struct StoreSearchQuery {
 #[derive(Deserialize)]
 pub struct StoreInstallRequest {
     pub slug: String,
+    #[serde(default)]
+    pub defer_first_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -252,7 +254,7 @@ pub async fn pipe_store_install(
     // 2. Install locally with store tracking
     let mgr = pm.lock().await;
     let name = match mgr
-        .install_pipe_from_store(&source_md, &body.slug, version)
+        .install_pipe_from_store(&source_md, &body.slug, version, body.defer_first_run)
         .await
     {
         Ok(name) => name,

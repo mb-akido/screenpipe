@@ -3753,6 +3753,18 @@ impl PipeManager {
 
     /// Enable or disable a pipe (writes back to pipe.md front-matter).
     pub async fn enable_pipe(&self, name: &str, enabled: bool) -> Result<()> {
+        self.enable_pipe_with_deferred_first_run(name, enabled, false)
+            .await
+    }
+
+    /// Enable or disable a pipe, optionally waiting one declared interval
+    /// before its first automatic run. Manual runs remain available.
+    pub async fn enable_pipe_with_deferred_first_run(
+        &self,
+        name: &str,
+        enabled: bool,
+        defer_first_run: bool,
+    ) -> Result<()> {
         let pipe_md = self.pipes_dir.join(name).join("pipe.md");
         if !pipe_md.exists() {
             return Err(self.pipe_not_found_error(name));
@@ -3765,6 +3777,24 @@ impl PipeManager {
         // old reminder. User must set a new `at <iso>` first.
         if enabled {
             validate_one_off_freshness(&config.schedule)?;
+            let has_run = if let Some(store) = &self.store {
+                store
+                    .get_scheduler_state(name)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|state| state.last_run_at)
+                    .is_some()
+            } else {
+                false
+            };
+            if defer_first_run && !has_run {
+                defer_first_interval_run(&mut config);
+            } else {
+                config.config.remove(FIRST_RUN_NOT_BEFORE_KEY);
+            }
+        } else {
+            config.config.remove(FIRST_RUN_NOT_BEFORE_KEY);
         }
         config.enabled = enabled;
         let new_content = serialize_pipe(&config, &body)?;
@@ -3781,7 +3811,11 @@ impl PipeManager {
         // Update in-memory
         let mut pipes = self.pipes.lock().await;
         if let Some(entry) = pipes.get_mut(name) {
-            entry.0.enabled = enabled;
+            // The scheduler reads this in-memory copy, so update both fields
+            // changed above. Do not replace the full config: parse_frontmatter
+            // does not know the directory-derived runtime name.
+            entry.0.enabled = config.enabled;
+            entry.0.config = config.config;
             entry.2 = new_content;
         }
 
@@ -3827,6 +3861,7 @@ impl PipeManager {
         config.name = name.to_string(); // preserve directory name
 
         let mut new_body = body.clone();
+        let mut schedule_changed = false;
         for (k, v) in &updates {
             match k.as_str() {
                 "prompt_body" => {
@@ -3837,6 +3872,7 @@ impl PipeManager {
                 "schedule" => {
                     if let Some(s) = v.as_str() {
                         config.schedule = s.to_string();
+                        schedule_changed = true;
                     }
                 }
                 "enabled" => {
@@ -3896,6 +3932,7 @@ impl PipeManager {
                         // Clearing the structured schedule = manual.
                         config.schedule_config = None;
                         config.schedule = "manual".to_string();
+                        schedule_changed = true;
                     } else {
                         match serde_json::from_value::<ScheduleConfig>(v.clone()) {
                             Ok(sc) => {
@@ -3904,6 +3941,7 @@ impl PipeManager {
                                 // legacy string at "manual" so front-matter never
                                 // contradicts it (the scheduler ignores it anyway).
                                 config.schedule = "manual".to_string();
+                                schedule_changed = true;
                             }
                             Err(e) => warn!("invalid schedule_config for '{}': {}", name, e),
                         }
@@ -3913,6 +3951,12 @@ impl PipeManager {
                     config.config.insert(k.clone(), v.clone());
                 }
             }
+        }
+
+        // A pending onboarding deferral belongs to the schedule that created
+        // it. If the user edits that schedule, let the new schedule take over.
+        if schedule_changed {
+            config.config.remove(FIRST_RUN_NOT_BEFORE_KEY);
         }
 
         let new_content = serialize_pipe(&config, &new_body)?;
@@ -4035,9 +4079,17 @@ impl PipeManager {
         source_md: &str,
         slug: &str,
         version: i64,
+        defer_first_run: bool,
     ) -> Result<String> {
         // Parse the source_md to get config + body
         let (mut config, body) = parse_frontmatter(source_md)?;
+
+        // Runtime scheduling state is device-owned; never accept it from the
+        // registry payload.
+        config.config.remove(FIRST_RUN_NOT_BEFORE_KEY);
+        if defer_first_run {
+            defer_first_interval_run(&mut config);
+        }
 
         // Set tracking fields
         config.source_slug = Some(slug.to_string());
@@ -4075,6 +4127,9 @@ impl PipeManager {
         }
 
         let (mut config, body) = parse_frontmatter(source_md)?;
+        // Runtime scheduling state is device-owned; only the local copy below
+        // may restore it during a store update.
+        config.config.remove(FIRST_RUN_NOT_BEFORE_KEY);
 
         // Preserve user's enabled state, schedule, preset, and connections from current config
         let current_path = dest_dir.join("pipe.md");
@@ -4090,6 +4145,11 @@ impl PipeManager {
                 config.preset = current_config.preset.clone();
                 config.schedule = current_config.schedule.clone();
                 config.connections = current_config.connections.clone();
+                if let Some(not_before) = current_config.config.get(FIRST_RUN_NOT_BEFORE_KEY) {
+                    config
+                        .config
+                        .insert(FIRST_RUN_NOT_BEFORE_KEY.to_string(), not_before.clone());
+                }
             }
         }
 
@@ -4455,6 +4515,9 @@ impl PipeManager {
                     }
 
                     let triggered_by_event = event_triggered.contains(name);
+                    if !triggered_by_event && first_run_is_deferred(config, Utc::now()) {
+                        continue;
+                    }
                     let last = last_run.get(name).copied().unwrap_or(DateTime::UNIX_EPOCH);
                     // Structured `schedule_config` is authoritative when set;
                     // otherwise fall back to the legacy `schedule` string.
@@ -5675,6 +5738,49 @@ const CRON_GRACE_WINDOW: chrono::Duration = chrono::Duration::minutes(5);
 /// Example: "every day at 7am" pipe, app starts at 7:12am → fires immediately.
 /// Example: app offline 3+ days, restarts → waits for next scheduled slot.
 const CRON_CATCHUP_WINDOW: chrono::Duration = chrono::Duration::hours(12);
+
+/// Device-local scheduling guard used when a UI enables a recurring pipe before
+/// it has enough source activity to produce a useful first result. Kept in the
+/// flattened config map so older clients can round-trip it safely; pipe sync
+/// strips and preserves it as a device-local runtime field.
+const FIRST_RUN_NOT_BEFORE_KEY: &str = "first_run_not_before";
+
+fn defer_first_interval_run(config: &mut PipeConfig) {
+    config.config.remove(FIRST_RUN_NOT_BEFORE_KEY);
+
+    let delay = if let Some(schedule) = &config.schedule_config {
+        match schedule.frequency {
+            Frequency::Minutes => chrono::Duration::minutes(schedule.interval.max(1) as i64),
+            Frequency::Hours => chrono::Duration::hours(schedule.interval.max(1) as i64),
+            // Calendar schedules already wait for their next real slot.
+            Frequency::Days | Frequency::Weeks | Frequency::Months => return,
+        }
+    } else {
+        let Some(ParsedSchedule::Interval(delay)) = parse_schedule(&config.schedule) else {
+            // Cron schedules already wait for their next real slot; manual and
+            // one-off schedules do not need an interval deferral.
+            return;
+        };
+        let Ok(delay) = chrono::Duration::from_std(delay) else {
+            return;
+        };
+        delay
+    };
+    let not_before = Utc::now() + delay;
+    config.config.insert(
+        FIRST_RUN_NOT_BEFORE_KEY.to_string(),
+        serde_json::Value::String(not_before.to_rfc3339()),
+    );
+}
+
+fn first_run_is_deferred(config: &PipeConfig, now: DateTime<Utc>) -> bool {
+    config
+        .config
+        .get(FIRST_RUN_NOT_BEFORE_KEY)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|not_before| now < not_before.with_timezone(&Utc))
+}
 
 /// Validate that a `schedule: at <iso>` timestamp isn't already stale.
 /// Returns `Ok(())` for any non-one-off schedule. Called from `install_pipe`
@@ -7977,6 +8083,163 @@ mod tests {
     fn test_should_run_interval_not_due() {
         let just_now = Utc::now();
         assert!(!should_run("every 1h", just_now));
+    }
+
+    #[test]
+    fn test_first_interval_run_deferral_waits_and_roundtrips() {
+        let content = "---\nschedule: every 4h\nenabled: true\n---\n\nPrompt";
+        let (mut config, body) = parse_frontmatter(content).unwrap();
+        let before = Utc::now();
+
+        defer_first_interval_run(&mut config);
+
+        let not_before = config
+            .config
+            .get(FIRST_RUN_NOT_BEFORE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .expect("deferral timestamp");
+        assert!(not_before >= before + chrono::Duration::hours(4));
+        assert!(not_before <= Utc::now() + chrono::Duration::hours(4));
+        assert!(first_run_is_deferred(&config, Utc::now()));
+        assert!(!first_run_is_deferred(
+            &config,
+            not_before + chrono::Duration::seconds(1)
+        ));
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        let (roundtripped, _) = parse_frontmatter(&serialized).unwrap();
+        assert!(first_run_is_deferred(&roundtripped, Utc::now()));
+    }
+
+    #[test]
+    fn test_first_run_deferral_only_applies_to_intervals() {
+        let once = format!(
+            "at {}",
+            (Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+        );
+        for schedule in ["manual", "0 7 * * *", once.as_str()] {
+            let content = format!(
+                "---\nschedule: {schedule}\nenabled: true\nfirst_run_not_before: 2099-01-01T00:00:00Z\n---\n\nPrompt"
+            );
+            let (mut config, _) = parse_frontmatter(&content).unwrap();
+
+            defer_first_interval_run(&mut config);
+
+            assert!(!config.config.contains_key(FIRST_RUN_NOT_BEFORE_KEY));
+        }
+    }
+
+    #[test]
+    fn test_first_run_deferral_supports_structured_intervals() {
+        let content = "---\nschedule: manual\nenabled: true\n---\n\nPrompt";
+        let (mut config, _) = parse_frontmatter(content).unwrap();
+        let mut schedule = cfg(Frequency::Hours);
+        schedule.interval = 3;
+        config.schedule_config = Some(schedule);
+        let before = Utc::now();
+
+        defer_first_interval_run(&mut config);
+
+        let not_before = config
+            .config
+            .get(FIRST_RUN_NOT_BEFORE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .expect("structured deferral timestamp");
+        assert!(not_before >= before + chrono::Duration::hours(3));
+        assert!(not_before <= Utc::now() + chrono::Duration::hours(3));
+    }
+
+    #[test]
+    fn test_malformed_first_run_deferral_fails_open() {
+        let content = "---\nschedule: every 4h\nenabled: true\nfirst_run_not_before: not-a-date\n---\n\nPrompt";
+        let (config, _) = parse_frontmatter(content).unwrap();
+
+        assert!(!first_run_is_deferred(&config, Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn test_store_install_applies_deferral_before_loading_pipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = PipeManager::new(tmp.path().to_path_buf(), HashMap::new(), None, 0);
+        let source = "---\nschedule: every 4h\nenabled: true\n---\n\nPrompt";
+
+        manager
+            .install_pipe_from_store(source, "deferred-pipe", 1, true)
+            .await
+            .unwrap();
+
+        let installed = std::fs::read_to_string(tmp.path().join("deferred-pipe/pipe.md")).unwrap();
+        let (config, _) = parse_frontmatter(&installed).unwrap();
+        assert!(config.enabled);
+        assert!(first_run_is_deferred(&config, Utc::now()));
+        let loaded = manager.get_pipe("deferred-pipe").await.unwrap();
+        assert!(first_run_is_deferred(&loaded.config, Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn test_enable_applies_deferral_to_loaded_pipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = PipeManager::new(tmp.path().to_path_buf(), HashMap::new(), None, 0);
+        let source = "---\nschedule: every 4h\nenabled: false\n---\n\nPrompt";
+
+        manager
+            .install_pipe_from_store(source, "existing-pipe", 1, false)
+            .await
+            .unwrap();
+        manager
+            .enable_pipe_with_deferred_first_run("existing-pipe", true, true)
+            .await
+            .unwrap();
+
+        let loaded = manager.get_pipe("existing-pipe").await.unwrap();
+        assert!(loaded.config.enabled);
+        assert!(first_run_is_deferred(&loaded.config, Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn test_store_input_cannot_inject_device_local_deferral() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = PipeManager::new(tmp.path().to_path_buf(), HashMap::new(), None, 0);
+        let source = "---\nschedule: every 4h\nenabled: true\nfirst_run_not_before: 2099-01-01T00:00:00Z\n---\n\nPrompt";
+
+        manager
+            .install_pipe_from_store(source, "registry-pipe", 1, false)
+            .await
+            .unwrap();
+
+        let loaded = manager.get_pipe("registry-pipe").await.unwrap();
+        assert!(!first_run_is_deferred(&loaded.config, Utc::now()));
+        assert!(!loaded.config.config.contains_key(FIRST_RUN_NOT_BEFORE_KEY));
+    }
+
+    #[tokio::test]
+    async fn test_schedule_edit_clears_pending_first_run_deferral() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = PipeManager::new(tmp.path().to_path_buf(), HashMap::new(), None, 0);
+        let source = "---\nschedule: every 4h\nenabled: true\n---\n\nPrompt";
+
+        manager
+            .install_pipe_from_store(source, "edited-pipe", 1, true)
+            .await
+            .unwrap();
+        manager
+            .update_config(
+                "edited-pipe",
+                HashMap::from([(
+                    "schedule".to_string(),
+                    serde_json::Value::String("every 1h".to_string()),
+                )]),
+            )
+            .await
+            .unwrap();
+
+        let loaded = manager.get_pipe("edited-pipe").await.unwrap();
+        assert_eq!(loaded.config.schedule, "every 1h");
+        assert!(!loaded.config.config.contains_key(FIRST_RUN_NOT_BEFORE_KEY));
     }
 
     // -- render_prompt_with_port -------------------------------------------

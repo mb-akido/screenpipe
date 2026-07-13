@@ -18,7 +18,7 @@ const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 export async function scheduleFirstRunNotification(): Promise<void> {
   try {
     const alreadyScheduled = await localforage.getItem<boolean>(
-      FIRST_RUN_SCHEDULED_KEY
+      FIRST_RUN_SCHEDULED_KEY,
     );
     if (alreadyScheduled) {
       console.log("first run notification already scheduled, skipping");
@@ -43,9 +43,7 @@ export async function checkFirstRunNotification(): Promise<void> {
     const alreadySent = await localforage.getItem<boolean>(FIRST_RUN_SENT_KEY);
     if (alreadySent) return;
 
-    const scheduledTime = await localforage.getItem<number>(
-      FIRST_RUN_TIME_KEY
-    );
+    const scheduledTime = await localforage.getItem<number>(FIRST_RUN_TIME_KEY);
     if (!scheduledTime) return;
 
     const elapsed = Date.now() - scheduledTime;
@@ -55,7 +53,7 @@ export async function checkFirstRunNotification(): Promise<void> {
       await showFirstRunNotification();
     } else {
       console.log(
-        `first run notification in ${Math.round(remaining / 60000)}m`
+        `first run notification in ${Math.round(remaining / 60000)}m`,
       );
       setTimeout(async () => {
         const sent = await localforage.getItem<boolean>(FIRST_RUN_SENT_KEY);
@@ -71,17 +69,19 @@ export async function checkFirstRunNotification(): Promise<void> {
 
 async function showFirstRunNotification(): Promise<void> {
   try {
-    await commands.showNotificationPanel(JSON.stringify({
+    await commands.showNotificationPanel(
+      JSON.stringify({
         id: "first-run-2h",
         type: "first_run",
-        title: "2 hours of memory ready",
-        body: "you have 2h of screen & audio recorded. explore your timeline or ask ai about your day.",
+        title: "ready to check what screenpipe captured?",
+        body: "if screenpipe has been running, explore your timeline or ask ai about your activity.",
         autoDismissMs: 20000,
         actions: [
           { label: "timeline", action: "open_timeline", primary: true },
           { label: "chat", action: "open_chat" },
         ],
-      }));
+      }),
+    );
     await localforage.setItem(FIRST_RUN_SENT_KEY, true);
     console.log("first run notification sent");
   } catch (e) {

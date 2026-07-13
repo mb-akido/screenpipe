@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use super::{
     load_local_overrides, parse_frontmatter, read_tombstones, save_local_overrides, serialize_pipe,
+    FIRST_RUN_NOT_BEFORE_KEY,
 };
 
 /// Current schema version for the sync manifest.
@@ -123,11 +124,15 @@ pub fn build_local_manifest(pipes_dir: &Path, machine_id: &str) -> PipeSyncManif
             }
         };
 
-        // Validate it parses
-        if parse_frontmatter(&raw_content).is_err() {
-            warn!("pipe sync: skipping {:?} — invalid frontmatter", pipe_md);
-            continue;
-        }
+        // Validate it parses and remove device-local runtime scheduling state
+        // before the raw pipe content leaves this machine.
+        let raw_content = match strip_first_run_not_before(&raw_content) {
+            Some(content) => content,
+            None => {
+                warn!("pipe sync: skipping {:?} — invalid frontmatter", pipe_md);
+                continue;
+            }
+        };
 
         // Use file mtime as last_modified
         let last_modified = std::fs::metadata(&pipe_md)
@@ -313,19 +318,28 @@ pub fn apply_manifest_to_disk(
                         // The enabled flag is device-local — syncing it across
                         // machines causes one device's toggle to flip others.
                         let local_overrides = load_local_overrides(pipes_dir);
-                        let local_enabled = if let Some(&ov) = local_overrides.get(name) {
-                            ov
-                        } else if pipe_md.exists() {
-                            // No explicit override — read current enabled from disk
+                        let local_config = if pipe_md.exists() {
                             std::fs::read_to_string(&pipe_md)
                                 .ok()
-                                .and_then(|c| parse_frontmatter(&c).ok())
-                                .map(|(cfg, _)| cfg.enabled)
-                                .unwrap_or(false)
+                                .and_then(|content| parse_frontmatter(&content).ok())
+                                .map(|(config, _)| config)
                         } else {
-                            false
+                            None
                         };
-                        override_enabled(&synced.raw_content, local_enabled)
+                        let local_enabled = local_overrides
+                            .get(name)
+                            .copied()
+                            .or_else(|| local_config.as_ref().map(|config| config.enabled))
+                            .unwrap_or(false);
+                        let first_run_not_before = local_config
+                            .as_ref()
+                            .and_then(|config| config.config.get(FIRST_RUN_NOT_BEFORE_KEY))
+                            .cloned();
+                        override_device_local_fields(
+                            &synced.raw_content,
+                            local_enabled,
+                            first_run_not_before,
+                        )
                     };
 
                     if let Err(e) = std::fs::write(&pipe_md, &content) {
@@ -379,9 +393,23 @@ fn force_disabled(raw_content: &str) -> String {
 /// Override the `enabled` field in pipe.md content with the given value.
 /// Used to apply device-local enabled overrides after sync.
 fn override_enabled(raw_content: &str, enabled: bool) -> String {
+    override_device_local_fields(raw_content, enabled, None)
+}
+
+fn override_device_local_fields(
+    raw_content: &str,
+    enabled: bool,
+    first_run_not_before: Option<serde_json::Value>,
+) -> String {
     match parse_frontmatter(raw_content) {
         Ok((mut config, body)) => {
             config.enabled = enabled;
+            config.config.remove(FIRST_RUN_NOT_BEFORE_KEY);
+            if let Some(not_before) = first_run_not_before {
+                config
+                    .config
+                    .insert(FIRST_RUN_NOT_BEFORE_KEY.to_string(), not_before);
+            }
             match serialize_pipe(&config, &body) {
                 Ok(content) => content,
                 Err(_) => raw_content.to_string(),
@@ -389,6 +417,14 @@ fn override_enabled(raw_content: &str, enabled: bool) -> String {
         }
         Err(_) => raw_content.to_string(),
     }
+}
+
+fn strip_first_run_not_before(raw_content: &str) -> Option<String> {
+    let (mut config, body) = parse_frontmatter(raw_content).ok()?;
+    if config.config.remove(FIRST_RUN_NOT_BEFORE_KEY).is_none() {
+        return Some(raw_content.to_string());
+    }
+    serialize_pipe(&config, &body).ok()
 }
 
 /// Parse an RFC 3339 timestamp, returning epoch on failure.
@@ -431,6 +467,21 @@ mod tests {
         assert!(manifest.pipes.contains_key("pipe-a"));
         assert!(manifest.pipes.contains_key("pipe-b"));
         assert_eq!(manifest.pipes["pipe-a"].last_modified_by, "machine-1");
+    }
+
+    #[test]
+    fn test_build_local_manifest_strips_device_local_first_run_deferral() {
+        let tmp = TempDir::new().unwrap();
+        let deferred = "---\nschedule: every 4h\nenabled: true\nfirst_run_not_before: 2099-01-01T00:00:00Z\n---\n\nPrompt\n";
+        make_pipe(tmp.path(), "deferred", deferred);
+
+        let manifest = build_local_manifest(tmp.path(), "machine-1");
+
+        assert!(!manifest.pipes["deferred"]
+            .raw_content
+            .contains(FIRST_RUN_NOT_BEFORE_KEY));
+        let local = fs::read_to_string(tmp.path().join("deferred/pipe.md")).unwrap();
+        assert!(local.contains(FIRST_RUN_NOT_BEFORE_KEY));
     }
 
     #[test]
@@ -524,6 +575,38 @@ mod tests {
 
         let written = fs::read_to_string(tmp.path().join("imported-pipe/pipe.md")).unwrap();
         assert!(written.contains("enabled: false"));
+    }
+
+    #[test]
+    fn test_apply_update_preserves_device_local_first_run_deferral() {
+        let tmp = TempDir::new().unwrap();
+        let local = "---\nschedule: every 4h\nenabled: true\nfirst_run_not_before: 2099-01-01T00:00:00Z\n---\n\nLocal\n";
+        make_pipe(tmp.path(), "shared", local);
+
+        let mut manifest = PipeSyncManifest::empty("m2");
+        manifest.pipes.insert(
+            "shared".into(),
+            SyncedPipe {
+                raw_content: PIPE_B.into(),
+                last_modified: Utc::now().to_rfc3339(),
+                last_modified_by: "m2".into(),
+            },
+        );
+
+        let actions = vec![PipeSyncAction::Updated("shared".into())];
+        let errors = apply_manifest_to_disk(&manifest, &actions, tmp.path());
+
+        assert!(errors.is_empty());
+        let written = fs::read_to_string(tmp.path().join("shared/pipe.md")).unwrap();
+        let (config, _) = parse_frontmatter(&written).unwrap();
+        assert_eq!(
+            config
+                .config
+                .get(FIRST_RUN_NOT_BEFORE_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some("2099-01-01T00:00:00Z")
+        );
+        assert!(written.contains("Do thing B"));
     }
 
     #[test]
