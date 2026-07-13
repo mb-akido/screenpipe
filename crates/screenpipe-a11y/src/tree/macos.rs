@@ -1021,22 +1021,22 @@ fn parse_xterm_bare_desc(val: &str) -> Option<String> {
 // 2026-07-10). `children()` stays separate (needed as elements for traversal)
 // and the parameterized line-bounds subsystem is left alone.
 //
-// cidre 0.13.1 does not wrap this API, so declare it here, mirroring cidre's
+// cidre does not wrap this API, so declare it here, mirroring cidre's
 // own extern pattern (see `AXUIElementGetPid` in cidre `src/ax/ui_element.rs`).
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C-unwind" {
     fn AXUIElementCopyMultipleAttributeValues(
         element: &ax::UiElement,
-        attributes: &cf::Array, // of cf::String attribute names
-        options: u32,           // 0 — parallel array, NOT stop-on-error (1)
-        values: *mut Option<arc::R<cf::Array>>,
+        attributes: &cf::ArrayOf<ax::Attr>,
+        options: u32, // 0 — parallel array, NOT stop-on-error (1)
+        values: *mut Option<arc::R<cf::ArrayOf<cf::Type>>>,
     ) -> ax::Error;
 }
 
 thread_local! {
     /// The six attribute names, in request order, built once per walker thread.
     /// The returned values array is parallel to this list (index-for-index).
-    static BATCH_ATTR_NAMES: arc::R<cf::Array> = {
+    static BATCH_ATTR_NAMES: arc::R<cf::ArrayOf<ax::Attr>> = {
         let names: [&ax::Attr; 6] = [
             ax::attr::role(),
             ax::attr::value(),
@@ -1045,14 +1045,14 @@ thread_local! {
             ax::attr::pos(),
             ax::attr::size(),
         ];
-        cf::Array::from_slice(&names).expect("batch attr name array")
+        cf::ArrayOf::from_slice(&names)
     };
 
     /// The automation-prop attribute names read by `fill_ax_props`, in request
     /// order. Batched separately from the primary six because `fill_ax_props`
     /// runs only for text-emitting nodes — folding these into the per-node batch
     /// would marshal 10 extra attrs for every container/skipped node too.
-    static FILL_ATTR_NAMES: arc::R<cf::Array> = {
+    static FILL_ATTR_NAMES: arc::R<cf::ArrayOf<ax::Attr>> = {
         let names: [&ax::Attr; 10] = [
             ax::attr::id(),               // 0 automation_id
             ax::attr::subrole(),          // 1 subrole
@@ -1065,7 +1065,7 @@ thread_local! {
             ax::attr::selected(),         // 8 is_selected (interactive)
             ax::attr::expanded(),         // 9 is_expanded (interactive)
         ];
-        cf::Array::from_slice(&names).expect("fill attr name array")
+        cf::ArrayOf::from_slice(&names)
     };
 }
 
@@ -1130,7 +1130,7 @@ fn batch_bool(entry: &cf::Type) -> Option<bool> {
 /// messaging timeout) — the same conditions under which the old `elem.role()`
 /// read would have failed and the node been skipped without walking children.
 fn read_node_attrs(elem: &ax::UiElement) -> Option<NodeAttrs> {
-    let mut out: Option<arc::R<cf::Array>> = None;
+    let mut out: Option<arc::R<cf::ArrayOf<cf::Type>>> = None;
     // options = 0: the returned array is parallel to the request, with
     // AXError placeholders for missing attrs. Never stop-on-error (1) — one
     // missing attr would kill the whole batch.
@@ -1162,8 +1162,8 @@ fn read_node_attrs(elem: &ax::UiElement) -> Option<NodeAttrs> {
 /// Returns the parallel values array (indices match `FILL_ATTR_NAMES`), or
 /// `None` on a failed batch — matching the old path, where every individual
 /// read would have failed and left each prop `None`.
-fn read_fill_attrs(elem: &ax::UiElement) -> Option<arc::R<cf::Array>> {
-    let mut out: Option<arc::R<cf::Array>> = None;
+fn read_fill_attrs(elem: &ax::UiElement) -> Option<arc::R<cf::ArrayOf<cf::Type>>> {
+    let mut out: Option<arc::R<cf::ArrayOf<cf::Type>>> = None;
     let status = FILL_ATTR_NAMES
         .with(|names| unsafe { AXUIElementCopyMultipleAttributeValues(elem, names, 0, &mut out) });
     if !status.is_ok() {
