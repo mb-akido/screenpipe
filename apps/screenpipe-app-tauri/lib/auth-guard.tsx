@@ -205,9 +205,19 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     }
   }, [loadUser, handleSessionExpired]);
 
+  // Settings updates are broadcast to every webview, and SettingsProvider may
+  // supply fresh callback identities on each render. Keep the scheduled work
+  // pointed at the latest verifier without tearing down and re-arming its
+  // initial five-second timer after every settings broadcast.
+  const verifyTokenRef = useRef(verifyToken);
+  verifyTokenRef.current = verifyToken;
+
   useEffect(() => {
-    const initial = setTimeout(verifyToken, 5000);
-    const interval = setInterval(verifyToken, CHECK_INTERVAL_MS);
+    const runVerifyToken = () => {
+      void verifyTokenRef.current();
+    };
+    const initial = setTimeout(runVerifyToken, 5000);
+    const interval = setInterval(runVerifyToken, CHECK_INTERVAL_MS);
 
     // Eagerly re-verify entitlement when the user returns to the app — e.g.
     // right after completing checkout in the browser — so a freshly-subscribed
@@ -221,7 +231,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
           typeof document !== "undefined" ? document.visibilityState : undefined
         )
       ) {
-        void verifyToken();
+        runVerifyToken();
       }
     };
     window.addEventListener("focus", onFocus);
@@ -232,7 +242,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [verifyToken]);
+  }, []);
 
   return <>{children}</>;
 }

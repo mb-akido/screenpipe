@@ -41,10 +41,10 @@ impl DatabaseManager {
         // handles retries with backoff.
         //
         // cache_size + mmap_size are tier-configurable and applied here; the
-        // WAL-safety pragmas that MUST be identical on every other pool over this
+        // WAL-safety pragmas that should be identical on every other pool over this
         // file (the secret-store pool in screenpipe-secrets) come from the single
         // source of truth `WAL_SAFETY_PRAGMAS` so the two pools can never diverge
-        // and race checkpoints on the shared -shm into code-11 corruption.
+        // in durability, locking, or checkpoint policy.
         let mut connect_options: SqliteConnectOptions = connection_string
             .parse::<SqliteConnectOptions>()?
             .busy_timeout(Duration::from_secs(5))
@@ -155,8 +155,8 @@ impl DatabaseManager {
 
         // Periodic WAL checkpoint so the write-ahead log can't grow unbounded
         // when passive auto-checkpoint is blocked by long-lived readers. An
-        // oversized WAL (observed at 650MB on a heavy 24/7 install) is the main
-        // driver of the WAL-index / `-shm` desync that corrupts the DB. Started
+        // oversized WAL (observed at 650MB on a heavy 24/7 install) degrades
+        // reads, increases disk use, and makes crash recovery slower. Started
         // here in `new()` — next to the integrity check — so EVERY caller gets
         // it: the desktop app runs the engine in-process and previously never
         // started it (only the standalone `screenpipe-engine` CLI did), so app

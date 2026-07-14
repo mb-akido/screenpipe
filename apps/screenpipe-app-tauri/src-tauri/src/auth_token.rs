@@ -82,7 +82,7 @@ fn write_encryption_key() -> anyhow::Result<Option<[u8; 32]>> {
 ///
 /// Uses [`SecretStore::open`] so every secret access in the process shares ONE
 /// long-lived, engine-matched pool instead of opening (and dropping) its own —
-/// the ad-hoc-pool churn that corrupts `db.sqlite` (#4263).
+/// avoiding ad-hoc pool churn and extra WAL/locking contention (#4263).
 async fn secret_store_at(data_dir: &Path, key: Option<[u8; 32]>) -> Option<SecretStore> {
     let db_path = data_dir.join("db.sqlite");
     SecretStore::open(&db_path.to_string_lossy(), key)
@@ -100,8 +100,35 @@ async fn store_token_at(
         .await
         .ok_or_else(|| anyhow::anyhow!("could not open secret store at {}", data_dir.display()))?;
     match token.filter(|t| !t.is_empty()) {
-        Some(t) => store.set(AUTH_TOKEN_KEY, t.as_bytes()).await,
-        None => store.delete(AUTH_TOKEN_KEY).await,
+        Some(t) => {
+            // `settingsStore.set()` can run for unrelated settings and several
+            // webviews can mirror the same in-memory session concurrently. Do
+            // not turn those broadcasts into a physical rewrite of the same
+            // encrypted row. Compare plaintext after SecretStore decryption so
+            // this also works when encryption uses a fresh random nonce for
+            // every write (ciphertext equality would never be stable).
+            //
+            // A read/decrypt failure deliberately falls through to `set`: the
+            // old behavior attempted the write, and a failed prior write must
+            // be retried rather than suppressed by any in-process cache.
+            if matches!(
+                store.get_with_encryption_state(AUTH_TOKEN_KEY).await,
+                Ok(Some((existing, is_encrypted)))
+                    if existing == t.as_bytes() && is_encrypted == key.is_some()
+            ) {
+                return Ok(());
+            }
+            store.set(AUTH_TOKEN_KEY, t.as_bytes()).await
+        }
+        None => {
+            // Repeated sign-out is also a no-op. As above, if the read fails we
+            // still attempt the delete so callers observe the same DB error and
+            // a later retry can complete the clear.
+            if matches!(store.get(AUTH_TOKEN_KEY).await, Ok(None)) {
+                return Ok(());
+            }
+            store.delete(AUTH_TOKEN_KEY).await
+        }
     }
 }
 
@@ -242,8 +269,7 @@ pub(crate) fn looks_like_jwt(s: &str) -> bool {
 /// existing desktop upgrade/logout specs can exercise persistence without a
 /// live identity provider. Production accepts JWT-shaped values only.
 pub(crate) fn is_cloud_session_token(value: &str) -> bool {
-    looks_like_jwt(value)
-        || (crate::config::is_e2e_mode() && value.starts_with("e2e-fake-token-"))
+    looks_like_jwt(value) || (crate::config::is_e2e_mode() && value.starts_with("e2e-fake-token-"))
 }
 
 /// Public account identifiers are not bearer credentials. Normalize every
@@ -709,6 +735,112 @@ mod tests {
         store_token_at(&dir, None, Some("jwt")).await.unwrap();
         store_token_at(&dir, None, None).await.unwrap();
         assert_eq!(read_back(&dir, None).await, None);
+
+        // A second clear must remain successful and keep the row absent. The
+        // idempotence branch above skips the DELETE entirely when get() says
+        // the desired empty state is already durable.
+        store_token_at(&dir, None, None).await.unwrap();
+        assert_eq!(read_back(&dir, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn repeated_same_token_does_not_advance_updated_at() {
+        let dir = unique_dir("same_token_no_rewrite");
+        store_token_at(&dir, None, Some(JWT)).await.unwrap();
+
+        let store = secret_store_at(&dir, None).await.unwrap();
+        let first_updated_at = store
+            .get_updated_at(AUTH_TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("token row should exist after first write");
+
+        // SQLite's strftime timestamp has millisecond precision. Leave a wide
+        // enough gap that an actual UPSERT would necessarily change it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        store_token_at(&dir, None, Some(JWT)).await.unwrap();
+        let same_updated_at = store
+            .get_updated_at(AUTH_TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("token row should still exist");
+        assert_eq!(
+            same_updated_at, first_updated_at,
+            "persisting identical plaintext must not rewrite cloud.auth_token"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        store_token_at(&dir, None, Some(JWT_ALT)).await.unwrap();
+        let changed_updated_at = store
+            .get_updated_at(AUTH_TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("changed token row should exist");
+        assert_ne!(
+            changed_updated_at, first_updated_at,
+            "a changed plaintext token must still be persisted"
+        );
+        assert_eq!(read_back(&dir, None).await, Some(JWT_ALT.to_string()));
+    }
+
+    #[tokio::test]
+    async fn same_plaintext_is_rewritten_when_encryption_becomes_available() {
+        let dir = unique_dir("same_token_encrypt_upgrade");
+        store_token_at(&dir, None, Some(JWT)).await.unwrap();
+
+        let plaintext_store = secret_store_at(&dir, None).await.unwrap();
+        let first_updated_at = plaintext_store
+            .get_updated_at(AUTH_TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("plaintext token row should exist");
+        let (_, initially_encrypted) = plaintext_store
+            .get_with_encryption_state(AUTH_TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("plaintext token should be readable");
+        assert!(!initially_encrypted);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let key = [9u8; 32];
+        store_token_at(&dir, Some(key), Some(JWT)).await.unwrap();
+
+        let encrypted_store = secret_store_at(&dir, Some(key)).await.unwrap();
+        let changed_updated_at = encrypted_store
+            .get_updated_at(AUTH_TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("encrypted token row should exist");
+        assert_ne!(changed_updated_at, first_updated_at);
+        let (value, now_encrypted) = encrypted_store
+            .get_with_encryption_state(AUTH_TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("encrypted token should be readable");
+        assert_eq!(value, JWT.as_bytes());
+        assert!(now_encrypted, "same plaintext must be upgraded at rest");
+
+        let raw = std::fs::read(dir.join("db.sqlite")).unwrap();
+        assert!(
+            !raw.windows(JWT.len())
+                .any(|window| window == JWT.as_bytes()),
+            "upgraded token must not remain plaintext in db.sqlite"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_token_write_is_retried_after_storage_recovers() {
+        let dir = unique_dir("retry_failed_write");
+
+        // Poison the DB path so the first persistence attempt cannot open the
+        // SecretStore. No process cache may turn the later identical request
+        // into a false success.
+        std::fs::create_dir(dir.join("db.sqlite")).unwrap();
+        assert!(store_token_at(&dir, None, Some(JWT)).await.is_err());
+
+        std::fs::remove_dir_all(dir.join("db.sqlite")).unwrap();
+        store_token_at(&dir, None, Some(JWT)).await.unwrap();
+        assert_eq!(read_back(&dir, None).await, Some(JWT.to_string()));
     }
 
     #[tokio::test]

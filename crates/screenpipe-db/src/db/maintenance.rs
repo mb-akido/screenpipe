@@ -1318,9 +1318,8 @@ impl DatabaseManager {
         let restore_steps = [
             "PRAGMA synchronous = NORMAL;",
             "PRAGMA journal_mode = WAL;",
-            // 0 = no inline auto-checkpoint (matches WAL_SAFETY_PRAGMAS); the
-            // maintenance task owns checkpointing. Must NOT re-enable inline
-            // auto-checkpoint here or a repaired DB re-opens the corruption path.
+            // 0 = no inline auto-checkpoint (matches WAL_SAFETY_PRAGMAS); keep
+            // checkpoint cadence and escalation owned by the maintenance task.
             "PRAGMA wal_autocheckpoint = 0;",
             "PRAGMA cache_size = -2000;", // Back to 2MB cache
             "PRAGMA locking_mode = NORMAL;",
@@ -1358,8 +1357,7 @@ impl DatabaseManager {
     /// Spawn the background task that owns ALL WAL checkpointing.
     ///
     /// Since `wal_autocheckpoint = 0` (see [`WAL_SAFETY_PRAGMAS`]) no committing
-    /// connection ever checkpoints inline — that under-load path could copy a
-    /// desynced `-shm` frame onto the wrong main-DB page. This task is therefore
+    /// connection ever checkpoints inline. This task is therefore
     /// the SOLE checkpointer, and it must (a) run often enough to keep the WAL
     /// small and (b) never let the WAL grow without bound when readers keep a
     /// plain `TRUNCATE` busy. It does a normal `TRUNCATE` each tick, and if the
@@ -1367,7 +1365,7 @@ impl DatabaseManager {
     /// serialized exclusive checkpoint (hold the single write permit so writers
     /// queue, bump `busy_timeout` to wait out short-lived readers) — the same
     /// reliable mechanism `compact()` uses. That escalation is the ceiling that
-    /// keeps `autocheckpoint = 0` from trading the corruption cliff for an
+    /// keeps `autocheckpoint = 0` from trading lower checkpoint contention for an
     /// unbounded-WAL cliff on the heaviest install.
     pub fn start_wal_maintenance(&self) {
         let pool = self.pool.clone();

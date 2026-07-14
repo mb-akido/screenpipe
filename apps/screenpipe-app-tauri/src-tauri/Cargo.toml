@@ -319,6 +319,9 @@ ignored = ["tauri-utils", "screenpipe-redact", "thiserror", "screenpipe-sync", "
 # Pinned by commit (not branch) for reproducible builds; drop once
 # upstream tauri-apps/muda#361 merges and ships in a released muda.
 muda = { git = "https://github.com/divanshu-go/muda", rev = "327f3f8198b0ecdc3d58d7be85dfb83b2fa0d05d" }
+# This manifest is a standalone workspace, so repeat the root workspace's
+# patched SQLite source selection here.
+libsqlite3-sys = { path = "../../../vendor/libsqlite3-sys" }
 
 [profile.release]
 codegen-units = 1

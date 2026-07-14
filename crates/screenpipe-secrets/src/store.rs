@@ -21,12 +21,11 @@ use crate::telemetry::ReportSecretStoreSqliteIntegrity;
 /// drop it — cloud-token persistence on each settings save, the OAuth refresh
 /// scheduler, keychain opt-in/out, every `oauth_connect`. Repeatedly opening and
 /// closing pools to the same WAL database churns the shared WAL-index (`-shm`)
-/// and, configured with sqlx defaults that don't match the engine's
-/// `DatabaseManager` pool, races the engine's writes and checkpoints. That is
-/// the documented path to "database disk image is malformed" (and the milder
-/// "database is locked" callers already hit). Sharing ONE long-lived,
-/// correctly-configured pool per db file removes both the churn and the pragma
-/// mismatch — see [`SecretStore::open`].
+/// and amplifies lock contention with the engine's `DatabaseManager` pool.
+/// Sharing ONE long-lived, correctly-configured pool per db file removes that
+/// churn and keeps operational pragmas consistent — see [`SecretStore::open`].
+/// The known upstream on-disk WAL-reset corruption race is fixed by the
+/// repository's patched bundled SQLite (3.51.3+).
 static SECRET_POOLS: OnceLock<AsyncMutex<HashMap<String, SqlitePool>>> = OnceLock::new();
 
 fn secret_pools() -> &'static AsyncMutex<HashMap<String, SqlitePool>> {
@@ -35,18 +34,18 @@ fn secret_pools() -> &'static AsyncMutex<HashMap<String, SqlitePool>> {
 
 /// Connection options for a secret-store pool. This pool is a SECOND long-lived
 /// pool over the same `db.sqlite` as the engine `DatabaseManager` pools (same
-/// process in the desktop app), so its WAL-affecting pragmas MUST be identical to
-/// the engine's, or the two pools race checkpoints on the shared `-shm` WAL-index
-/// and corrupt the file ("database disk image is malformed", code 11).
+/// process in the desktop app), so its WAL-affecting pragmas stay identical to
+/// the engine's. That avoids competing auto-checkpoint policies and makes lock
+/// and durability behavior predictable across every connection.
 ///
 /// We take those from the single source of truth
 /// [`screenpipe_config::WAL_SAFETY_PRAGMAS`] precisely so this list can never
-/// again drift from the engine pool — the original bug here was an *incomplete*
+/// again drift from the engine pool — the earlier mismatch here was an *incomplete*
 /// "safe subset" that set journal mode + synchronous but silently inherited
 /// SQLite's default `wal_autocheckpoint=1000` while the engine used `4000`.
 ///
-/// `mmap_size=0` matches the engine (memory-mapped writes are a corruption source,
-/// disabled fleet-wide — never re-enable on a side pool). `busy_timeout` makes a
+/// `mmap_size=0` matches the engine and avoids divergent access modes between
+/// pools. `busy_timeout` makes a
 /// writer WAIT for the lock instead of failing with "database is locked".
 /// `create_if_missing` preserves the old `?mode=rwc` behavior exactly.
 fn secret_connect_options(db_path: &str) -> SqliteConnectOptions {
@@ -89,16 +88,14 @@ pub async fn shared_secret_pool(db_path: &str) -> Result<SqlitePool> {
 /// Close every cached secret-store pool and clear the cache; pools recreate
 /// lazily on the next [`shared_secret_pool`] call.
 ///
-/// This is the other half of DB-wedge recovery. A `code 522`
-/// (`SQLITE_IOERR_SHORT_READ`) / "disk image is malformed" wedge — typically a
-/// WAL-index (`-shm`) desync after macOS sleep/wake — is only cleared by
-/// rebuilding `-shm`, and SQLite rebuilds it only once the LAST connection to
-/// the db file closes. When recording restarts, the engine's `DatabaseManager`
-/// read/write pools are rebuilt — but this process-wide secret pool keeps a warm
-/// connection alive (`min_connections=1`, no idle/lifetime reaping), and with it
-/// the `-shm` mapping. So an in-process restart alone can't clear the wedge: the
-/// recovery must close these pools too, or recording stays down until a full
-/// process exit (quit + relaunch).
+/// This is the other half of DB-wedge recovery. A transient I/O or WAL-index
+/// error can remain attached to a live SQLite connection until the last handle
+/// closes. When recording restarts, the engine's `DatabaseManager` read/write
+/// pools are rebuilt — but this process-wide secret pool otherwise keeps a warm
+/// connection alive (`min_connections=1`, no idle/lifetime reaping), along with
+/// its SQLite connection state. Closing it lets an in-process restart build all
+/// pools afresh. This resets transient connection state; it does not claim to
+/// repair an already-corrupt main database file.
 pub async fn close_all_secret_pools() {
     let mut cache = secret_pools().lock().await;
     let count = cache.len();
@@ -140,8 +137,8 @@ impl SecretStore {
     /// process-wide shared pool (see [`shared_secret_pool`]).
     ///
     /// Prefer this everywhere over `SqlitePool::connect(db.sqlite)` +
-    /// [`SecretStore::new`]: a fresh pool per call is the WAL-index churn that
-    /// corrupts `db.sqlite`. Engine code that already holds the managed
+    /// [`SecretStore::new`]: a fresh pool per call adds avoidable WAL-index and
+    /// locking churn. Engine code that already holds the managed
     /// `DatabaseManager` pool should keep passing it to [`SecretStore::new`] —
     /// this is for the standalone app/CLI callers that have no such handle and
     /// otherwise each spin up their own pool.
@@ -183,8 +180,10 @@ impl SecretStore {
         Ok(())
     }
 
-    /// Retrieve and decrypt a secret value. Returns None if the key doesn't exist.
-    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    /// Retrieve and decrypt a secret value together with its at-rest encryption
+    /// state. The boolean is `true` when the row has a non-zero encryption nonce
+    /// and `false` for the legacy/base64 plaintext representation.
+    pub async fn get_with_encryption_state(&self, key: &str) -> Result<Option<(Vec<u8>, bool)>> {
         let row: Option<(Vec<u8>, Vec<u8>)> =
             sqlx::query_as("SELECT value, nonce FROM secrets WHERE key = ?")
                 .bind(key)
@@ -218,9 +217,17 @@ impl SecretStore {
                         key
                     );
                 };
-                Ok(Some(plaintext))
+                Ok(Some((plaintext, !is_plaintext)))
             }
         }
+    }
+
+    /// Retrieve and decrypt a secret value. Returns None if the key doesn't exist.
+    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_with_encryption_state(key)
+            .await?
+            .map(|(plaintext, _is_encrypted)| plaintext))
     }
 
     /// Get the updated_at timestamp for a secret. Returns None if key doesn't exist.
@@ -662,9 +669,9 @@ mod tests {
     /// The core regression test. Hammer the db the way production does — a
     /// managed-style pool writing continuously and TRUNCATE-checkpointing the
     /// WAL, WHILE many concurrent secret writes go through the shared pool — and
-    /// prove the db stays integrity-clean and every secret round-trips. This is
-    /// the exact concurrency (engine pool + checkpoints + secret writes) that
-    /// corrupted db.sqlite when secrets used ad-hoc pools (#4263).
+    /// prove the db stays integrity-clean and every secret round-trips. This
+    /// exercises the production concurrency shape (engine pool + checkpoints +
+    /// secret writes) while guarding the shared-pool behavior from #4263.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn shared_pool_survives_concurrent_writes_and_checkpoints() {

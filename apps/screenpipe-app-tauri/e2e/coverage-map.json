@@ -723,6 +723,16 @@
       "notes": "Enterprise license prompt handles invalid keys, full-seat errors, and retry success after seats are added without staying stuck in validating state."
     },
     {
+      "spec": "zz-auth-secret-write-loop.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["real-ui-e2e", "settings", "local-api"],
+      "features": ["auth-session", "secret-store"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "synthetic",
+      "notes": "Credential-free fake-token login verifies an unrelated settings broadcast neither restarts /api/user polling nor advances the real cloud.auth_token secrets.updated_at timestamp, while a changed token still updates the runtime cache and persisted row."
+    },
+    {
       "spec": "zz-logout-resurrect.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["real-ui-e2e", "settings"],
