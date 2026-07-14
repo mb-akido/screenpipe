@@ -28,7 +28,7 @@ this works for all API key, webhook, and custom credential fields.
 
 | pattern | examples | notes |
 | --- | --- | --- |
-| OAuth | Outlook, Google Calendar, Google Docs, Notion, Jira, Microsoft 365, Teams, Vercel, Supabase, Zoom, HubSpot | best user experience; tokens are stored locally; no API key needed |
+| OAuth | Gmail, Outlook, Google Calendar, Google Docs, Notion, Jira, Microsoft 365, Teams, Vercel, Supabase, Zoom, HubSpot | best user experience; tokens are stored locally; no API key needed |
 | API key | Linear, PostHog, Sentry, Stripe, Toggl, Pipedrive, Glean, Mochi | simple and reliable; help links guide you to API settings pages; rotate keys if a device is lost |
 | webhook URL | n8n, Make, Zapier, Pushover, ntfy, Resend | best for one-way notifications or workflow triggers |
 | local path | Obsidian, Logseq | keeps notes local |
@@ -52,7 +52,7 @@ The app registry currently includes these connection IDs:
 
 | category | integrations |
 | --- | --- |
-| communication | Slack, Discord, Email (SMTP), Outlook, Telegram, WhatsApp, Microsoft Teams, Zoom |
+| communication | Gmail, Slack, Discord, Email (SMTP), Outlook, Telegram, WhatsApp, Microsoft Teams, Zoom |
 | productivity | Notion, Obsidian, Google Calendar, Google Docs, Microsoft 365, Logseq, Workflowy, Airtable, Confluence, Odoo, Mochi, Hermes |
 | project management | Linear, Jira, Asana, Monday.com, Trello, ClickUp, Todoist, Cal.com, Calendly |
 | CRM and support | HubSpot, Salesforce, Pipedrive, Intercom, Zendesk, Bitrix24 |
@@ -72,6 +72,7 @@ use named instances when you have more than one account for the same service:
 | --- | --- |
 | `notion:work` and `notion:personal` | separate work and personal workspaces |
 | `google-calendar:work` and `google-calendar:personal` | separate calendars |
+| `gmail:work` and `gmail:personal` | separate Gmail inboxes |
 | `hubspot:prod` and `hubspot:sandbox` | separate CRM portals |
 | `posthog:screenpipe` and `posthog:bench` | separate analytics projects |
 
@@ -81,6 +82,7 @@ after connecting, run a tiny request before relying on a pipe:
 
 ```bash
 curl "http://localhost:3030/connections/google-calendar/events?hours_ahead=8"
+curl "http://localhost:3030/connections/gmail/proxy/users/me/messages?maxResults=1"
 curl "http://localhost:3030/connections/notion/proxy/v1/users/me"
 curl "http://localhost:3030/connections/hubspot/proxy/crm/v3/objects/contacts?limit=1"
 curl "http://localhost:3030/connections/linear/proxy/graphql"
@@ -112,6 +114,7 @@ if OAuth fails:
 | better speaker names | Google Calendar |
 | CRM follow-up after calls | HubSpot, Salesforce, Pipedrive, Notion |
 | daily notes and highlights | Obsidian, Logseq, Google Docs, Readwise |
+| email search and sending | Gmail, Outlook |
 | product analytics context | PostHog, Sentry, GitHub, Vercel |
 | finance or billing workflows | Stripe, Brex, QuickBooks |
 | meeting import | Zoom, Fireflies.ai, Granola, Otter.ai |
