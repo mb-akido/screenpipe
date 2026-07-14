@@ -173,7 +173,10 @@ export default function GeneralSettings() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await commands.setEnhancedAiSuggestions(false, "");
+        const res = await commands.setEnhancedAiSuggestions(
+          false,
+          settings?.user?.token || "",
+        );
         if (res.status === "error") throw new Error(res.error);
         if (!cancelled) await updateSettings({ enhancedAI: false });
       } catch (e) {
@@ -183,7 +186,12 @@ export default function GeneralSettings() {
     return () => {
       cancelled = true;
     };
-  }, [hasCloudMediaAccess, settings?.enhancedAI, updateSettings]);
+  }, [
+    hasCloudMediaAccess,
+    settings?.enhancedAI,
+    settings?.user?.token,
+    updateSettings,
+  ]);
 
   const handleEnhancedAIChange = async (checked: boolean) => {
     if (checked && !hasCloudMediaAccess) {
@@ -195,7 +203,7 @@ export default function GeneralSettings() {
       return;
     }
 
-    const token = checked ? settings?.user?.token || "" : "";
+    const token = settings?.user?.token || "";
     try {
       const res = await commands.setEnhancedAiSuggestions(checked, token);
       if (res.status === "error") throw new Error(res.error);

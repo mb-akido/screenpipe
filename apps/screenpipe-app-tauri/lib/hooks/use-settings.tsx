@@ -826,6 +826,28 @@ export async function setSettingsStripped(store: Store, settings: Settings) {
 	await store.set("settings", toPersist);
 }
 
+export async function restoreEnhancedAiAfterCloudIdentityChange(
+	wasEnabled: boolean,
+	token: string,
+	disablePreference: () => Promise<void>,
+): Promise<void> {
+	if (!wasEnabled) return;
+	const result = await commands.setEnhancedAiSuggestions(true, token);
+	if (result.status !== "error") return;
+	// A new free/cancelled account must not keep a checked preference that the
+	// native scheduler cannot honor. A CAS mismatch means an even newer auth
+	// transition already won, so leave its preference to that transition.
+	if (result.error === "cloud_auth_identity_changed") return;
+	if (
+		result.error.includes("Screenpipe Business") ||
+		result.error.includes("Sign in")
+	) {
+		await disablePreference();
+		return;
+	}
+	throw new Error(result.error);
+}
+
 /**
  * #3943: the cloud auth token no longer lives in store.bin (it's in the
  * encrypted secret store). Neither `store.get("settings")` nor the cross-window
@@ -1584,9 +1606,21 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				return;
 			}
 
+			const enhancedAiWasEnabled = Boolean(settingsRef.current.enhancedAI);
 			// Only broadcast/persist the profile after native identity and Pi
 			// sessions have rotated, so listeners cannot rehydrate the prior token.
 			await updateSettings({ user: userData });
+			try {
+				await restoreEnhancedAiAfterCloudIdentityChange(
+					enhancedAiWasEnabled,
+					token,
+					() => updateSettings({ enhancedAI: false }),
+				);
+			} catch (e) {
+				// The account itself is already committed and usable. Surface this
+				// optional background-feature failure without rolling auth back.
+				console.warn("failed to restore Enhanced AI after auth change:", e);
+			}
 		} catch (err) {
 			console.error("failed to load user:", err instanceof Error ? err.message : err);
 			throw err;

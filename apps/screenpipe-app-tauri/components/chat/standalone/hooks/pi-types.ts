@@ -119,7 +119,7 @@ type PiSessionRefs = {
   piActiveStopRequestedRef: React.MutableRefObject<boolean>;
   piContentBlocksRef: React.MutableRefObject<ContentBlock[]>;
   piCrashCountRef: React.MutableRefObject<number>;
-  piFirstCallRetried?: React.MutableRefObject<boolean>;
+  piFirstCallRetried?: React.MutableRefObject<Set<string>>;
   piIntentionallyStoppedPidsRef?: React.MutableRefObject<Set<number>>;
   piLastCrashRef?: React.MutableRefObject<number>;
   piLastErrorRef?: React.MutableRefObject<string | null>;

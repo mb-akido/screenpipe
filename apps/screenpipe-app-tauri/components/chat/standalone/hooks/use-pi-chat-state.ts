@@ -36,7 +36,11 @@ export function usePiChatState() {
   // Invalidates delayed work whenever the foreground account/conversation
   // boundary changes. Late completions may not mutate the next session's locks.
   const piAsyncOperationGenerationRef = useRef(0);
-  const piFirstCallRetried = useRef(false);
+  // Foreground turns that already consumed the one-shot workaround for Pi's
+  // first-RPC crash. The event hook bounds this insertion-ordered set so later
+  // conversation/provider turns can recover without reopening retries for a
+  // recently consumed assistant turn after a crash or rerender.
+  const piFirstCallRetried = useRef<Set<string>>(new Set());
   // Per-turn 429 auto-retry budget; reset on each new user send + on success.
   const piRateLimitRetries = useRef(0);
   const sessionActivityLastEmitAtRef = useRef<Record<string, number>>({});

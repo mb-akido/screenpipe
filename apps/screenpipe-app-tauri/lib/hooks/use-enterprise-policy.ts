@@ -64,9 +64,10 @@ const ENTERPRISE_DEFAULT_HIDDEN = ["referral"];
 // Re-fetch policy every 5 minutes so admin changes propagate without app restart
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
 const LOCAL_POLICY_COMMAND_TIMEOUT_MS = 8_000;
-const ENGINE_RESTART_COMMAND_TIMEOUT_MS = 12_000;
+export const ENTERPRISE_POLICY_APPLICATION_TIMEOUT_MS = 60_000;
 
 const CACHE_KEY = "enterprise-policy-cache";
+const CACHE_AUTHORIZATION_FINGERPRINT_KEY = "__authorizationFingerprint";
 const SEAT_ACCEPTANCE_KEY = "enterprise-seat-acceptance-v1";
 const OFFLINE_SEAT_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
 export const E2E_ENTERPRISE_POLICY_KEY = "screenpipe_e2e_enterprise_policy";
@@ -425,10 +426,18 @@ async function applyAppUpdatePolicy(
  * The enforced map is persisted as metadata so every local settings write
  * reasserts policy, including controls that do not render a dedicated lock UI.
  */
-let managedSettingsRestartInFlight = false;
+type ManagedSettingsRestartAttempt = {
+  promise: Promise<void>;
+  isActive: () => boolean;
+};
+
+let managedSettingsRestartInFlight: ManagedSettingsRestartAttempt | null =
+  null;
+let managedSettingsRestartRequired = false;
 
 async function applyManagedDeviceSettings(
   lockedSettings: Record<string, unknown>,
+  isCurrent: () => boolean = () => true,
 ): Promise<void> {
   const store = await getStore();
   const settings = (await store.get<Record<string, unknown>>("settings")) || {};
@@ -443,48 +452,81 @@ async function applyManagedDeviceSettings(
     JSON.stringify(settings.enterpriseManagedSettings || {}) !==
     JSON.stringify(managedValues);
 
-  if (!engineChanged && !liveChanged && !managedValuesChanged) return;
-
-  await store.set("settings", {
-    ...settings,
-    ...engineUpdates,
-    ...liveUpdates,
-    enterpriseManagedSettings: managedValues,
-  });
-  await store.save();
-  console.log(
-    `[enterprise] managed settings applied: ${Object.entries({
+  if (engineChanged || liveChanged || managedValuesChanged) {
+    await store.set("settings", {
+      ...settings,
       ...engineUpdates,
       ...liveUpdates,
-    })
-      .map(([k, v]) => `${k}=${Array.isArray(v) ? JSON.stringify(v) : v}`)
-      .join(
-        ", ",
-      )}${engineChanged ? " — restarting engine" : " (no restart needed)"}`,
-  );
+      enterpriseManagedSettings: managedValues,
+    });
+    await store.save();
+    console.log(
+      `[enterprise] managed settings applied: ${Object.entries({
+        ...engineUpdates,
+        ...liveUpdates,
+      })
+        .map(([k, v]) => `${k}=${Array.isArray(v) ? JSON.stringify(v) : v}`)
+        .join(
+          ", ",
+        )}${engineChanged ? " — restarting engine" : " (no restart needed)"}`,
+    );
+  }
+
+  if (engineChanged) managedSettingsRestartRequired = true;
 
   // Live-only change (e.g. analytics) needs no restart.
-  if (!engineChanged) return;
+  if (!managedSettingsRestartRequired || !isCurrent()) return;
 
   // Restart so the forced values take effect without waiting for the employee to
-  // restart manually. Guarded so overlapping policy polls don't stack restarts;
-  // steady-state polls are no-ops because the store already matches the policy.
-  if (managedSettingsRestartInFlight) return;
-  managedSettingsRestartInFlight = true;
-  try {
-    await withTimeout(
-      "enterprise input capture stopScreenpipe",
-      commands.stopScreenpipe(),
-      ENGINE_RESTART_COMMAND_TIMEOUT_MS,
-    );
+  // restart manually. A current attempt is shared by overlapping polls. Once its
+  // owning policy times out or becomes stale, a replacement may start a new
+  // attempt instead of inheriting the wedged promise.
+  const existingRestart = managedSettingsRestartInFlight;
+  if (existingRestart?.isActive()) {
+    await existingRestart.promise;
+    if (!managedSettingsRestartRequired || !isCurrent()) return;
+  }
+
+  if (!isCurrent()) return;
+  const restart = (async () => {
+    try {
+      await commands.stopScreenpipe();
+    } catch (error) {
+      managedSettingsRestartRequired = true;
+      throw error;
+    }
+    if (!isCurrent()) {
+      // The stale stop may have landed after a newer policy restarted the
+      // recorder. Keep the dirty bit set so late-settlement reconciliation
+      // performs one authoritative restart for the newest policy.
+      managedSettingsRestartRequired = true;
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    await withTimeout(
-      "enterprise input capture spawnScreenpipe",
-      commands.spawnScreenpipe(null),
-      ENGINE_RESTART_COMMAND_TIMEOUT_MS,
-    );
+    if (!isCurrent()) {
+      managedSettingsRestartRequired = true;
+      return;
+    }
+    try {
+      await commands.spawnScreenpipe(null);
+    } catch (error) {
+      managedSettingsRestartRequired = true;
+      throw error;
+    }
+    if (!isCurrent()) {
+      managedSettingsRestartRequired = true;
+      return;
+    }
+    managedSettingsRestartRequired = false;
+  })();
+  const attempt = { promise: restart, isActive: isCurrent };
+  managedSettingsRestartInFlight = attempt;
+  try {
+    await restart;
   } finally {
-    managedSettingsRestartInFlight = false;
+    if (managedSettingsRestartInFlight === attempt) {
+      managedSettingsRestartInFlight = null;
+    }
   }
 }
 
@@ -624,34 +666,62 @@ async function sendHeartbeat(
         error: "stale enterprise license operation",
       };
     }
-    recordSeatAcceptance(licenseKey, deviceId);
     return { ok: true };
   } catch (e) {
     return { ok: false, reason: "network_error", error: String(e) };
   }
 }
 
-function cachePolicy(policy: EnterprisePolicy) {
+type CachedEnterprisePolicy = {
+  policy: EnterprisePolicy;
+  authorizationFingerprint: string | null;
+};
+
+function cachePolicy(
+  policy: EnterprisePolicy,
+  authorizationFingerprint: string,
+): boolean {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(policy));
-  } catch {}
+    localStorage.setItem(
+      CACHE_KEY,
+      JSON.stringify({
+        ...policy,
+        [CACHE_AUTHORIZATION_FINGERPRINT_KEY]: authorizationFingerprint,
+      }),
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function loadCachedPolicy(): EnterprisePolicy | null {
+function loadCachedPolicyRecord(): CachedEnterprisePolicy | null {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
     if (raw) {
-      const policy = JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      const authorizationFingerprint =
+        typeof parsed[CACHE_AUTHORIZATION_FINGERPRINT_KEY] === "string"
+          ? parsed[CACHE_AUTHORIZATION_FINGERPRINT_KEY]
+          : null;
+      const { [CACHE_AUTHORIZATION_FINGERPRINT_KEY]: _, ...policy } = parsed;
       return {
-        ...EMPTY_POLICY,
-        ...policy,
-        appUpdatePolicy: normalizeEnterpriseAppUpdatePolicy(
-          policy.appUpdatePolicy,
-        ),
+        policy: {
+          ...EMPTY_POLICY,
+          ...policy,
+          appUpdatePolicy: normalizeEnterpriseAppUpdatePolicy(
+            policy.appUpdatePolicy,
+          ),
+        },
+        authorizationFingerprint,
       };
     }
   } catch {}
   return null;
+}
+
+function loadCachedPolicy(): EnterprisePolicy | null {
+  return loadCachedPolicyRecord()?.policy ?? null;
 }
 
 function clearCachedEnterpriseAuthorization(): void {
@@ -665,11 +735,18 @@ async function loadAcceptedOfflinePolicy(
   licenseKey: string,
   isCurrent: () => boolean = () => true,
 ): Promise<EnterprisePolicy | null> {
-  const cached = loadCachedPolicy();
+  const cached = loadCachedPolicyRecord();
   if (!cached) return null;
   const deviceId = await getEnterpriseDeviceId();
   if (!deviceId || !isCurrent()) return null;
-  return hasRecentSeatAcceptance(licenseKey, deviceId) ? cached : null;
+  const expectedFingerprint = seatAcceptanceFingerprint(licenseKey, deviceId);
+  if (cached.authorizationFingerprint !== expectedFingerprint) {
+    // Legacy/unbound or cross-license caches may still be useful as provisional
+    // UI state, but can never authorize offline recording.
+    clearCachedEnterpriseAuthorization();
+    return null;
+  }
+  return hasRecentSeatAcceptance(licenseKey, deviceId) ? cached.policy : null;
 }
 
 type PreparedEnterprisePolicy = {
@@ -686,7 +763,12 @@ type FetchResult =
     }
   | {
       ok: false;
-      reason: "invalid_key" | "seat_limit" | "network_error" | "stale";
+      reason:
+        | "invalid_key"
+        | "seat_limit"
+        | "network_error"
+        | "local_apply_error"
+        | "stale";
     };
 
 export type EnterprisePolicyStatus =
@@ -701,8 +783,229 @@ export type EnterprisePolicyStatus =
 interface FetchPolicyOptions {
   applyLocalPolicy?: boolean;
   seatAlreadyVerified?: boolean;
+  clearTeamAuthorization?: boolean;
   prepared?: PreparedEnterprisePolicy;
   isCurrent?: () => boolean;
+}
+
+// Enterprise policy is consumed by process-wide Rust state, localStorage, and
+// the managed-pipe filesystem, while this hook can be mounted by multiple app
+// surfaces. Keep one process-wide application queue so an old surface that is
+// already mid-apply can never finish after a replacement surface and overwrite
+// its newer authorization. Each queued task still owns an `isCurrent` guard.
+let enterprisePolicyApplicationQueue: Promise<void> = Promise.resolve();
+let enterpriseLicenseActivationQueue: Promise<void> = Promise.resolve();
+
+type EnterprisePolicyApplicationTask = (
+  isApplicationActive: () => boolean,
+) => Promise<void>;
+
+type EnterprisePolicyApplication = {
+  id: number;
+  task: EnterprisePolicyApplicationTask;
+};
+
+let nextEnterprisePolicyApplicationId = 0;
+let latestEnterprisePolicyApplication: EnterprisePolicyApplication | null =
+  null;
+const queuedEnterprisePolicyReconciliations = new Set<number>();
+
+type ProcessWideAuthorizationBoundary = {
+  licenseKey: string | null;
+  generation: number;
+};
+
+type ProcessWideAuthorizationEvent = ProcessWideAuthorizationBoundary & {
+  reason: "replacement" | "revocation";
+};
+
+const enterpriseAuthorizationOwners = new Set<symbol>();
+const enterpriseAuthorizationListeners = new Map<
+  symbol,
+  (event: ProcessWideAuthorizationEvent) => void
+>();
+let processWideAuthorizationBoundary: ProcessWideAuthorizationBoundary = {
+  licenseKey: null,
+  generation: 0,
+};
+let processWideActivationRequestId = 0;
+
+function registerEnterpriseAuthorizationOwner(
+  owner: symbol,
+  listener: (event: ProcessWideAuthorizationEvent) => void,
+): void {
+  enterpriseAuthorizationOwners.add(owner);
+  enterpriseAuthorizationListeners.set(owner, listener);
+}
+
+function unregisterEnterpriseAuthorizationOwner(owner: symbol): void {
+  enterpriseAuthorizationOwners.delete(owner);
+  enterpriseAuthorizationListeners.delete(owner);
+  if (enterpriseAuthorizationOwners.size === 0) {
+    processWideAuthorizationBoundary = {
+      licenseKey: null,
+      generation: processWideAuthorizationBoundary.generation + 1,
+    };
+    processWideActivationRequestId += 1;
+  }
+}
+
+function notifyEnterpriseAuthorizationOwners(
+  event: ProcessWideAuthorizationEvent,
+  sourceOwner: symbol,
+): void {
+  for (const [owner, listener] of enterpriseAuthorizationListeners) {
+    if (owner !== sourceOwner) listener(event);
+  }
+}
+
+function claimSavedEnterpriseAuthorization(
+  licenseKey: string,
+): ProcessWideAuthorizationBoundary {
+  if (processWideAuthorizationBoundary.licenseKey === null) {
+    processWideAuthorizationBoundary = {
+      licenseKey,
+      generation: processWideAuthorizationBoundary.generation + 1,
+    };
+  }
+  // A key already selected by a live manual activation wins over a stale key
+  // that another surface read from disk before that save completed.
+  return processWideAuthorizationBoundary;
+}
+
+function replaceProcessWideEnterpriseAuthorization(
+  licenseKey: string,
+  sourceOwner: symbol,
+): ProcessWideAuthorizationBoundary {
+  processWideAuthorizationBoundary = {
+    licenseKey,
+    generation: processWideAuthorizationBoundary.generation + 1,
+  };
+  notifyEnterpriseAuthorizationOwners(
+    { ...processWideAuthorizationBoundary, reason: "replacement" },
+    sourceOwner,
+  );
+  return processWideAuthorizationBoundary;
+}
+
+function revokeProcessWideEnterpriseAuthorization(
+  expectedLicenseKey: string | null,
+  retainedLicenseKey: string | null,
+  sourceOwner: symbol,
+): ProcessWideAuthorizationBoundary | null {
+  if (processWideAuthorizationBoundary.licenseKey !== expectedLicenseKey) {
+    return null;
+  }
+  processWideAuthorizationBoundary = {
+    licenseKey: retainedLicenseKey,
+    generation: processWideAuthorizationBoundary.generation + 1,
+  };
+  notifyEnterpriseAuthorizationOwners(
+    { ...processWideAuthorizationBoundary, reason: "revocation" },
+    sourceOwner,
+  );
+  return processWideAuthorizationBoundary;
+}
+
+function isProcessWideEnterpriseAuthorizationCurrent(
+  licenseKey: string,
+  generation: number | null,
+): boolean {
+  return (
+    generation !== null &&
+    processWideAuthorizationBoundary.licenseKey === licenseKey &&
+    processWideAuthorizationBoundary.generation === generation
+  );
+}
+
+function scheduleLatestEnterprisePolicyReconciliation(
+  settledApplicationId: number,
+): void {
+  const latest = latestEnterprisePolicyApplication;
+  if (!latest || queuedEnterprisePolicyReconciliations.has(latest.id)) {
+    return;
+  }
+
+  // A timed-out task keeps running because Promises cannot be cancelled. If it
+  // eventually commits a side effect, replay the newest guarded application so
+  // the obsolete result cannot win. This also covers a timeout on the current
+  // application: its late completion may have mutated native state after the
+  // caller failed closed, so the same policy needs one clean reconciliation.
+  // `settledApplicationId` is intentionally retained for the log/debug identity
+  // even when the latest application is the same entry.
+  queuedEnterprisePolicyReconciliations.add(latest.id);
+  console.warn(
+    `[enterprise] reconciling policy after timed-out application ${settledApplicationId} settled; latest=${latest.id}`,
+  );
+  void enqueueEnterprisePolicyApplication(latest.task).then(
+    () => queuedEnterprisePolicyReconciliations.delete(latest.id),
+    () => queuedEnterprisePolicyReconciliations.delete(latest.id),
+  );
+}
+
+function enqueueEnterprisePolicyApplication(
+  task: EnterprisePolicyApplicationTask,
+) {
+  const entry: EnterprisePolicyApplication = {
+    id: ++nextEnterprisePolicyApplicationId,
+    task,
+  };
+  latestEnterprisePolicyApplication = entry;
+
+  const application = enterprisePolicyApplicationQueue
+    .catch(() => {})
+    .then(async () => {
+      let applicationActive = true;
+      let taskSettled = false;
+      let timedOut = false;
+      const taskPromise = Promise.resolve().then(() =>
+        entry.task(() => applicationActive),
+      );
+      void taskPromise.then(
+        () => {
+          taskSettled = true;
+          if (timedOut) {
+            scheduleLatestEnterprisePolicyReconciliation(entry.id);
+          }
+        },
+        () => {
+          taskSettled = true;
+          if (timedOut) {
+            scheduleLatestEnterprisePolicyReconciliation(entry.id);
+          }
+        },
+      );
+
+      try {
+        await withTimeout(
+          "enterprise policy application",
+          taskPromise,
+          ENTERPRISE_POLICY_APPLICATION_TIMEOUT_MS,
+        );
+      } catch (error) {
+        timedOut = !taskSettled;
+        if (timedOut) applicationActive = false;
+        throw error;
+      }
+    });
+  // Keep the queue usable after a command failure or timeout while returning
+  // the original promise so the caller can fail closed. A timed-out underlying
+  // task is reconciled above if it later settles behind a newer application.
+  enterprisePolicyApplicationQueue = application.catch(() => {});
+  return application;
+}
+
+function enqueueEnterpriseLicenseActivation<T>(
+  task: () => Promise<T>,
+): Promise<T> {
+  const activation = enterpriseLicenseActivationQueue
+    .catch(() => {})
+    .then(task);
+  enterpriseLicenseActivationQueue = activation.then(
+    () => undefined,
+    () => undefined,
+  );
+  return activation;
 }
 
 /**
@@ -730,25 +1033,16 @@ export function useEnterprisePolicy() {
     useState<EnterprisePolicyStatus>("loading");
   const [needsLicenseKey, setNeedsLicenseKey] = useState(false);
   const licenseKeyRef = useRef<string | null>(null);
+  const processAuthorizationGenerationRef = useRef<number | null>(null);
+  const authorizationOwnerRef = useRef(Symbol("enterprise-policy-owner"));
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const policyAuthorizationGenerationRef = useRef(0);
   const activationRequestIdRef = useRef(0);
-  const policyApplicationPromiseRef = useRef<Promise<void> | null>(null);
 
-  const enqueuePolicyApplication = useCallback((task: () => Promise<void>) => {
-    const previousApplication = policyApplicationPromiseRef.current;
-    let application: Promise<void>;
-    application = (previousApplication ?? Promise.resolve())
-      .catch(() => {})
-      .then(task)
-      .finally(() => {
-        if (policyApplicationPromiseRef.current === application) {
-          policyApplicationPromiseRef.current = null;
-        }
-      });
-    policyApplicationPromiseRef.current = application;
-    return application;
-  }, []);
+  const enqueuePolicyApplication = useCallback(
+    enqueueEnterprisePolicyApplication,
+    [],
+  );
 
   const fetchPolicy = useCallback(
     async (
@@ -904,82 +1198,59 @@ export function useEnterprisePolicy() {
         if (!isCurrent()) return { ok: false, reason: "stale" };
 
         let applied = false;
-        await enqueuePolicyApplication(async () => {
-          if (!isCurrent()) return;
+        try {
+          await enqueuePolicyApplication(async (isApplicationActive) => {
+            const applicationIsCurrent = () =>
+              isCurrent() && isApplicationActive();
+            if (!applicationIsCurrent()) return;
 
-          cachePolicy(result);
-
-          // Apply enterprise AI preset policy to settings store.
-          if (result.aiPresetPolicy) {
-            try {
+            // Apply enterprise AI preset policy to settings store.
+            if (result.aiPresetPolicy) {
               await applyAiPresetPolicy(result.aiPresetPolicy);
               console.log(
                 `[enterprise] applied AI preset policy: cloud=${result.aiPresetPolicy.allow_screenpipe_cloud}, employee=${result.aiPresetPolicy.allow_employee_custom_presets}, managed=${result.aiPresetPolicy.managed_presets.length}`,
               );
-            } catch (e) {
-              console.warn("[enterprise] failed to apply AI preset policy:", e);
             }
-          }
+            if (!applicationIsCurrent()) return;
 
-          try {
             const metadata = await applyAppUpdatePolicy(result.appUpdatePolicy);
             console.log(
               `[enterprise] applied app update policy: mode=${result.appUpdatePolicy.mode}, manager=${metadata.update_manager}, managed=${metadata.managed}`,
             );
-          } catch (e) {
-            console.warn("[enterprise] failed to apply app update policy:", e);
-          }
+            if (!applicationIsCurrent()) return;
 
-          // Apply every validated managed device setting in one pass. PII, capture,
-          // audio, filters, and performance changes share one coordinated restart.
-          try {
-            await applyManagedDeviceSettings(result.lockedSettings);
-          } catch (e) {
-            console.warn(
-              "[enterprise] failed to apply managed device policy:",
-              e,
+            // Apply every validated managed device setting in one pass. PII, capture,
+            // audio, filters, and performance changes share one coordinated restart.
+            await applyManagedDeviceSettings(
+              result.lockedSettings,
+              applicationIsCurrent,
             );
-          }
+            if (!applicationIsCurrent()) return;
 
-          // Sync managed pipes to local filesystem. Always runs (even with an
-          // empty list) so pipes removed from the policy get disabled on devices.
-          // Pruning is only allowed when the server actually returned the
-          // managedPipes field — an older backend that omits it must not
-          // mass-disable the fleet.
-          try {
+            // Sync managed pipes to local filesystem. Always runs (even with an
+            // empty list) so pipes removed from the policy get disabled on devices.
+            // Pruning is only allowed when the server actually returned the
+            // managedPipes field — an older backend that omits it must not
+            // mass-disable the fleet.
             await syncManagedPipes(result.managedPipes, {
               pruneUnlisted: Array.isArray(data.managedPipes),
             });
-          } catch (e) {
-            console.warn("[enterprise] failed to sync managed pipes:", e);
-          }
+            if (!applicationIsCurrent()) return;
 
-          // Push hidden sections to Rust so tray menu can use them
-          try {
-            await withTimeout(
-              "enterprise setEnterprisePolicy",
-              commands.setEnterprisePolicy(result.hiddenSections),
-              LOCAL_POLICY_COMMAND_TIMEOUT_MS,
-            );
+            // Push hidden sections to Rust so tray menu can use them
+            await commands.setEnterprisePolicy(result.hiddenSections);
             // Reconcile the live app with the policy we just pushed: if it turns on
             // hidden-UI mode, retract any windows already on screen and drop the
             // dock icon now (set_enterprise_policy only updates state — it doesn't
             // hide what's already visible). Also persists the decision so the next
             // launch starts hidden before any window renders. No-op when not hidden.
-            await withTimeout(
-              "enterprise applyEnterpriseUiVisibility",
-              commands.applyEnterpriseUiVisibility(),
-              LOCAL_POLICY_COMMAND_TIMEOUT_MS,
-            );
-          } catch (e) {
-            console.warn("[enterprise] failed to push policy to Rust:", e);
-          }
+            await commands.applyEnterpriseUiVisibility();
+            if (!applicationIsCurrent()) return;
 
-          // Push per-stream sync toggles to Rust so the enterprise sync task
-          // gates each upload kind. Defaults to all-true server-side, so an
-          // older server that doesn't return syncStreams ends up here as
-          // undefined → all true (no behavior change).
-          try {
+            // Push per-stream sync toggles to Rust so the enterprise sync task
+            // gates each upload kind. Defaults to all-true server-side, so an
+            // older server that doesn't return syncStreams ends up here as
+            // undefined → all true (no behavior change).
             const streams = (data.syncStreams ?? {}) as Record<string, unknown>;
             const pickBool = (key: string): boolean =>
               typeof streams[key] === "boolean"
@@ -996,53 +1267,80 @@ export function useEnterprisePolicy() {
                 : rawMode === true
                   ? "cited"
                   : "off";
-            await withTimeout(
-              "enterprise setSyncStreams",
-              commands.setSyncStreams(
-                pickBool("frames"),
-                pickBool("audio"),
-                pickBool("ui_events"),
-                pickBool("memories"),
-                pickBool("snapshots"),
-                frameImages,
-              ),
-              LOCAL_POLICY_COMMAND_TIMEOUT_MS,
+            await commands.setSyncStreams(
+              pickBool("frames"),
+              pickBool("audio"),
+              pickBool("ui_events"),
+              pickBool("memories"),
+              pickBool("snapshots"),
+              frameImages,
             );
-          } catch (e) {
-            console.warn(
-              "[enterprise] failed to push sync streams to Rust:",
-              e,
-            );
-          }
+            if (!applicationIsCurrent()) return;
 
-          // Persist admin status into ~/.screenpipe/enterprise.json so the
-          // pi-agent can decide whether to install the screenpipe-team skill
-          // on its next boot. Only meaningful when we sent a cloud token in
-          // the request — without one, the server has no way to identify the
-          // user, so `data.isAdmin` is always false (don't accidentally wipe
-          // an existing admin marker just because the user was signed-out at
-          // policy-fetch time).
-          if (cloudToken) {
-            try {
+            // Persist admin status into ~/.screenpipe/enterprise.json so the
+            // pi-agent can decide whether to install the screenpipe-team skill
+            // on its next boot. Only meaningful when we sent a cloud token in
+            // the request — without one, the server has no way to identify the
+            // user, so `data.isAdmin` is always false (don't accidentally wipe
+            // an existing admin marker just because the user was signed-out at
+            // policy-fetch time).
+            if (cloudToken) {
               const adminFlag = Boolean(data.isAdmin);
               console.log(
                 `[enterprise] persisting team config: is_admin=${adminFlag} (raw response.isAdmin=${data.isAdmin})`,
               );
-              await withTimeout(
-                "enterprise saveEnterpriseTeamConfig",
-                commands.saveEnterpriseTeamConfig(adminFlag, true, null),
-                LOCAL_POLICY_COMMAND_TIMEOUT_MS,
+              await commands.saveEnterpriseTeamConfig(adminFlag, true, null);
+            } else if (options.clearTeamAuthorization) {
+              await commands.saveEnterpriseTeamConfig(false, false, "");
+            } else {
+              console.warn(
+                "[enterprise] no cloud token available — skipping team-config persist (sign in to screenpipe cloud to enable team queries)",
               );
-            } catch (e) {
-              console.warn("[enterprise] failed to persist team config:", e);
             }
-          } else {
-            console.warn(
-              "[enterprise] no cloud token available — skipping team-config persist (sign in to screenpipe cloud to enable team queries)",
-            );
+            if (!applicationIsCurrent()) return;
+
+            // Publish the offline cache only after this exact authorization has
+            // completed every local side effect. A crash, revocation, unmount, or
+            // replacement activation mid-apply must not leave a partially applied
+            // policy eligible for offline reuse.
+            const cacheDeviceId = await getEnterpriseDeviceId();
+            if (!applicationIsCurrent()) return;
+            if (cacheDeviceId) {
+              const cachePublished = cachePolicy(
+                result,
+                seatAcceptanceFingerprint(licenseKey, cacheDeviceId),
+              );
+              // Heartbeat acceptance becomes durable only after the exact policy
+              // completed every local side effect and its matching cache commit.
+              // Refreshing this proof earlier would let a crash re-authorize an
+              // older same-license cache for another 30 days.
+              if (cachePublished) {
+                recordSeatAcceptance(licenseKey, cacheDeviceId);
+              } else {
+                try {
+                  localStorage.removeItem(SEAT_ACCEPTANCE_KEY);
+                } catch {}
+              }
+            } else {
+              // The live policy is still applied, but offline authorization must
+              // not survive without a device-bound cache identity.
+              try {
+                localStorage.removeItem(CACHE_KEY);
+              } catch {}
+            }
+            applied = true;
+          });
+        } catch (error) {
+          console.error(
+            "[enterprise] required local policy application failed:",
+            error,
+          );
+          if (isCurrent()) {
+            clearCachedEnterpriseAuthorization();
+            return { ok: false, reason: "local_apply_error" };
           }
-          applied = true;
-        });
+          return { ok: false, reason: "stale" };
+        }
 
         if (!applied || !isCurrent()) {
           return { ok: false, reason: "stale" };
@@ -1064,7 +1362,20 @@ export function useEnterprisePolicy() {
   }, []);
 
   const invalidateSavedAuthorization = useCallback(
-    (reason: "invalid_key" | "seat_limit") => {
+    (
+      reason: "invalid_key" | "seat_limit",
+      recoveryKey?: string,
+    ): number | null => {
+      const expectedKey = recoveryKey ?? licenseKeyRef.current;
+      const retainedKey = recoveryKey ?? null;
+      const processBoundary = revokeProcessWideEnterpriseAuthorization(
+        expectedKey,
+        retainedKey,
+        authorizationOwnerRef.current,
+      );
+      // Another mounted surface already replaced this key. This stale hook may
+      // not clear shared cache/team auth or start a recovery poll for its key.
+      if (!processBoundary) return null;
       console.warn(
         reason === "seat_limit"
           ? "[enterprise] device no longer has an available license seat"
@@ -1072,53 +1383,81 @@ export function useEnterprisePolicy() {
       );
       stopPolling();
       const revocationGeneration = ++policyAuthorizationGenerationRef.current;
-      licenseKeyRef.current = null;
+      licenseKeyRef.current = retainedKey;
+      processAuthorizationGenerationRef.current = processBoundary.generation;
       clearCachedEnterpriseAuthorization();
       setPolicy({ ...EMPTY_POLICY, hiddenSections: ENTERPRISE_DEFAULT_HIDDEN });
       setNeedsLicenseKey(true);
       setEnterprisePolicyStatus("license_invalid");
       // Revoke the durable local authorization consumed by the pi-agent while
-      // preserving the key itself so MDM devices can recover automatically after
-      // an admin restores the license/seat.
-      void enqueuePolicyApplication(async () => {
+      // retaining only the key identity needed for bounded polling recovery. A
+      // new generation invalidates every request that was already in flight, so
+      // a slow pre-revocation response cannot reopen the recorder. The key itself
+      // remains on disk so MDM devices can recover after an admin restores the
+      // license or seat.
+      void enqueuePolicyApplication(async (isApplicationActive) => {
         if (
+          !isApplicationActive() ||
           policyAuthorizationGenerationRef.current !== revocationGeneration ||
-          licenseKeyRef.current !== null
+          licenseKeyRef.current !== retainedKey
         ) {
           return;
         }
-        await commands
-          .saveEnterpriseTeamConfig(false, false, null)
-          .catch((error) => {
-            console.warn(
-              "[enterprise] failed to clear saved team authorization:",
-              error,
-            );
-          });
+        await commands.saveEnterpriseTeamConfig(false, false, "");
+        // The native write is not cancellable. If this application timed out or
+        // a replacement won while it was pending, the queue's late-settlement
+        // reconciliation will replay the latest guarded policy.
+        if (!isApplicationActive()) return;
+      }).catch((error) => {
+        console.warn(
+          "[enterprise] failed to clear saved team authorization:",
+          error,
+        );
       });
+      return revocationGeneration;
     },
     [enqueuePolicyApplication, stopPolling],
   );
 
   const startPolling = useCallback(
-    (key: string, authorizationGeneration: number) => {
+    function startEnterprisePolling(
+      key: string,
+      authorizationGeneration: number,
+    ) {
       stopPolling();
       const isCurrent = () =>
         licenseKeyRef.current === key &&
-        policyAuthorizationGenerationRef.current === authorizationGeneration;
+        policyAuthorizationGenerationRef.current === authorizationGeneration &&
+        isProcessWideEnterpriseAuthorizationCurrent(
+          key,
+          processAuthorizationGenerationRef.current,
+        );
       intervalRef.current = setInterval(async () => {
         const result = await fetchPolicy(key, { isCurrent });
         // A slow request for an old key must never resurrect authorization after
         // a newer activation or a revocation has replaced/cleared it.
         if (!isCurrent()) return;
         if (result.ok) {
+          setNeedsLicenseKey(false);
           setPolicy(result.policy);
           setEnterprisePolicyStatus("loaded");
         } else if (
           result.reason === "invalid_key" ||
           result.reason === "seat_limit"
         ) {
-          invalidateSavedAuthorization(result.reason);
+          const recoveryGeneration = invalidateSavedAuthorization(
+            result.reason,
+            key,
+          );
+          if (recoveryGeneration !== null) {
+            startEnterprisePolling(key, recoveryGeneration);
+          }
+        } else if (result.reason === "local_apply_error") {
+          setPolicy({
+            ...EMPTY_POLICY,
+            hiddenSections: ENTERPRISE_DEFAULT_HIDDEN,
+          });
+          setEnterprisePolicyStatus("unavailable");
         } else {
           // A transient outage may use only a policy backed by a successful seat
           // heartbeat for this exact license/device within the 30-day seat window.
@@ -1142,13 +1481,21 @@ export function useEnterprisePolicy() {
   );
 
   const initWithKey = useCallback(
-    async (key: string) => {
+    async (requestedKey: string) => {
+      const processBoundary = claimSavedEnterpriseAuthorization(requestedKey);
+      const key = processBoundary.licenseKey;
+      if (!key) return;
       const authorizationGeneration =
         ++policyAuthorizationGenerationRef.current;
       licenseKeyRef.current = key;
+      processAuthorizationGenerationRef.current = processBoundary.generation;
       const isCurrent = () =>
         licenseKeyRef.current === key &&
-        policyAuthorizationGenerationRef.current === authorizationGeneration;
+        policyAuthorizationGenerationRef.current === authorizationGeneration &&
+        isProcessWideEnterpriseAuthorizationCurrent(
+          key,
+          processAuthorizationGenerationRef.current,
+        );
       setNeedsLicenseKey(false);
       // Stay gated until the live seat check distinguishes a rejection from a
       // transient outage. Only after a transient failure may the bounded offline
@@ -1166,7 +1513,20 @@ export function useEnterprisePolicy() {
         result.reason === "invalid_key" ||
         result.reason === "seat_limit"
       ) {
-        invalidateSavedAuthorization(result.reason);
+        const recoveryGeneration = invalidateSavedAuthorization(
+          result.reason,
+          key,
+        );
+        if (recoveryGeneration !== null) {
+          startPolling(key, recoveryGeneration);
+        }
+      } else if (result.reason === "local_apply_error") {
+        setPolicy({
+          ...EMPTY_POLICY,
+          hiddenSections: ENTERPRISE_DEFAULT_HIDDEN,
+        });
+        setEnterprisePolicyStatus("unavailable");
+        startPolling(key, authorizationGeneration);
       } else {
         const cached = await loadAcceptedOfflinePolicy(key, isCurrent);
         if (!isCurrent()) return;
@@ -1188,118 +1548,140 @@ export function useEnterprisePolicy() {
    * API, saves it to ~/.screenpipe/enterprise.json, and starts fetching policy.
    */
   const submitLicenseKey = useCallback(
-    async (key: string): Promise<{ ok: boolean; error?: string }> => {
-      const activationRequestId = ++activationRequestIdRef.current;
-      const isLatestActivation = () =>
-        activationRequestIdRef.current === activationRequestId;
-      const superseded = {
-        ok: false,
-        error: "a newer license activation replaced this request",
-      };
-      const result = await fetchPolicy(key, {
-        applyLocalPolicy: false,
-        isCurrent: isLatestActivation,
-      });
-      if (!isLatestActivation()) return superseded;
-      if (!result.ok) {
-        return {
+    (key: string): Promise<{ ok: boolean; error?: string }> =>
+      enqueueEnterpriseLicenseActivation(async () => {
+        const activationRequestId = ++activationRequestIdRef.current;
+        const processActivationRequestId = ++processWideActivationRequestId;
+        const isLatestActivation = () =>
+          activationRequestIdRef.current === activationRequestId &&
+          processWideActivationRequestId === processActivationRequestId;
+        const superseded = {
           ok: false,
-          error:
-            result.reason === "invalid_key"
-              ? "invalid or expired license key"
-              : "could not validate license - check your connection and try again",
+          error: "a newer license activation replaced this request",
         };
-      }
-
-      const heartbeat = await withTimeout(
-        "enterprise heartbeat",
-        sendHeartbeat(key, isLatestActivation),
-        LOCAL_POLICY_COMMAND_TIMEOUT_MS,
-      ).catch((e): HeartbeatResult => ({
-        ok: false,
-        reason: "network_error",
-        error: String(e),
-      }));
-      if (!isLatestActivation()) return superseded;
-      if (!heartbeat.ok && heartbeat.reason === "seat_limit") {
-        return {
-          ok: false,
-          error: "license seat limit reached - contact your admin to add seats",
-        };
-      }
-      if (!heartbeat.ok && heartbeat.reason === "invalid_license") {
-        return { ok: false, error: "invalid or expired license key" };
-      }
-      if (!heartbeat.ok) {
-        return {
-          ok: false,
-          error:
-            "could not verify an available license seat - check your connection and try again",
-        };
-      }
-
-      // Save only after the server accepts this device. Otherwise a full-seat
-      // or unavailable heartbeat could leave an unverified key on disk and look
-      // activated after a restart.
-      try {
-        const saveResult = await withTimeout(
-          "enterprise saveEnterpriseLicenseKey",
-          commands.saveEnterpriseLicenseKey(key),
-          LOCAL_POLICY_COMMAND_TIMEOUT_MS,
-        );
-        if (saveResult.status === "error") {
-          return { ok: false, error: saveResult.error };
-        }
-      } catch (e) {
-        return { ok: false, error: `failed to save: ${e}` };
-      }
-      if (!isLatestActivation()) return superseded;
-      // The global entitlement gate owns the activation prompt now. Once its
-      // E2E activation succeeds, newly-mounted policy-hook consumers must read
-      // the just-saved key instead of independently reopening a second prompt.
-      acknowledgeSavedLicenseForE2e();
-
-      // Apply the policy and start polling
-      const authorizationGeneration =
-        ++policyAuthorizationGenerationRef.current;
-      licenseKeyRef.current = key;
-      const isCurrent = () =>
-        isLatestActivation() &&
-        licenseKeyRef.current === key &&
-        policyAuthorizationGenerationRef.current === authorizationGeneration;
-      setNeedsLicenseKey(false);
-      setPolicy(result.policy);
-      // The key is accepted, but keep the recorder held until the validated
-      // policy has also completed its local application pass below.
-      setEnterprisePolicyStatus("loading");
-      startPolling(key, authorizationGeneration);
-
-      fetchPolicy(key, {
-        seatAlreadyVerified: true,
-        prepared: result.prepared,
-        isCurrent,
-      })
-        .then((backgroundResult) => {
-          if (!isCurrent()) return;
-          if (backgroundResult.ok) {
-            setPolicy(backgroundResult.policy);
-            setEnterprisePolicyStatus("loaded");
-          } else if (
-            backgroundResult.reason === "invalid_key" ||
-            backgroundResult.reason === "seat_limit"
-          ) {
-            invalidateSavedAuthorization(backgroundResult.reason);
-          } else {
-            setEnterprisePolicyStatus("unavailable");
-          }
-        })
-        .catch((e) => {
-          console.warn("[enterprise] background policy apply failed:", e);
-          if (isCurrent()) setEnterprisePolicyStatus("unavailable");
+        const result = await fetchPolicy(key, {
+          applyLocalPolicy: false,
+          isCurrent: isLatestActivation,
         });
+        if (!isLatestActivation()) return superseded;
+        if (!result.ok) {
+          return {
+            ok: false,
+            error:
+              result.reason === "invalid_key"
+                ? "invalid or expired license key"
+                : "could not validate license - check your connection and try again",
+          };
+        }
 
-      return { ok: true };
-    },
+        const heartbeat = await withTimeout(
+          "enterprise heartbeat",
+          sendHeartbeat(key, isLatestActivation),
+          LOCAL_POLICY_COMMAND_TIMEOUT_MS,
+        ).catch((e): HeartbeatResult => ({
+          ok: false,
+          reason: "network_error",
+          error: String(e),
+        }));
+        if (!isLatestActivation()) return superseded;
+        if (!heartbeat.ok && heartbeat.reason === "seat_limit") {
+          return {
+            ok: false,
+            error:
+              "license seat limit reached - contact your admin to add seats",
+          };
+        }
+        if (!heartbeat.ok && heartbeat.reason === "invalid_license") {
+          return { ok: false, error: "invalid or expired license key" };
+        }
+        if (!heartbeat.ok) {
+          return {
+            ok: false,
+            error:
+              "could not verify an available license seat - check your connection and try again",
+          };
+        }
+
+        // Save only after the server accepts this device. Otherwise a full-seat
+        // or unavailable heartbeat could leave an unverified key on disk and look
+        // activated after a restart.
+        try {
+          const saveResult = await withTimeout(
+            "enterprise saveEnterpriseLicenseKey",
+            commands.saveEnterpriseLicenseKey(key),
+            LOCAL_POLICY_COMMAND_TIMEOUT_MS,
+          );
+          if (saveResult.status === "error") {
+            return { ok: false, error: saveResult.error };
+          }
+        } catch (e) {
+          return { ok: false, error: `failed to save: ${e}` };
+        }
+        if (!isLatestActivation()) return superseded;
+        // The global entitlement gate owns the activation prompt now. Once its
+        // E2E activation succeeds, newly-mounted policy-hook consumers must read
+        // the just-saved key instead of independently reopening a second prompt.
+        acknowledgeSavedLicenseForE2e();
+
+        // Apply the policy and start polling
+        const authorizationGeneration =
+          ++policyAuthorizationGenerationRef.current;
+        licenseKeyRef.current = key;
+        const processBoundary = replaceProcessWideEnterpriseAuthorization(
+          key,
+          authorizationOwnerRef.current,
+        );
+        processAuthorizationGenerationRef.current = processBoundary.generation;
+        clearCachedEnterpriseAuthorization();
+        const isCurrent = () =>
+          isLatestActivation() &&
+          licenseKeyRef.current === key &&
+          policyAuthorizationGenerationRef.current ===
+            authorizationGeneration &&
+          isProcessWideEnterpriseAuthorizationCurrent(
+            key,
+            processAuthorizationGenerationRef.current,
+          );
+        setNeedsLicenseKey(false);
+        setPolicy(result.policy);
+        // The key is accepted, but keep the recorder held until the validated
+        // policy has also completed its local application pass below.
+        setEnterprisePolicyStatus("loading");
+        startPolling(key, authorizationGeneration);
+
+        fetchPolicy(key, {
+          seatAlreadyVerified: true,
+          clearTeamAuthorization: true,
+          prepared: result.prepared,
+          isCurrent,
+        })
+          .then((backgroundResult) => {
+            if (!isCurrent()) return;
+            if (backgroundResult.ok) {
+              setPolicy(backgroundResult.policy);
+              setEnterprisePolicyStatus("loaded");
+            } else if (
+              backgroundResult.reason === "invalid_key" ||
+              backgroundResult.reason === "seat_limit"
+            ) {
+              const recoveryGeneration = invalidateSavedAuthorization(
+                backgroundResult.reason,
+                key,
+              );
+              if (recoveryGeneration !== null) {
+                startPolling(key, recoveryGeneration);
+              }
+            } else {
+              setEnterprisePolicyStatus("unavailable");
+            }
+          })
+          .catch((e) => {
+            console.warn("[enterprise] background policy apply failed:", e);
+            if (isCurrent()) setEnterprisePolicyStatus("unavailable");
+          });
+
+        return { ok: true };
+      }),
     [fetchPolicy, invalidateSavedAuthorization, startPolling],
   );
 
@@ -1307,8 +1689,39 @@ export function useEnterprisePolicy() {
     if (!isEnterprise) return;
 
     let cancelled = false;
+    const owner = authorizationOwnerRef.current;
+    registerEnterpriseAuthorizationOwner(owner, (event) => {
+      stopPolling();
+      activationRequestIdRef.current += 1;
+      const authorizationGeneration =
+        ++policyAuthorizationGenerationRef.current;
+      licenseKeyRef.current = event.licenseKey;
+      processAuthorizationGenerationRef.current = event.generation;
+      setPolicy({ ...EMPTY_POLICY, hiddenSections: ENTERPRISE_DEFAULT_HIDDEN });
+
+      if (!event.licenseKey) {
+        setNeedsLicenseKey(true);
+        setEnterprisePolicyStatus("license_missing");
+        return;
+      }
+
+      if (event.reason === "revocation") {
+        setNeedsLicenseKey(true);
+        setEnterprisePolicyStatus("license_invalid");
+        startPolling(event.licenseKey, authorizationGeneration);
+        return;
+      }
+
+      // A valid replacement saved by another mounted surface is now the sole
+      // process-wide authorization. Fail closed here, then load that key so the
+      // global entitlement gate and every settings consumer converge on it.
+      setNeedsLicenseKey(false);
+      setEnterprisePolicyStatus("loading");
+      void initWithKey(event.licenseKey);
+    });
 
     (async () => {
+      const bootstrapBoundary = { ...processWideAuthorizationBoundary };
       // Read license key from enterprise.json (MDM or ~/.screenpipe/)
       let key: string | null = null;
       if (!shouldSkipSavedLicenseForE2e()) {
@@ -1329,6 +1742,23 @@ export function useEnterprisePolicy() {
       }
 
       if (cancelled) return;
+
+      // A manual activation on another mounted surface is authoritative. A
+      // delayed null or stale disk value from this bootstrap must not overwrite
+      // the replacement event that already moved this hook to the new key.
+      if (
+        processWideAuthorizationBoundary.generation !==
+          bootstrapBoundary.generation ||
+        processWideAuthorizationBoundary.licenseKey !==
+          bootstrapBoundary.licenseKey
+      ) {
+        return;
+      }
+
+      if (processWideAuthorizationBoundary.licenseKey) {
+        await initWithKey(processWideAuthorizationBoundary.licenseKey);
+        return;
+      }
 
       if (!key) {
         console.warn(
@@ -1352,8 +1782,17 @@ export function useEnterprisePolicy() {
     return () => {
       cancelled = true;
       stopPolling();
+      // This hook is mounted by more than one app surface. Invalidate every
+      // request owned by this instance before it disappears; otherwise a slow
+      // old-key poll can finish after the global gate replaces the license,
+      // clear the shared authorization/cache, and even start an orphan poller.
+      activationRequestIdRef.current += 1;
+      policyAuthorizationGenerationRef.current += 1;
+      licenseKeyRef.current = null;
+      processAuthorizationGenerationRef.current = null;
+      unregisterEnterpriseAuthorizationOwner(owner);
     };
-  }, [isEnterprise, initWithKey, stopPolling]);
+  }, [isEnterprise, initWithKey, startPolling, stopPolling]);
 
   // Consumer builds: stable no-op functions (no network calls, no re-renders)
   const noop = useCallback(() => false, []);

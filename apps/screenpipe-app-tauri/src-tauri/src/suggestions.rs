@@ -19,7 +19,9 @@ use crate::store::SettingsStore;
 use futures::StreamExt;
 use screenpipe_core::strings::{safe_byte_prefix, truncate_string};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use specta::Type;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::AppHandle;
 use tokio::sync::Mutex;
@@ -61,8 +63,23 @@ pub struct CachedSuggestions {
 #[derive(Debug, Clone)]
 pub struct EnhancedAIConfig {
     pub enabled: bool,
-    /// User's Clerk JWT token for authenticating with screenpipe cloud.
-    pub token: String,
+    /// Bind the opt-in to the exact native cloud-auth generation without
+    /// retaining another raw Clerk JWT outside the process-wide auth store.
+    token_digest: [u8; 32],
+}
+
+impl EnhancedAIConfig {
+    pub fn for_token(enabled: bool, token: &str) -> Self {
+        Self {
+            enabled,
+            token_digest: Sha256::digest(token.as_bytes()).into(),
+        }
+    }
+
+    fn accepts_token(&self, token: &str) -> bool {
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        self.token_digest == digest
+    }
 }
 
 // ─── Managed state ──────────────────────────────────────────────────────────
@@ -71,6 +88,10 @@ pub struct SuggestionsState {
     pub cache: Arc<Mutex<Option<CachedSuggestions>>>,
     pub scheduler_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub enhanced_ai: Arc<Mutex<Option<EnhancedAIConfig>>>,
+    /// Changes before every enhanced-config/account transition. Work that
+    /// started under an earlier generation may finish its provider request but
+    /// can never publish that account's output into the shared cache.
+    pub cloud_identity_generation: Arc<AtomicU64>,
 }
 
 impl SuggestionsState {
@@ -79,7 +100,81 @@ impl SuggestionsState {
             cache: Arc::new(Mutex::new(None)),
             scheduler_handle: Arc::new(Mutex::new(None)),
             enhanced_ai: Arc::new(Mutex::new(None)),
+            cloud_identity_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn invalidate_cloud_identity_work(&self) -> u64 {
+        self.cloud_identity_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    fn cloud_identity_generation(&self) -> u64 {
+        self.cloud_identity_generation.load(Ordering::SeqCst)
+    }
+
+    async fn replace_enhanced_ai_config(&self, config: Option<EnhancedAIConfig>) {
+        // Invalidate first: an already-dispatched request must lose publication
+        // rights before the old config/cache becomes unavailable.
+        self.invalidate_cloud_identity_work();
+        *self.enhanced_ai.lock().await = config;
+        *self.cache.lock().await = None;
+    }
+
+    async fn replace_enhanced_ai_config_if_current(
+        &self,
+        expected_generation: u64,
+        config: Option<EnhancedAIConfig>,
+    ) -> bool {
+        let mut guard = self.enhanced_ai.lock().await;
+        let next_generation = expected_generation.wrapping_add(1);
+        if self
+            .cloud_identity_generation
+            .compare_exchange(
+                expected_generation,
+                next_generation,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        *guard = config;
+        // Keep the config mutex through cache invalidation. A newer account
+        // transition may already have advanced the generation, but it cannot
+        // clear/rebind the config until this complete mutation releases the
+        // lock, and generation-bound producers cannot publish in the gap.
+        *self.cache.lock().await = None;
+        true
+    }
+
+    async fn publish_cache_if_current(
+        &self,
+        expected_generation: u64,
+        cached: CachedSuggestions,
+    ) -> bool {
+        if self.cloud_identity_generation() != expected_generation {
+            return false;
+        }
+        let mut guard = self.cache.lock().await;
+        // Recheck after acquiring the cache lock so logout/account rotation
+        // cannot win between the first check and the write.
+        if self.cloud_identity_generation() != expected_generation {
+            return false;
+        }
+        *guard = Some(cached);
+        true
+    }
+
+    /// Drop every account-bound suggestion artifact before cloud identity
+    /// rotation becomes visible. A scheduler iteration that cloned the old
+    /// config still cannot use it with the new token because the config stores
+    /// only an exact token digest, dispatch checks the current token, and cache
+    /// publication is bound to this generation.
+    pub async fn clear_cloud_identity(&self) {
+        self.replace_enhanced_ai_config(None).await;
     }
 }
 
@@ -135,11 +230,16 @@ pub async fn force_regenerate_suggestions(
     state: tauri::State<'_, SuggestionsState>,
     app: AppHandle,
 ) -> Result<CachedSuggestions, String> {
+    let identity_generation = state.cloud_identity_generation();
     let enhanced = state.enhanced_ai.lock().await.clone();
     let api = local_api_context_from_app(&app);
     let cached = generate_suggestions(&api, enhanced.as_ref()).await?;
-    let mut guard = state.cache.lock().await;
-    *guard = Some(cached.clone());
+    if !state
+        .publish_cache_if_current(identity_generation, cached.clone())
+        .await
+    {
+        return Err("cloud_auth_identity_changed".to_string());
+    }
     Ok(cached)
 }
 
@@ -152,11 +252,35 @@ pub async fn set_enhanced_ai_suggestions(
     enabled: bool,
     token: String,
 ) -> Result<(), String> {
-    let mut guard = state.enhanced_ai.lock().await;
+    let expected_generation = state.cloud_identity_generation();
+    let supplied_non_empty = !token.is_empty();
+    let normalized = crate::auth_token::normalize_cloud_token(Some(token));
+    let current_token = crate::auth_token::cached_cloud_token();
+    if !enhanced_ai_request_matches_current_token(supplied_non_empty, &normalized, &current_token) {
+        // A stale webview/account must never clear or replace the configuration
+        // installed by the identity that won the native auth transition.
+        return Err("cloud_auth_identity_changed".to_string());
+    }
+
     if !enabled {
-        *guard = None;
+        if !state
+            .replace_enhanced_ai_config_if_current(expected_generation, None)
+            .await
+        {
+            return Err("cloud_auth_identity_changed".to_string());
+        }
         return Ok(());
     }
+
+    let Some(token) = normalized else {
+        if !state
+            .replace_enhanced_ai_config_if_current(expected_generation, None)
+            .await
+        {
+            return Err("cloud_auth_identity_changed".to_string());
+        }
+        return Err("Sign in before enabling Enhanced AI suggestions".to_string());
+    };
 
     let cloud_entitled = SettingsStore::get(&app)
         .ok()
@@ -164,16 +288,33 @@ pub async fn set_enhanced_ai_suggestions(
         .map(|settings| settings.cloud_transcription_entitled())
         .unwrap_or(false);
     if !cloud_entitled {
-        *guard = None;
+        if !state
+            .replace_enhanced_ai_config_if_current(expected_generation, None)
+            .await
+        {
+            return Err("cloud_auth_identity_changed".to_string());
+        }
         return Err("Screenpipe Business is required for Enhanced AI suggestions".to_string());
     }
-    if token.is_empty() {
-        *guard = None;
-        return Err("Sign in before enabling Enhanced AI suggestions".to_string());
-    }
 
-    *guard = Some(EnhancedAIConfig { enabled, token });
+    if !state
+        .replace_enhanced_ai_config_if_current(
+            expected_generation,
+            Some(EnhancedAIConfig::for_token(enabled, &token)),
+        )
+        .await
+    {
+        return Err("cloud_auth_identity_changed".to_string());
+    }
     Ok(())
+}
+
+fn enhanced_ai_request_matches_current_token(
+    supplied_non_empty: bool,
+    supplied: &Option<String>,
+    current: &Option<String>,
+) -> bool {
+    (!supplied_non_empty || supplied.is_some()) && supplied == current
 }
 
 // ─── Auto-start ─────────────────────────────────────────────────────────────
@@ -184,6 +325,7 @@ pub async fn auto_start_scheduler(app: AppHandle, state: &SuggestionsState) {
     let cache = state.cache.clone();
     let handle_arc = state.scheduler_handle.clone();
     let enhanced_ai = state.enhanced_ai.clone();
+    let cloud_identity_generation = state.cloud_identity_generation.clone();
 
     let handle = tokio::spawn(async move {
         info!("suggestions scheduler: started (10-min interval + event triggers)");
@@ -231,6 +373,7 @@ pub async fn auto_start_scheduler(app: AppHandle, state: &SuggestionsState) {
             }
 
             // Read current enhanced AI config (picks up setting changes each cycle)
+            let identity_generation = cloud_identity_generation.load(Ordering::SeqCst);
             let enhanced = enhanced_ai.lock().await.clone();
 
             // Fetch activity & generate suggestions
@@ -244,8 +387,16 @@ pub async fn auto_start_scheduler(app: AppHandle, state: &SuggestionsState) {
                         cached.ai_generated,
                         trigger
                     );
+                    if cloud_identity_generation.load(Ordering::SeqCst) != identity_generation {
+                        info!(
+                            "suggestions scheduler: discarded output after cloud identity changed"
+                        );
+                        continue;
+                    }
                     let mut guard = cache.lock().await;
-                    *guard = Some(cached);
+                    if cloud_identity_generation.load(Ordering::SeqCst) == identity_generation {
+                        *guard = Some(cached);
+                    }
                 }
                 Err(e) => {
                     warn!("suggestions scheduler: generation failed: {}", e);
@@ -1441,7 +1592,7 @@ async fn generate_ai_suggestions(
     // Enhanced (cloud) AI is the only AI backend for suggestions. Without an
     // enabled token, fall back to deterministic templates.
     let config = match enhanced_ai {
-        Some(c) if c.enabled && !c.token.is_empty() => c,
+        Some(c) if c.enabled => c,
         _ => {
             info!("suggestions: enhanced AI not enabled, using templates");
             return None;
@@ -1449,6 +1600,17 @@ async fn generate_ai_suggestions(
     };
 
     let context = build_activity_context(api, apps, windows).await;
+
+    // Resolve the bearer only at dispatch time. The config never owns the raw
+    // JWT, and an account change/token refresh makes its digest unusable even
+    // if a scheduler iteration cloned the old config before native cleanup.
+    let token = match crate::auth_token::cached_cloud_token() {
+        Some(token) if config.accepts_token(&token) => token,
+        _ => {
+            info!("suggestions: cloud auth identity changed, using templates");
+            return None;
+        }
+    };
 
     debug!(
         "suggestions: AI prompt ~{} tokens, backend=screenpipe-cloud",
@@ -1459,7 +1621,7 @@ async fn generate_ai_suggestions(
 
     let resp = client
         .post(format!("{}/chat/completions", SCREENPIPE_CLOUD_API))
-        .header("Authorization", format!("Bearer {}", config.token))
+        .header("Authorization", format!("Bearer {token}"))
         // Suggestions run in the background (no user waiting) -> flex tier.
         .header("x-screenpipe-latency", "background")
         .json(&serde_json::json!({
@@ -1846,6 +2008,233 @@ mod tests {
         let input = r#"["a", "b", "c", "d", "e", "f", "g", "h"]"#;
         let result = parse_ai_response(input).unwrap();
         assert_eq!(result.suggestions.len(), 6);
+    }
+
+    #[test]
+    fn enhanced_ai_config_is_bound_without_retaining_the_raw_token() {
+        let config = EnhancedAIConfig::for_token(true, "account-a-secret-jwt");
+        assert!(config.accepts_token("account-a-secret-jwt"));
+        assert!(!config.accepts_token("account-b-secret-jwt"));
+        assert!(!format!("{config:?}").contains("account-a-secret-jwt"));
+    }
+
+    #[test]
+    fn enhanced_ai_mutations_require_the_current_native_identity() {
+        let account_a = Some("account-a-secret-jwt".to_string());
+        let account_b = Some("account-b-secret-jwt".to_string());
+
+        assert!(enhanced_ai_request_matches_current_token(
+            true, &account_a, &account_a,
+        ));
+        assert!(!enhanced_ai_request_matches_current_token(
+            true, &account_a, &account_b,
+        ));
+        assert!(enhanced_ai_request_matches_current_token(
+            false, &None, &None,
+        ));
+        assert!(!enhanced_ai_request_matches_current_token(
+            false, &None, &account_b,
+        ));
+        // A non-empty malformed credential normalizes to None, but is not the
+        // same request as an explicit signed-out/empty disable.
+        assert!(!enhanced_ai_request_matches_current_token(
+            true, &None, &None,
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_enable_cannot_overwrite_the_winning_account_config() {
+        let state = SuggestionsState::new();
+        let stale_account_generation = state.cloud_identity_generation();
+
+        state.clear_cloud_identity().await;
+        let winning_account_generation = state.cloud_identity_generation();
+        assert!(
+            state
+                .replace_enhanced_ai_config_if_current(
+                    winning_account_generation,
+                    Some(EnhancedAIConfig::for_token(
+                        true,
+                        "winning-account-secret-jwt",
+                    )),
+                )
+                .await
+        );
+
+        let stale_applied = state
+            .replace_enhanced_ai_config_if_current(
+                stale_account_generation,
+                Some(EnhancedAIConfig::for_token(
+                    true,
+                    "stale-account-secret-jwt",
+                )),
+            )
+            .await;
+
+        assert!(!stale_applied);
+        let config = state
+            .enhanced_ai
+            .lock()
+            .await
+            .clone()
+            .expect("winning account config");
+        assert!(config.accepts_token("winning-account-secret-jwt"));
+        assert!(!config.accepts_token("stale-account-secret-jwt"));
+    }
+
+    #[tokio::test]
+    async fn stale_disable_cannot_clear_the_winning_account_config_or_cache() {
+        let state = SuggestionsState::new();
+        let stale_account_generation = state.cloud_identity_generation();
+
+        state.clear_cloud_identity().await;
+        let winning_account_generation = state.cloud_identity_generation();
+        assert!(
+            state
+                .replace_enhanced_ai_config_if_current(
+                    winning_account_generation,
+                    Some(EnhancedAIConfig::for_token(
+                        true,
+                        "winning-account-secret-jwt",
+                    )),
+                )
+                .await
+        );
+        *state.cache.lock().await = Some(CachedSuggestions {
+            suggestions: vec![Suggestion {
+                text: "winning account suggestion".to_string(),
+                preview: None,
+                priority: 1,
+            }],
+            generated_at: "2026-07-14T00:00:00Z".to_string(),
+            mode: "coding".to_string(),
+            ai_generated: true,
+            tags: Vec::new(),
+        });
+
+        let stale_applied = state
+            .replace_enhanced_ai_config_if_current(stale_account_generation, None)
+            .await;
+
+        assert!(!stale_applied);
+        let config = state
+            .enhanced_ai
+            .lock()
+            .await
+            .clone()
+            .expect("winning account config");
+        assert!(config.accepts_token("winning-account-secret-jwt"));
+        let cached = state.cache.lock().await.clone().expect("winning cache");
+        assert_eq!(cached.suggestions[0].text, "winning account suggestion");
+    }
+
+    #[tokio::test]
+    async fn accepted_mutation_clears_cache_even_if_auth_then_invalidates_generation() {
+        let state = Arc::new(SuggestionsState::new());
+        *state.cache.lock().await = Some(CachedSuggestions {
+            suggestions: vec![Suggestion {
+                text: "old cached suggestion".to_string(),
+                preview: None,
+                priority: 1,
+            }],
+            generated_at: "2026-07-14T00:00:00Z".to_string(),
+            mode: "coding".to_string(),
+            ai_generated: true,
+            tags: Vec::new(),
+        });
+        let expected_generation = state.cloud_identity_generation();
+
+        // Hold the cache mutex so the mutation completes its generation CAS and
+        // config write, then pauses immediately before cache invalidation.
+        let cache_guard = state.cache.lock().await;
+        let mutation_state = state.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_state
+                .replace_enhanced_ai_config_if_current(expected_generation, None)
+                .await
+        });
+        for _ in 0..100 {
+            if state.cloud_identity_generation() != expected_generation {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_ne!(state.cloud_identity_generation(), expected_generation);
+
+        // Model a newer non-null auth transition starting and then rolling back
+        // to this same identity. It invalidates work but intentionally performs
+        // no destructive config/cache clear of its own.
+        state.invalidate_cloud_identity_work();
+        drop(cache_guard);
+
+        assert!(mutation.await.expect("mutation task"));
+        assert!(state.cache.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cloud_identity_change_clears_enhanced_config_and_cached_output() {
+        let state = SuggestionsState::new();
+        *state.enhanced_ai.lock().await =
+            Some(EnhancedAIConfig::for_token(true, "account-a-secret-jwt"));
+        *state.cache.lock().await = Some(CachedSuggestions {
+            suggestions: vec![Suggestion {
+                text: "account A suggestion".to_string(),
+                preview: None,
+                priority: 1,
+            }],
+            generated_at: "2026-07-13T00:00:00Z".to_string(),
+            mode: "coding".to_string(),
+            ai_generated: true,
+            tags: Vec::new(),
+        });
+
+        state.clear_cloud_identity().await;
+
+        assert!(state.enhanced_ai.lock().await.is_none());
+        assert!(state.cache.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_cloud_generation_cannot_resurrect_prior_account_output() {
+        let state = SuggestionsState::new();
+        *state.enhanced_ai.lock().await =
+            Some(EnhancedAIConfig::for_token(true, "account-a-secret-jwt"));
+        let account_a_generation = state.cloud_identity_generation();
+
+        state.clear_cloud_identity().await;
+        *state.cache.lock().await = Some(CachedSuggestions {
+            suggestions: vec![Suggestion {
+                text: "account B local suggestion".to_string(),
+                preview: None,
+                priority: 1,
+            }],
+            generated_at: "2026-07-13T00:01:00Z".to_string(),
+            mode: "idle".to_string(),
+            ai_generated: false,
+            tags: Vec::new(),
+        });
+
+        let published = state
+            .publish_cache_if_current(
+                account_a_generation,
+                CachedSuggestions {
+                    suggestions: vec![Suggestion {
+                        text: "account A cloud output".to_string(),
+                        preview: None,
+                        priority: 1,
+                    }],
+                    generated_at: "2026-07-13T00:00:00Z".to_string(),
+                    mode: "coding".to_string(),
+                    ai_generated: true,
+                    tags: Vec::new(),
+                },
+            )
+            .await;
+
+        assert!(!published);
+        let cached = state.cache.lock().await.clone().expect("account B cache");
+        assert_eq!(cached.suggestions[0].text, "account B local suggestion");
+        assert!(!cached.ai_generated);
     }
 
     // ─── Benchmark tests ─────────────────────────────────────────────────────

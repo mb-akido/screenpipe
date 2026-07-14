@@ -173,7 +173,13 @@ export function StandaloneChat({
     suggestions: autoSuggestions,
     refreshing: suggestionsRefreshing,
     forceRefresh: refreshSuggestions,
-  } = useAutoSuggestions();
+  } = useAutoSuggestions(
+    settings.user?.id
+      ? `account:${settings.user.id}`
+      : settings.user?.token
+        ? `token:${settings.user.token}`
+        : null,
+  );
   const { pipes, templatePipes } = usePipes();
   // Connected integrations (google-calendar, google-docs, slack, etc.) surfaced in the
   // filter popover so users can mention them directly with @id — helps the
@@ -920,7 +926,7 @@ export function StandaloneChat({
     sendDispatchInFlightRef.current = false;
     sendDispatchOwnerRef.current = null;
     piStartInFlightRef.current = false;
-    piFirstCallRetried.current = false;
+    piFirstCallRetried.current.clear();
     piRateLimitRetries.current = 0;
     piCrashCountRef.current = 0;
     piLastCrashRef.current = 0;

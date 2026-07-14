@@ -1832,10 +1832,9 @@ async fn main() {
                         if !token.is_empty() {
                             // Use try_lock — blocking_lock panics inside a tokio runtime context
                             if let Ok(mut guard) = suggestions_state.enhanced_ai.try_lock() {
-                                *guard = Some(suggestions::EnhancedAIConfig {
-                                    enabled: true,
-                                    token,
-                                });
+                                *guard = Some(suggestions::EnhancedAIConfig::for_token(
+                                    true, &token,
+                                ));
                             }
                         }
                     }
@@ -1845,6 +1844,9 @@ async fn main() {
                 cache: suggestions_state.cache.clone(),
                 scheduler_handle: suggestions_state.scheduler_handle.clone(),
                 enhanced_ai: suggestions_state.enhanced_ai.clone(),
+                cloud_identity_generation: suggestions_state
+                    .cloud_identity_generation
+                    .clone(),
             };
             let app_handle_for_suggestions = app_handle.clone();
             tauri::async_runtime::spawn(async move {

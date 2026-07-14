@@ -24,78 +24,181 @@ export type ActivityMode =
   | "video_editing"
   | "idle";
 
+type SuggestionBoundary = {
+  identityKey: string | null;
+  generation: number;
+};
+
+type SuggestionSnapshot = {
+  generation: number;
+  suggestions: Suggestion[];
+  mode: ActivityMode;
+  tags: string[];
+};
+
+const FALLBACK_SUGGESTIONS: Suggestion[] = [
+  { text: "what did I work on in the last hour?", priority: 1 },
+  { text: "summarize my day so far" },
+  { text: "which apps did I use most today" },
+  { text: "show my recent screen activity" },
+  { text: "what was I working on" },
+  { text: "how much time did I spend on each app" },
+];
+
+const EMPTY_SUGGESTIONS: Suggestion[] = [];
+const EMPTY_TAGS: string[] = [];
+
 // ─── Hook ──────────────────────────────────────────────────────────────────────
 
-export function useAutoSuggestions() {
-  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
-  const [mode, setMode] = useState<ActivityMode>("idle");
-  const [tags, setTags] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const prevSignatureRef = useRef<string>("");
+export function useAutoSuggestions(authIdentityKey: string | null = null) {
+  // Update this boundary during render so the first B render cannot expose an
+  // account-A snapshot while the identity-change effect is still pending.
+  const identityBoundaryRef = useRef<SuggestionBoundary>({
+    identityKey: authIdentityKey,
+    generation: 0,
+  });
+  if (identityBoundaryRef.current.identityKey !== authIdentityKey) {
+    identityBoundaryRef.current = {
+      identityKey: authIdentityKey,
+      generation: identityBoundaryRef.current.generation + 1,
+    };
+  }
+  const initialGeneration = identityBoundaryRef.current.generation;
+  const [snapshot, setSnapshot] = useState<SuggestionSnapshot>({
+    generation: initialGeneration,
+    suggestions: [],
+    mode: "idle",
+    tags: [],
+  });
+  const [loadingState, setLoadingState] = useState({
+    generation: initialGeneration,
+    value: true,
+  });
+  const [refreshingState, setRefreshingState] = useState({
+    generation: initialGeneration,
+    value: false,
+  });
+  const prevSignatureRef = useRef({
+    generation: initialGeneration,
+    value: "",
+  });
+
+  const isCurrentBoundary = useCallback((boundary: SuggestionBoundary) => {
+    const current = identityBoundaryRef.current;
+    return (
+      current.generation === boundary.generation &&
+      current.identityKey === boundary.identityKey
+    );
+  }, []);
 
   const applySuggestions = useCallback(
-    (data: { suggestions: Suggestion[]; mode: string; tags?: string[] }, options?: { force?: boolean }) => {
+    (
+      data: { suggestions: Suggestion[]; mode: string; tags?: string[] },
+      boundary: SuggestionBoundary,
+      options?: { force?: boolean },
+    ) => {
+      if (!isCurrentBoundary(boundary)) return;
       const newSignature = JSON.stringify(
-        data.suggestions.map((s) => [s.text, s.preview ?? "", s.priority ?? "", s.connectionIcon ?? ""])
+        data.suggestions.map((s) => [
+          s.text,
+          s.preview ?? "",
+          s.priority ?? "",
+          s.connectionIcon ?? "",
+        ]),
       );
-      // Only update state if suggestions actually changed (avoids re-render flicker),
-      // except for a manual refresh where the user expects visible feedback.
-      if (options?.force || newSignature !== prevSignatureRef.current) {
-        prevSignatureRef.current = newSignature;
-        setSuggestions(data.suggestions);
-      }
-      setMode(data.mode as ActivityMode);
-      setTags(data.tags || []);
+      setSnapshot((current) => {
+        // React may defer this updater until after another identity render.
+        if (!isCurrentBoundary(boundary)) return current;
+        const sameGeneration =
+          current.generation === boundary.generation &&
+          prevSignatureRef.current.generation === boundary.generation;
+        const keepSuggestionArray =
+          !options?.force &&
+          sameGeneration &&
+          newSignature === prevSignatureRef.current.value;
+        prevSignatureRef.current = {
+          generation: boundary.generation,
+          value: newSignature,
+        };
+        return {
+          generation: boundary.generation,
+          suggestions: keepSuggestionArray
+            ? current.suggestions
+            : data.suggestions,
+          mode: data.mode as ActivityMode,
+          tags: data.tags || [],
+        };
+      });
     },
-    []
+    [isCurrentBoundary],
   );
 
   // Read from cache (lightweight)
   const refresh = useCallback(async () => {
+    const boundary = { ...identityBoundaryRef.current };
     try {
       const result = await commands.getCachedSuggestions();
       if (result.status === "ok") {
-        applySuggestions(result.data);
+        applySuggestions(result.data, boundary);
       } else {
         throw new Error("failed");
       }
     } catch {
       // Fallback if Tauri command not available yet
-      setSuggestions([
-        { text: "what did I work on in the last hour?", priority: 1 },
-        { text: "summarize my day so far" },
-        { text: "which apps did I use most today" },
-        { text: "show my recent screen activity" },
-        { text: "what was I working on" },
-        { text: "how much time did I spend on each app" },
-      ]);
-      setMode("idle");
-      setTags([]);
+      applySuggestions(
+        { suggestions: FALLBACK_SUGGESTIONS, mode: "idle", tags: [] },
+        boundary,
+      );
     } finally {
-      setLoading(false);
+      if (isCurrentBoundary(boundary)) {
+        setLoadingState({ generation: boundary.generation, value: false });
+      }
     }
-  }, [applySuggestions]);
+  }, [applySuggestions, isCurrentBoundary]);
 
   // Force regenerate (calls AI, bypasses scheduler guards)
   const forceRefresh = useCallback(async () => {
-    setRefreshing(true);
+    const boundary = { ...identityBoundaryRef.current };
+    setRefreshingState({ generation: boundary.generation, value: true });
     try {
       const result = await commands.forceRegenerateSuggestions();
       if (result.status === "ok") {
-        applySuggestions(result.data, { force: true });
+        applySuggestions(result.data, boundary, { force: true });
       }
     } catch (err) {
       console.error("force refresh failed:", err);
     } finally {
-      setRefreshing(false);
+      if (isCurrentBoundary(boundary)) {
+        setRefreshingState({ generation: boundary.generation, value: false });
+      }
     }
-  }, [applySuggestions]);
+  }, [applySuggestions, isCurrentBoundary]);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    const boundary = { ...identityBoundaryRef.current };
+    setLoadingState({ generation: boundary.generation, value: true });
+    setRefreshingState({ generation: boundary.generation, value: false });
+    void refresh();
+  }, [authIdentityKey, refresh]);
   useInterval(refresh, POLL_INTERVAL_MS);
 
-  return { suggestions, mode, tags, loading, refreshing, refresh, forceRefresh };
+  const currentGeneration = identityBoundaryRef.current.generation;
+  const currentSnapshot =
+    snapshot.generation === currentGeneration ? snapshot : null;
+  const loading =
+    loadingState.generation === currentGeneration ? loadingState.value : true;
+  const refreshing =
+    refreshingState.generation === currentGeneration
+      ? refreshingState.value
+      : false;
+
+  return {
+    suggestions: currentSnapshot?.suggestions ?? EMPTY_SUGGESTIONS,
+    mode: currentSnapshot?.mode ?? "idle",
+    tags: currentSnapshot?.tags ?? EMPTY_TAGS,
+    loading,
+    refreshing,
+    refresh,
+    forceRefresh,
+  };
 }

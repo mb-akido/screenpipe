@@ -179,6 +179,7 @@ function createFixture() {
   const piAsyncOperationGenerationRef = { current: 1 };
   const piMessageIdRef = { current: "assistant-a" as string | null };
   const piSessionIdRef = { current: "session-a" };
+  const piFirstCallRetried = { current: new Set<string>() };
   const piRunningConfigRef = { current: { ...configA, token: "token-a" } };
   const piRateLimitRetries = { current: 0 };
   const pendingSteerBatchRef = { current: [] as Array<{ sessionId: string }> };
@@ -215,7 +216,7 @@ function createFixture() {
     piAsyncOperationGenerationRef,
     piContentBlocksRef: { current: [] },
     piCrashCountRef: { current: 0 },
-    piFirstCallRetried: { current: false },
+    piFirstCallRetried,
     piIntentionallyStoppedPidsRef: { current: new Set<number>() },
     piStartInFlightRef: { current: false },
     piLastCrashRef: { current: 0 },
@@ -258,6 +259,7 @@ function createFixture() {
     optimisticSteerRef,
     pendingSteerBatchRef,
     piAsyncOperationGenerationRef,
+    piFirstCallRetried,
     piMessageIdRef,
     piRateLimitRetries,
     piRunningConfigRef,
@@ -280,6 +282,16 @@ function emitRateLimit(fixture: ReturnType<typeof createFixture>) {
       type: "response",
       success: false,
       error: "429 rate limit exceeded, wait 1 seconds",
+    });
+  });
+}
+
+function emitFirstCallBug(fixture: ReturnType<typeof createFixture>) {
+  act(() => {
+    fixture.handleAgentEventDataRef.current?.({
+      type: "response",
+      success: false,
+      error: "cannot read properties of undefined (reading 'startsWith')",
     });
   });
 }
@@ -481,6 +493,96 @@ describe("usePiForegroundEvents deferred boundaries", () => {
       null,
       null,
     );
+  });
+
+  it("retries the Pi first-call crash once for each distinct assistant turn", () => {
+    const fixture = createFixture();
+
+    emitFirstCallBug(fixture);
+    emitFirstCallBug(fixture);
+
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+    expect(mocks.piPrompt).toHaveBeenLastCalledWith(
+      "session-a",
+      "marked dispatch A",
+      null,
+      null,
+    );
+    expect(fixture.piFirstCallRetried.current).toEqual(
+      new Set(["session-a:assistant-a"]),
+    );
+
+    fixture.sessions["session-b"] = createSession(
+      "session-b",
+      "provider B private prompt",
+      "assistant-b",
+    );
+    fixture.piSessionIdRef.current = "session-b";
+    fixture.piMessageIdRef.current = "assistant-b";
+    fixture.lastPiDispatchPromptRef.current = "marked dispatch B";
+    fixture.piRunningConfigRef.current = { ...configB, token: "token-a" };
+    fixture.rerender({
+      options: {
+        ...fixture.baseOptions,
+        activePreset: presetB,
+        buildProviderConfig: vi.fn(() => configB),
+      },
+    });
+
+    emitFirstCallBug(fixture);
+    emitFirstCallBug(fixture);
+
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(2);
+    expect(mocks.piPrompt).toHaveBeenLastCalledWith(
+      "session-b",
+      "marked dispatch B",
+      null,
+      null,
+    );
+    expect(fixture.piFirstCallRetried.current).toEqual(
+      new Set(["session-a:assistant-a", "session-b:assistant-b"]),
+    );
+
+    fixture.piSessionIdRef.current = "session-a";
+    fixture.piMessageIdRef.current = "assistant-a";
+    fixture.lastPiDispatchPromptRef.current = "marked dispatch A";
+    fixture.piRunningConfigRef.current = { ...configA, token: "token-a" };
+    fixture.rerender({
+      options: {
+        ...fixture.baseOptions,
+        activePreset: presetA,
+        buildProviderConfig: vi.fn(() => configA),
+      },
+    });
+
+    emitFirstCallBug(fixture);
+
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(2);
+    expect(fixture.piFirstCallRetried.current).toEqual(
+      new Set(["session-a:assistant-a", "session-b:assistant-b"]),
+    );
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (let index = 0; index < 128; index += 1) {
+        fixture.piSessionIdRef.current = `session-history-${index}`;
+        fixture.piMessageIdRef.current = `assistant-history-${index}`;
+        fixture.lastPiDispatchPromptRef.current = `marked history ${index}`;
+        emitFirstCallBug(fixture);
+      }
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    expect(fixture.piFirstCallRetried.current.size).toBe(128);
+    expect(fixture.piFirstCallRetried.current.has("session-a:assistant-a")).toBe(
+      false,
+    );
+    expect(
+      fixture.piFirstCallRetried.current.has(
+        "session-history-127:assistant-history-127",
+      ),
+    ).toBe(true);
   });
 
   it("stores native-echoed gateway bytes when a queued free turn starts", () => {

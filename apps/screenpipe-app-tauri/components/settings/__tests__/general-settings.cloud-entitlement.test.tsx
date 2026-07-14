@@ -91,7 +91,10 @@ describe("GeneralSettings hosted background AI entitlement", () => {
     render(<GeneralSettings />);
 
     await waitFor(() => {
-      expect(mocks.setEnhancedAiSuggestions).toHaveBeenCalledWith(false, "");
+      expect(mocks.setEnhancedAiSuggestions).toHaveBeenCalledWith(
+        false,
+        "token_123",
+      );
       expect(mocks.updateSettings).toHaveBeenCalledWith({ enhancedAI: false });
     });
   });
@@ -112,6 +115,28 @@ describe("GeneralSettings hosted background AI entitlement", () => {
     await waitFor(() => {
       expect(mocks.setEnhancedAiSuggestions).toHaveBeenCalledWith(true, "token_123");
       expect(mocks.updateSettings).toHaveBeenCalledWith({ enhancedAI: true });
+    });
+  });
+
+  it("binds a user-requested disable to the current cloud identity", async () => {
+    mocks.settings = {
+      user: userWithCloud(true),
+      enhancedAI: true,
+      cloudMediaAnalysisEnabled: false,
+    };
+
+    const { container } = render(<GeneralSettings />);
+    const toggle = container.querySelector("#enhanced-ai-toggle") as HTMLElement;
+
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(mocks.setEnhancedAiSuggestions).toHaveBeenCalledWith(
+        false,
+        "token_123",
+      );
+      expect(mocks.updateSettings).toHaveBeenCalledWith({ enhancedAI: false });
     });
   });
 });

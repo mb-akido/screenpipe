@@ -52,6 +52,18 @@ import type { PiForegroundEventsOptions } from "@/components/chat/standalone/hoo
 import { requestUsageStatusRefresh } from "@/lib/hooks/use-usage-status";
 
 const POST_STREAM_SIDE_EFFECT_DELAY_MS = 1_500;
+const PI_FIRST_CALL_RETRY_HISTORY_LIMIT = 128;
+
+function rememberPiFirstCallRetry(consumedKeys: Set<string>, turnKey: string) {
+  if (consumedKeys.has(turnKey)) return false;
+  while (consumedKeys.size >= PI_FIRST_CALL_RETRY_HISTORY_LIMIT) {
+    const oldest = consumedKeys.values().next().value;
+    if (typeof oldest !== "string") break;
+    consumedKeys.delete(oldest);
+  }
+  consumedKeys.add(turnKey);
+  return true;
+}
 
 export function usePiForegroundEvents({
   activePreset,
@@ -1179,8 +1191,13 @@ export function usePiForegroundEvents({
             "[Pi] first-call bug hit, auto-retrying prompt:",
             errorStr,
           );
-          if (piMessageIdRef.current && !piFirstCallRetried.current) {
-            piFirstCallRetried.current = true;
+          const retryTurnKey = piMessageIdRef.current
+            ? `${piSessionIdRef.current}:${piMessageIdRef.current}`
+            : null;
+          if (
+            retryTurnKey &&
+            rememberPiFirstCallRetry(piFirstCallRetried.current, retryTurnKey)
+          ) {
             // Re-send the exact dispatched bytes. Rebuilding from the
             // persisted user bubble would drop conversation context and the
             // opaque hosted-turn marker, incorrectly charging another turn.

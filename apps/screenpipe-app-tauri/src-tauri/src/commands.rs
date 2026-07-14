@@ -409,7 +409,74 @@ fn read_enterprise_key_from_path(path: &std::path::Path) -> Option<String> {
     key
 }
 
-/// Save the enterprise license key to `~/.screenpipe/enterprise.json`.
+static ENTERPRISE_CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn read_enterprise_json(path: &std::path::Path) -> serde_json::Value {
+    let mut json = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !json.is_object() {
+        json = serde_json::json!({});
+    }
+    json
+}
+
+fn write_enterprise_json_atomic(
+    path: &std::path::Path,
+    json: &serde_json::Value,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    let body = serde_json::to_vec_pretty(json)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("failed to create temp file in {}: {e}", parent.display()))?;
+    temp.write_all(&body)
+        .map_err(|e| format!("failed to write temp file for {}: {e}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|e| format!("failed to sync temp file for {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to protect temp file for {}: {e}", path.display()))?;
+    }
+    temp.persist(path)
+        .map_err(|e| format!("failed to atomically replace {}: {}", path.display(), e.error))?;
+    #[cfg(unix)]
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn save_enterprise_license_key_at(
+    path: &std::path::Path,
+    license_key: String,
+) -> Result<(), String> {
+    let _guard = ENTERPRISE_CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "enterprise config write lock was poisoned".to_string())?;
+    let mut json = read_enterprise_json(path);
+    json["license_key"] = serde_json::Value::String(license_key);
+    // The key and its authorization metadata are one crash-consistent unit.
+    // Key B must never become durable while key A's admin/team grant survives.
+    json["is_admin"] = serde_json::Value::Bool(false);
+    json["license_active"] = serde_json::Value::Bool(false);
+    json["team_api_token"] = serde_json::Value::Null;
+    write_enterprise_json_atomic(path, &json)
+}
+
+/// Save the enterprise license key to `~/.screenpipe/enterprise.json` while
+/// atomically revoking authorization metadata belonging to the previous key.
 /// Used by the in-app prompt when enterprise.json is not deployed via MDM.
 #[tauri::command]
 #[specta::specta]
@@ -418,16 +485,44 @@ pub fn save_enterprise_license_key(license_key: String) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create dir: {}", e))?;
 
     let path = dir.join("enterprise.json");
-    let mut json = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    json["license_key"] = serde_json::Value::String(license_key);
-    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap())
-        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+    save_enterprise_license_key_at(&path, license_key)?;
 
     info!("enterprise: license key saved to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod enterprise_license_persistence_tests {
+    use super::save_enterprise_license_key_at;
+
+    #[test]
+    fn replacement_key_atomically_clears_prior_team_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enterprise.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "license_key": "ENT-OLD",
+                "is_admin": true,
+                "license_active": true,
+                "team_api_token": "team-token-a",
+                "hide_app": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        save_enterprise_license_key_at(&path, "ENT-NEW".to_string()).unwrap();
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["license_key"], "ENT-NEW");
+        assert_eq!(persisted["is_admin"], false);
+        assert_eq!(persisted["license_active"], false);
+        assert!(persisted["team_api_token"].is_null());
+        assert_eq!(persisted["hide_app"], true);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }
 
 /// Persist the resolved "hide app UI" decision into `~/.screenpipe/enterprise.json`
@@ -447,10 +542,15 @@ pub fn save_enterprise_license_key(license_key: String) -> Result<(), String> {
 fn persist_enterprise_hide_app(hidden: bool) {
     let path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
 
-    let mut json = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let _guard = match ENTERPRISE_CONFIG_WRITE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            warn!("enterprise: enterprise config write lock was poisoned");
+            return;
+        }
+    };
+
+    let mut json = read_enterprise_json(&path);
 
     let currently_set = json
         .get("hide_app")
@@ -470,15 +570,10 @@ fn persist_enterprise_hide_app(hidden: bool) {
         }
     }
     json["hide_app"] = serde_json::Value::Bool(hidden);
-    match serde_json::to_string_pretty(&json) {
-        Ok(body) => {
-            if let Err(e) = std::fs::write(&path, body) {
-                warn!("enterprise: failed to persist hide_app to {}: {}", path.display(), e);
-            } else {
-                info!("enterprise: persisted hide_app={} to {}", hidden, path.display());
-            }
-        }
-        Err(e) => warn!("enterprise: failed to serialize enterprise.json: {}", e),
+    if let Err(e) = write_enterprise_json_atomic(&path, &json) {
+        warn!("enterprise: failed to persist hide_app to {}: {}", path.display(), e);
+    } else {
+        info!("enterprise: persisted hide_app={} to {}", hidden, path.display());
     }
 }
 
@@ -601,6 +696,7 @@ pub async fn set_cloud_token(
     force_clear: bool,
     state: tauri::State<'_, crate::recording::RecordingState>,
     pi_state: tauri::State<'_, crate::pi::PiState>,
+    suggestions_state: tauri::State<'_, crate::suggestions::SuggestionsState>,
 ) -> Result<(), String> {
     let supplied_non_empty = token.as_ref().is_some_and(|value| !value.is_empty());
     let normalized = crate::auth_token::normalize_cloud_token(token);
@@ -641,6 +737,12 @@ pub async fn set_cloud_token(
         &expected,
         force_clear,
     );
+    if should_invalidate_pi_sessions {
+        // Revoke publication rights before the credential transition starts.
+        // Do not destructively clear the config/cache yet: a failed non-null
+        // rotation can restore the prior authoritative identity below.
+        suggestions_state.invalidate_cloud_identity_work();
+    }
     // Pi children retain SCREENPIPE_API_KEY and queued work from their spawn.
     // Every explicit sign-out must invalidate them even if the Arc was already
     // empty; a different non-empty token also means an account/credential
@@ -738,6 +840,20 @@ pub async fn set_cloud_token(
             .await
             .map_err(|e| format!("failed to persist cloud token to secret store: {e}"))
     };
+    if should_invalidate_pi_sessions {
+        let committed_identity = state.cloud_token.load_full();
+        if should_clear_suggestions_after_cloud_auth_transition(
+            transition_result.is_ok(),
+            &previous_identity,
+            committed_identity.as_ref(),
+        ) {
+            // Enhanced suggestions are a recurring hosted-AI path outside
+            // PiState. Clear only once the identity transition committed, or
+            // when failure left native runtime signed out. A failed rotation
+            // that restored account A keeps A's enabled preference/cache.
+            suggestions_state.clear_cloud_identity().await;
+        }
+    }
     transition_result
 }
 
@@ -764,10 +880,19 @@ fn should_invalidate_pi_sessions_for_cloud_auth(
     previous != next || (next.is_none() && (force_clear || expected.is_some()))
 }
 
+fn should_clear_suggestions_after_cloud_auth_transition(
+    transition_succeeded: bool,
+    previous: &Option<String>,
+    committed: &Option<String>,
+) -> bool {
+    transition_succeeded || committed != previous
+}
+
 #[cfg(test)]
 mod cloud_token_cas_tests {
     use super::{
-        cloud_token_compare_and_set_allowed, should_invalidate_pi_sessions_for_cloud_auth,
+        cloud_token_compare_and_set_allowed, should_clear_suggestions_after_cloud_auth_transition,
+        should_invalidate_pi_sessions_for_cloud_auth,
     };
 
     fn token(value: &str) -> Option<String> {
@@ -809,6 +934,25 @@ mod cloud_token_cas_tests {
             &None,
             &token("account-a"),
             true,
+        ));
+    }
+
+    #[test]
+    fn enhanced_suggestions_clear_only_after_commit_or_fail_closed_identity_change() {
+        assert!(should_clear_suggestions_after_cloud_auth_transition(
+            true,
+            &token("account-a"),
+            &token("account-b"),
+        ));
+        assert!(!should_clear_suggestions_after_cloud_auth_transition(
+            false,
+            &token("account-a"),
+            &token("account-a"),
+        ));
+        assert!(should_clear_suggestions_after_cloud_auth_transition(
+            false,
+            &token("account-a"),
+            &None,
         ));
     }
 
@@ -855,10 +999,10 @@ pub fn save_enterprise_team_config(
     std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create dir: {}", e))?;
 
     let path = dir.join("enterprise.json");
-    let mut json = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let _guard = ENTERPRISE_CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "enterprise config write lock was poisoned".to_string())?;
+    let mut json = read_enterprise_json(&path);
 
     if let Some(v) = is_admin {
         json["is_admin"] = serde_json::Value::Bool(v);
@@ -875,8 +1019,7 @@ pub fn save_enterprise_team_config(
         };
     }
 
-    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap())
-        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+    write_enterprise_json_atomic(&path, &json)?;
 
     info!(
         "enterprise: team config saved to {} (is_admin set: {}, license_active set: {}, token set: {})",
