@@ -170,11 +170,16 @@ describe('validateAuth — verified identities only', () => {
     verifyTokenMock.mockImplementation(async () => ({ sub: 'user_subscribed' }) as any);
     globalThis.fetch = mock(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.includes('/rest/v1/users?')) {
-        return new Response(JSON.stringify([{ id: '22222222-2222-4222-8222-222222222222' }]), { status: 200 });
-      }
-      if (url.includes('/rest/v1/cloud_subscriptions?')) {
-        return new Response(JSON.stringify([{ id: 'sub_123' }]), { status: 200 });
+      if (url === 'https://screenpipe.com/api/user') {
+        return new Response(JSON.stringify({
+          success: true,
+          user: {
+            clerk_id: 'user_subscribed',
+            cloud_subscribed: true,
+            app_entitled: true,
+            entitlement: { active: true, features: { app: true, cloud: true } },
+          },
+        }), { status: 200 });
       }
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
@@ -234,7 +239,8 @@ describe('validateAuth — verified identities only', () => {
 		  success: true,
 		  user: {
 			clerk_id: 'user_app_only',
-			cloud_subscribed: false,
+			// A stale legacy boolean must not override an explicit modern denial.
+			cloud_subscribed: true,
 			app_entitled: true,
 			entitlement: { active: true, features: { app: true, cloud: false, enterprise: false } },
 		  },
@@ -249,6 +255,87 @@ describe('validateAuth — verified identities only', () => {
 	  deviceId: 'user_app_only',
 	  userId: 'user_app_only',
 	});
+  });
+
+  it('does not turn an active Basic subscription row into unlimited hosted AI', async () => {
+    verifyTokenMock.mockImplementation(async () => ({ sub: 'user_basic' }) as any);
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://screenpipe.com/api/user') {
+        return new Response(JSON.stringify({
+          success: true,
+          user: {
+            clerk_id: 'user_basic',
+            cloud_subscribed: false,
+            app_entitled: true,
+            entitlement: {
+              active: true,
+              source: 'cloud_subscription',
+              plan: 'standard',
+              features: { app: true, cloud: false, enterprise: false },
+            },
+          },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.basic.clerk'), env)).toEqual({
+      isValid: true,
+      tier: 'logged_in',
+      deviceId: 'user_basic',
+      userId: 'user_basic',
+    });
+  });
+
+  it('preserves an enterprise seat when an app-only lifetime entitlement is the primary object', async () => {
+    verifyTokenMock.mockImplementation(async () => ({ sub: 'user_enterprise_lifetime' }) as any);
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://screenpipe.com/api/user') {
+        return new Response(JSON.stringify({
+          success: true,
+          user: {
+            clerk_id: 'user_enterprise_lifetime',
+            cloud_subscribed: true,
+            app_entitled: true,
+            entitlement: {
+              active: true,
+              source: 'lifetime',
+              features: { app: true, cloud: false, enterprise: false },
+            },
+            enterprise_account: { requires_enterprise_app: true },
+          },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.enterprise.lifetime'), env)).toEqual({
+      isValid: true,
+      tier: 'subscribed',
+      deviceId: 'user_enterprise_lifetime',
+      userId: 'user_enterprise_lifetime',
+    });
+  });
+
+  it('treats a malformed canonical response as unavailable after Clerk verifies identity', async () => {
+    verifyTokenMock.mockImplementation(async () => ({ sub: 'user_verified' }) as any);
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://screenpipe.com/api/user') {
+        return new Response(JSON.stringify({ success: false }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    expect(await validateAuth(requestFor('eyJ.verified.malformed'), env)).toEqual({
+      isValid: true,
+      tier: 'logged_in',
+      deviceId: 'user_verified',
+      userId: 'user_verified',
+      error: 'subscription_lookup_unavailable',
+    });
   });
 
   it('marks a transient subscription lookup failure instead of silently downgrading a paying user', async () => {

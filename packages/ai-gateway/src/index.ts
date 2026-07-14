@@ -480,7 +480,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				if (freeTurn.reason === 'request_budget' || freeTurn.reason === 'followup_expired') {
 					return addCorsHeaders(
 						createErrorResponse(
-							429,
+							402,
 							JSON.stringify({
 								error: 'free_chat_turn_request_limit',
 								message:
@@ -493,7 +493,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				if (freeTurn.reason === 'global_limit') {
 					return addCorsHeaders(
 						createErrorResponse(
-							429,
+							402,
 							JSON.stringify({
 								error: 'free_chat_global_daily_limit',
 								message:
@@ -506,7 +506,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				if (freeTurn.reason === 'network_limit') {
 					return addCorsHeaders(
 						createErrorResponse(
-							429,
+							402,
 							JSON.stringify({
 								error: 'free_chat_network_daily_limit',
 								message:
@@ -519,7 +519,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				if (freeTurn.reason === 'network_identity') {
 					return addCorsHeaders(
 						createErrorResponse(
-							429,
+							402,
 							JSON.stringify({
 								error: 'free_chat_network_identity_unavailable',
 								message:
@@ -577,7 +577,7 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 					await releaseFreeChatTurn(env, authResult.userId, freeTurn.turnHash, freeTurn.leaseToken).catch(captureException);
 					return addCorsHeaders(
 						createErrorResponse(
-							429,
+							402,
 							JSON.stringify({
 								error: 'free_chat_shadow_budget_exhausted',
 								message:

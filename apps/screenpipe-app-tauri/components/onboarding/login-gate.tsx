@@ -349,7 +349,7 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
               animate={{ opacity: 1 }}
               transition={{ duration: 0.5, delay: 1.0 }}
             >
-              sign in for 2 included cloud turns
+              sign in to use Screenpipe Cloud · local and your own AI stay free
             </motion.p>
           </>
         )}

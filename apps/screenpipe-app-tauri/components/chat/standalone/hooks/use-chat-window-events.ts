@@ -25,6 +25,13 @@ import { useChatStore } from "@/lib/stores/chat-store";
 import { useChatPrefillEvents } from "@/components/chat/standalone/hooks/use-chat-prefill-events";
 import type { PiAuthIdentity } from "@/components/chat/standalone/hooks/pi-types";
 import { isSamePiAuthIdentity } from "@/lib/chat/free-tier-turn-marker";
+import {
+  consumeFreeTierAiSetupReturnRoute,
+  consumePendingChatConversation,
+  isRestorableChatConversation,
+  resolveFreeTierPresetForRestore,
+  restorePendingChatSetup,
+} from "@/lib/chat/free-tier-provider-setup";
 import { chatAuthBoundaryForToken } from "@/lib/chat-utils";
 import { isDevBillingBypassEnabled } from "@/lib/app-entitlement";
 
@@ -431,15 +438,31 @@ export function useChatConversationRoutingEvents({
   }, [focusMessageById, openConversationLocally, openFilePreview]);
 
   useEffect(() => {
-    const pendingId = localStorage.getItem("pending-chat-conversation");
-    if (pendingId) {
-      localStorage.removeItem("pending-chat-conversation");
+    const returnRoutePending = consumeFreeTierAiSetupReturnRoute(
+      () => window.location.href,
+      (href) => window.history.replaceState(window.history.state, "", href),
+    );
+    const storedPending = consumePendingChatConversation(
+      () => window.localStorage,
+    );
+    // The one-shot URL is authoritative because it survives disabled browser
+    // storage and is tied to this navigation. Still consume the storage copy
+    // so it cannot replay on a later mount.
+    const pending = returnRoutePending ?? storedPending;
+    if (pending) {
       void (async () => {
         const { loadConversationFile } = await import("@/lib/chat-storage");
-        const conv = await loadConversationFile(pendingId);
-        if (conv) {
-          loadConversationRef.current(conv);
-        }
+        await restorePendingChatSetup(
+          pending,
+          async (conversationId) => {
+            const conversation = await loadConversationFile(conversationId);
+            return isRestorableChatConversation(conversation, conversationId)
+              ? conversation
+              : null;
+          },
+          (conversation) => loadConversationRef.current(conversation),
+          (presetId) => emit("chat-preset-restore", { presetId }),
+        );
       })();
     }
   }, []);
@@ -622,10 +645,21 @@ export function useChatWindowSyncEvents({
   useEffect(() => {
     const unlisten = listen<{ presetId: string }>(
       "chat-preset-restore",
-      (event) => {
+      async (event) => {
         const { presetId } = event.payload;
-        if (!presetId || !aiPresets) return;
-        const match = aiPresets.find((preset) => preset.id === presetId);
+        if (!presetId) return;
+        const match = await resolveFreeTierPresetForRestore(
+          presetId,
+          aiPresets,
+          async () => {
+            const { getStore } = await import("@/lib/hooks/use-settings");
+            const store = await getStore();
+            const freshSettings = await store.get<{
+              aiPresets?: AIPreset[];
+            }>("settings");
+            return freshSettings?.aiPresets;
+          },
+        );
         if (match) {
           setActivePreset(match);
         }

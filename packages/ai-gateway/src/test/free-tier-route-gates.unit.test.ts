@@ -91,6 +91,89 @@ function globalLimitDb(): D1Database {
 	} as unknown as D1Database;
 }
 
+function networkLimitDb(): D1Database {
+	let inserted = false;
+	let leaseToken = '';
+	return {
+		prepare(sql: string) {
+			const normalized = sql.replace(/\s+/g, ' ').trim();
+			const bound = (args: unknown[]) => ({
+				async first<T>() {
+					if (normalized.startsWith('SELECT reservation_day, network_hash') && inserted) {
+						return {
+							reservation_day: '2026-07-13',
+							network_hash: 'hashed-network',
+							global_counted: 1,
+							network_counted: 0,
+						} as T;
+					}
+					if (normalized.startsWith('SELECT COUNT')) return { count: inserted ? 1 : 0 } as T;
+					return null;
+				},
+				async run() {
+					if (normalized.startsWith('DELETE FROM free_chat_turns') && normalized.includes('followup_expires_at')) {
+						return { meta: { changes: 0 } };
+					}
+					if (normalized.startsWith('INSERT OR IGNORE INTO free_chat_turns')) {
+						inserted = true;
+						leaseToken = String(args[2]);
+						return { meta: { changes: 1 } };
+					}
+					if (normalized.startsWith('INSERT INTO free_chat_global_daily')) return { meta: { changes: 1 } };
+					if (normalized.startsWith('UPDATE free_chat_turns SET global_counted = 1')) return { meta: { changes: 1 } };
+					if (normalized.startsWith('INSERT INTO free_chat_network_daily')) return { meta: { changes: 0 } };
+					if (
+						normalized.startsWith('DELETE FROM free_chat_turns') &&
+						normalized.includes('request_count = 1') &&
+						String(args[2]) === leaseToken
+					) {
+						inserted = false;
+						return { meta: { changes: 1 } };
+					}
+					if (normalized.startsWith('UPDATE free_chat_global_daily')) return { meta: { changes: 1 } };
+					return { meta: { changes: 0 } };
+				},
+			});
+			return {
+				bind(...args: unknown[]) {
+					return bound(args);
+				},
+				async first<T>() {
+					return bound([]).first<T>();
+				},
+			};
+		},
+	} as unknown as D1Database;
+}
+
+function blockedExistingTurnDb(state: {
+	request_count: number;
+	lease_active: number;
+	followup_expired: number;
+}): D1Database {
+	return {
+		prepare(sql: string) {
+			const normalized = sql.replace(/\s+/g, ' ').trim();
+			return {
+				bind() {
+					return {
+						async first<T>() {
+							if (normalized.startsWith('SELECT COUNT')) return { count: 1 } as T;
+							if (normalized.startsWith('SELECT status, request_count')) {
+								return { status: 'pending', ...state } as T;
+							}
+							return null;
+						},
+						async run() {
+							return { meta: { changes: 0 } };
+						},
+					};
+				},
+			};
+		},
+	} as unknown as D1Database;
+}
+
 function allowedTurnDb(): D1Database & { hasTurn(): boolean } {
 	let inserted = false;
 	let globalCounted = 0;
@@ -403,6 +486,17 @@ function chatRequest(headers?: HeadersInit, content = TEST_TURN): Request {
 	});
 }
 
+function chatRequestWithoutNetworkIdentity(headers?: HeadersInit): Request {
+	return new Request('https://gateway.test/v1/chat/completions', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', ...headers },
+		body: JSON.stringify({
+			model: 'auto',
+			messages: [{ role: 'user', content: TEST_TURN }],
+		}),
+	});
+}
+
 async function errorCode(response: Response): Promise<string> {
 	const outer = (await response.json()) as { error: string };
 	return JSON.parse(outer.error).error;
@@ -641,7 +735,7 @@ describe('staged free-tier hosted route gates', () => {
 		for (const path of ['/v1/usage', '/v1/models']) {
 			const response = await handleRequest(
 				new Request(`https://gateway.test${path}`, {
-					headers: { Authorization: 'Bearer verified-clerk-token' },
+					headers: { Authorization: 'Bearer eyJ.verified-clerk-token' },
 				}),
 				env,
 				ctx,
@@ -764,6 +858,7 @@ describe('staged free-tier hosted route gates', () => {
 		expect(handleChatCompletionsMock.mock.calls[0]?.[0]?.freePreview).toBeUndefined();
 
 		const authenticatedFree = {
+			isValid: true,
 			tier: 'logged_in',
 			deviceId: 'user_free',
 			userId: 'user_free',
@@ -817,14 +912,53 @@ describe('staged free-tier hosted route gates', () => {
 		expect(handleChatCompletionsMock).not.toHaveBeenCalled();
 	});
 
-	it('returns a structured 429 when the global daily new-turn circuit breaker is full', async () => {
+	it('returns a non-retryable structured wall when the global daily new-turn circuit breaker is full', async () => {
 		const response = await handleRequest(
 			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
 			{ ...env, DB: globalLimitDb(), FREE_CHAT_GLOBAL_DAILY_TURN_LIMIT: '1' } as Env,
 			ctx,
 		);
-		expect(response.status).toBe(429);
+		expect(response.status).toBe(402);
 		expect(await errorCode(response)).toBe('free_chat_global_daily_limit');
+	});
+
+	it('returns a non-retryable structured wall when the network daily circuit breaker is full', async () => {
+		const response = await handleRequest(
+			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
+			{ ...env, DB: networkLimitDb(), FREE_CHAT_NETWORK_DAILY_TURN_LIMIT: '1' } as Env,
+			ctx,
+		);
+		expect(response.status).toBe(402);
+		expect(await errorCode(response)).toBe('free_chat_network_daily_limit');
+	});
+
+	it('returns a non-retryable structured wall when a network identity cannot be derived', async () => {
+		const response = await handleRequest(
+			chatRequestWithoutNetworkIdentity({ Authorization: 'Bearer verified-clerk-token' }),
+			{ ...env, DB: allowedTurnDb() } as Env,
+			ctx,
+		);
+		expect(response.status).toBe(402);
+		expect(await errorCode(response)).toBe('free_chat_network_identity_unavailable');
+	});
+
+	it.each([
+		{
+			name: 'request cap',
+			state: { request_count: 12, lease_active: 0, followup_expired: 0 },
+		},
+		{
+			name: 'fixed follow-up window',
+			state: { request_count: 2, lease_active: 0, followup_expired: 1 },
+		},
+	])('returns a non-retryable structured wall after the per-turn $name', async ({ state }) => {
+		const response = await handleRequest(
+			chatRequest({ Authorization: 'Bearer verified-clerk-token' }),
+			{ ...env, DB: blockedExistingTurnDb(state), FREE_CHAT_MAX_REQUESTS_PER_TURN: '12' } as Env,
+			ctx,
+		);
+		expect(response.status).toBe(402);
+		expect(await errorCode(response)).toBe('free_chat_turn_request_limit');
 	});
 
 	it('stops before inference when the independent retail shadow budget is zero', async () => {
@@ -838,7 +972,7 @@ describe('staged free-tier hosted route gates', () => {
 			} as Env,
 			ctx,
 		);
-		expect(response.status).toBe(429);
+		expect(response.status).toBe(402);
 		expect(await errorCode(response)).toBe('free_chat_shadow_budget_exhausted');
 		expect(db.hasTurn()).toBe(false);
 	});
@@ -966,7 +1100,7 @@ describe('staged free-tier hosted route gates', () => {
 	});
 
 	it('fails closed with a structured 503 when the staged D1 migration is missing', async () => {
-		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), env, ctx);
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer eyJ.verified-clerk-token' }), env, ctx);
 		expect(response.status).toBe(503);
 		expect(await errorCode(response)).toBe('free_chat_ledger_unavailable');
 	});
@@ -986,7 +1120,7 @@ describe('staged free-tier hosted route gates', () => {
 			throw new Error(`unexpected upstream fetch: ${url}`);
 		}) as typeof fetch;
 
-		const response = await handleRequest(chatRequest({ Authorization: 'Bearer verified-clerk-token' }), env, ctx);
+		const response = await handleRequest(chatRequest({ Authorization: 'Bearer eyJ.verified-clerk-token' }), env, ctx);
 		expect(response.status).toBe(503);
 		expect(await errorCode(response)).toBe('subscription_status_unavailable');
 	});

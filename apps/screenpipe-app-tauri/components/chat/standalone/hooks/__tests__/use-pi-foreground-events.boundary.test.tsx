@@ -5,6 +5,10 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { usePiForegroundEvents } from "../use-pi-foreground-events";
+import {
+  FREE_CHAT_SAFETY_LIMIT_MESSAGE,
+  HOSTED_AI_SUBSCRIPTION_REQUIRED_MESSAGE,
+} from "@/lib/chat/quota-errors";
 
 const mocks = vi.hoisted(() => ({
   emit: vi.fn(async () => undefined),
@@ -493,6 +497,58 @@ describe("usePiForegroundEvents deferred boundaries", () => {
       null,
       null,
     );
+  });
+
+  it("does not retry a wrapped terminal hosted-preview wall", async () => {
+    const fixture = createFixture();
+    const wrappedError = `402 ${JSON.stringify({
+      error: JSON.stringify({
+        error: "hosted_ai_subscription_required",
+      }),
+    })}`;
+
+    act(() => {
+      fixture.handleAgentEventDataRef.current?.({
+        type: "response",
+        success: false,
+        error: wrappedError,
+      });
+    });
+
+    expect(fixture.piRateLimitRetries.current).toBe(0);
+    expect(fixture.getPanelMessages().find(
+      (message: any) => message.id === "assistant-a",
+    )?.content).toBe(HOSTED_AI_SUBSCRIPTION_REQUIRED_MESSAGE);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+  });
+
+  it("does not retry a wrapped terminal safety wall", async () => {
+    const fixture = createFixture();
+    const wrappedError = `402 ${JSON.stringify({
+      error: JSON.stringify({
+        error: "free_chat_global_daily_limit",
+      }),
+    })}`;
+
+    act(() => {
+      fixture.handleAgentEventDataRef.current?.({
+        type: "response",
+        success: false,
+        error: wrappedError,
+      });
+    });
+
+    expect(fixture.piRateLimitRetries.current).toBe(0);
+    expect(fixture.getPanelMessages().find(
+      (message: any) => message.id === "assistant-a",
+    )?.content).toBe(FREE_CHAT_SAFETY_LIMIT_MESSAGE);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
   });
 
   it("retries the Pi first-call crash once for each distinct assistant turn", () => {

@@ -169,8 +169,13 @@ function HomeContent() {
       const section = activeSection === "disk-usage" || activeSection === "cloud-archive" || activeSection === "cloud-sync"
         ? "storage"
         : activeSection;
-      const setup = new URLSearchParams(window.location.search).get("setup");
-      router.push(buildAiSettingsRoute(section, setup));
+      const search = new URLSearchParams(window.location.search);
+      router.push(
+        buildAiSettingsRoute(section, search.get("setup"), {
+          activate: search.get("activate"),
+          from: search.get("from"),
+        }),
+      );
     }
   }, [activeSection, router]);
 
@@ -888,7 +893,12 @@ function HomeContent() {
     if (SETTINGS_SECTIONS.has(section)) {
       const mapped = section === "disk-usage" || section === "cloud-archive" || section === "cloud-sync"
         ? "storage" : section;
-      router.push(buildAiSettingsRoute(mapped, url.searchParams.get("setup")));
+      router.push(
+        buildAiSettingsRoute(mapped, url.searchParams.get("setup"), {
+          activate: url.searchParams.get("activate"),
+          from: url.searchParams.get("from"),
+        }),
+      );
     } else {
       const mapped = section === "feedback" ? "help" : section;
       if (ALL_SECTIONS.includes(mapped)) setActiveSection(mapped);

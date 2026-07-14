@@ -16,6 +16,7 @@
     body[data-flow="free-home"] .free-home,
     body[data-flow="preview"] .preview,
     body[data-flow="limit"] .limit,
+    body[data-flow="preview-off"] .preview-off,
     body[data-flow="own-ai"] .own-ai,
     body[data-flow="tree-access"] .tree-access,
     body[data-flow="tree-ai"] .tree-ai { display:flex; }
@@ -137,7 +138,7 @@
 <div class="nav">
 <span>↯</span> Pipes</div>
 <div class="side-note">Your recordings stay on this computer.<br>
-<br>Sign in for 2 hosted AI turns. Business adds ongoing hosted AI, cloud transcription, sync, and team controls.</div>
+<br>Sign in to use Screenpipe Cloud. Local and your own AI stay free. Business adds hosted AI, cloud transcription, sync, and team controls.</div>
 </aside>
       <main class="main">
 <div class="main-head">
@@ -209,7 +210,7 @@
 </div>
         <div class="chatbar">
 <span>Ask with local AI or a provider you own…</span>
-<span class="counter">sign in for 2 hosted AI turns</span>
+<span class="counter">screenpipe cloud requires sign-in</span>
 </div>
       </main>
 </div>
@@ -323,6 +324,42 @@
 <small>Ollama keeps prompts and screen context on this computer.</small>
 </div>
 </div>
+</div>
+</div>
+</div>
+  </section>
+
+  <section class="frame app preview-off" style="position:relative">
+    <header class="top">
+<div class="brand">screenpipe</div>
+<div class="badge green">free / local</div>
+<div class="spacer"></div>
+<div class="status"><span class="dot"></span> recording locally</div>
+</header>
+<div class="shell">
+<aside class="side">
+<div class="nav active"><span>✦</span> Chat</div>
+<div class="side-note">Hosted preview paused.<br><br>Recording, search, timeline, meetings, MCP, local models, and providers you own continue to work.</div>
+</aside>
+<main class="main">
+<div class="main-head"><div><div class="eyebrow">screenpipe cloud · preview unavailable</div><h1>New chat</h1></div></div>
+<div class="chat">
+<div class="message user"><div class="message-label">you</div>What did I decide about pricing?</div>
+<div class="message ai"><div class="message-label">screenpipe cloud</div><div class="answer">Screenpipe Cloud AI requires Business right now. Local screenpipe and your own AI stay free.</div></div>
+</div>
+</main>
+</div>
+    <div class="overlay">
+<div class="modal">
+<div class="modal-top">
+<div class="eyebrow">free / local</div>
+<h2>keep your memory. choose your ai.</h2>
+<p>Screenpipe Cloud AI requires Business right now. Recording, local search, meetings, timeline, MCP, and local or user-provided AI stay free.</p>
+</div>
+<div class="choices">
+<div class="choice primary"><div class="icon">☁</div><div><strong>Upgrade for hosted AI ↗</strong><small>Screenpipe manages the models, usage, cloud transcription, and sync.</small></div></div>
+<div class="choice"><div class="icon">⌁</div><div><strong>Continue free with your AI</strong><small>Connect ChatGPT Plus (including Codex), an Anthropic or OpenAI API key, or any compatible endpoint.</small></div></div>
+<div class="choice"><div class="icon">▣</div><div><strong>Run fully local</strong><small>Ollama keeps prompts and screen context on this computer.</small></div></div>
 </div>
 </div>
 </div>

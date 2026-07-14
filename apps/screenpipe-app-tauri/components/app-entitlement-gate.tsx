@@ -29,7 +29,6 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { commands } from "@/lib/utils/tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
 
 const E2E_ACCOUNT_USER_KEY = "screenpipe_e2e_account_user";
 const E2E_ACCOUNT_USER_EVENT = "screenpipe-e2e-seed-account-user";
@@ -107,13 +106,9 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const { settings, updateSettings, loadUser, isSettingsLoaded } = useSettings();
   const {
     isEnterprise,
-    enterpriseBuildResolved,
-    enterpriseBuildError,
     isSectionHidden,
     needsLicenseKey,
-    policyStatus,
-    policyResolved,
-    submitLicenseKey,
+    policy: enterprisePolicy,
   } = useEnterprisePolicy();
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
@@ -121,8 +116,6 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const [devSubmitting, setDevSubmitting] = useState(false);
   const [devError, setDevError] = useState<string | null>(null);
   const stoppedForGateRef = useRef(false);
-  const gateStopPromiseRef = useRef<Promise<void> | null>(null);
-  const resumeAllowedRef = useRef(false);
   const prevGateRef = useRef<boolean | null>(null);
   const skipNextResumeForE2ESeedRef = useRef(false);
   const resumingRef = useRef(false);
@@ -168,12 +161,10 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     (everEntitledRef.current ||
       (tokenPending && hasPersistedEntitlementEvidence(user)));
 
-  const shouldGateForEnterprisePolicy =
-    !enterpriseBuildResolved ||
-    (isEnterprise && (!policyResolved || needsLicenseKey));
+  const enterpriseAccountPolicyLoaded = Boolean(enterprisePolicy.orgName);
   const enterpriseRequiresLogin =
     isEnterprise &&
-    policyResolved &&
+    enterpriseAccountPolicyLoaded &&
     !needsLicenseKey &&
     !isSectionHidden("account");
   const shouldGateForEnterpriseLogin = enterpriseRequiresLogin && !user?.token;
@@ -191,12 +182,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   // use their feature-level checks; enterprise policy gates remain mandatory.
   const shouldGate =
     shouldGateForEnterpriseApp ||
-    shouldGateForEnterprisePolicy ||
     shouldGateForEnterpriseLogin;
-  resumeAllowedRef.current =
-    enterpriseBuildResolved &&
-    !shouldGate &&
-    (!isEnterprise || (policyResolved && !needsLicenseKey));
   const email = user?.email || "this account";
   const enterpriseOrgName = enterpriseAccount?.org_name || "your workspace";
   const planLabel = useMemo(
@@ -238,11 +224,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     gateReportedRef.current = true;
     posthog.capture("app_entitlement_gate_shown", {
       logged_in: Boolean(user?.token),
-      reason: shouldGateForEnterprisePolicy
-        ? "enterprise_policy_required"
-        : shouldGateForEnterpriseLogin
-          ? "enterprise_login_required"
-          : "app_entitlement",
+      reason: shouldGateForEnterpriseLogin ? "enterprise_login_required" : "app_entitlement",
       plan: user?.subscription_plan ?? null,
       app_entitled: user?.app_entitled ?? null,
       // Diagnostics for the enterprise post-update loop (SCR-132): tell a
@@ -254,13 +236,11 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
       transient_fail_open: failOpenForTransientAccessLoss,
       gate_path: shouldGateForEnterpriseLogin
         ? "enterprise_login"
-        : shouldGateForEnterprisePolicy
-          ? `enterprise_policy_${policyStatus}`
-          : shouldGateForEnterpriseApp
-            ? "enterprise_app"
-            : "entitlement",
+        : shouldGateForEnterpriseApp
+          ? "enterprise_app"
+          : "entitlement",
     });
-  }, [isSettingsLoaded, shouldGate, shouldGateForEnterpriseLogin, shouldGateForEnterprisePolicy, shouldGateForEnterpriseApp, policyStatus, isEnterprise, tokenPending, failOpenForTransientAccessLoss, user?.app_entitled, user?.subscription_plan, user?.token]);
+  }, [isSettingsLoaded, shouldGate, shouldGateForEnterpriseLogin, shouldGateForEnterpriseApp, isEnterprise, tokenPending, failOpenForTransientAccessLoss, user?.app_entitled, user?.subscription_plan, user?.token]);
 
   // When failing open on a pending token, keep trying to re-read it from the
   // secret store. Once the store heals (the periodic WAL checkpoint clears the
@@ -292,19 +272,16 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   }, [devBypass, failOpenForTransientAccessLoss, tokenPending, loadUser]);
 
   useEffect(() => {
-    if (!shouldGate) {
+    if (!isSettingsLoaded || !shouldGate) {
       stoppedForGateRef.current = false;
       return;
     }
     if (stoppedForGateRef.current) return;
     stoppedForGateRef.current = true;
-    gateStopPromiseRef.current = commands
-      .stopScreenpipe()
-      .then(() => undefined)
-      .catch((err) => {
-        console.warn("failed to stop screenpipe after entitlement gate:", err);
-      });
-  }, [shouldGate]);
+    commands.stopScreenpipe().catch((err) => {
+      console.warn("failed to stop screenpipe after entitlement gate:", err);
+    });
+  }, [isSettingsLoaded, shouldGate]);
 
   const openPricing = useCallback(() => {
     posthog.capture("app_entitlement_choose_plan_clicked", {
@@ -471,14 +448,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   // capture session" (port never rebound). See the recording-settings
   // "Apply & Restart" path for the canonical sequence.
   useEffect(() => {
-    // The recorder is stopped as soon as an unresolved build/policy gate is
-    // observed, even before settings hydration. Remember that gated state so a
-    // consumer resolution that lands during hydration still triggers exactly
-    // one safe restart once settings are ready.
-    if (!isSettingsLoaded) {
-      if (shouldGate) prevGateRef.current = true;
-      return;
-    }
+    if (!isSettingsLoaded || devBypass) return;
     if (skipNextResumeForE2ESeedRef.current) {
       prevGateRef.current = shouldGate;
       if (!shouldGate) skipNextResumeForE2ESeedRef.current = false;
@@ -487,13 +457,6 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     const previouslyGated = prevGateRef.current;
     prevGateRef.current = shouldGate;
     if (previouslyGated !== true || shouldGate) return;
-    // Never resume while an enterprise policy is still unresolved or while a
-    // replacement license is required. This guard is deliberately independent
-    // of orgName: valid policies may use an empty display name.
-    if (
-      !enterpriseBuildResolved ||
-      (isEnterprise && (!policyResolved || needsLicenseKey))
-    ) return;
     // A required enterprise sign-in/app gate was cleared in-session.
     posthog.capture("app_entitlement_restored", {
       plan: user?.subscription_plan ?? null,
@@ -504,28 +467,18 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     // Collapse rapid re-fires into one restart in flight.
     if (resumingRef.current) return;
     resumingRef.current = true;
-    const pendingGateStop = gateStopPromiseRef.current;
     void (async () => {
       try {
-        // A fast policy response can clear the React gate before the async stop
-        // requested by the previous render has settled. Serialize behind that
-        // stop before running the canonical stop -> settle -> spawn sequence.
-        await pendingGateStop;
-        if (!resumeAllowedRef.current) return;
         await commands.stopScreenpipe();
         await new Promise((r) => setTimeout(r, 500));
-        if (!resumeAllowedRef.current) return;
         await commands.spawnScreenpipe(null);
       } catch (err) {
         console.warn("failed to restart screenpipe after entitlement restored:", err);
       } finally {
         resumingRef.current = false;
-        if (gateStopPromiseRef.current === pendingGateStop) {
-          gateStopPromiseRef.current = null;
-        }
       }
     })();
-  }, [shouldGate, isSettingsLoaded, enterpriseBuildResolved, isEnterprise, policyResolved, needsLicenseKey, user?.subscription_plan]);
+  }, [devBypass, shouldGate, isSettingsLoaded, user?.subscription_plan]);
 
   const devLoginBlock = isDevLoginEnabled() ? (
     <div className="mt-5 border-t border-border pt-4">
@@ -569,39 +522,6 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
 
   if (!shouldGate) {
     return <>{children}</>;
-  }
-
-  if (shouldGateForEnterprisePolicy) {
-    if (needsLicenseKey) {
-      return (
-        <>
-          <EntitlementShell
-            title="enterprise license required"
-            description="screenpipe will keep recording paused until this device has a valid workspace license and policy."
-          >
-            <div className="h-10 w-full animate-pulse bg-muted" />
-          </EntitlementShell>
-          <EnterpriseLicensePrompt onSubmit={submitLicenseKey} />
-        </>
-      );
-    }
-
-    return (
-      <EntitlementShell
-        title="loading workspace policy"
-        description={
-          enterpriseBuildError
-            ? "screenpipe could not verify whether this is a managed build. recording stays paused while it retries."
-            : policyStatus === "unavailable"
-            ? "screenpipe could not load this device's workspace policy. reconnect to the internet; recording stays paused until policy is available."
-            : enterpriseBuildResolved
-              ? "checking this device's workspace policy before recording and AI start."
-              : "checking whether this app is managed before recording and AI start."
-        }
-      >
-        <div className="h-10 w-full animate-pulse bg-muted" />
-      </EntitlementShell>
-    );
   }
 
   if (shouldGateForEnterpriseApp) {

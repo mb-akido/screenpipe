@@ -124,7 +124,11 @@ import {
   isEnterpriseManagedPreset,
 } from "@/lib/enterprise-ai-preset-policy";
 import {
+  activateFreeTierAiSetupPreset,
   buildFreeTierAiSetupPreset,
+  isFreeTierAiSetupReady,
+  resolveFreeTierAiSetupPreset,
+  verifyFreeTierChatGptConnection,
   type FreeTierAiSetupProvider,
 } from "@/lib/chat/free-tier-provider-setup";
 
@@ -262,12 +266,16 @@ const AISection = ({
   isDuplicating,
   piAvailable,
   initialSetupProvider,
+  activateOnSave = false,
+  onSetupComplete,
 }: {
   preset?: AIPreset;
   setDialog: (value: boolean) => void;
   isDuplicating?: boolean;
   piAvailable?: boolean;
   initialSetupProvider?: FreeTierAiSetupProvider;
+  activateOnSave?: boolean;
+  onSetupComplete?: (preset: AIPreset) => void | Promise<void>;
 }) => {
   const { settings, updateSettings } = useSettings();
   const { isEnterprise, policy: enterprisePolicy } = useEnterprisePolicy();
@@ -301,6 +309,15 @@ const AISection = ({
   const [chatgptLoading, setChatgptLoading] = useState(false);
   const [chatgptChecking, setChatgptChecking] = useState(
     () => settingsPreset?.provider === "openai-chatgpt"
+  );
+
+  const verifyChatGptConnection = useCallback(
+    () =>
+      verifyFreeTierChatGptConnection(async () => {
+        const result = await commands.chatgptOauthCheckToken();
+        return result.status === "ok" && result.data;
+      }),
+    [],
   );
 
   // Filter presets the same way the UI does so hidden presets don't block creation
@@ -360,31 +377,40 @@ const AISection = ({
   // Check ChatGPT OAuth status when provider is selected
   useEffect(() => {
     if (settingsPreset?.provider === "openai-chatgpt") {
+      let cancelled = false;
       setChatgptChecking(true);
-      const timeout = setTimeout(() => setChatgptChecking(false), 5000);
-      commands.chatgptOauthStatus().then((res) => {
-        clearTimeout(timeout);
-        if (res.status === "ok") {
-          setChatgptLoggedIn(res.data.logged_in);
-        }
-        setChatgptChecking(false);
-      }).catch(() => {
-        clearTimeout(timeout);
+      void verifyChatGptConnection().then((valid) => {
+        if (cancelled) return;
+        setChatgptLoggedIn(valid);
         setChatgptChecking(false);
       });
-      return () => clearTimeout(timeout);
+      return () => {
+        cancelled = true;
+      };
     } else {
+      setChatgptLoggedIn(false);
       setChatgptChecking(false);
     }
-  }, [settingsPreset?.provider]);
+  }, [settingsPreset?.provider, verifyChatGptConnection]);
 
 
   const isFormValid = useMemo(() => {
-    return Object.keys(validationErrors).length === 0 && 
-           settingsPreset?.id && 
-           settingsPreset?.provider && 
-           settingsPreset?.model;
-  }, [validationErrors, settingsPreset]);
+    const baseValid = Boolean(
+      Object.keys(validationErrors).length === 0 &&
+      settingsPreset?.id &&
+      settingsPreset?.provider &&
+      settingsPreset?.model,
+    );
+    return baseValid && (
+      !activateOnSave
+      || isFreeTierAiSetupReady(settingsPreset, chatgptLoggedIn)
+    );
+  }, [
+    activateOnSave,
+    chatgptLoggedIn,
+    validationErrors,
+    settingsPreset,
+  ]);
 
   const updateStoreSettings = async () => {
     if (!employeePresetsAllowed) {
@@ -435,25 +461,36 @@ const AISection = ({
         });
 
         setDialog(false);
+        if (activateOnSave) {
+          try {
+            localStorage.setItem("chat-active-preset-id", defaultPreset.id);
+          } catch {}
+          await onSetupComplete?.(defaultPreset);
+        }
         return;
       }
 
+      let savedPreset: AIPreset | null = null;
       // Handle update case
       if (preset && !isDuplicating) {
         const updatedPresets = settings.aiPresets.map((p) => {
           if (p.id === preset.id) {
-            return {
+            savedPreset = {
               ...settingsPreset,
               prompt: settingsPreset?.prompt || DEFAULT_PROMPT,
               maxContextChars: settingsPreset?.maxContextChars || 512000,
               defaultPreset: p.defaultPreset,
             } as AIPreset;
+            return savedPreset;
           }
           return p;
         });
 
         await updateSettings({
-          aiPresets: updatedPresets,
+          aiPresets:
+            activateOnSave && savedPreset
+              ? activateFreeTierAiSetupPreset(updatedPresets, savedPreset)
+              : updatedPresets,
         });
 
         toast({
@@ -468,6 +505,7 @@ const AISection = ({
           maxContextChars: settingsPreset?.maxContextChars || 512000,
           defaultPreset: false,
         } as AIPreset;
+        savedPreset = newPreset;
 
         // Remove any hidden preset with the same name (e.g. filtered Pi preset
         // in enterprise builds) so it doesn't ghost-block future operations
@@ -476,7 +514,9 @@ const AISection = ({
         );
 
         await updateSettings({
-          aiPresets: [...cleanedPresets, newPreset],
+          aiPresets: activateOnSave
+            ? activateFreeTierAiSetupPreset(cleanedPresets, newPreset)
+            : [...cleanedPresets, newPreset],
         });
 
         toast({
@@ -488,6 +528,12 @@ const AISection = ({
       }
 
       setDialog(false);
+      if (activateOnSave && savedPreset) {
+        try {
+          localStorage.setItem("chat-active-preset-id", savedPreset.id);
+        } catch {}
+        await onSetupComplete?.(savedPreset);
+      }
     } catch (error) {
       toast({
         title: "Error saving preset",
@@ -1397,11 +1443,22 @@ const AISection = ({
                       try {
                         const res = await commands.chatgptOauthLogin();
                         if (res.status === "ok" && res.data) {
-                          setChatgptLoggedIn(true);
-                          toast({
-                            title: "ChatGPT connected",
-                            description: "Click \"Create preset\" below to save and start using it.",
-                          });
+                          setChatgptChecking(true);
+                          const valid = await verifyChatGptConnection();
+                          setChatgptLoggedIn(valid);
+                          setChatgptChecking(false);
+                          if (valid) {
+                            toast({
+                              title: "ChatGPT connected",
+                              description: "Click \"Create preset\" below to save and start using it.",
+                            });
+                          } else {
+                            toast({
+                              title: "ChatGPT connection could not be verified",
+                              description: "Please sign in again before saving this preset.",
+                              variant: "destructive",
+                            });
+                          }
                         } else if (res.status === "error") {
                           const msg = String(res.error || "unknown error");
                           console.error("chatgpt oauth failed:", msg);
@@ -1880,6 +1937,12 @@ const AISection = ({
                   ? "Enter a preset name to continue"
                   : !settingsPreset?.model
                   ? "Select a model to continue"
+                  : activateOnSave && settingsPreset.provider === "openai-chatgpt" && !chatgptLoggedIn
+                  ? "Connect ChatGPT before continuing"
+                  : activateOnSave && (settingsPreset.provider === "openai" || settingsPreset.provider === "anthropic") && !("apiKey" in settingsPreset && settingsPreset.apiKey?.trim())
+                  ? "Enter an API key before continuing"
+                  : activateOnSave && settingsPreset.provider === "custom" && !settingsPreset.url?.trim()
+                  ? "Enter a compatible endpoint URL before continuing"
                   : "Fix validation errors to continue"}
               </TooltipContent>
             )}
@@ -2051,18 +2114,23 @@ function SortablePresetCard({
 
 export const AIPresets = ({
   initialSetupProvider,
+  activateOnSave = false,
+  onSetupComplete,
 }: {
   initialSetupProvider?: FreeTierAiSetupProvider;
+  activateOnSave?: boolean;
+  onSetupComplete?: (preset: AIPreset) => void | Promise<void>;
 } = {}) => {
-  const { settings, updateSettings } = useSettings();
+  const { settings, updateSettings, isSettingsLoaded } = useSettings();
   const [createPresetsDialog, setCreatePresentDialog] = useState(
-    () => !!initialSetupProvider,
+    () => !!initialSetupProvider && isSettingsLoaded,
   );
   const [selectedPreset, setSelectedPreset] = useState<AIPreset | undefined>(
-    () =>
-      initialSetupProvider
-        ? settings.aiPresets.find((preset) => preset.provider === initialSetupProvider)
-        : undefined,
+    () => resolveFreeTierAiSetupPreset(
+      settings.aiPresets,
+      initialSetupProvider,
+      isSettingsLoaded,
+    ),
   );
   const [isLoading, setIsLoading] = useState(false);
   const [presetToDelete, setPresetToDelete] = useState<string | null>(null);
@@ -2084,21 +2152,30 @@ export const AIPresets = ({
   const [chatgptTokenValid, setChatgptTokenValid] = useState<boolean | null>(null);
   const team = useTeam();
   const isTeamAdmin = !!team.team && team.role === "admin";
-  const handledInitialSetupRef = useRef(initialSetupProvider);
+  const handledInitialSetupRef = useRef(
+    isSettingsLoaded ? initialSetupProvider : undefined,
+  );
 
   useEffect(() => {
     if (!initialSetupProvider) {
       handledInitialSetupRef.current = undefined;
       return;
     }
+    // The Settings provider starts with defaults and hydrates persisted presets
+    // asynchronously. Do not enter create mode against that temporary empty
+    // list: an existing ChatGPT/Ollama preset would look new and fail duplicate
+    // validation when the user saves it.
+    if (!isSettingsLoaded) return;
     if (handledInitialSetupRef.current === initialSetupProvider) return;
     handledInitialSetupRef.current = initialSetupProvider;
-    setSelectedPreset(
-      settings.aiPresets.find((preset) => preset.provider === initialSetupProvider),
-    );
+    setSelectedPreset(resolveFreeTierAiSetupPreset(
+      settings.aiPresets,
+      initialSetupProvider,
+      isSettingsLoaded,
+    ));
     setIsDuplicating(false);
     setCreatePresentDialog(true);
-  }, [initialSetupProvider, settings.aiPresets]);
+  }, [initialSetupProvider, isSettingsLoaded, settings.aiPresets]);
 
   const sharePresetToTeam = async (preset: AIPreset) => {
     try {
@@ -2173,6 +2250,23 @@ useEffect(() => {
   }
 }, [createPresetsDialog]);
 
+  if (
+    initialSetupProvider
+    && (!isSettingsLoaded
+      || handledInitialSetupRef.current !== initialSetupProvider)
+  ) {
+    return (
+      <div
+        className="flex min-h-40 items-center justify-center text-sm text-muted-foreground"
+        data-testid="ai-preset-settings-loading"
+        role="status"
+      >
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+        loading saved AI providers…
+      </div>
+    );
+  }
+
   if (createPresetsDialog)
     return (
       <AISection
@@ -2181,6 +2275,8 @@ useEffect(() => {
         isDuplicating={isDuplicating}
         piAvailable={piAvailable}
         initialSetupProvider={selectedPreset ? undefined : initialSetupProvider}
+        activateOnSave={activateOnSave}
+        onSetupComplete={onSetupComplete}
       />
     );
 

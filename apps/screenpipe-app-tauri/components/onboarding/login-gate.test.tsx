@@ -65,7 +65,10 @@ describe("onboarding login gate", () => {
     const next = vi.fn();
     render(<OnboardingLogin handleNextSlide={next} />);
     expect(screen.getByText(/^sign in$/i)).toBeInTheDocument();
-    expect(screen.getByText(/2 included cloud turns/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/local and your own AI stay free/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/2 included cloud turns/i)).not.toBeInTheDocument();
     const continueButton = await screen.findByRole("button", {
       name: /continue free with local capture/i,
     });

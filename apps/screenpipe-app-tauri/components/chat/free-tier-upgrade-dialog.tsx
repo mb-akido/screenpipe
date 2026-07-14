@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { ArrowUpRight, Cloud, KeyRound, MonitorDown } from "lucide-react";
 import posthog from "posthog-js";
@@ -18,6 +18,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { FreeTierOwnAiChoice } from "@/lib/chat/free-tier-provider-setup";
+import type { FreeTierHostedAiWall } from "@/lib/chat/quota-errors";
 
 export function buildFreeTierUpgradeUrl(userToken?: string | null): string {
   if (!userToken) return PRICING_URL;
@@ -32,6 +33,7 @@ export function FreeTierUpgradeDialog({
   userToken,
   limit = 2,
   plan = null,
+  reason = "limit",
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -39,14 +41,21 @@ export function FreeTierUpgradeDialog({
   userToken?: string | null;
   limit?: number;
   plan?: string | null;
+  reason?: FreeTierHostedAiWall["reason"];
 }) {
   const shownRef = useRef(false);
   const actionRef = useRef(false);
+  const [pendingAction, setPendingAction] = useState<
+    "upgrade" | FreeTierOwnAiChoice | null
+  >(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) {
       shownRef.current = false;
       actionRef.current = false;
+      setPendingAction(null);
+      setActionError(null);
       return;
     }
     if (shownRef.current) return;
@@ -56,8 +65,9 @@ export function FreeTierUpgradeDialog({
       plan,
       limit,
       remaining: 0,
+      reason,
     });
-  }, [limit, open, plan]);
+  }, [limit, open, plan, reason]);
 
   const closeAfterAction = () => {
     actionRef.current = true;
@@ -70,6 +80,7 @@ export function FreeTierUpgradeDialog({
         provider: "screenpipe-cloud",
         plan,
         limit,
+        reason,
       });
     }
     onOpenChange(nextOpen);
@@ -81,9 +92,24 @@ export function FreeTierUpgradeDialog({
       plan,
       limit,
     });
-    const upgradeUrl = buildFreeTierUpgradeUrl(userToken);
-    await openUrl(upgradeUrl).catch(() => window.open(upgradeUrl, "_blank"));
-    closeAfterAction();
+    setPendingAction("upgrade");
+    setActionError(null);
+    try {
+      const upgradeUrl = buildFreeTierUpgradeUrl(userToken);
+      try {
+        await openUrl(upgradeUrl);
+      } catch {
+        const popup = window.open(upgradeUrl, "_blank");
+        if (!popup) throw new Error("could not open pricing");
+      }
+      closeAfterAction();
+    } catch (error) {
+      setActionError(
+        error instanceof Error ? error.message : "could not open pricing",
+      );
+    } finally {
+      setPendingAction(null);
+    }
   };
 
   const chooseOwnAI = async (choice: FreeTierOwnAiChoice) => {
@@ -91,9 +117,32 @@ export function FreeTierUpgradeDialog({
       choice === "local" ? "free_chat_local_clicked" : "free_chat_byok_clicked",
       { provider: "screenpipe-cloud", plan, limit },
     );
-    await onChooseOwnAI(choice);
-    closeAfterAction();
+    setPendingAction(choice);
+    setActionError(null);
+    try {
+      await onChooseOwnAI(choice);
+      closeAfterAction();
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : "could not open AI provider setup",
+      );
+    } finally {
+      setPendingAction(null);
+    }
   };
+
+  const description =
+    reason === "preview_unavailable"
+      ? "Screenpipe Cloud AI requires Business right now. Recording, local search, meetings, timeline, MCP, and local or user-provided AI stay free."
+      : reason === "temporarily_unavailable"
+        ? "The included hosted preview could not verify its network safety key. Try again later, upgrade, or connect your own AI. Local screenpipe features stay free."
+      : reason === "safety_limit"
+        ? "The included hosted preview hit a safety limit. Try again tomorrow, upgrade, or connect your own AI. Local screenpipe features stay free."
+        : reason === "turn_request_limit"
+          ? "This included hosted turn reached its tool-loop limit. Start a new message, upgrade, or connect your own AI. Local screenpipe features stay free."
+        : `You used the ${limit} included Screenpipe Cloud ${limit === 1 ? "turn" : "turns"}. Recording, local search, meetings, timeline, MCP, and local pipes stay free.`;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -105,8 +154,7 @@ export function FreeTierUpgradeDialog({
           <DialogHeader className="mt-3">
             <DialogTitle>keep your memory. choose your ai.</DialogTitle>
             <DialogDescription className="leading-6">
-              You used the {limit} included Screenpipe Cloud {limit === 1 ? "turn" : "turns"}. Recording, local search,
-              meetings, timeline, MCP, and local pipes stay free.
+              {description}
             </DialogDescription>
           </DialogHeader>
         </div>
@@ -115,6 +163,7 @@ export function FreeTierUpgradeDialog({
           <button
             type="button"
             onClick={() => void upgrade()}
+            disabled={pendingAction !== null}
             className="flex w-full items-start gap-4 border border-foreground bg-foreground p-4 text-left text-background transition-opacity hover:opacity-90"
           >
             <Cloud className="mt-0.5 h-5 w-5 shrink-0" />
@@ -131,6 +180,7 @@ export function FreeTierUpgradeDialog({
           <button
             type="button"
             onClick={() => void chooseOwnAI("provider")}
+            disabled={pendingAction !== null}
             className="flex w-full items-start gap-4 border border-border p-4 text-left transition-colors hover:bg-muted/60"
           >
             <KeyRound className="mt-0.5 h-5 w-5 shrink-0" />
@@ -145,6 +195,7 @@ export function FreeTierUpgradeDialog({
           <button
             type="button"
             onClick={() => void chooseOwnAI("local")}
+            disabled={pendingAction !== null}
             className="flex w-full items-start gap-4 border border-dashed border-border p-4 text-left transition-colors hover:bg-muted/60"
           >
             <MonitorDown className="mt-0.5 h-5 w-5 shrink-0" />
@@ -156,7 +207,18 @@ export function FreeTierUpgradeDialog({
             </div>
           </button>
 
-          <Button variant="ghost" onClick={() => handleOpenChange(false)} className="mt-1 w-full">
+          {actionError && (
+            <p role="alert" className="text-xs leading-5 text-destructive">
+              {actionError}
+            </p>
+          )}
+
+          <Button
+            variant="ghost"
+            onClick={() => handleOpenChange(false)}
+            className="mt-1 w-full"
+            disabled={pendingAction !== null}
+          >
             not now
           </Button>
         </div>

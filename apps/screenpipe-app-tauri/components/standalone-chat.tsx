@@ -88,7 +88,11 @@ import {
 import type { ContentBlock, Message } from "@/lib/chat/types";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { AGENT_TOPICS, type AgentEventEnvelope } from "@/lib/events/types";
-import { parseFreeChatLimitMessage } from "@/lib/chat/quota-errors";
+import {
+  parseHandledFreeTierErrorIds,
+  parseFreeTierHostedAiMessage,
+  type FreeTierHostedAiWall,
+} from "@/lib/chat/quota-errors";
 import {
   isFreeScreenpipeCloudTextOnly,
   isSamePiAuthIdentity,
@@ -267,6 +271,9 @@ export function StandaloneChat({
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
   const [freeTierDialogOpen, setFreeTierDialogOpen] = useState(false);
   const [freeTierLimit, setFreeTierLimit] = useState(2);
+  const [freeTierWallReason, setFreeTierWallReason] = useState<
+    FreeTierHostedAiWall["reason"]
+  >("limit");
   const handledFreeLimitIdsRef = useRef<Set<string> | null>(null);
   const activePresetRef = useRef<AIPreset | undefined>(activePreset);
   activePresetRef.current = activePreset;
@@ -706,20 +713,29 @@ export function StandaloneChat({
   ) as Message[];
 
   useEffect(() => {
+    // A saved hosted-error message can briefly reappear while the originating
+    // conversation is restored. Once the explicit selection is user-owned or
+    // local, that stale message must never reopen or keep open the hosted wall.
+    if (
+      activePreset?.provider &&
+      !isScreenpipeCloudProvider(activePreset.provider)
+    ) {
+      setFreeTierDialogOpen(false);
+      return;
+    }
     const runningProvider =
       piRunningConfigRef.current?.provider ?? activePreset?.provider;
     if (!isScreenpipeCloudProvider(runningProvider)) return;
 
     if (!handledFreeLimitIdsRef.current) {
-      let stored: string[] = [];
+      let raw: string | null = null;
       try {
-        const raw = window.localStorage.getItem(FREE_CHAT_HANDLED_ERRORS_KEY);
-        stored = raw ? JSON.parse(raw) : [];
+        raw = window.localStorage.getItem(FREE_CHAT_HANDLED_ERRORS_KEY);
       } catch {
-        stored = [];
+        raw = null;
       }
       handledFreeLimitIdsRef.current = new Set(
-        stored.filter((value) => typeof value === "string"),
+        parseHandledFreeTierErrorIds(raw),
       );
     }
 
@@ -727,13 +743,14 @@ export function StandaloneChat({
       const message = messages[index];
       if (message.role !== "assistant" || typeof message.content !== "string")
         continue;
-      const quota = parseFreeChatLimitMessage(message.content);
-      if (!quota) continue;
+      const wall = parseFreeTierHostedAiMessage(message.content);
+      if (!wall) continue;
 
       const errorId = `${conversationId ?? "new"}:${message.id ?? index}`;
       if (handledFreeLimitIdsRef.current.has(errorId)) return;
       handledFreeLimitIdsRef.current.add(errorId);
-      setFreeTierLimit(quota.limit);
+      setFreeTierLimit(wall.limit);
+      setFreeTierWallReason(wall.reason);
       setFreeTierDialogOpen(true);
       try {
         const recentIds = [...handledFreeLimitIdsRef.current].slice(-100);
@@ -956,6 +973,7 @@ export function StandaloneChat({
       handledFreeLimitIdsRef.current = null;
       setFreeTierDialogOpen(false);
       setFreeTierLimit(2);
+      setFreeTierWallReason("limit");
       try {
         sessionStorage.removeItem("pendingChatPrefill");
       } catch {
@@ -2111,13 +2129,19 @@ export function StandaloneChat({
       <FreeTierUpgradeDialog
         open={!conversationAuthResetPending && freeTierDialogOpen}
         limit={freeTierLimit}
+        reason={freeTierWallReason}
         plan={settings.user?.subscription_plan ?? null}
         userToken={settings.user?.token}
         onOpenChange={setFreeTierDialogOpen}
         onChooseOwnAI={async (choice) => {
-          await commands.showWindow({
-            Home: { page: buildFreeTierAiSetupPage(choice) },
+          const result = await commands.showWindow({
+            Home: {
+              page: buildFreeTierAiSetupPage(choice, conversationId),
+            },
           });
+          if (result.status === "error") {
+            throw new Error(result.error || "could not open AI provider setup");
+          }
         }}
       />
     </div>

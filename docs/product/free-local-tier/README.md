@@ -48,13 +48,15 @@ Pi extensions and installed pipes are trusted code running as the same operating
 
 Codex MCP onboarding and Settings write `SCREENPIPE_LOCAL_API_KEY` into the nested screenpipe MCP environment table while preserving unrelated TOML tables. The hosted-limit dialog routes ChatGPT and Ollama choices directly into the corresponding setup form; the broader provider screen also exposes user-owned Anthropic and OpenAI API-key options. None of those local/MCP/BYOK paths consume a hosted preview turn.
 
+When the staged preview is off, its configured limit is zero, or a preview safety circuit breaker fires, the hosted error is terminal: these walls use a non-retryable HTTP status, and the desktop decodes the gateway's nested transport envelope instead of letting Pi or the app spend three automatic retries on it. Instead it opens the same upgrade/own-AI chooser with reason-specific copy and never claims that turns were used when no preview was available. A per-turn tool-loop stop says to start a new message; a daily safety stop says to try tomorrow; an unavailable network-safety key says to retry later. The staged-preview-off onboarding copy does not promise two turns before operators enable them.
+
+Saving the ChatGPT or Ollama setup makes that preset the sole active default before returning to the originating conversation. ChatGPT setup must confirm that its OAuth token is currently refreshable; merely finding a stored token is not enough. If the Settings window cannot open, the chooser stays open and surfaces the error. If provider saving fails, the setup form stays open with its error. Persisted provider settings are hydrated before create/edit mode is chosen. The one-shot return URL carries both the exact conversation and activated preset, with localStorage only as a backward-compatible fallback, so blocked webview storage cannot lose the handoff or turn a successful save into a failure. A still-mounted chat window reloads the freshly persisted preset before using a same-ID cached copy, preventing an edited URL, key, model, or provider from briefly reverting to the old payer/privacy boundary. A missing, mismatched, or parseable-but-corrupt conversation is rejected before it can mutate the active chat session and cannot prevent the new provider from being activated. If both native shell opening and the browser popup fallback fail for pricing, the chooser also stays open with an actionable error.
+
 The authenticated account is also a payer and privacy boundary. Explicit logout, token invalidation, and account changes stop every legacy and UUID Pi subprocess, discard its native and frontend prompt queues, mint a blank conversation session so the next account cannot upload the prior account's visible history, and scrub the Screenpipe Cloud credential from Pi auth files. Credential refresh for the same stable account restarts native work without erasing local chat history. Local and user-owned providers remain free and start a fresh process on the next message. A trusted auto-prefill may bridge ordinary React startup lag, but it can never bypass the hosted sign-in requirement.
 
 Enhanced AI suggestions are recurring Screenpipe-hosted work, not part of the two-turn preview. Their scheduler stores only a SHA-256 digest of the enabling cloud-token identity and resolves the bearer from native auth at dispatch. Every logout, token, account, or preference transition first invalidates in-flight publication; committed identity changes then clear the config and cached cloud output. A request already dispatched for account A may finish at the provider, but its old generation cannot return from force-regenerate or repopulate the shared cache under account B. The frontend also generation-binds cached reads and immediately hides the prior rendered snapshot on an account boundary, so a late native read cannot put A's suggestion text back under B. A failed non-null token rotation that restores A preserves A's config, while a successful entitled token refresh safely rebinds the persisted preference to the new token; a replacement free account clears the stale preference.
 
-Enterprise policy effects are process-wide even though multiple app surfaces mount the hook. One process-wide authorization generation, manual-activation queue, policy-application queue, and cross-surface notification boundary make the newest saved license authoritative. Other mounted surfaces fail closed and converge on it; stale polls cannot revoke or republish an older authorization. Each queued local application has a 60-second observer deadline. JavaScript cannot cancel a native command already in progress, so a timed-out application loses permission to continue, the next policy may proceed, and settlement of the late command schedules a guarded replay of the newest policy (including a same-license policy) so its side effect cannot remain the final state. A required local-command failure publishes neither cache nor seat proof and leaves the global gate unavailable for retry.
-
-Offline cache is fingerprinted to the exact license plus device and published only after the current application completes. The matching 30-day seat proof is refreshed only after that cache commit, so a successful heartbeat followed by a crash cannot extend an older same-license policy. Enterprise credential writes share one native mutex and replace `enterprise.json` through a synced temporary file. Saving license B atomically stores B while clearing license A's `is_admin`, `license_active`, and team token; a crash cannot persist the new key with the old key's authorization metadata.
+This launch intentionally leaves the existing enterprise-policy hook and its tests unchanged from `main`. The Free / Local change removes only the consumer subscription wall; existing enterprise app, license, and required-login gates remain in force. Business and enterprise hosted-AI bypass is resolved through the canonical `/api/user` cloud entitlement, including the explicit enterprise-account override and legacy responses that predate the entitlement object. A stale top-level boolean cannot override an explicit modern Basic/app-only `cloud=false`, and raw subscription-row existence never grants unlimited hosted AI.
 
 Chat files and drafts remain local-device data scoped to the operating-system user, not a cloud-account vault. An account switch never auto-carries or auto-sends the previous account's active conversation, attachments, prefills, or retries, but someone with the same OS login can deliberately reopen local chat history. Use separate OS accounts or data directories when local history itself must be isolated between people.
 
@@ -121,6 +123,8 @@ Never use `FREE_LOCAL_TIER_ENFORCEMENT_ENABLED=false` as a routine rollback. The
 
 ## Review flows
 
+These are conceptual, static launch-review mockups rather than pixel claims about the current production build. They cover both the future preview-on state and the staged preview-off state used for safe rollout.
+
 ### 1. Free app entry
 
 ![Free Local home](./free-home.png)
@@ -137,11 +141,15 @@ Never use `FREE_LOCAL_TIER_ENFORCEMENT_ENABLED=false` as a routine rollback. The
 
 ![Own AI providers](./own-ai.png)
 
-### 5. Desktop access decision tree
+### 5. Hosted preview paused: upgrade or own AI without a false usage claim
+
+![Hosted preview paused](./preview-off.png)
+
+### 6. Desktop access decision tree
 
 ![Desktop access decision tree](./tree-access.png)
 
-### 6. AI cost decision tree
+### 7. AI cost decision tree
 
 ![AI cost decision tree](./tree-ai.png)
 
@@ -172,21 +180,10 @@ Never use `FREE_LOCAL_TIER_ENFORCEMENT_ENABLED=false` as a routine rollback. The
 | Free old client without the turn marker while preview is on | `426 free_chat_client_update_required` before rate limits, D1 reservation, or inference; never silently metered |
 | Free old client while enforcement is on and preview is off | `402 hosted_ai_subscription_required`; local/user-owned AI remains available |
 | Active Business/enterprise on an old client | Paid hosted route continues without requiring the free-preview marker |
+| Active Basic/app-only/lifetime/manual row with modern `cloud=false`, even if a stale top-level cloud boolean says true | Remains on the free-preview path; the explicit modern denial wins and raw subscription-row existence never grants unlimited hosted AI |
+| Enterprise seat plus an app-only lifetime primary entitlement | Canonical enterprise-account override preserves paid hosted AI even though the primary entitlement object's cloud feature is false |
 | Positive prepaid-credit balance without Business/enterprise | Does not bypass enforcement or the two-turn ledger |
 | Enterprise build requiring sign-in | Enterprise gate shown; recorder stopped until mandatory policy is satisfied |
-| Enterprise policy is loading, unavailable without a validated cache, missing a required key, or has an invalid key | Global gate remains closed and recording does not resume; a cached policy is trusted only when its authorization fingerprint matches the same saved key/device and that seat heartbeat is within the 30-day offline grace |
-| New/manual enterprise activation while heartbeat is offline or returns `5xx` | Retryable activation error; no key, policy cache, or seat proof is persisted and recording remains stopped |
-| New/manual enterprise activation passes policy validation and heartbeat | The key is saved and the prompt may close, but the global gate stays loading while that already validated response completes its serialized local apply; no second policy fetch is required for the activating surface, and a superseded apply cannot publish cache or reopen recording |
-| Two mounted surfaces submit different enterprise keys at once | One process-wide activation queue serializes validation, heartbeat, and save; each accepted activation finishes in order and every surface converges on the last successfully saved key |
-| License B replaces license A while A has saved admin/team authorization | One atomic native file replacement stores B and clears A's admin, active-license, and team-token fields under the same write lock; unrelated enterprise preferences are preserved |
-| Previously accepted enterprise device receives heartbeat `401`, `402`, or `403` | The browser policy cache and seat proof are synchronously cleared and the global gate closes; durable team/admin authorization is cleared through the serialized native application queue, while a fail-closed five-minute recovery poll retains only the saved key identity so an admin-restored seat/license recovers without restart or key re-entry |
-| One hook's delayed bootstrap returns `null` or an old saved key after another surface activates a replacement | The process-wide generation changed, so the bootstrap result is ignored and cannot reopen the prompt or move the surface back to the stale key |
-| Old enterprise hook/poll resolves after the app mounted a replacement hook or license, whether the old hook unmounted or stayed live | Process-wide plus local generation/key guards reject the result; it cannot revoke the replacement authorization, apply policy, recreate old cache, or start an orphan poller |
-| Two app surfaces apply different enterprise policies concurrently, including an old apply stalled mid-side-effect | One process-wide queue serializes effects until the 60-second observer deadline; current-generation checks after every await stop the old task from continuing, the newer policy proceeds, and late settlement schedules a newest-policy replay before any cache/seat publication |
-| A required local enterprise effect rejects | Application fails closed, policy cache and seat proof are cleared, status becomes unavailable, and polling retries; recording is never authorized from the partially applied response |
-| A native enterprise effect never settles or settles after its 60-second observer deadline | The gate remains fail-closed and the queue admits newer work after the deadline; if the old effect eventually settles, a guarded replay reapplies the latest policy, including when the latest policy has the same key |
-| App crashes, unmounts, or changes license midway through enterprise policy application | The offline cache and then its matching seat proof are published only after every current local side effect completes; no partially applied, cross-license, or freshly reauthorized old same-license cache can authorize offline recording |
-| Previously accepted enterprise device has a transient heartbeat outage | The last validated policy may continue only for the same key/device until its 30-day seat proof expires; after that the global gate fails closed |
 | Consumer account requiring enterprise app | Enterprise download gate remains |
 | Same marked turn with agent/tool calls | One slot; at most 8 requests within the original 30-minute window |
 | Identical visible text sent again | New marker and new turn |
@@ -202,6 +199,10 @@ Never use `FREE_LOCAL_TIER_ENFORCEMENT_ENABLED=false` as a routine rollback. The
 | Image paste/drop/picker, queued image, or steering image while free hosted preview is selected | Blocked before a native prompt command; composer or queue state is preserved so the user can remove it, choose their own provider, or upgrade |
 | Requested output above 4,096 tokens | Clamped to 4,096 |
 | Third distinct hosted turn | `402 free_chat_limit_exhausted`; provider-choice modal |
+| Preview is off or its configured limit is `0` | Terminal hosted-AI wall opens the provider chooser without saying turns were used; no automatic rate-limit retry or D1 mutation |
+| Nested OpenAI/Pi or Anthropic-style transport wraps a structured hosted error and runtime counters | Client decodes the bounded nested envelopes, preserves the real configured count, and routes terminal walls without a generic retry loop |
+| Preview network/global/shadow daily safety stop | Treated as a terminal safety wall with try-tomorrow copy, not a generic `429`; no three-retry loop that can amplify cost or hide the actionable choice |
+| Per-turn request/tool-loop cap | Terminal for that turn, but copy says to start a new message rather than wait until tomorrow |
 | Authenticated free usage-status read | Returns the authoritative lifetime `used/limit/remaining` count without reserving a turn or touching abuse/shadow ledgers; UI refreshes after completion and clears immediately on account-token change |
 | Usage-status preview ledger unavailable | Structured `503`; no inference and no guessed/stale cross-account counter |
 | `FREE_CHAT_TURN_LIMIT=0`, including an existing marker | Rejected before upstream inference |
@@ -209,21 +210,28 @@ Never use `FREE_LOCAL_TIER_ENFORCEMENT_ENABLED=false` as a routine rollback. The
 | Dispatch-guard batch statement 2 fails after statement 1 is attempted | D1 rolls back both statements; no provider call, lifetime turn, daily counter, or shadow dollar remains consumed |
 | Provider throws, times out, returns final non-2xx, or exhausts its fallback cascade | Lifetime turn, network/global counters, and `$1` shadow reservation remain consumed; only the exact lease is released |
 | Upstream fails after returning a response | Lifetime turn and shadow reservation remain consumed; only the exact lease is released |
-| Missing network identity | Fail closed; no lifetime slot or inference |
-| Network daily cap reached | Structured `429`; no new lifetime slot, no net global counter charge, local/BYOK remains available |
+| Missing network identity | Fail closed; no lifetime slot or inference, no automatic three-retry loop, and copy says to retry later rather than tomorrow |
+| Network daily cap reached | Terminal non-retryable `402`; no new lifetime slot, no net global counter charge, local/BYOK remains available |
 | Global daily cap reached | Structured stop before inference; no new lifetime slot |
-| Retail shadow budget is `0` or exhausted | Structured `429` before inference; exact turn lease is released |
+| Retail shadow budget is `0` or exhausted | Terminal non-retryable `402` before inference; exact turn lease is released |
 | Shadow reservation table is missing/unavailable | Structured `503`; no inference starts |
 | Provider call throws or returns non-2xx after dispatch begins | Shadow reservation remains settled because provider work or earlier fallback attempts may still be billable |
 | Upstream returns 2xx but its body later breaks | Shadow reservation and lifetime turn remain settled; only the exact in-flight lease is released |
 | Missing ledger table or counter update failure | Structured `503`; never infer unmetered |
-| Subscription lookup unavailable, including legacy Screenpipe-token `/api/user` `5xx` or network failure | Hosted routes plus entitlement-sensitive usage/model metadata return structured `503`; never downgrade a potentially paying account to anonymous/free or consume a preview turn |
+| Subscription lookup unavailable, including malformed canonical `2xx`, legacy Screenpipe-token `/api/user` `5xx`, or network failure | Hosted routes plus entitlement-sensitive usage/model metadata return structured `503`; never downgrade a potentially paying account to anonymous/free or consume a preview turn |
 | Raw IPv4/IPv6 variants in one subnet | Normalize to one HMAC bucket; raw address never stored |
 | Completed preview turn | Network digest cleared immediately; daily counters and abandoned pending rows older than 7 days are removed by the scheduled/off-path cleanup |
 | Business/enterprise entitlement | Preview ledger bypassed; paid model, rate, and usage limits still apply |
 | External Claude/Codex using local API/MCP | Never reaches or consumes the hosted preview; user's provider charges may apply |
 | Codex MCP setup over an existing multi-table config | Replaces only screenpipe plus its nested env table, writes `SCREENPIPE_LOCAL_API_KEY`, and preserves every unrelated TOML table |
-| Hosted-limit ChatGPT or Ollama action | Opens the matching actionable setup form rather than a generic dead-end settings page |
+| Hosted-limit ChatGPT or Ollama action | Opens the matching setup form, activates the saved preset as the sole default, and returns to the originating conversation |
+| Own-AI settings window or setup navigation fails | Upgrade chooser stays open with an actionable error instead of dropping the user back onto exhausted Screenpipe Cloud |
+| Pricing native-shell open fails and the browser popup is blocked | Upgrade chooser stays open and says pricing could not be opened |
+| Existing own-AI preset arrives after asynchronous Settings hydration | Loading state waits for persisted settings, then opens edit mode for the existing provider instead of creating a duplicate |
+| ChatGPT has only a stale or unrefreshable stored token | Setup remains incomplete; token existence alone cannot activate the provider |
+| Provider save succeeds while localStorage is unavailable | Preset remains activated and the one-shot URL restores the exact conversation plus preset; storage is only a legacy fallback |
+| Cross-window chat has a stale same-ID preset after an edit | Receiver reloads persisted settings first, so the new provider, URL, key, and model win over the cached payer/privacy boundary |
+| Originating chat file is missing, mismatched, or parseable but malformed | Reject it before changing the active session, still activate the saved own-AI preset, and do not reopen the stale hosted-limit wall |
 | Ollama setup/request fails | Surface Ollama error; never fall through to Anthropic, OpenAI, ChatGPT, or a custom cloud endpoint |
 | Anthropic setup/request fails | Surface Anthropic error; never fall through to OpenAI/ChatGPT or another credential boundary |
 | App title, onboarding summary, region OCR, retry, background work | Does not silently consume a hosted preview turn |
