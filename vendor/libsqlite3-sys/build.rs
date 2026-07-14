@@ -27,6 +27,13 @@ fn is_compiler(compiler_name: &str) -> bool {
 }
 
 fn main() {
+    if cfg!(any(feature = "sqlcipher", feature = "bundled-sqlcipher")) {
+        panic!(
+            "screenpipe's vendored libsqlite3-sys does not ship SQLCipher; \
+             upgrade SQLCipher to a WAL-reset-safe release before enabling this feature"
+        );
+    }
+
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
     if cfg!(feature = "in_gecko") {

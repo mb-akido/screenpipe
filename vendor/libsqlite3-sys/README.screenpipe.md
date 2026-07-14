@@ -14,9 +14,11 @@ Upstream advisory: <https://www.sqlite.org/wal.html#walresetbug>
 - `sqlite3.c` SHA3-256: `32d5424f97e0a7fc5ed2f6335afbb58be4e0298bd7117a34e39d345ff13d859e`
 - SQLite source ID: `2026-03-13 10:38:09 737ae4a34738ffa0c3ff7f9bb18df914dd1cad163f28fd6b6e114a344fe6d618`
 
-The `sqlcipher/` directory is the unchanged compatibility source shipped in
-`libsqlite3-sys` 0.26.0. Screenpipe's production dependency enables the
-ordinary `bundled` SQLite feature, not SQLCipher.
+Screenpipe's production dependency enables the ordinary `bundled` SQLite
+feature, not SQLCipher. The old `libsqlite3-sys` 0.26 SQLCipher amalgamation is
+intentionally omitted, and the build script rejects SQLCipher features. It is
+based on SQLite 3.39.4 and must receive a separate WAL-reset-safe upgrade before
+future use.
 
 Do not remove the path patches in either workspace manifest: the desktop app
 has a standalone Cargo workspace and lockfile in addition to the repository
