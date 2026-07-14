@@ -22,6 +22,10 @@ import type {
 	EnterpriseInstallMetadata,
 } from "@ee/lib/app-update-policy";
 import { type FontSize, applyFontSize } from "@/lib/utils/font-size";
+import {
+	applyManagedOverrides,
+	type ManagedSettingValue,
+} from "./managed-settings";
 export type VadSensitivity = "low" | "medium" | "high";
 
 export type AIProviderType =
@@ -208,6 +212,8 @@ export interface ChatHistoryStore {
 // Extend SettingsStore with fields added before Rust types are regenerated
 export type Settings = SettingsStore & {
 	deviceId?: string;
+	/** Device-key values enforced by the current enterprise policy. */
+	enterpriseManagedSettings?: Record<string, ManagedSettingValue>;
 	updateChannel?: UpdateChannel;
 	chatHistory?: ChatHistoryStore;
 	ignoredUrls?: string[];
@@ -1057,10 +1063,23 @@ function createSettingsStore() {
 		// Migration: backfill disabledShortcuts for installs that predate the
 		// field. Several call sites assume it's always an array (`.includes(...)`)
 		// and crash with "Cannot read properties of undefined" when it's missing.
-		if (!Array.isArray(settings.disabledShortcuts)) {
-			settings.disabledShortcuts = [];
-			needsUpdate = true;
-		}
+			if (!Array.isArray(settings.disabledShortcuts)) {
+				settings.disabledShortcuts = [];
+				needsUpdate = true;
+			}
+
+			// Migrations may touch recording defaults. Enterprise values are the
+			// final authority and must survive reads as well as explicit writes.
+			const managedValues = settings.enterpriseManagedSettings;
+			if (managedValues) {
+				const managedChanged = Object.entries(managedValues).some(
+					([key, value]) => JSON.stringify(settings[key]) !== JSON.stringify(value)
+				);
+				if (managedChanged) {
+					Object.assign(settings, applyManagedOverrides(settings, managedValues));
+					needsUpdate = true;
+				}
+			}
 
 		// Save migrations if needed
 		if (needsUpdate) {
@@ -1074,6 +1093,7 @@ function createSettingsStore() {
 	const set = async (value: Partial<Settings>) => {
 		const store = await getStore();
 		const current = await get();
+		const managedValues = current.enterpriseManagedSettings;
 		let newSettings = { ...current, ...value } as Settings;
 		if ("user" in value) {
 			// On logout / Pro→non-Pro transition, clear the V2 marker so a future
@@ -1083,13 +1103,25 @@ function createSettingsStore() {
 			}
 			newSettings = applyProCloudAudioDefaults(newSettings);
 		}
+		newSettings = applyManagedOverrides(
+			newSettings as Record<string, unknown>,
+			managedValues
+		) as Settings;
+		if (managedValues) newSettings.enterpriseManagedSettings = managedValues;
 		await setSettingsStripped(store, newSettings);
 		await saveAndEncrypt(store);
 	};
 
 	const reset = async () => {
 		const store = await getStore();
-		await store.set("settings", createDefaultSettingsObject());
+		const current = await get();
+		const managedValues = current.enterpriseManagedSettings;
+		const defaults = applyManagedOverrides(
+			createDefaultSettingsObject() as Record<string, unknown>,
+			managedValues
+		) as Settings;
+		if (managedValues) defaults.enterpriseManagedSettings = managedValues;
+		await store.set("settings", defaults);
 		await saveAndEncrypt(store);
 	};
 
