@@ -23,6 +23,27 @@ export function useNextTurnAttachments(conversationId: string | null) {
     [],
   );
 
+  const mergePendingAttachments = useCallback(
+    (recovered: ChatAttachment[]) => {
+      const seen = new Set<string>();
+      pendingAttachmentsRef.current = [
+        ...recovered,
+        ...pendingAttachmentsRef.current,
+      ].filter((attachment) => {
+        const key = JSON.stringify([
+          attachment.name,
+          attachment.ext,
+          attachment.charCount,
+          attachment.truncated,
+        ]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    },
+    [],
+  );
+
   const appendPendingAttachment = useCallback((attachment: ChatAttachment) => {
     pendingAttachmentsRef.current = [
       ...pendingAttachmentsRef.current,
@@ -42,6 +63,7 @@ export function useNextTurnAttachments(conversationId: string | null) {
     appendPendingAttachment,
     clearPendingAttachments,
     consumePendingAttachments,
+    mergePendingAttachments,
     pendingAttachmentsRef,
     stagePendingAttachments,
   };

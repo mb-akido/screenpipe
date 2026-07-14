@@ -60,8 +60,8 @@ describe("AskUserToolCard", () => {
   });
 
   it("submits a dropdown answer as a chat reply", async () => {
-    const onSubmit = vi.fn().mockResolvedValue(undefined);
-    render(<AskUserToolCard toolCall={askTool({
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    const toolCall = askTool({
       title: "Implementation choice",
       questions: [
         {
@@ -75,7 +75,10 @@ describe("AskUserToolCard", () => {
           ],
         },
       ],
-    })} onSubmit={onSubmit} />);
+    });
+    const view = render(
+      <AskUserToolCard toolCall={toolCall} onSubmit={onSubmit} />,
+    );
 
     fireEvent.change(screen.getByLabelText("Answer Scope"), {
       target: { value: "ui" },
@@ -87,11 +90,19 @@ describe("AskUserToolCard", () => {
       "Here are my answers to your ask_user questions:\n- Where should I start?: UI polish",
     );
     expect(onSubmit.mock.calls[0][1]).toBe("Answered Ask user: UI polish");
-    expect(await screen.findByText("sent")).toBeInTheDocument();
+    expect(onSubmit.mock.calls[0][2]).toBe("tool-ask-1");
+    view.rerender(
+      <AskUserToolCard
+        toolCall={toolCall}
+        onSubmit={onSubmit}
+        alreadySubmitted
+      />,
+    );
+    expect(screen.getByText("sent")).toBeInTheDocument();
   });
 
   it("supports multi-select plus free-form nuance", async () => {
-    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const onSubmit = vi.fn().mockResolvedValue(true);
     render(<AskUserToolCard toolCall={askTool({
       questions: [
         {
@@ -115,6 +126,270 @@ describe("AskUserToolCard", () => {
     expect(onSubmit.mock.calls[0][0]).toContain(
       "- Which checks should run?: Unit tests, E2E, Also inspect the screenshot state.",
     );
+  });
+
+  it("keeps the selected answer retryable when chat rejects the send", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(false);
+    render(<AskUserToolCard toolCall={askTool({
+      questions: [{
+        id: "scope",
+        label: "Scope",
+        prompt: "Where should I start?",
+        type: "single",
+        options: ["Subagents", "Main agent"],
+      }],
+    })} onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText("Answer Scope"), {
+      target: { value: "Subagents" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reply" })).toBeEnabled());
+    expect(screen.queryByText("sent")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Answer Scope")).toHaveValue("Subagents");
+  });
+
+  it("keeps a selected answer disabled until chat is ready", () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    const toolCall = askTool({
+      questions: [{
+        id: "scope",
+        label: "Scope",
+        prompt: "Where should I start?",
+        type: "single",
+        options: ["Subagents", "Main agent"],
+      }],
+    });
+    const { rerender } = render(
+      <AskUserToolCard toolCall={toolCall} onSubmit={onSubmit} disabled />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Answer Scope"), {
+      target: { value: "Subagents" },
+    });
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+    expect(screen.getByText(/chat isn't ready to send your reply yet/i)).toBeInTheDocument();
+
+    rerender(<AskUserToolCard toolCall={toolCall} onSubmit={onSubmit} />);
+    expect(screen.getByRole("button", { name: "Reply" })).toBeEnabled();
+    expect(screen.getByLabelText("Answer Scope")).toHaveValue("Subagents");
+  });
+
+  it("requires every required question while allowing optional questions to stay blank", () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    render(<AskUserToolCard toolCall={askTool({
+      questions: [
+        {
+          id: "first",
+          label: "First",
+          prompt: "First required answer?",
+          required: true,
+        },
+        {
+          id: "second",
+          label: "Second",
+          prompt: "Second required answer?",
+          required: true,
+        },
+        {
+          id: "optional",
+          label: "Optional",
+          prompt: "Optional detail?",
+        },
+      ],
+    })} onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText("Custom answer First"), {
+      target: { value: "first answer" },
+    });
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Second" }));
+    fireEvent.change(screen.getByLabelText("Custom answer Second"), {
+      target: { value: "   " },
+    });
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Custom answer Second"), {
+      target: { value: "second answer" },
+    });
+    expect(screen.getByRole("button", { name: "Reply" })).toBeEnabled();
+  });
+
+  it("locks answer controls while submitting and after acceptance", async () => {
+    let resolveSubmit!: (accepted: boolean) => void;
+    const onSubmit = vi.fn(() => new Promise<boolean>((resolve) => {
+      resolveSubmit = resolve;
+    }));
+    const toolCall = askTool({
+      questions: [{
+        id: "scope",
+        label: "Scope",
+        prompt: "Where should I start?",
+        options: ["Subagents", "Main agent"],
+      }],
+    });
+    const view = render(
+      <AskUserToolCard toolCall={toolCall} onSubmit={onSubmit} />,
+    );
+
+    const answer = screen.getByLabelText("Answer Scope");
+    fireEvent.change(answer, { target: { value: "Subagents" } });
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+
+    await waitFor(() => expect(answer).toBeDisabled());
+    expect(answer).toHaveValue("Subagents");
+    resolveSubmit(true);
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <AskUserToolCard
+        toolCall={toolCall}
+        onSubmit={onSubmit}
+        alreadySubmitted
+      />,
+    );
+    expect(screen.getByText("sent")).toBeInTheDocument();
+    expect(answer).toBeDisabled();
+    expect(answer).toHaveValue("Subagents");
+  });
+
+  it("deduplicates explicit question ids so answers cannot overwrite each other", () => {
+    const parsed = parseAskUserToolCall(askTool({
+      questions: [
+        { id: "scope", label: "First", prompt: "First?" },
+        { id: "scope", label: "Second", prompt: "Second?" },
+        { id: "scope-2", label: "Third", prompt: "Third?" },
+      ],
+    }));
+
+    expect(parsed?.questions.map((question) => question.id)).toEqual([
+      "scope",
+      "scope-2",
+      "scope-2-2",
+    ]);
+  });
+
+  it("keeps a persisted answer submitted after the card remounts", () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    const toolCall = askTool({
+      questions: [{
+        id: "scope",
+        label: "Scope",
+        prompt: "Where should I start?",
+        options: ["Subagents", "Main agent"],
+      }],
+    });
+
+    const first = render(
+      <AskUserToolCard
+        toolCall={toolCall}
+        onSubmit={onSubmit}
+        alreadySubmitted
+      />,
+    );
+
+    expect(screen.getByText("sent")).toBeInTheDocument();
+    expect(screen.getByLabelText("Answer Scope")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    first.unmount();
+    render(
+      <AskUserToolCard
+        toolCall={toolCall}
+        onSubmit={onSubmit}
+        alreadySubmitted
+      />,
+    );
+    expect(screen.getByText("sent")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+  });
+
+  it("shows fail-closed delivery uncertainty for a persisted queued reply", () => {
+    render(
+      <AskUserToolCard
+        toolCall={askTool({
+          questions: [{
+            id: "scope",
+            label: "Scope",
+            prompt: "Where should I start?",
+            options: ["Subagents", "Main agent"],
+          }],
+        })}
+        onSubmit={vi.fn()}
+        alreadySubmitted
+        deliveryPending
+      />,
+    );
+
+    expect(screen.getByText("queued")).toBeInTheDocument();
+    expect(
+      screen.getByText(/retry is locked to prevent duplicates/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/delivery is uncertain.*start a new chat/i),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+  });
+
+  it("unlocks after queued cancellation without erasing the selected answer", () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    const toolCall = askTool({
+      questions: [{
+        id: "scope",
+        label: "Scope",
+        prompt: "Where should I start?",
+        options: ["Subagents", "Main agent"],
+      }],
+    });
+    const view = render(
+      <AskUserToolCard toolCall={toolCall} onSubmit={onSubmit} />,
+    );
+    const answer = screen.getByLabelText("Answer Scope");
+    fireEvent.change(answer, { target: { value: "Subagents" } });
+
+    view.rerender(
+      <AskUserToolCard
+        toolCall={toolCall}
+        onSubmit={onSubmit}
+        alreadySubmitted
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+
+    view.rerender(
+      <AskUserToolCard toolCall={toolCall} onSubmit={onSubmit} />,
+    );
+    expect(answer).toHaveValue("Subagents");
+    expect(screen.getByRole("button", { name: "Reply" })).toBeEnabled();
+  });
+
+  it("locks a saved but rejected answer onto the retry path", () => {
+    const onSubmit = vi.fn().mockResolvedValue(true);
+    render(
+      <AskUserToolCard
+        toolCall={askTool({
+          questions: [{
+            id: "scope",
+            label: "Scope",
+            prompt: "Where should I start?",
+            options: ["Subagents", "Main agent"],
+          }],
+        })}
+        onSubmit={onSubmit}
+        retryRequired
+      />,
+    );
+
+    expect(screen.getByText(/answer saved.*try again below/i)).toBeInTheDocument();
+    expect(screen.getByText(/saved answer was not accepted/i)).toBeInTheDocument();
+    expect(screen.getByLabelText("Answer Scope")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reply" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 
   it("accepts legacy single-question args with choices", () => {

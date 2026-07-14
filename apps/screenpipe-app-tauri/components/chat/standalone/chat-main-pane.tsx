@@ -50,6 +50,7 @@ interface ChatMainPaneProps {
   onOpenSettings: () => void | Promise<void>;
   summaryCardsProps: React.ComponentProps<typeof SummaryCards>;
   messageListProps: ChatMessageListProps;
+  canSendMessages: boolean;
   isUserScrolledUp: boolean;
   scrollToBottom: () => void;
 }
@@ -82,6 +83,7 @@ export function ChatMainPane({
   onOpenSettings,
   summaryCardsProps,
   messageListProps,
+  canSendMessages,
   isUserScrolledUp,
   scrollToBottom,
 }: ChatMainPaneProps) {
@@ -171,8 +173,8 @@ export function ChatMainPane({
             !isLoading &&
             !isStreaming &&
             hasPresets &&
-            hasValidModel && <SummaryCards {...summaryCardsProps} />}
-          <ChatMessageList {...messageListProps} />
+            hasValidModel && <SummaryCards {...summaryCardsProps} canSend={canSendMessages} />}
+          <ChatMessageList {...messageListProps} canSendMessages={canSendMessages} />
 
           <div ref={messagesEndRef} />
         </div>

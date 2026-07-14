@@ -440,10 +440,18 @@ function ToolCallRailItem({
   toolCall,
   isLast,
   onAskUserReply,
+  alreadyAnswered,
+  deliveryPending,
+  retryRequired,
+  canSendMessages,
 }: {
   toolCall: ToolCall;
   isLast: boolean;
-  onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
+  onAskUserReply?: (reply: string, displayLabel: string, toolCallId: string) => boolean | Promise<boolean>;
+  alreadyAnswered: boolean;
+  deliveryPending: boolean;
+  retryRequired: boolean;
+  canSendMessages: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const label = friendlyToolLabel(toolCall);
@@ -489,7 +497,14 @@ function ToolCallRailItem({
       {/* Content */}
       <div className="flex-1 min-w-0 pb-2">
         {isAskUser ? (
-          <AskUserToolCard toolCall={toolCall} onSubmit={onAskUserReply} />
+          <AskUserToolCard
+            toolCall={toolCall}
+            onSubmit={onAskUserReply}
+            disabled={!canSendMessages}
+            alreadySubmitted={alreadyAnswered}
+            deliveryPending={deliveryPending}
+            retryRequired={retryRequired}
+          />
         ) : (
           <button
             onClick={() => setExpanded(!expanded)}
@@ -1107,6 +1122,10 @@ function ToolCallGroup({
   hideSummary = false,
   forceCollapsed = false,
   onAskUserReply,
+  answeredAskUserToolCallIds,
+  pendingAskUserToolCallIds,
+  retryAskUserToolCallIds,
+  canSendMessages,
 }: {
   toolCalls: ToolCall[];
   defaultExpanded?: boolean;
@@ -1116,7 +1135,11 @@ function ToolCallGroup({
   workStartedAtMs?: number;
   hideSummary?: boolean;
   forceCollapsed?: boolean;
-  onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
+  onAskUserReply?: (reply: string, displayLabel: string, toolCallId: string) => boolean | Promise<boolean>;
+  answeredAskUserToolCallIds: ReadonlySet<string>;
+  pendingAskUserToolCallIds: ReadonlySet<string>;
+  retryAskUserToolCallIds: ReadonlySet<string>;
+  canSendMessages: boolean;
 }) {
   const [manualExpand, setManualExpand] = useState<boolean | null>(null);
   const [runningSummary, setRunningSummary] = useState("Working");
@@ -1234,6 +1257,10 @@ function ToolCallGroup({
                     toolCall={tc}
                     isLast={i === toolCalls.length - 1}
                     onAskUserReply={onAskUserReply}
+                    alreadyAnswered={answeredAskUserToolCallIds.has(tc.id)}
+                    deliveryPending={pendingAskUserToolCallIds.has(tc.id)}
+                    retryRequired={retryAskUserToolCallIds.has(tc.id)}
+                    canSendMessages={canSendMessages}
                   />
                 </motion.div>
               ))}
@@ -1261,6 +1288,10 @@ export function MessageContent({
   onContinueConnectionAction,
   onDismissConnectionAction,
   onAskUserReply,
+  answeredAskUserToolCallIds = new Set<string>(),
+  pendingAskUserToolCallIds = new Set<string>(),
+  retryAskUserToolCallIds = new Set<string>(),
+  canSendMessages = true,
 }: {
   message: Message;
   isGenerating?: boolean;
@@ -1275,7 +1306,11 @@ export function MessageContent({
   onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
   onContinueConnectionAction?: (prompt: string, label?: string) => void | Promise<void>;
   onDismissConnectionAction?: (messageId: string, connectionId: string) => void;
-  onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
+  onAskUserReply?: (reply: string, displayLabel: string, toolCallId: string) => boolean | Promise<boolean>;
+  answeredAskUserToolCallIds?: ReadonlySet<string>;
+  pendingAskUserToolCallIds?: ReadonlySet<string>;
+  retryAskUserToolCallIds?: ReadonlySet<string>;
+  canSendMessages?: boolean;
 }) {
   const isUser = message.role === "user";
   const sourceCitations = isUser ? [] : sourceCitationsFromMessage(message);
@@ -1478,6 +1513,10 @@ export function MessageContent({
                 hideSummary={hideToolSummary}
                 forceCollapsed={forceCollapseTools}
                 onAskUserReply={onAskUserReply}
+                answeredAskUserToolCallIds={answeredAskUserToolCallIds}
+                pendingAskUserToolCallIds={pendingAskUserToolCallIds}
+                retryAskUserToolCallIds={retryAskUserToolCallIds}
+                canSendMessages={canSendMessages}
               />
             );
           }
@@ -1499,6 +1538,10 @@ export function MessageContent({
                 hideSummary={hideToolSummary}
                 forceCollapsed={forceCollapseTools}
                 onAskUserReply={onAskUserReply}
+                answeredAskUserToolCallIds={answeredAskUserToolCallIds}
+                pendingAskUserToolCallIds={pendingAskUserToolCallIds}
+                retryAskUserToolCallIds={retryAskUserToolCallIds}
+                canSendMessages={canSendMessages}
               />
             );
           }

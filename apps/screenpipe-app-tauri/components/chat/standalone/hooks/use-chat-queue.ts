@@ -22,6 +22,7 @@ import {
 } from "@/lib/chat/queued-display";
 import { normalizeQueueEventPayload } from "@/lib/chat-queue-controls";
 import { toast } from "@/components/ui/use-toast";
+import { markAskUserQueueCancelled } from "@/lib/chat/ask-user-cancellation-tombstone";
 
 const EMPTY_QUEUED_PROMPTS: PiQueuedPrompt[] = [];
 
@@ -200,6 +201,24 @@ export function useChatQueue(
         expectedSessionId,
         prompt.id,
       );
+      if (result.status === "ok" && result.data) {
+        // Native cancellation is authoritative even if the user switched
+        // chats/accounts while it was in flight. Clear the captured session's
+        // ephemeral queue state and notify the session-addressable persistence
+        // listener; never leave its durable Ask User card locked forever.
+        markAskUserQueueCancelled(expectedSessionId, prompt.id);
+        takeQueuedDisplayById(expectedSessionId, prompt.id);
+        removeQueuedPrompt(expectedSessionId, prompt.id);
+        window.dispatchEvent(
+          new CustomEvent("screenpipe:queued-prompt-cancelled", {
+            detail: {
+              sessionId: expectedSessionId,
+              promptId: prompt.id,
+            },
+          }),
+        );
+        return true;
+      }
       if (
         piSessionIdRef.current !== expectedSessionId ||
         !isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current)
@@ -225,11 +244,10 @@ export function useChatQueue(
         }
         return false;
       }
-      takeQueuedDisplayById(currentQueueSessionId, prompt.id);
-      removeQueuedPrompt(currentQueueSessionId, prompt.id);
-      return true;
+      return false;
     } catch (e) {
       if (
+        piSessionIdRef.current !== expectedSessionId ||
         !isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current)
       ) {
         return false;
@@ -243,7 +261,10 @@ export function useChatQueue(
       }
       return false;
     } finally {
-      if (isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current)) {
+      if (
+        piSessionIdRef.current === expectedSessionId &&
+        isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current)
+      ) {
         finishQueuedAction(prompt.id);
       }
     }

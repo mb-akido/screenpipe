@@ -14,6 +14,7 @@ import type {
   ChatAttachment,
   ContentBlock,
   Message,
+  MessageSourceContext,
   OptimisticSteerPayload,
   PendingSteerBatchItem,
   QueuedDisplayPayload,
@@ -63,6 +64,16 @@ export type PiMessageSendOptions = {
    * paired with `reuseHostedTurnId`; retries must not rebuild it from mutable
    * conversation state because the gateway fingerprints the full content. */
   reuseHostedTurnPrompt?: string;
+  /** Explicit replay metadata. `null` means this retry/edit has no source and
+   * must not inherit unrelated live search/timeline state from the composer. */
+  sourceContext?: MessageSourceContext | null;
+  sourceFrameId?: number | null;
+  /** Persist the Ask User tool identity on its accepted reply so reopening a
+   * conversation cannot make an already-answered card actionable again. */
+  askUserToolCallId?: string;
+  /** Interactive card replies are independent of the free-form composer. Keep
+   * its draft, images, attachments, and source selection untouched. */
+  preserveComposer?: boolean;
 };
 
 type ChatStateActions = {
@@ -77,6 +88,7 @@ type ComposerAttachmentActions = {
   setPastedImages: React.Dispatch<React.SetStateAction<string[]>>;
   setAttachedDocs: React.Dispatch<React.SetStateAction<ExtractedDoc[]>>;
   consumePendingAttachments: () => ChatAttachment[] | undefined;
+  mergePendingAttachments: (attachments: ChatAttachment[]) => void;
   stagePendingAttachments: (attachments: ChatAttachment[]) => void;
 };
 
@@ -190,6 +202,12 @@ type PrefillActions = {
 export type PiAuthIdentity = {
   token: string | null;
   generation: number;
+  /**
+   * Stable account ownership for UI cleanup after a routine JWT refresh.
+   * Older callers/tests may omit it; those boundaries conservatively fall
+   * back to exact-token ownership.
+   */
+  userId?: string | null;
 };
 
 export type PiDispatchBoundary = {
@@ -212,6 +230,7 @@ export type PiSendTransportOptions = {
   conversationOperationPendingRef?: React.MutableRefObject<boolean>;
   cancelStreamingMessageRender: StreamingActions["cancelStreamingMessageRender"];
   consumePendingAttachments: ComposerAttachmentActions["consumePendingAttachments"];
+  mergePendingAttachments: ComposerAttachmentActions["mergePendingAttachments"];
   currentQueueSessionId: string | null;
   beginQueuedAction: QueueActions["beginQueuedAction"];
   finishQueuedAction: QueueActions["finishQueuedAction"];

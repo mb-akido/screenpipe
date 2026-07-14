@@ -175,6 +175,23 @@ function basicAccountUser() {
 }
 
 async function seedBasicAccountUser(): Promise<void> {
+  // The React seed intentionally bypasses the real Clerk callback. Production
+  // login commits the native cloud identity before persisting the profile, so
+  // mirror that ordering here as well. Otherwise the profile write is correctly
+  // rejected by the native compare-and-set guard as an identity change.
+  const cleared = await invoke("set_cloud_token", {
+    token: null,
+    expectedCurrentToken: null,
+    forceClear: true,
+  });
+  expect(cleared.ok).toBe(true);
+  const seeded = await invoke("set_cloud_token", {
+    token: FAKE_TOKEN,
+    expectedCurrentToken: null,
+    forceClear: false,
+  });
+  expect(seeded.ok).toBe(true);
+
   await browser.execute(
     (key: string, eventName: string, user: ReturnType<typeof basicAccountUser>) => {
       window.localStorage.setItem(key, JSON.stringify(user));

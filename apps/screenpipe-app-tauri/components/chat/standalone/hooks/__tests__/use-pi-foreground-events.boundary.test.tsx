@@ -686,6 +686,79 @@ describe("usePiForegroundEvents deferred boundaries", () => {
     expect(fixture.lastPiDispatchPromptRef.current).toBe(nativePrompt);
   });
 
+  it("recovers a queued Ask User receipt after foreground remount metadata is lost", () => {
+    const fixture = createFixture();
+    const reply =
+      "Here are my answers to your ask_user questions:\n- Which scope?: Main agent";
+    const rows = [
+      ...fixture.getPanelMessages(),
+      {
+        id: "assistant-ask",
+        role: "assistant",
+        content: "Choose a scope",
+        contentBlocks: [
+          {
+            type: "tool",
+            toolCall: {
+              id: "ask-1",
+              toolName: "ask_user",
+              args: {
+                questions: [
+                  {
+                    id: "scope",
+                    prompt: "Which scope?",
+                    options: ["Main agent", "Subagents"],
+                  },
+                ],
+              },
+              isRunning: false,
+            },
+          },
+        ],
+        pendingAskUserReplies: [
+          { toolCallId: "ask-1", queueId: "queue-1", replyText: reply },
+        ],
+        timestamp: 3,
+      },
+    ];
+    fixture.replacePanelMessages(rows);
+    fixture.sessions["session-a"].messages = rows.map((message) => ({
+      ...message,
+    }));
+    fixture.piMessageIdRef.current = null;
+
+    act(() => {
+      fixture.handleAgentEventDataRef.current?.({
+        type: "message_start",
+        message: { role: "user", content: reply },
+      });
+    });
+
+    expect(
+      fixture
+        .getPanelMessages()
+        .find(
+          (message) =>
+            message.role === "user" && message.content === reply,
+        ),
+    ).toMatchObject({
+      askUserToolCallId: "ask-1",
+      askUserReplyAccepted: true,
+    });
+    expect(
+      fixture.sessions["session-a"].messages.find(
+        (message: any) =>
+          message.role === "user" && message.content === reply,
+      ),
+    ).toMatchObject({
+      askUserToolCallId: "ask-1",
+      askUserReplyAccepted: true,
+    });
+    expect(
+      fixture.baseOptions.consumeQueuedDisplayForStartedMessage,
+    ).toHaveReturnedWith(null);
+  });
+
   it("replaces an optimistic steer's provisional payload with its native echo", () => {
     const fixture = createFixture();
     const steerPrompt = "<steering_context>redirect</steering_context>";

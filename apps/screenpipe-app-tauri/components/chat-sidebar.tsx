@@ -324,11 +324,20 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       );
       unlistenFns.push(unlistenSaved);
 
-      const unlistenDeleted = await listen<{ id: string }>("chat-deleted", (event) => {
+      const dropDeletedConversation = (event: { payload?: { id?: string } }) => {
         const id = event.payload?.id;
         if (!id) return;
         useChatStore.getState().actions.drop(id);
-      });
+      };
+      const unlistenDeleting = await listen<{ id: string }>(
+        "chat-deleting",
+        dropDeletedConversation,
+      );
+      unlistenFns.push(unlistenDeleting);
+      const unlistenDeleted = await listen<{ id: string }>(
+        "chat-deleted",
+        dropDeletedConversation,
+      );
       unlistenFns.push(unlistenDeleted);
 
       const unlistenVisibility = await listen<{ id: string; hidden: boolean }>(

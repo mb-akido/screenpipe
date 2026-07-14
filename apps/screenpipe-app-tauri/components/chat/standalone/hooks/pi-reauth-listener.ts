@@ -10,6 +10,7 @@ import {
   piProviderConfigsMatch,
 } from "@/lib/chat/free-tier-turn-marker";
 import type { PiForegroundEventsOptions } from "@/components/chat/standalone/hooks/pi-types";
+import { isConversationDeleted } from "@/lib/chat/conversation-delete-tombstone";
 
 interface PiReauthListenerOptions {
   isMounted: () => boolean;
@@ -49,6 +50,7 @@ export function registerPiReauthListener({
     if (!providerConfig) return;
     const boundaryIsCurrent = () =>
       isMounted() &&
+      !isConversationDeleted(expectedSessionId) &&
       piAsyncOperationGenerationRef.current === expectedOperationGeneration &&
       piSessionIdRef.current === expectedSessionId &&
       isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&

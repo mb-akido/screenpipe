@@ -32,6 +32,8 @@ const originalMessages: Message[] = [
     attachments: [attachment],
     hostedTurnId: "123e4567-e89b-42d3-a456-426614174000",
     hostedTurnPrompt,
+    sourceContext: { label: "timeline selection", text: "selected text" },
+    sourceFrameId: 42,
     timestamp: 1,
   },
   {
@@ -54,6 +56,9 @@ function createFixture(
           attachments?: (typeof attachment)[];
           reuseHostedTurnId?: string;
           reuseHostedTurnPrompt?: string;
+          sourceContext?: { label: string; text: string } | null;
+          sourceFrameId?: number | null;
+          preserveComposer?: boolean;
         },
       ) => Promise<boolean>
     >
@@ -94,6 +99,35 @@ describe("useChatMessageActions transactional replacements", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("propagates Ask User acceptance instead of reporting false success", async () => {
+    const sendMessage = vi.fn(async () => false);
+    const fixture = createFixture(sendMessage);
+
+    let accepted: boolean | undefined;
+    await act(async () => {
+      accepted =
+        await fixture.result.current.actions.messageListProps.onAskUserReply?.(
+          "structured answer",
+          "Answered Ask user: Subagents",
+          "tool-ask-1",
+        );
+    });
+
+    expect(accepted).toBe(false);
+    expect(sendMessage).toHaveBeenCalledWith(
+      "structured answer",
+      "Answered Ask user: Subagents",
+      [],
+      {
+        askUserToolCallId: "tool-ask-1",
+        attachments: [],
+        sourceContext: null,
+        sourceFrameId: null,
+        preserveComposer: true,
+      },
+    );
+  });
+
   it("keeps the complete branch when retry dispatch rejects", async () => {
     const sendMessage = vi.fn(async () => {
       throw new Error("provider preflight failed");
@@ -128,6 +162,12 @@ describe("useChatMessageActions transactional replacements", () => {
         attachments: [attachment],
         reuseHostedTurnId: "123e4567-e89b-42d3-a456-426614174000",
         reuseHostedTurnPrompt: hostedTurnPrompt,
+        sourceContext: {
+          label: "timeline selection",
+          text: "selected text",
+        },
+        sourceFrameId: 42,
+        preserveComposer: true,
       },
     );
   });
@@ -178,6 +218,12 @@ describe("useChatMessageActions transactional replacements", () => {
       {
         replaceFromMessageId: "user-1",
         attachments: [attachment],
+        sourceContext: {
+          label: "timeline selection",
+          text: "selected text",
+        },
+        sourceFrameId: 42,
+        preserveComposer: true,
       },
     );
   });

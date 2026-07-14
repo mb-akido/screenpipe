@@ -1268,7 +1268,7 @@ async piCancelQueued(sessionId: string | null, promptId: string) : Promise<Resul
  * the start of a deferred provider/model switch so old-provider follow-ups
  * cannot run under the newly selected provider.
  */
-async piInvalidateQueuedPrompts(sessionId: string | null) : Promise<Result<number, string>> {
+async piInvalidateQueuedPrompts(sessionId: string | null) : Promise<Result<string[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pi_invalidate_queued_prompts", { sessionId }) };
 } catch (e) {

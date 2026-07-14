@@ -3498,7 +3498,7 @@ pub async fn pi_cancel_queued(
 pub async fn pi_invalidate_queued_prompts(
     state: State<'_, PiState>,
     session_id: Option<String>,
-) -> Result<usize, String> {
+) -> Result<Vec<String>, String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
     let queue = {
         let pool = state.0.lock().await;

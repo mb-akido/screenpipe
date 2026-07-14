@@ -282,6 +282,8 @@ export function isRestorableChatConversation(
     "turnIntentId",
     "hostedTurnId",
     "hostedTurnPrompt",
+    "askUserToolCallId",
+    "retryPrompt",
     "model",
     "provider",
     "displayContent",
@@ -315,6 +317,31 @@ export function isRestorableChatConversation(
         )
       ) {
         return false;
+      }
+      if (
+        message.askUserReplyAccepted !== undefined &&
+        typeof message.askUserReplyAccepted !== "boolean"
+      ) {
+        return false;
+      }
+      if (message.pendingAskUserReplies !== undefined) {
+        if (!Array.isArray(message.pendingAskUserReplies)) return false;
+        if (
+          message.pendingAskUserReplies.some(
+            (pending) =>
+              !pending ||
+              typeof pending !== "object" ||
+              Array.isArray(pending) ||
+              typeof (pending as Record<string, unknown>).toolCallId !==
+                "string" ||
+              typeof (pending as Record<string, unknown>).queueId !== "string" ||
+              ((pending as Record<string, unknown>).replyText !== undefined &&
+                typeof (pending as Record<string, unknown>).replyText !==
+                  "string"),
+          )
+        ) {
+          return false;
+        }
       }
       for (const field of ["contentBlocks", "sourceCitations"] as const) {
         const entries = message[field];

@@ -101,7 +101,15 @@ vi.mock("@/lib/hooks/use-settings", () => ({
 
 // ── Import under test (after mocks) ───────────────────────────────────
 import { useChatConversations } from "../../components/hooks/use-chat-conversations";
-import { loadConversationFile } from "@/lib/chat-storage";
+import {
+  loadConversationFile,
+  saveConversationFile,
+} from "@/lib/chat-storage";
+import { __resetConversationSaveQueueForTests } from "@/lib/chat/conversation-save-queue";
+import {
+  __resetConversationDeleteTombstonesForTests,
+  markConversationDeleted,
+} from "@/lib/chat/conversation-delete-tombstone";
 import { useChatStore } from "../stores/chat-store";
 
 // Test harness: thin component that wires up the refs/state the hook
@@ -171,6 +179,8 @@ function deferred<T>() {
 }
 
 beforeEach(() => {
+  __resetConversationSaveQueueForTests();
+  __resetConversationDeleteTombstonesForTests();
   saveCalls.length = 0;
   deleteCachedBrowserState("chat-A");
   deleteCachedBrowserState("fresh-sid");
@@ -551,6 +561,10 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
         content: "clean visible prompt",
         hostedTurnId,
         hostedTurnPrompt,
+        askUserToolCallId: "tool-ask-1",
+        askUserReplyAccepted: true,
+        sourceContext: { label: "timeline selection", text: "selected text" },
+        sourceFrameId: 42,
         timestamp: 1,
       },
       {
@@ -576,6 +590,10 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
       content: "clean visible prompt",
       hostedTurnId,
       hostedTurnPrompt,
+      askUserToolCallId: "tool-ask-1",
+      askUserReplyAccepted: true,
+      sourceContext: { label: "timeline selection", text: "selected text" },
+      sourceFrameId: 42,
     });
 
     const persisted = {
@@ -594,6 +612,200 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
       content: "clean visible prompt",
       hostedTurnId,
       hostedTurnPrompt,
+      askUserToolCallId: "tool-ask-1",
+      askUserReplyAccepted: true,
+      sourceContext: { label: "timeline selection", text: "selected text" },
+      sourceFrameId: 42,
     });
+  });
+
+  it("cold-rehydrates a failed Ask User reply with its retry prompt", async () => {
+    const failedMessages = [
+      {
+        id: "u-ask",
+        role: "user" as const,
+        content: "structured answer",
+        displayContent: "Answered Ask user: Subagents",
+        askUserToolCallId: "tool-ask-1",
+        timestamp: 1,
+      },
+      {
+        id: "a-error",
+        role: "assistant" as const,
+        content: "Provider did not start",
+        retryPrompt: "structured answer",
+        timestamp: 2,
+      },
+    ];
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: failedMessages,
+        initialConversationId: "chat-A",
+        initialPiSessionId: "chat-A",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(failedMessages);
+    });
+    expect(saveCalls[0].messages[0]).toMatchObject({
+      askUserToolCallId: "tool-ask-1",
+    });
+    expect(saveCalls[0].messages[0].askUserReplyAccepted).toBeUndefined();
+    expect(saveCalls[0].messages[1]).toMatchObject({
+      retryPrompt: "structured answer",
+    });
+
+    const persisted = {
+      id: "chat-B",
+      title: "failed ask reply",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: saveCalls[0].messages,
+    };
+    vi.mocked(loadConversationFile).mockResolvedValueOnce(persisted as any);
+    await act(async () => {
+      await result.current.hook.loadConversation(persisted as any);
+    });
+
+    expect(result.current.messagesRef.current[0]).toMatchObject({
+      askUserToolCallId: "tool-ask-1",
+    });
+    expect(result.current.messagesRef.current[0].askUserReplyAccepted).toBeUndefined();
+    expect(result.current.messagesRef.current[1]).toMatchObject({
+      retryPrompt: "structured answer",
+    });
+  });
+
+  it("serializes foreground terminal saves behind an in-flight turn save", async () => {
+    const firstWrite = deferred<void>();
+    vi.mocked(saveConversationFile).mockImplementationOnce(async (conv: any) => {
+      saveCalls.push({ id: conv.id, messages: conv.messages });
+      await firstWrite.promise;
+    });
+    const staleRows = [
+      { id: "u0", role: "user" as const, content: "old", timestamp: 1 },
+      {
+        id: "a0",
+        role: "assistant" as const,
+        content: "Processing...",
+        timestamp: 2,
+      },
+      { id: "u1", role: "user" as const, content: "new", timestamp: 3 },
+      {
+        id: "a1",
+        role: "assistant" as const,
+        content: "Processing...",
+        timestamp: 3,
+      },
+    ];
+    const terminalRows = staleRows.map((message) =>
+      message.id === "a0"
+        ? { ...message, content: "completed old reply" }
+        : message,
+    );
+    useChatStore.getState().actions.upsert({
+      id: "chat-A",
+      title: "chat A",
+      preview: "",
+      status: "streaming",
+      messageCount: staleRows.length,
+      createdAt: 1,
+      updatedAt: 1,
+      pinned: false,
+      unread: false,
+      messages: staleRows as any,
+    });
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: staleRows,
+        initialConversationId: "chat-A",
+        initialPiSessionId: "chat-A",
+      }),
+    );
+
+    let initialSave!: Promise<void>;
+    act(() => {
+      initialSave = result.current.hook.saveConversation(staleRows, {
+        idOverride: "chat-A",
+        refreshHistory: false,
+      });
+    });
+    await vi.waitFor(() => expect(saveCalls).toHaveLength(1));
+
+    let terminalSave!: Promise<void>;
+    act(() => {
+      terminalSave = result.current.hook.saveConversation(terminalRows, {
+        idOverride: "chat-A",
+        refreshHistory: false,
+      });
+    });
+    await Promise.resolve();
+    expect(saveCalls).toHaveLength(1);
+
+    firstWrite.resolve(undefined);
+    await act(async () => {
+      await Promise.all([initialSave, terminalSave]);
+    });
+
+    expect(saveCalls).toHaveLength(2);
+    expect(saveCalls[1].messages).toEqual(terminalRows);
+    expect(
+      useChatStore.getState().sessions["chat-A"]?.messages,
+    ).toEqual(terminalRows);
+  });
+
+  it("does not re-add a deleted chat after a high-level save was already in flight", async () => {
+    const write = deferred<void>();
+    vi.mocked(saveConversationFile).mockImplementationOnce(async (conv: any) => {
+      saveCalls.push({ id: conv.id, messages: conv.messages });
+      await write.promise;
+    });
+    const rows = [
+      {
+        id: "u1",
+        role: "user" as const,
+        content: "private turn",
+        timestamp: 1,
+      },
+    ];
+    useChatStore.getState().actions.upsert({
+      id: "chat-A",
+      title: "chat A",
+      preview: "",
+      status: "idle",
+      messageCount: rows.length,
+      createdAt: 1,
+      updatedAt: 1,
+      pinned: false,
+      unread: false,
+      messages: rows,
+    });
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: rows,
+        initialConversationId: "chat-A",
+        initialPiSessionId: "chat-A",
+      }),
+    );
+
+    let save!: Promise<void>;
+    act(() => {
+      save = result.current.hook.saveConversation(rows, {
+        idOverride: "chat-A",
+        refreshHistory: false,
+      });
+    });
+    await vi.waitFor(() => expect(saveCalls).toHaveLength(1));
+
+    markConversationDeleted("chat-A");
+    useChatStore.getState().actions.drop("chat-A");
+    write.resolve(undefined);
+    await act(async () => {
+      await save;
+    });
+
+    expect(useChatStore.getState().sessions["chat-A"]).toBeUndefined();
+    expect(saveCalls).toHaveLength(1);
   });
 });

@@ -9,6 +9,9 @@ export function formatConversationHistoryLines(messages: Message[], limit = 40):
     .slice(-limit)
     .map((m) => {
       let text = m.content || "";
+      if (m.role === "user" && m.sourceContext) {
+        text = `[Context from ${m.sourceContext.label}: ${m.sourceContext.text}]\n\n${text}`;
+      }
       if (m.contentBlocks?.length) {
         const blockTexts = m.contentBlocks
           .map((b: any) => {

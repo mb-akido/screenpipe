@@ -27,7 +27,7 @@ import {
   piImageFromFrameId,
   promptWithConversationHistory,
 } from "@/components/chat/standalone/hooks/pi-message-preparation";
-import type { Message } from "@/lib/chat/types";
+import type { Message, MessageSourceContext } from "@/lib/chat/types";
 import type {
   PiDispatchBoundary,
   PiMessageSendOptions,
@@ -36,12 +36,62 @@ import type {
 import {
   canDispatchPiSend,
   isFreeScreenpipeCloudTextOnly,
+  isSamePiAuthAccount,
   isSamePiAuthIdentity,
   payerSafePiAutoStartPresets,
   piProviderConfigsMatch,
   requiresScreenpipeCloudLogin,
   resolveScreenpipeCloudTurnPrompt,
 } from "@/lib/chat/free-tier-turn-marker";
+import { commitCapturedNativeTurnInConversationFile } from "@/lib/chat-storage";
+import { isConversationDeleted } from "@/lib/chat/conversation-delete-tombstone";
+
+// A retry/edit is a new sendPiMessage invocation, so a queue local to one
+// invocation cannot prevent its save from overtaking the failed turn it
+// replaces. Keep one ordered tail per auth generation + conversation for the
+// lifetime of the webview. Provider switches share the queue; account/session
+// transitions get a separate scope and cannot inherit another identity's
+// stalled write.
+const piConversationSaveQueues = new Map<string, Promise<void>>();
+
+function conversationSaveScope(
+  authGeneration: number,
+  sessionId: string,
+): string {
+  return `${authGeneration}:${sessionId}`;
+}
+
+function conversationSaveTail(scope: string): Promise<void> {
+  return piConversationSaveQueues.get(scope) ?? Promise.resolve();
+}
+
+function enqueueConversationSave(
+  scope: string,
+  save: () => Promise<void>,
+): Promise<boolean> {
+  const previous = conversationSaveTail(scope);
+  const attempt: Promise<void> = previous.catch(() => undefined).then(save);
+  const queued: Promise<void> = attempt.catch((error) => {
+    // A failed write must not poison the queue forever. Later retry/error
+    // snapshots still get a chance to persist, while provider dispatch only
+    // resumes after this failed attempt has settled.
+    console.warn("[Pi] failed to persist accepted chat turn", error);
+  });
+  piConversationSaveQueues.set(scope, queued);
+  void queued.then(() => {
+    if (piConversationSaveQueues.get(scope) === queued) {
+      piConversationSaveQueues.delete(scope);
+    }
+  });
+  // Keep the shared queue recoverable while still reporting this attempt's
+  // result to its caller. In particular, the initial accepted-turn save must
+  // fail closed before native/provider dispatch instead of treating the
+  // swallowed queue error as durable acceptance.
+  return attempt.then(
+    () => true,
+    () => false,
+  );
+}
 
 export function usePiSendTransport(options: PiSendTransportOptions) {
   const {
@@ -240,6 +290,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     const expectedProviderConfig = resolvedBoundary.providerConfig;
     const dispatchBoundaryIsCurrent = () =>
       !conversationOperationPendingRef?.current &&
+      !isConversationDeleted(expectedSessionId) &&
       expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
       expectedSessionId === piSessionIdRef.current &&
       isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
@@ -250,9 +301,30 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     if (!dispatchBoundaryIsCurrent()) return;
     clearPendingSteerTransportState();
 
+    const hasSourceContextOverride = Boolean(
+      sendOptions && Object.prototype.hasOwnProperty.call(sendOptions, "sourceContext"),
+    );
+    const hasSourceFrameOverride = Boolean(
+      sendOptions && Object.prototype.hasOwnProperty.call(sendOptions, "sourceFrameId"),
+    );
+    const liveSourceContext: MessageSourceContext | null = prefillContext
+      ? {
+          label:
+            prefillSource === "timeline" ? "timeline selection" : "search",
+          text: prefillContext,
+        }
+      : null;
+    const turnSourceContext = hasSourceContextOverride
+      ? (sendOptions?.sourceContext ?? null)
+      : liveSourceContext;
+    const turnSourceFrameId = hasSourceFrameOverride
+      ? (sendOptions?.sourceFrameId ?? null)
+      : prefillFrameId;
+
     if (
       isFreeHostedTextOnly(expectedProviderConfig.provider) &&
-      ((imageDataUrls ?? pastedImages).length > 0 || prefillFrameId !== null)
+      ((imageDataUrls ?? pastedImages).length > 0 ||
+        turnSourceFrameId !== null)
     ) {
       showHostedTextOnlyError();
       return;
@@ -262,178 +334,6 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       await piPresetSwitchPromiseRef.current;
     }
     if (!dispatchBoundaryIsCurrent()) return;
-
-    let piRunningForDispatch = Boolean(piInfo?.running);
-    if (
-      piRunningForDispatch &&
-      !piProviderConfigsMatch(
-        piRunningConfigRef.current,
-        expectedProviderConfig,
-      )
-    ) {
-      await restartCurrentPiSession(expectedProviderConfig, {
-        sessionId: expectedSessionId,
-        userToken: expectedAuthIdentity.token,
-        isCurrent: dispatchBoundaryIsCurrent,
-      });
-      if (!dispatchBoundaryIsCurrent()) return;
-      piRunningForDispatch = true;
-    }
-
-    // Auto-start Pi if it's not running yet (new session or crash recovery)
-    if (!piRunningForDispatch) {
-      if (piStartInFlightRef.current) {
-        if (!autoSendBypassRef.current) {
-          toast({
-            title: "Pi starting",
-            description: "Please wait a moment",
-            variant: "destructive",
-          });
-          return;
-        }
-        // Prefill auto-send: wait for in-flight start to complete
-        const startWait = Date.now();
-        while (piStartInFlightRef.current && Date.now() - startWait < 10000) {
-          await new Promise((r) => setTimeout(r, 300));
-        }
-        if (!dispatchBoundaryIsCurrent()) return;
-        if (piStartInFlightRef.current) return; // timed out
-      } else {
-        console.log("[Pi] Not running, auto-starting before sending message");
-        piStartInFlightRef.current = true;
-        setPiStarting(true);
-
-        // Try only the explicitly selected preset. A failed local/BYOK preset
-        // must not upload context or charge a different provider, and a failed
-        // hosted preset must not start charging a configured user API key.
-        const activeP = getActivePreset();
-        const allPresets = settings.aiPresets ?? [];
-        const presetsToTry = payerSafePiAutoStartPresets(activeP, allPresets);
-
-        let started = false;
-        let lastError = "";
-
-        try {
-          const home = await homeDir();
-          const dir = await join(home, ".screenpipe", "pi-chat");
-          if (!dispatchBoundaryIsCurrent()) return;
-
-          for (const preset of presetsToTry) {
-            const providerConfig = expectedProviderConfig;
-
-            // Pre-check ChatGPT token validity before attempting start —
-            // avoids a noisy error from the Tauri command layer when the
-            // token is expired/missing, and lets us skip straight to
-            // fallback. Wrapped in a 5s timeout so a slow refresh can't
-            // block the entire fallback loop.
-            if (providerConfig.provider === "openai-chatgpt") {
-              try {
-                const checkResult = await Promise.race([
-                  commands.chatgptOauthCheckToken(),
-                  new Promise<Result<boolean, string>>((resolve) =>
-                    setTimeout(
-                      () => resolve({ status: "error", error: "timeout" }),
-                      5_000,
-                    ),
-                  ),
-                ]);
-                if (!dispatchBoundaryIsCurrent()) return;
-                if (checkResult.status !== "ok" || !checkResult.data) {
-                  console.log(
-                    `[Pi] Skipping preset "${preset.id}" — ChatGPT token not valid`,
-                  );
-                  lastError = "ChatGPT OAuth token unavailable";
-                  continue;
-                }
-              } catch {
-                console.log(
-                  `[Pi] Skipping preset "${preset.id}" — ChatGPT token check failed`,
-                );
-                lastError = "ChatGPT OAuth token check failed";
-                continue;
-              }
-            }
-
-            try {
-              if (!dispatchBoundaryIsCurrent()) return;
-              const result = await commands.piStart(
-                expectedSessionId,
-                dir,
-                expectedAuthIdentity.token,
-                providerConfig,
-              );
-              if (!dispatchBoundaryIsCurrent()) return;
-              if (result.status === "ok" && result.data.running) {
-                setPiInfo(result.data);
-                piSessionSyncedRef.current = false;
-                piCrashCountRef.current = 0;
-                setRunningConfigFromProviderConfig(providerConfig);
-                syncThinkingLevelAfterStart(expectedSessionId);
-
-                // Notify the user about the session-only fallback, but
-                // do NOT persist it — the user's chosen preset stays.
-                if (preset.id !== activeP?.id) {
-                  console.log(
-                    `[Pi] Fell back to preset "${preset.id}" for this session (not persisted)`,
-                  );
-                  toast({
-                    title: `using "${preset.id}" preset for this session`,
-                    description: `"${activeP?.id ?? "active"}" preset failed to start — using fallback for this session only`,
-                  });
-                }
-                started = true;
-                piRunningForDispatch = true;
-                break;
-              } else {
-                lastError =
-                  result.status === "error"
-                    ? (result.error ?? "Unknown error")
-                    : "Unknown error";
-                console.warn(
-                  `[Pi] Preset "${preset.id}" (${providerConfig.provider}) failed: ${lastError}`,
-                );
-              }
-            } catch (e) {
-              if (!dispatchBoundaryIsCurrent()) return;
-              lastError = String(e);
-              console.warn(
-                `[Pi] Preset "${preset.id}" (${providerConfig.provider}) threw: ${lastError}`,
-              );
-            }
-          }
-
-          if (!started) {
-            if (!dispatchBoundaryIsCurrent()) return;
-            const providerLabel = activeP?.provider || "AI";
-            toast({
-              title: `failed to start AI assistant (${providerLabel})`,
-              description:
-                presetsToTry.length > 1
-                  ? `all ${presetsToTry.length} presets failed — ${lastError}`
-                  : lastError,
-              variant: "destructive",
-            });
-            return;
-          }
-        } finally {
-          // The auth-transition reset owns these refs once identity changes.
-          // An old start finishing late must not mark a newer account's start
-          // as complete.
-          if (dispatchBoundaryIsCurrent()) {
-            setPiStarting(false);
-            piStartInFlightRef.current = false;
-          }
-        }
-      }
-    }
-
-    await interruptActivePiTurn(
-      expectedSessionId,
-      dispatchBoundaryIsCurrent,
-      expectedAuthIdentity.token,
-    );
-    if (!dispatchBoundaryIsCurrent()) return;
-    forceQueueModeRef.current = true;
 
     const outgoingImages = imageDataUrls ?? pastedImages;
     const shouldClearPastedImages =
@@ -447,10 +347,8 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     const hostedTurnId = isFreeHostedTextOnly(expectedProviderConfig.provider)
       ? (sendOptions?.reuseHostedTurnId ?? crypto.randomUUID())
       : undefined;
-    const contextLabel =
-      prefillSource === "timeline" ? "timeline selection" : "search";
-    const dispatchUserMessage = prefillContext
-      ? `[Context from ${contextLabel}: ${prefillContext}]\n\n${userMessage}`
+    const dispatchUserMessage = turnSourceContext
+      ? `[Context from ${turnSourceContext.label}: ${turnSourceContext.text}]\n\n${userMessage}`
       : userMessage;
     const replacementHistoryIndex = replacementMessageId
       ? messages.findIndex((message) => message.id === replacementMessageId)
@@ -471,31 +369,69 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
           sendOptions?.reuseHostedTurnPrompt,
         )
       : basePromptMessage;
+    const turnCreatedAt = Date.now();
     const newUserMessage: Message = {
-      id: Date.now().toString(),
+      id: crypto.randomUUID(),
       role: "user",
       content: userMessage,
       ...(displayLabel ? { displayContent: displayLabel } : {}),
       ...(outgoingImages.length > 0 ? { images: [...outgoingImages] } : {}),
       ...(consumedAttachments ? { attachments: consumedAttachments } : {}),
+      ...(sendOptions?.askUserToolCallId
+        ? { askUserToolCallId: sendOptions.askUserToolCallId }
+        : {}),
+      ...(turnSourceContext
+        ? { sourceContext: { ...turnSourceContext } }
+        : {}),
+      ...(turnSourceFrameId !== null
+        ? { sourceFrameId: turnSourceFrameId }
+        : {}),
       ...(hostedTurnId ? { hostedTurnId } : {}),
       ...(hostedTurnId ? { hostedTurnPrompt: promptMessage } : {}),
-      timestamp: Date.now(),
+      timestamp: turnCreatedAt,
     };
 
-    const assistantMessageId = (Date.now() + 1).toString();
-
-    piStreamingTextRef.current = "";
-    piMessageIdRef.current = assistantMessageId;
-    piContentBlocksRef.current = [];
-
-    piRateLimitRetries.current = 0;
-    lastPiDispatchPromptRef.current = promptMessage;
-    lastUserMessageRef.current = userMessage;
+    const assistantMessageId = crypto.randomUUID();
+    const assistantPlaceholder: Message = {
+      id: assistantMessageId,
+      role: "assistant",
+      content: "Processing...",
+      timestamp: turnCreatedAt,
+      model: getActivePreset()?.model,
+      provider: getActivePreset()?.provider,
+    };
 
     // The id this turn is dispatched and streamed under — the single source of
     // truth for the whole turn's persistence (#4719).
     const turnSessionId = expectedSessionId;
+    // Saves within one conversation must commit in invocation order. The
+    // initial Processing placeholder and a fast startup/preflight failure can
+    // otherwise race through saveConversation's independent file writes; if
+    // the slower placeholder save renames last, it resurrects Processing in
+    // both the store and on disk. The shared scope also covers the next
+    // retry/edit invocation, so its accepted branch cannot be overwritten by
+    // an older failed-turn save that was still in flight.
+    const saveScope = conversationSaveScope(
+      expectedAuthIdentity.generation,
+      turnSessionId,
+    );
+    let turnSaveChain: Promise<boolean> = conversationSaveTail(saveScope).then(
+      () => true,
+    );
+    const queueTurnSave = (
+      rows: Message[],
+      options?: { syncActiveConversation?: boolean },
+    ) => {
+      const snapshot = rows.map((message) => ({ ...message }));
+      turnSaveChain = enqueueConversationSave(saveScope, () =>
+        saveConversation(snapshot, {
+          refreshHistory: false,
+          idOverride: turnSessionId,
+          syncActiveConversation: options?.syncActiveConversation,
+        }),
+      );
+      return turnSaveChain;
+    };
     // Pull `conversationId` (React state, used by the edge/streaming auto-saves
     // in useChatConversations) into lockstep with the dispatched session id. If
     // it lags, those later saves write under a SECOND id and the sidebar
@@ -504,27 +440,39 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     // one id.
     setConversationId(turnSessionId);
 
-    let nextRowsAfterUserAppend: Message[] | null = null;
+    // Snapshot from this render before scheduling React state. State updater
+    // execution is intentionally deferred/batched by React and must never be
+    // used as a side channel to decide whether the durability gate exists.
+    const nextRowsAfterTurnAppend = [
+      ...messages,
+      newUserMessage,
+      assistantPlaceholder,
+    ];
     setMessages((prev) => {
       // A retry/edit is provisional until the native process accepts it. Keep
       // the old branch present so a provider preflight or native rejection can
       // remove only these provisional rows without reconstructing lost state.
-      const next = [...prev, newUserMessage];
-      nextRowsAfterUserAppend = next;
-      return next;
+      // Normal sends, however, are accepted locally before any provider work:
+      // persisting both rows here makes provider startup failure visible and
+      // prevents accepted card/prefill actions from disappearing.
+      return [...prev, newUserMessage, assistantPlaceholder];
     });
-    if (nextRowsAfterUserAppend && !replacementMessageId) {
+    if (!replacementMessageId) {
       // conversationId state hasn't committed yet this tick, so force the
       // immediate save under the same id explicitly.
-      void saveConversation(nextRowsAfterUserAppend, {
-        refreshHistory: false,
-        idOverride: turnSessionId,
+      void queueTurnSave(nextRowsAfterTurnAppend, {
+        syncActiveConversation: false,
       });
     }
-    setInput("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
-    setIsLoading(true);
-    setIsStreaming(true);
+    if (!sendOptions?.preserveComposer) {
+      setInput("");
+      if (inputRef.current) inputRef.current.style.height = "auto";
+      if (shouldClearPastedImages) setPastedImages([]);
+      if (!hasSourceFrameOverride && prefillFrameId !== null) {
+        setPrefillFrameId(null);
+      }
+      if (!hasSourceContextOverride && prefillContext) setPrefillContext(null);
+    }
 
     // Mirror the user message + assistant placeholder DIRECTLY into the
     // chat-store, synchronously. The snapshot-on-switch path reads
@@ -558,21 +506,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       if (displayLabel && isPlaceholderConversationTitle(currentTitle)) {
         storeState.actions.patch(sidNow, { title: displayLabel });
       }
-      storeState.actions.appendMessage(sidNow, {
-        id: assistantMessageId,
-        role: "assistant",
-        content: "Processing...",
-        timestamp: Date.now(),
-        model: getActivePreset()?.model,
-        provider: getActivePreset()?.provider,
-      } as any);
-      storeState.actions.setStreaming(sidNow, {
-        streamingMessageId: assistantMessageId,
-        streamingText: "",
-        contentBlocks: [],
-        isStreaming: true,
-        isLoading: true,
-      });
+      storeState.actions.appendMessage(sidNow, assistantPlaceholder as any);
       // Bump the sort key — sending a message is the one user action
       // that should pull a chat to the top of the sidebar. Pi-driven
       // activity (text_delta, agent_end) does NOT bump this; the
@@ -583,18 +517,128 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       // the session hidden (draft:true) even though there's a user message.
       storeState.actions.patch(sidNow, { draft: false });
     }
-    if (!replacementMessageId) onAccepted?.();
-
+    const persistNativeAcceptanceAfterBoundaryChange = (
+      { commitCapturedReplacement = false } = {},
+    ): boolean => {
+      if (isConversationDeleted(expectedSessionId)) return false;
+      const markAskUserAccepted = Boolean(sendOptions?.askUserToolCallId);
+      const ownsConversationPanel =
+        isSamePiAuthAccount(expectedAuthIdentity, authIdentityRef.current) &&
+        piSessionIdRef.current === expectedSessionId;
+      if (!markAskUserAccepted && !commitCapturedReplacement) {
+        return ownsConversationPanel;
+      }
+      const markAccepted = (rows: Message[]) =>
+        markAskUserAccepted
+          ? rows.map((message) =>
+              message.id === newUserMessage.id
+                ? { ...message, askUserReplyAccepted: true }
+                : message,
+            )
+          : rows;
+      const ownsDispatchConfig =
+        ownsConversationPanel &&
+        piProviderConfigsMatch(
+          expectedProviderConfig,
+          buildProviderConfig(getActivePreset()),
+        );
+      if (ownsConversationPanel) {
+        setMessages((prev) => {
+          const acceptedRows = markAccepted(prev);
+          if (!commitCapturedReplacement || !replacementMessageId) {
+            return acceptedRows;
+          }
+          const replaceIndex = acceptedRows.findIndex(
+            (message) => message.id === replacementMessageId,
+          );
+          const provisionalUser = acceptedRows.find(
+            (message) => message.id === newUserMessage.id,
+          );
+          const provisionalAssistant = acceptedRows.find(
+            (message) => message.id === assistantMessageId,
+          );
+          if (replaceIndex < 0 || !provisionalUser || !provisionalAssistant) {
+            return acceptedRows;
+          }
+          return [
+            ...acceptedRows.slice(0, replaceIndex),
+            provisionalUser,
+            provisionalAssistant,
+          ];
+        });
+      }
+      if (sidNow) {
+        const storeState = useChatStore.getState();
+        if (markAskUserAccepted) {
+          storeState.actions.patchMessage(
+            sidNow,
+            newUserMessage.id,
+            (message: unknown) => ({
+              ...(message as Message),
+              askUserReplyAccepted: true,
+            }),
+          );
+        }
+        const storedMessages = useChatStore.getState().sessions[sidNow]
+          ?.messages as Message[] | undefined;
+        let rowsToPersist = storedMessages ?? markAccepted(nextRowsAfterTurnAppend);
+        if (commitCapturedReplacement && replacementMessageId) {
+          const replaceIndex = rowsToPersist.findIndex(
+            (message) => message.id === replacementMessageId,
+          );
+          const provisionalUser = rowsToPersist.find(
+            (message) => message.id === newUserMessage.id,
+          );
+          const provisionalAssistant = rowsToPersist.find(
+            (message) => message.id === assistantMessageId,
+          );
+          if (
+            replaceIndex >= 0 &&
+            provisionalUser &&
+            provisionalAssistant
+          ) {
+            rowsToPersist = [
+              ...rowsToPersist.slice(0, replaceIndex),
+              provisionalUser,
+              provisionalAssistant,
+            ];
+            storeState.actions.setMessages(sidNow, rowsToPersist as any);
+          }
+        }
+        // The store can be cleared by an account transition before native
+        // acceptance resolves. Persist the captured C1 snapshot in that case;
+        // never patch the successor panel merely to make the old turn durable.
+        if (ownsDispatchConfig) {
+          void queueTurnSave(rowsToPersist, {
+            syncActiveConversation: false,
+          });
+        } else {
+          // The current hook now belongs to another panel/account. Patch only
+          // the captured conversation file so live preset credentials, title
+          // generation, and successor UI state cannot leak into this save.
+          void commitCapturedNativeTurnInConversationFile({
+            id: sidNow,
+            userMessage: newUserMessage,
+            assistantMessage: assistantPlaceholder,
+            markAskUserAccepted,
+            ...(commitCapturedReplacement && replacementMessageId
+              ? { replaceFromMessageId: replacementMessageId }
+              : {}),
+          });
+        }
+      }
+      return ownsConversationPanel;
+    };
     const provisionalIds = new Set([newUserMessage.id, assistantMessageId]);
     const removeProvisionalReplacement = () => {
       if (!replacementMessageId) return false;
 
-      const sameAuth = isSamePiAuthIdentity(
+      const sameAccount = isSamePiAuthAccount(
         expectedAuthIdentity,
         authIdentityRef.current,
       );
       const ownsLocalPanel =
-        sameAuth && piSessionIdRef.current === expectedSessionId;
+        sameAccount && piSessionIdRef.current === expectedSessionId;
       if (ownsLocalPanel) {
         setMessages((prev) =>
           prev.filter((message) => !provisionalIds.has(message.id)),
@@ -603,7 +647,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
 
       // Never write an old account's branch into the successor account's
       // store. The auth-transition path owns cleanup once identity changes.
-      if (sameAuth && sidNow) {
+      if (sameAccount && sidNow) {
         const storeState = useChatStore.getState();
         const storedMessages = storeState.sessions[sidNow]?.messages as
           Message[] | undefined;
@@ -640,7 +684,12 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     };
 
     const commitAcceptedReplacement = () => {
-      if (!replacementMessageId) return;
+      if (
+        !replacementMessageId ||
+        isConversationDeleted(expectedSessionId)
+      ) {
+        return;
+      }
 
       let committedLocalRows: Message[] | null = null;
       setMessages((prev) => {
@@ -696,28 +745,41 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
 
       const committedRows = committedStoreRows ?? committedLocalRows;
       if (committedRows) {
-        void saveConversation(committedRows, {
-          refreshHistory: false,
-          idOverride: turnSessionId,
-        });
+        void queueTurnSave(committedRows);
       }
     };
 
-    const abandonUnacceptedTurn = () => {
-      if (removeProvisionalReplacement()) return;
+    const finishPendingTurnWithRetry = (
+      retryableMessage: string,
+      { commitReplacement = false }: { commitReplacement?: boolean } = {},
+    ) => {
+      if (isConversationDeleted(expectedSessionId)) {
+        if (piMessageIdRef.current === assistantMessageId) {
+          piMessageIdRef.current = null;
+          piStreamingTextRef.current = "";
+          piContentBlocksRef.current = [];
+          forceQueueModeRef.current = false;
+          setIsLoading(false);
+          setIsStreaming(false);
+        }
+        return;
+      }
+      if (replacementMessageId && !commitReplacement) {
+        removeProvisionalReplacement();
+        return;
+      }
       const retryMessage = newUserMessage.content;
-      const abandonedMessage =
-        "AI setup changed before this message was sent. Retry to send it with the selected provider.";
       // React's message array belongs to whichever account/conversation is
       // currently visible, while the chat store below can address C1 by id.
       // Never let a late C1 completion append its retry prompt into a B panel.
       // A provider-only change keeps the same auth/session/message ownership,
       // so it may replace the placeholder that this turn actually created.
-      const ownsLocalPanelTurn =
-        isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
-        piSessionIdRef.current === expectedSessionId &&
-        piMessageIdRef.current === assistantMessageId;
-      if (ownsLocalPanelTurn) {
+      const ownsLocalPanel =
+        isSamePiAuthAccount(expectedAuthIdentity, authIdentityRef.current) &&
+        piSessionIdRef.current === expectedSessionId;
+      const ownsForegroundTurn =
+        ownsLocalPanel && piMessageIdRef.current === assistantMessageId;
+      if (ownsLocalPanel) {
         setMessages((prev) =>
           prev.map((message) =>
             message.id === assistantMessageId &&
@@ -725,7 +787,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
             message.content === "Processing..."
               ? {
                   ...message,
-                  content: abandonedMessage,
+                  content: retryableMessage,
                   retryPrompt: retryMessage,
                 }
               : message,
@@ -746,7 +808,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
             message?.content === "Processing..."
               ? {
                   ...message,
-                  content: abandonedMessage,
+                  content: retryableMessage,
                   retryPrompt: retryMessage,
                 }
               : message,
@@ -760,20 +822,26 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
             isStreaming: false,
           });
         }
+      }
+
+      if (replacementMessageId && commitReplacement) {
+        // A retry/edit that reached local acceptance must become one branch,
+        // even when Pi cannot start. Committing the retryable assistant row
+        // avoids both a vanished user action and duplicate replacement rows.
+        commitAcceptedReplacement();
+        onAccepted?.();
+      } else if (sidNow) {
         const storedMessages = useChatStore.getState().sessions[sidNow]
           ?.messages as Message[] | undefined;
         if (storedMessages) {
-          void saveConversation(storedMessages, {
-            refreshHistory: false,
-            idOverride: sidNow,
-          });
+          void queueTurnSave(storedMessages);
         }
       }
 
       // Only the operation that still owns these foreground refs may clear
       // them. A conversation/account reset mints a different session or nulls
       // the message ref before its newer work can start.
-      if (ownsLocalPanelTurn) {
+      if (ownsForegroundTurn) {
         piMessageIdRef.current = null;
         piStreamingTextRef.current = "";
         piContentBlocksRef.current = [];
@@ -783,11 +851,266 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       }
     };
 
+    const abandonUnacceptedTurn = () =>
+      finishPendingTurnWithRetry(
+        "AI setup changed before this message was sent. Retry to send it with the selected provider.",
+      );
+
+    const failPiStartup = (rawError: string) => {
+      const cleanError =
+        rawError.trim() || "The selected provider did not start.";
+      const providerMessage = buildProviderErrorMessage(
+        cleanError,
+        getActivePreset(),
+      );
+      const retryableMessage =
+        providerMessage ??
+        (cleanError.toLowerCase().includes("chatgpt oauth")
+          ? "ChatGPT sign-in is unavailable. Reconnect ChatGPT in AI settings, then retry this message."
+          : `Couldn't start the AI assistant: ${cleanError}. Retry this message after checking your AI preset.`);
+      finishPendingTurnWithRetry(retryableMessage, {
+        commitReplacement: true,
+      });
+    };
+
+    // Do not let provider work (or a hosted preview spend) overtake durable
+    // local acceptance. The UI and chat store were updated synchronously
+    // above, so this only gates native/provider dispatch on the initial file
+    // save. It also prevents that Processing snapshot from completing after a
+    // fast streaming terminal save performed by another hook.
+    const initialTurnPersisted = await turnSaveChain;
+    if (!initialTurnPersisted) {
+      finishPendingTurnWithRetry(
+        "Couldn't save this chat locally. Check available disk space and storage access, then retry this message.",
+      );
+      return;
+    }
+    if (!dispatchBoundaryIsCurrent()) {
+      abandonUnacceptedTurn();
+      return;
+    }
+
+    // The local conversation owns the accepted action before any native or
+    // provider work. Interrupting, restarting, and auto-starting Pi are all
+    // fallible; every failure below therefore resolves the already-persisted
+    // placeholder into a retryable assistant row instead of losing the input.
+    try {
+      await interruptActivePiTurn(
+        expectedSessionId,
+        dispatchBoundaryIsCurrent,
+        expectedAuthIdentity.token,
+      );
+    } catch (error) {
+      if (!dispatchBoundaryIsCurrent()) {
+        abandonUnacceptedTurn();
+        return;
+      }
+      failPiStartup(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (!dispatchBoundaryIsCurrent()) {
+      abandonUnacceptedTurn();
+      return;
+    }
+
+    piStreamingTextRef.current = "";
+    piMessageIdRef.current = assistantMessageId;
+    piContentBlocksRef.current = [];
+    piRateLimitRetries.current = 0;
+    lastPiDispatchPromptRef.current = promptMessage;
+    lastUserMessageRef.current = userMessage;
+    forceQueueModeRef.current = true;
+    setIsLoading(true);
+    setIsStreaming(true);
+    if (sidNow) {
+      useChatStore.getState().actions.setStreaming(sidNow, {
+        streamingMessageId: assistantMessageId,
+        streamingText: "",
+        contentBlocks: [],
+        isStreaming: true,
+        isLoading: true,
+      });
+    }
+
+    let piRunningForDispatch = Boolean(piInfo?.running);
+    if (
+      piRunningForDispatch &&
+      !piProviderConfigsMatch(
+        piRunningConfigRef.current,
+        expectedProviderConfig,
+      )
+    ) {
+      try {
+        await restartCurrentPiSession(expectedProviderConfig, {
+          sessionId: expectedSessionId,
+          userToken: expectedAuthIdentity.token,
+          isCurrent: dispatchBoundaryIsCurrent,
+        });
+      } catch (error) {
+        if (!dispatchBoundaryIsCurrent()) {
+          abandonUnacceptedTurn();
+          return;
+        }
+        failPiStartup(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (!dispatchBoundaryIsCurrent()) {
+        abandonUnacceptedTurn();
+        return;
+      }
+      piRunningForDispatch = true;
+    }
+
+    // Auto-start Pi if it's not running yet (new session or crash recovery).
+    // Only the explicitly selected provider may start: automatic fallback
+    // across payer/privacy boundaries is forbidden.
+    if (!piRunningForDispatch) {
+      if (piStartInFlightRef.current) {
+        const startWait = Date.now();
+        while (piStartInFlightRef.current && Date.now() - startWait < 10_000) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+        if (!dispatchBoundaryIsCurrent()) {
+          abandonUnacceptedTurn();
+          return;
+        }
+        if (piStartInFlightRef.current) {
+          failPiStartup("AI startup timed out");
+          return;
+        }
+        // The lifecycle-owned start completed. React's piInfo snapshot can lag
+        // this async function; let piPrompt verify the registered session and
+        // use its same-provider auto-spawn retry if registration is absent.
+        piRunningForDispatch = true;
+      } else {
+        console.log("[Pi] Not running, auto-starting after saving message");
+        piStartInFlightRef.current = true;
+        setPiStarting(true);
+
+        const activeP = getActivePreset();
+        const allPresets = settings.aiPresets ?? [];
+        const presetsToTry = payerSafePiAutoStartPresets(activeP, allPresets);
+        let started = false;
+        let lastError =
+          presetsToTry.length === 0 ? "No valid AI preset selected" : "";
+
+        try {
+          const home = await homeDir();
+          const dir = await join(home, ".screenpipe", "pi-chat");
+          if (!dispatchBoundaryIsCurrent()) {
+            abandonUnacceptedTurn();
+            return;
+          }
+
+          for (const preset of presetsToTry) {
+            const providerConfig = expectedProviderConfig;
+
+            if (providerConfig.provider === "openai-chatgpt") {
+              try {
+                const checkResult = await Promise.race([
+                  commands.chatgptOauthCheckToken(),
+                  new Promise<Result<boolean, string>>((resolve) =>
+                    setTimeout(
+                      () => resolve({ status: "error", error: "timeout" }),
+                      5_000,
+                    ),
+                  ),
+                ]);
+                if (!dispatchBoundaryIsCurrent()) {
+                  abandonUnacceptedTurn();
+                  return;
+                }
+                if (checkResult.status !== "ok" || !checkResult.data) {
+                  lastError = "ChatGPT OAuth token unavailable";
+                  continue;
+                }
+              } catch {
+                if (!dispatchBoundaryIsCurrent()) {
+                  abandonUnacceptedTurn();
+                  return;
+                }
+                lastError = "ChatGPT OAuth token check failed";
+                continue;
+              }
+            }
+
+            try {
+              if (!dispatchBoundaryIsCurrent()) {
+                abandonUnacceptedTurn();
+                return;
+              }
+              const result = await commands.piStart(
+                expectedSessionId,
+                dir,
+                expectedAuthIdentity.token,
+                providerConfig,
+              );
+              if (!dispatchBoundaryIsCurrent()) {
+                abandonUnacceptedTurn();
+                return;
+              }
+              if (result.status === "ok" && result.data.running) {
+                setPiInfo(result.data);
+                piSessionSyncedRef.current = false;
+                piCrashCountRef.current = 0;
+                setRunningConfigFromProviderConfig(providerConfig);
+                syncThinkingLevelAfterStart(expectedSessionId);
+                started = true;
+                piRunningForDispatch = true;
+                break;
+              }
+              lastError =
+                result.status === "error"
+                  ? (result.error ?? "Unknown error")
+                  : "Unknown error";
+              console.warn(
+                `[Pi] Preset "${preset.id}" (${providerConfig.provider}) failed: ${lastError}`,
+              );
+            } catch (error) {
+              if (!dispatchBoundaryIsCurrent()) {
+                abandonUnacceptedTurn();
+                return;
+              }
+              lastError =
+                error instanceof Error ? error.message : String(error);
+              console.warn(
+                `[Pi] Preset "${preset.id}" (${providerConfig.provider}) threw: ${lastError}`,
+              );
+            }
+          }
+
+          if (!started) {
+            if (!dispatchBoundaryIsCurrent()) {
+              abandonUnacceptedTurn();
+              return;
+            }
+            failPiStartup(lastError);
+            return;
+          }
+        } catch (error) {
+          if (!dispatchBoundaryIsCurrent()) {
+            abandonUnacceptedTurn();
+            return;
+          }
+          failPiStartup(error instanceof Error ? error.message : String(error));
+          return;
+        } finally {
+          // The auth-transition reset owns these refs once identity changes.
+          // An old start finishing late must not mark a newer account's start
+          // as complete.
+          if (dispatchBoundaryIsCurrent()) {
+            setPiStarting(false);
+            piStartInFlightRef.current = false;
+          }
+        }
+      }
+    }
+
     posthog.capture("chat_message_sent", {
       provider: getActivePreset()?.provider,
       model: getActivePreset()?.model,
-      has_images: outgoingImages.length > 0 || !!prefillFrameId,
-      has_context: !!prefillContext,
+      has_images: outgoingImages.length > 0 || turnSourceFrameId !== null,
+      has_context: !!turnSourceContext,
       message_index: messages.filter((m) => m.role === "user").length,
     });
 
@@ -802,9 +1125,9 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       const piImages: Array<{ type: string; mimeType: string; data: string }> =
         [];
 
-      if (prefillFrameId) {
+      if (turnSourceFrameId !== null) {
         try {
-          const frameImage = await piImageFromFrameId(prefillFrameId);
+          const frameImage = await piImageFromFrameId(turnSourceFrameId);
           if (frameImage) piImages.push(frameImage);
         } catch (error) {
           console.error("Failed to fetch frame image for Pi:", error);
@@ -813,32 +1136,12 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
           abandonUnacceptedTurn();
           return;
         }
-        setPrefillFrameId(null);
-      }
-
-      // Clear prefill context banner (was only cleared in non-Pi path)
-      if (prefillContext) {
-        setPrefillContext(null);
       }
 
       for (const img of outgoingImages) {
         const piImage = piImageFromDataUrl(img);
         if (piImage) piImages.push(piImage);
       }
-      if (shouldClearPastedImages) setPastedImages([]);
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: assistantMessageId,
-          role: "assistant",
-          content: "Processing...",
-          timestamp: Date.now(),
-          model: getActivePreset()?.model,
-          provider: getActivePreset()?.provider,
-        },
-      ]);
-
       // Always re-inject the recent conversation history into every prompt
       // when the chat has prior turns (issue #3636).
       //
@@ -906,42 +1209,10 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
           });
           return;
         }
-        piStreamingTextRef.current = "";
-        piMessageIdRef.current = null;
-        piContentBlocksRef.current = [];
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantMessageId
-              ? {
-                  ...m,
-                  content: providerPreflight.message,
-                  retryPrompt: userMessage,
-                }
-              : m,
-          ),
-        );
-        if (sidNow) {
-          const storeState = useChatStore.getState();
-          storeState.actions.patchMessage(
-            sidNow,
-            assistantMessageId,
-            (m: any) => ({
-              ...m,
-              content: providerPreflight.message,
-              retryPrompt: userMessage,
-            }),
-          );
-          storeState.actions.setStreaming(sidNow, {
-            streamingMessageId: null,
-            streamingText: "",
-            contentBlocks: [],
-            isLoading: false,
-            isStreaming: false,
-          });
-        }
-        forceQueueModeRef.current = false;
-        setIsLoading(false);
-        setIsStreaming(false);
+        // The turn was already accepted and persisted locally. Resolve its
+        // placeholder through the shared finalizer so React, the chat store,
+        // and the saved conversation cannot disagree about this failure.
+        finishPendingTurnWithRetry(providerPreflight.message);
         return;
       }
 
@@ -959,7 +1230,16 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       );
       promptAcceptedByNative = result.status === "ok";
       if (!dispatchBoundaryIsCurrent()) {
-        if (!promptAcceptedByNative) abandonUnacceptedTurn();
+        if (promptAcceptedByNative) {
+          if (
+            persistNativeAcceptanceAfterBoundaryChange({
+              commitCapturedReplacement: true,
+            })
+          ) {
+            onAccepted?.();
+          }
+        }
+        else abandonUnacceptedTurn();
         return;
       }
 
@@ -1023,7 +1303,16 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       }
 
       if (!dispatchBoundaryIsCurrent()) {
-        if (!promptAcceptedByNative) abandonUnacceptedTurn();
+        if (promptAcceptedByNative) {
+          if (
+            persistNativeAcceptanceAfterBoundaryChange({
+              commitCapturedReplacement: true,
+            })
+          ) {
+            onAccepted?.();
+          }
+        }
+        else abandonUnacceptedTurn();
         return;
       }
       if (result.status === "error") {
@@ -1031,7 +1320,6 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         // Provide helpful error messages for common failures
         const rawError = result.error;
         let errorMsg: string;
-        let retryPrompt: string | undefined;
         const currentPreset = getActivePreset();
         const providerError = buildProviderErrorMessage(
           rawError,
@@ -1040,7 +1328,6 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
 
         if (rawError.includes("already processing")) {
           errorMsg = "The AI was mid-response when your message arrived.";
-          retryPrompt = userMessage;
         } else if (
           rawError.includes("Broken pipe") ||
           rawError.includes("not running") ||
@@ -1052,15 +1339,12 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
             provider === "native-ollama"
               ? "Ollama isn't running. Start it with: `ollama serve`"
               : "AI agent crashed — restarting automatically...";
-          retryPrompt = userMessage;
         } else if (providerError) {
           errorMsg = providerError;
-          retryPrompt = userMessage;
         } else if (rawError.includes("not found")) {
           errorMsg = `Model "${currentPreset?.model}" not found. Check your AI preset in settings.`;
         } else {
           errorMsg = rawError;
-          retryPrompt = userMessage;
         }
         if (replacementMessageId) {
           removeProvisionalReplacement();
@@ -1071,28 +1355,30 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
           });
           return;
         }
-        piMessageIdRef.current = null;
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantMessageId
-              ? {
-                  ...m,
-                  content: errorMsg,
-                  ...(retryPrompt ? { retryPrompt } : {}),
-                }
-              : m,
-          ),
-        );
-        forceQueueModeRef.current = false;
-        setIsLoading(false);
-        setIsStreaming(false);
-      } else if (replacementMessageId) {
-        commitAcceptedReplacement();
+        finishPendingTurnWithRetry(errorMsg);
+      } else {
+        persistNativeAcceptanceAfterBoundaryChange();
+        if (replacementMessageId) {
+          commitAcceptedReplacement();
+        }
+        // `sendMessage()` is also the contract used by interactive cards.
+        // Report success only after the native session accepted the prompt;
+        // local persistence alone must not make an Ask User answer claim it
+        // was sent when startup, preflight, or dispatch actually failed.
         onAccepted?.();
       }
     } catch (error) {
       if (!dispatchBoundaryIsCurrent()) {
-        if (!promptAcceptedByNative) abandonUnacceptedTurn();
+        if (promptAcceptedByNative) {
+          if (
+            persistNativeAcceptanceAfterBoundaryChange({
+              commitCapturedReplacement: true,
+            })
+          ) {
+            onAccepted?.();
+          }
+        }
+        else abandonUnacceptedTurn();
         return;
       }
       if (timeoutId) clearTimeout(timeoutId);
@@ -1110,17 +1396,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         });
         return;
       }
-      piMessageIdRef.current = null;
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantMessageId
-            ? { ...m, content: providerError || `Error: ${rawError}` }
-            : m,
-        ),
-      );
-      forceQueueModeRef.current = false;
-      setIsLoading(false);
-      setIsStreaming(false);
+      finishPendingTurnWithRetry(providerError || `Error: ${rawError}`);
     }
   }
 
@@ -1138,6 +1414,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     if (!expectedProviderConfig) return false;
     const isExpectedDispatchBoundary = () =>
       !conversationOperationPendingRef?.current &&
+      !isConversationDeleted(expectedSessionId) &&
       expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
       expectedSessionId === piSessionIdRef.current &&
       isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
@@ -1161,14 +1438,36 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     )
       return false;
     const trimmed = userMessage.trim();
-    const outgoingImages = imageDataUrls ?? pastedImages;
-    const queuedDocs = attachedDocsRef.current;
+    const outgoingImages = sendOptions?.preserveComposer
+      ? (imageDataUrls ?? [])
+      : (imageDataUrls ?? pastedImages);
+    const queuedDocs = sendOptions?.preserveComposer
+      ? []
+      : sendOptions?.attachments !== undefined
+        ? []
+        : attachedDocsRef.current;
+    const hasSourceContextOverride = Boolean(
+      sendOptions && Object.prototype.hasOwnProperty.call(sendOptions, "sourceContext"),
+    );
+    const hasSourceFrameOverride = Boolean(
+      sendOptions && Object.prototype.hasOwnProperty.call(sendOptions, "sourceFrameId"),
+    );
+    const sourceContextForSend = hasSourceContextOverride
+      ? (sendOptions?.sourceContext ?? null)
+      : sendOptions?.preserveComposer
+        ? null
+      : prefillContext;
+    const sourceFrameForSend = hasSourceFrameOverride
+      ? (sendOptions?.sourceFrameId ?? null)
+      : sendOptions?.preserveComposer
+        ? null
+      : prefillFrameId;
     if (!trimmed && outgoingImages.length === 0 && queuedDocs.length === 0)
       return false;
 
     if (
       isFreeHostedTextOnly(expectedProviderConfig.provider) &&
-      (outgoingImages.length > 0 || prefillFrameId !== null)
+      (outgoingImages.length > 0 || sourceFrameForSend !== null)
     ) {
       showHostedTextOnlyError();
       return false;
@@ -1290,6 +1589,8 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     if (
       canQueueOnExpectedProvider &&
       !sendOptions?.replaceFromMessageId &&
+      !sourceContextForSend &&
+      sourceFrameForSend === null &&
       (forceQueueModeRef.current ||
         piMessageIdRef.current ||
         isLoading ||

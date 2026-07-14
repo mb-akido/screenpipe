@@ -68,12 +68,19 @@ import {
   extractInjectedUserText,
   isInjectedTitleSourcePrompt,
 } from "@/lib/chat-utils";
+import { pendingAskUserToolCallForReply } from "@/lib/chat/ask-user-reply-state";
 import {
   extractScreenpipeCloudTurnId,
   stripScreenpipeCloudTurnMarker,
 } from "@/lib/chat/free-tier-turn-marker";
 import { deriveFallbackConversationTitle } from "@/lib/utils/chat-title";
 import { isInternalTitleSession } from "@/lib/utils/internal-session";
+import {
+  flushSerializedConversationSaves,
+  serializeConversationSave,
+} from "@/lib/chat/conversation-save-queue";
+import { isConversationDeleted } from "@/lib/chat/conversation-delete-tombstone";
+import type { Message } from "@/lib/chat/types";
 import {
   getPersistedViewedAt,
   useChatStore,
@@ -184,6 +191,10 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   const sid = envelope.sessionId;
   const inner = envelope.event;
   if (!sid || !inner) return; // events without a session id or body can't be routed
+  if (isConversationDeleted(sid)) {
+    useChatStore.getState().actions.drop(sid);
+    return;
+  }
   // Internal Pi sessions (title generation, etc.) — never routed to chat store
   if (isInternalTitleSession(sid)) return;
   // Pipe sessions are only routed when chat-store already has a record
@@ -305,6 +316,11 @@ export function handleTerminated(payload: AgentTerminatedPayload) {
   // streaming dot.
   const sid = payload.sessionId;
   if (!sid) return;
+  if (isConversationDeleted(sid)) {
+    useChatStore.getState().actions.drop(sid);
+    previewLastEmittedAt.delete(sid);
+    return;
+  }
   const store = useChatStore.getState();
   if (!store.sessions[sid]) return;
   const isCleanExit = payload.exitCode === 0 || payload.exitCode == null;
@@ -521,6 +537,10 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
     // hosted marker gives us a collision-safe identity for updating that
     // existing row with the exact gateway bytes instead of duplicating it.
     const existingMessages = (existing.messages ?? []) as MutableMessage[];
+    const recoveredAskUserToolCallId = pendingAskUserToolCallForReply(
+      existingMessages as Message[],
+      text,
+    );
     const existingUser = hostedTurnId
       ? [...existingMessages]
           .reverse()
@@ -564,6 +584,12 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
           ...(images.length ? { images } : {}),
           ...(hostedTurnId ? { hostedTurnId } : {}),
           ...(hostedTurnId ? { hostedTurnPrompt: rawText } : {}),
+          ...(recoveredAskUserToolCallId
+            ? {
+                askUserToolCallId: recoveredAskUserToolCallId,
+                askUserReplyAccepted: true,
+              }
+            : {}),
           timestamp: Date.now(),
         };
     const assistantShell: MutableMessage = {
@@ -755,6 +781,7 @@ const saveQueue = new Map<string, Promise<void>>();
 export async function flushPendingSaves(): Promise<void> {
   const sessions = useChatStore.getState().sessions;
   const ids = Object.keys(sessions).filter((id) => {
+    if (isConversationDeleted(id)) return false;
     const s = sessions[id];
     return !!s.messages && s.messages.length > 0;
   });
@@ -763,6 +790,7 @@ export async function flushPendingSaves(): Promise<void> {
   // flush started, even if their sessions no longer appear in the
   // current store snapshot.
   await Promise.all([...saveQueue.values()]);
+  await flushSerializedConversationSaves();
 }
 
 /**
@@ -780,10 +808,13 @@ export async function flushPendingSaves(): Promise<void> {
  * for hard-to-reproduce bugs.
  */
 async function persistBackgroundSession(sid: string): Promise<void> {
+  if (isConversationDeleted(sid)) return;
   const prev = saveQueue.get(sid) ?? Promise.resolve();
   const next = prev
     .catch(() => undefined)
     .then(async () => {
+      return serializeConversationSave(sid, async () => {
+      if (isConversationDeleted(sid)) return;
       const session = useChatStore.getState().sessions[sid];
       if (!session) return;
       const messages = (session.messages as MutableMessage[] | undefined) ?? [];
@@ -894,12 +925,37 @@ async function persistBackgroundSession(sid: string): Promise<void> {
             ...(m.displayContent ? { displayContent: m.displayContent } : {}),
             ...(blocks?.length ? { contentBlocks: blocks } : {}),
             ...(m.images?.length ? { images: m.images } : {}),
+            ...(m.askUserToolCallId
+              ? { askUserToolCallId: m.askUserToolCallId }
+              : {}),
+            ...(m.askUserReplyAccepted
+              ? { askUserReplyAccepted: true }
+              : {}),
+            ...(m.pendingAskUserReplies?.length
+              ? {
+                  pendingAskUserReplies: m.pendingAskUserReplies.map(
+                    (pending: {
+                      toolCallId: string;
+                      queueId: string;
+                    }) => ({
+                      ...pending,
+                    }),
+                  ),
+                }
+              : {}),
             ...(m.hostedTurnId ? { hostedTurnId: m.hostedTurnId } : {}),
             ...(m.hostedTurnPrompt
               ? { hostedTurnPrompt: m.hostedTurnPrompt }
               : {}),
+            ...(m.sourceContext
+              ? { sourceContext: { ...m.sourceContext } }
+              : {}),
+            ...(typeof m.sourceFrameId === "number"
+              ? { sourceFrameId: m.sourceFrameId }
+              : {}),
             ...(m.model ? { model: m.model } : {}),
             ...(m.provider ? { provider: m.provider } : {}),
+            ...(m.retryPrompt ? { retryPrompt: m.retryPrompt } : {}),
             ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
             ...(m.steeredResponse ? { steeredResponse: true } : {}),
             ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),
@@ -946,6 +1002,7 @@ async function persistBackgroundSession(sid: string): Promise<void> {
       } catch (e) {
         console.warn("[router] background save failed for", sid, e);
       }
+      });
     })
     .finally(() => {
       // Drop the entry once we're the tail — keeps the map from growing

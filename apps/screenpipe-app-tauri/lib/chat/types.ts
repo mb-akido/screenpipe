@@ -13,6 +13,11 @@ export type ChatAttachment = {
   truncated: boolean;
 };
 
+export type MessageSourceContext = {
+  label: string;
+  text: string;
+};
+
 export interface ToolCall {
   id: string;
   toolName: string;
@@ -49,6 +54,29 @@ export interface Message {
   turnIntentId?: string;
   images?: string[];
   attachments?: ChatAttachment[];
+  /** Tool-call identity for a persisted Ask User reply. Old interactive cards
+   * use this to stay answered after remount/reload instead of sending twice. */
+  askUserToolCallId?: string;
+  /** True only after Pi accepted the Ask User reply. A missing/false value
+   * means the saved turn must be recovered through its assistant retry CTA. */
+  askUserReplyAccepted?: boolean;
+  /** Ask User replies accepted into Pi's native queue before their user rows
+   * exist. This marker stays fail-closed across process/WebView restarts: only
+   * an explicit confirmed native cancellation may make the card actionable
+   * again, which prevents an uncertain reply from being submitted twice. */
+  pendingAskUserReplies?: Array<{
+    toolCallId: string;
+    queueId: string;
+    /** Plain structured reply before history/cloud wrappers. Used only to
+     * identify the native user_start echo after a WebView remount. */
+    replyText?: string;
+  }>;
+  /** Search/timeline text explicitly attached to this turn. Kept separate
+   * from visible content so a failed provider start can retry exact context. */
+  sourceContext?: MessageSourceContext;
+  /** Timeline frame explicitly attached to this turn. Retried by id so a
+   * provider-start failure cannot silently drop the selected screenshot. */
+  sourceFrameId?: number;
   /** Stable identity for one Screenpipe-hosted user turn. Manual retries reuse
    * this UUID so the gateway can retry the same bounded turn instead of
    * charging another lifetime preview turn. Never sent to user-owned AI. */
@@ -79,6 +107,7 @@ export type QueuedDisplayPayload = {
   turnIntentId?: string;
   hostedTurnId?: string;
   hostedTurnPrompt?: string;
+  askUserToolCallId?: string;
 };
 
 export type OptimisticSteerPayload = {

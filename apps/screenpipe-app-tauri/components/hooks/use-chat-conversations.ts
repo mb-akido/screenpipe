@@ -45,12 +45,18 @@ import {
 import type { ContentBlock, Message } from "@/lib/chat/types";
 import { hasCloudEntitlement } from "@/lib/app-entitlement";
 import { canUseProviderForAuxiliaryAI } from "@/lib/chat/free-tier-turn-marker";
+import { serializeConversationSave } from "@/lib/chat/conversation-save-queue";
 import {
   isSamePiConversationAccount,
   piConversationAuthIdentity,
   type PiConversationAuthIdentity,
 } from "@/lib/chat/auth-conversation-boundary";
 import type { PiAuthIdentity } from "@/components/chat/standalone/hooks/pi-types";
+import { stripCancelledAskUserReplies } from "@/lib/chat/ask-user-cancellation-tombstone";
+import {
+  isConversationDeleted,
+  markConversationDeleted,
+} from "@/lib/chat/conversation-delete-tombstone";
 
 // --- Hook options ---
 
@@ -520,12 +526,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const unlistenFns: Array<() => void> = [];
 
     (async () => {
-      const unlistenDeleted = await listen<{ id: string }>(
-        "chat-deleted",
-        (event) => {
+      const handleConversationDeletion = (event: { payload?: { id?: string } }) => {
           if (cancelled) return;
           const id = event.payload?.id;
           if (!id) return;
+          markConversationDeleted(id);
+          void import("@/lib/stores/chat-store")
+            .then(({ useChatStore }) => {
+              useChatStore.getState().actions.drop(id);
+            })
+            .catch(() => {
+              // The file-backed list below remains authoritative.
+            });
           invalidateConversationListCache();
           setFileConversations((prev) => prev.filter((c) => c.id !== id));
           if (conversationId === id) {
@@ -533,7 +545,15 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             setConversationId(null);
           }
           scheduleHistoryRefresh();
-        },
+      };
+      const unlistenDeleting = await listen<{ id: string }>(
+        "chat-deleting",
+        handleConversationDeletion,
+      );
+      unlistenFns.push(unlistenDeleting);
+      const unlistenDeleted = await listen<{ id: string }>(
+        "chat-deleted",
+        handleConversationDeletion,
       );
       unlistenFns.push(unlistenDeleted);
 
@@ -655,7 +675,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       conversationId ||
       piSessionIdRef.current ||
       useChatStore.getState().currentId;
-    if (!convId) return;
+    if (!convId || isConversationDeleted(convId)) return;
+
+    return serializeConversationSave(convId, async () => {
+    if (isConversationDeleted(convId)) return;
 
     // Try to load existing conversation to preserve createdAt + title + kind.
     const { loadConversationFile } = await import("@/lib/chat-storage");
@@ -725,6 +748,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       autoTitleEnabled &&
       titleProviderIsFunded &&
       !isPipeChat &&
+      !isConversationDeleted(convId) &&
       titleSource === "fallback" &&
       rawContent &&
       hasValidPreset &&
@@ -742,9 +766,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             currentPreset,
             settings?.user?.token ?? null,
             async (partial) => {
+              if (isConversationDeleted(convId)) return;
               try {
                 const { useChatStore } =
                   await import("@/lib/stores/chat-store");
+                if (isConversationDeleted(convId)) return;
                 const session = useChatStore.getState().sessions[convId];
                 // Only stream partial title while still at fallback priority.
                 // If the user renamed (titleSource === "user") or AI already
@@ -761,14 +787,19 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             },
           );
 
+          if (isConversationDeleted(convId)) return;
           if (aiTitle) {
+            await serializeConversationSave(convId, async () => {
+            if (isConversationDeleted(convId)) return;
             // Reload conversation to check title priority
             const existingConv = await loadConversationFile(convId);
+            if (isConversationDeleted(convId)) return;
             if (!existingConv) {
               // Conversation deleted — clear streaming state
               try {
                 const { useChatStore } =
                   await import("@/lib/stores/chat-store");
+                if (isConversationDeleted(convId)) return;
                 useChatStore
                   .getState()
                   .actions.patch(convId, { streamingTitle: undefined });
@@ -784,6 +815,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
               existingConv.title = aiTitle;
               existingConv.titleSource = "ai";
               await saveConversationFile(existingConv);
+              if (isConversationDeleted(convId)) return;
 
               // Clear streamingTitle atomically with the final title apply
               // so the sidebar transitions directly from partial → final
@@ -791,6 +823,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
               try {
                 const { useChatStore } =
                   await import("@/lib/stores/chat-store");
+                if (isConversationDeleted(convId)) return;
                 useChatStore.getState().actions.patch(convId, {
                   title: aiTitle,
                   titleSource: "ai",
@@ -828,11 +861,14 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
                   .actions.patch(convId, { streamingTitle: undefined });
               } catch {}
             }
+            });
           } else {
             // AI returned null — clear streaming state, allow retry.
             aiTitleAttempted.delete(convId);
+            if (isConversationDeleted(convId)) return;
             try {
               const { useChatStore } = await import("@/lib/stores/chat-store");
+              if (isConversationDeleted(convId)) return;
               useChatStore
                 .getState()
                 .actions.patch(convId, { streamingTitle: undefined });
@@ -841,8 +877,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         } catch (error) {
           // Clear streamingTitle on error, allow retry.
           aiTitleAttempted.delete(convId);
+          if (isConversationDeleted(convId)) return;
           try {
             const { useChatStore } = await import("@/lib/stores/chat-store");
+            if (isConversationDeleted(convId)) return;
             useChatStore
               .getState()
               .actions.patch(convId, { streamingTitle: undefined });
@@ -906,12 +944,32 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           ...((m as any).attachments?.length
             ? { attachments: (m as any).attachments }
             : {}),
+          ...(m.askUserToolCallId
+            ? { askUserToolCallId: m.askUserToolCallId }
+            : {}),
+          ...(m.askUserReplyAccepted
+            ? { askUserReplyAccepted: true }
+            : {}),
+          ...(m.pendingAskUserReplies?.length
+            ? {
+                pendingAskUserReplies: m.pendingAskUserReplies.map(
+                  (pending) => ({ ...pending }),
+                ),
+              }
+            : {}),
           ...(m.hostedTurnId ? { hostedTurnId: m.hostedTurnId } : {}),
           ...(m.hostedTurnPrompt
             ? { hostedTurnPrompt: m.hostedTurnPrompt }
             : {}),
+          ...(m.sourceContext
+            ? { sourceContext: { ...m.sourceContext } }
+            : {}),
+          ...(typeof m.sourceFrameId === "number"
+            ? { sourceFrameId: m.sourceFrameId }
+            : {}),
           ...(m.model ? { model: m.model } : {}),
           ...(m.provider ? { provider: m.provider } : {}),
+          ...(m.retryPrompt ? { retryPrompt: m.retryPrompt } : {}),
           ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
           ...(m.steeredResponse ? { steeredResponse: true } : {}),
           ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),
@@ -966,6 +1024,16 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           : {}),
     };
 
+    // A confirmed native queue cancellation must beat any stale snapshot that
+    // was captured before it. Re-sanitize at the last in-memory boundary (the
+    // storage layer repeats this for disk) so a delayed save cannot relock an
+    // Ask User card after cancellation.
+    conversation.messages = stripCancelledAskUserReplies(
+      convId,
+      conversation.messages as Message[],
+    );
+    if (isConversationDeleted(convId)) return;
+
     // Mirror the final messages into the in-memory chat-store BEFORE
     // writing disk. The pi-event-router's persistBackgroundSession runs
     // for any session that's no longer foregrounded when agent_end fires
@@ -979,6 +1047,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // away, come back, the assistant message is gone."
     try {
       const { useChatStore } = await import("@/lib/stores/chat-store");
+      if (isConversationDeleted(convId)) return;
       if (useChatStore.getState().sessions[convId]) {
         useChatStore
           .getState()
@@ -989,11 +1058,13 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     }
 
     await saveConversationFile(conversation);
+    if (isConversationDeleted(convId)) return;
     if (options.refreshHistory) {
       await refreshFileConversations();
     } else {
       upsertFileConversationMeta(conversation);
     }
+    if (isConversationDeleted(convId)) return;
     try {
       await emit("chat-conversation-saved", {
         id: conversation.id,
@@ -1003,6 +1074,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     } catch {
       // ignore broadcast failures; local save already succeeded
     }
+    if (isConversationDeleted(convId)) return;
 
     // Sync the persisted title back into the in-memory chat-store so the
     // sidebar (which reads `sessions[id].title` directly) updates immediately.
@@ -1010,6 +1082,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // launch — that's the rename-doesn't-stick bug users reported.
     try {
       const { useChatStore } = await import("@/lib/stores/chat-store");
+      if (isConversationDeleted(convId)) return;
       const sessions = useChatStore.getState().sessions;
       if (sessions[convId]) {
         useChatStore.getState().actions.patch(convId, {
@@ -1032,10 +1105,14 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
 
     // Update activeConversationId in store (lightweight — no conversation data)
     if (options.syncActiveConversation !== false) {
+      if (isConversationDeleted(convId)) return;
       try {
         const { getStore } = await import("@/lib/hooks/use-settings");
+        if (isConversationDeleted(convId)) return;
         const store = await getStore();
+        if (isConversationDeleted(convId)) return;
         const freshSettings = await store.get<any>("settings");
+        if (isConversationDeleted(convId)) return;
         await store.set("settings", {
           ...freshSettings,
           chatHistory: {
@@ -1045,15 +1122,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             conversations: [], // keep empty — data lives in files now
           },
         });
+        if (isConversationDeleted(convId)) return;
         await store.save();
       } catch (e) {
         console.warn("[chat] failed to update activeConversationId:", e);
       }
     }
 
+    if (isConversationDeleted(convId)) return;
     if (!conversationId || conversationId !== convId) {
       setConversationId(convId);
     }
+    });
   };
 
   // ---- Auto-save conversation when a response completes (isLoading transitions from true to false) ----
@@ -1145,14 +1225,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const trimmed = newTitle.trim();
     if (!trimmed) return;
     const { loadConversationFile } = await import("@/lib/chat-storage");
-    const conv = await loadConversationFile(convId);
-    if (!conv) return;
-    await saveConversationFile({
-      ...conv,
-      title: trimmed,
-      titleSource: "user",
-      updatedAt: Date.now(),
+    const renamed = await serializeConversationSave(convId, async () => {
+      const conv = await loadConversationFile(convId);
+      if (!conv) return false;
+      await saveConversationFile({
+        ...conv,
+        title: trimmed,
+        titleSource: "user",
+        updatedAt: Date.now(),
+      });
+      return true;
     });
+    if (!renamed) return;
     await refreshFileConversations();
     // Mirror to the in-memory store so the chat sidebar reflects the new
     // title without waiting for app restart. Some call sites already patch
@@ -1184,7 +1268,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
 
   // ---- deleteConversation ----
   const deleteConversation = async (convId: string) => {
-    await deleteConversationFile(convId);
+    // deleteConversationFile installs the tombstone synchronously before its
+    // first await. Drop the in-memory row while the serialized file removal
+    // waits for any already-running save, so late callbacks have nothing to
+    // patch and the deleted chat disappears immediately.
+    const fileDeletion = deleteConversationFile(convId);
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      useChatStore.getState().actions.drop(convId);
+    } catch {
+      // File deletion is authoritative; another window may own the store.
+    }
+    await fileDeletion;
     await refreshFileConversations();
 
     // Clear activeConversationId if it was the deleted one
@@ -1452,6 +1547,31 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           ...((m as any).hostedTurnPrompt
             ? { hostedTurnPrompt: (m as any).hostedTurnPrompt }
             : {}),
+          ...((m as any).askUserToolCallId
+            ? { askUserToolCallId: (m as any).askUserToolCallId }
+            : {}),
+          ...((m as any).askUserReplyAccepted
+            ? { askUserReplyAccepted: true }
+            : {}),
+          ...(Array.isArray((m as any).pendingAskUserReplies) &&
+          (m as any).pendingAskUserReplies.length
+            ? {
+                pendingAskUserReplies: (m as any).pendingAskUserReplies.map(
+                  (pending: {
+                    toolCallId: string;
+                    queueId: string;
+                  }) => ({
+                    ...pending,
+                  }),
+                ),
+              }
+            : {}),
+          ...((m as any).sourceContext
+            ? { sourceContext: { ...(m as any).sourceContext } }
+            : {}),
+          ...(typeof (m as any).sourceFrameId === "number"
+            ? { sourceFrameId: (m as any).sourceFrameId }
+            : {}),
           timestamp: m.timestamp,
           ...(m.displayContent ? { displayContent: m.displayContent } : {}),
           ...(m.contentBlocks?.length
@@ -1467,6 +1587,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
               : {}),
           ...((m as any).model ? { model: (m as any).model } : {}),
           ...((m as any).provider ? { provider: (m as any).provider } : {}),
+          ...((m as any).retryPrompt
+            ? { retryPrompt: (m as any).retryPrompt }
+            : {}),
           ...((m as any).interruptedBySteer
             ? { interruptedBySteer: true }
             : {}),
@@ -1697,12 +1820,28 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             ...((m as any).attachments?.length
               ? { attachments: (m as any).attachments }
               : {}),
+            ...(m.askUserToolCallId
+              ? { askUserToolCallId: m.askUserToolCallId }
+              : {}),
+            ...(m.askUserReplyAccepted
+              ? { askUserReplyAccepted: true }
+              : {}),
+            // Native queue ownership belongs to the source conversation.
+            // A branch cannot cancel, observe, or safely retry that queue, so
+            // never clone its fail-closed pending marker into the new chat.
             ...(m.hostedTurnId ? { hostedTurnId: m.hostedTurnId } : {}),
             ...(m.hostedTurnPrompt
               ? { hostedTurnPrompt: m.hostedTurnPrompt }
               : {}),
+            ...(m.sourceContext
+              ? { sourceContext: { ...m.sourceContext } }
+              : {}),
+            ...(typeof m.sourceFrameId === "number"
+              ? { sourceFrameId: m.sourceFrameId }
+              : {}),
             ...(m.model ? { model: m.model } : {}),
             ...(m.provider ? { provider: m.provider } : {}),
+            ...(m.retryPrompt ? { retryPrompt: m.retryPrompt } : {}),
             ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
             ...(m.steeredResponse ? { steeredResponse: true } : {}),
             ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),

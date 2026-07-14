@@ -59,17 +59,23 @@ vi.mock("@/lib/utils/tauri", () => ({
     listChatEntriesByMtime: vi.fn(async () => {
       throw new Error("no tauri runtime");
     }),
+    piStop: vi.fn(async () => ({ status: "ok", data: null })),
   },
 }));
 
 import { commands } from "@/lib/utils/tauri";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { __resetConversationSaveQueueForTests } from "@/lib/chat/conversation-save-queue";
+import { markAskUserQueueCancelled } from "@/lib/chat/ask-user-cancellation-tombstone";
 import {
   CHAT_CONTENT_SEARCH_SCAN_LIMIT,
   CHAT_HISTORY_INITIAL_LIMIT,
   CONVERSATION_DEDUP_WINDOW_MS,
   __resetChatStorageCachesForTests,
+  clearPendingAskUserReplyFromConversationFile,
   conversationDedupKey,
   conversationMetaFromJson,
+  deleteConversationFile,
   dedupeConversationMetas,
   listConversations,
   loadConversationFile,
@@ -137,6 +143,129 @@ describe("chat-storage bounded history", () => {
     fsMock.reads.length = 0;
     fsMock.stats.length = 0;
     __resetChatStorageCachesForTests();
+    __resetConversationSaveQueueForTests();
+  });
+
+  it("does not resurrect a deleted chat after an in-flight save", async () => {
+    let releaseWrite!: () => void;
+    let markWriteStarted!: () => void;
+    const writeStarted = new Promise<void>((resolve) => {
+      markWriteStarted = resolve;
+    });
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    vi.mocked(writeTextFile).mockImplementationOnce(async (path, text) => {
+      markWriteStarted();
+      await writeGate;
+      fsMock.files.set(path, { text, mtime: Date.now() });
+    });
+
+    const conversation = {
+      id: "delete-race",
+      title: "delete race",
+      messages: [
+        { id: "u1", role: "user" as const, content: "hello", timestamp: 1 },
+      ],
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    // Deliberately call the raw primitive: callers normally serialize saves,
+    // but the storage boundary itself must remain safe if one does not.
+    const save = saveConversationFile(conversation);
+    await writeStarted;
+    const deletion = deleteConversationFile(conversation.id);
+
+    releaseWrite();
+    await save;
+    await deletion;
+
+    expect(await loadConversationFile(conversation.id)).toBeNull();
+  });
+
+  it("tombstones saves scheduled after deletion", async () => {
+    const conversation = {
+      id: "delete-late-save",
+      title: "delete late save",
+      messages: [
+        { id: "u1", role: "user" as const, content: "hello", timestamp: 1 },
+      ],
+      createdAt: 1,
+      updatedAt: 2,
+    };
+
+    await deleteConversationFile(conversation.id);
+    await saveConversationFile(conversation);
+
+    expect(await loadConversationFile(conversation.id)).toBeNull();
+  });
+
+  it("clears a background Ask User queue marker without changing conversation metadata", async () => {
+    await saveConversationFile({
+      id: "background-cancel",
+      title: "keep this title",
+      titleSource: "user",
+      presetId: "claude-owned",
+      messages: [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "question",
+          timestamp: 1,
+          pendingAskUserReplies: [
+            { toolCallId: "ask-1", queueId: "queue-1" },
+          ],
+        },
+      ],
+      createdAt: 1,
+      updatedAt: 2,
+    });
+
+    await clearPendingAskUserReplyFromConversationFile(
+      "background-cancel",
+      "queue-1",
+    );
+    const conversation = await loadConversationFile("background-cancel");
+
+    expect(conversation?.title).toBe("keep this title");
+    expect(conversation?.titleSource).toBe("user");
+    expect(conversation?.presetId).toBe("claude-owned");
+    expect(conversation?.messages[0].pendingAskUserReplies).toBeUndefined();
+  });
+
+  it("does not resurrect a cancelled Ask User marker from a stale save", async () => {
+    const staleConversation = {
+      id: "cancelled-ask-user-save",
+      title: "cancelled ask user",
+      messages: [
+        {
+          id: "assistant-1",
+          role: "assistant" as const,
+          content: "question",
+          timestamp: 1,
+          pendingAskUserReplies: [
+            {
+              toolCallId: "ask-1",
+              queueId: "queue-1",
+              replyText: "main agent",
+            },
+          ],
+        },
+      ],
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    await saveConversationFile(staleConversation);
+
+    markAskUserQueueCancelled(staleConversation.id, "queue-1");
+    await clearPendingAskUserReplyFromConversationFile(
+      staleConversation.id,
+      "queue-1",
+    );
+    await saveConversationFile(staleConversation);
+
+    const persisted = await loadConversationFile(staleConversation.id);
+    expect(persisted?.messages[0].pendingAskUserReplies).toBeUndefined();
   });
 
   it("loads only the newest 50 conversation files for the default history view", async () => {

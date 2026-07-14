@@ -16,6 +16,7 @@ import {
 } from "@/lib/app-entitlement";
 import {
   isFreeScreenpipeCloudTextOnly,
+  isSamePiAuthAccount,
   isSamePiAuthIdentity,
   markScreenpipeCloudTurn,
   piProviderConfigsMatch,
@@ -30,6 +31,11 @@ import type {
   PiSendCommand,
   PiSendTransportOptions,
 } from "@/components/chat/standalone/hooks/pi-types";
+import { isConversationDeleted } from "@/lib/chat/conversation-delete-tombstone";
+import {
+  mergeRecoveredComposerImages,
+  mergeRecoveredComposerText,
+} from "@/lib/chat/composer-recovery";
 
 export function usePiSteeringRefs() {
   const pendingNextPiUserIntentRef = useRef<"steer" | null>(null);
@@ -66,6 +72,7 @@ export function usePiSteeringTransport(
     isStreaming,
     lastPiDispatchPromptRef,
     lastUserMessageRef,
+    mergePendingAttachments,
     optimisticSteerRef,
     pastedImages,
     pendingNextPiUserDisplayRef,
@@ -132,11 +139,12 @@ export function usePiSteeringTransport(
       return changed ? next : prev;
     });
     if (!changed || !nextRows) return;
+    const sidNow = piSessionIdRef.current;
     void saveConversation(nextRows, {
+      ...(sidNow ? { idOverride: sidNow } : {}),
       refreshHistory: false,
       syncActiveConversation: false,
     });
-    const sidNow = piSessionIdRef.current;
     if (sidNow) {
       useChatStore.getState().actions.setMessages(sidNow, nextRows as any);
     }
@@ -144,6 +152,55 @@ export function usePiSteeringTransport(
 
   function markCurrentAssistantInterrupted() {
     setAssistantInterruptedState(piMessageIdRef.current, true);
+  }
+
+  function removeMessagesFromConversation(
+    sessionId: string,
+    messageIds: Set<string>,
+  ) {
+    if (messageIds.size === 0 || isConversationDeleted(sessionId)) return;
+    setMessages((prev) =>
+      prev.some((message) => messageIds.has(message.id))
+        ? prev.filter((message) => !messageIds.has(message.id))
+        : prev,
+    );
+
+    const storeState = useChatStore.getState();
+    const storedMessages = storeState.sessions?.[sessionId]?.messages as
+      | Message[]
+      | undefined;
+    if (!storedMessages) return;
+    const nextStoredMessages = storedMessages.filter(
+      (message) => !messageIds.has(message.id),
+    );
+    if (nextStoredMessages.length === storedMessages.length) return;
+    storeState.actions.setMessages(sessionId, nextStoredMessages as any);
+    void saveConversation(nextStoredMessages, {
+      idOverride: sessionId,
+      refreshHistory: false,
+      syncActiveConversation: false,
+    });
+  }
+
+  function clearStoredStreamingIfOwned(
+    sessionId: string,
+    assistantMessageId: string | null,
+  ) {
+    if (!assistantMessageId) return;
+    const storeState = useChatStore.getState();
+    if (
+      storeState.sessions?.[sessionId]?.streamingMessageId !==
+      assistantMessageId
+    ) {
+      return;
+    }
+    storeState.actions.setStreaming(sessionId, {
+      streamingMessageId: null,
+      streamingText: "",
+      contentBlocks: [],
+      isStreaming: false,
+      isLoading: false,
+    });
   }
 
   function clearPendingSteerTransportState(sessionId = piSessionIdRef.current) {
@@ -293,6 +350,7 @@ export function usePiSteeringTransport(
     if (!expectedProviderConfig) return;
     const boundaryIsCurrent = () =>
       !conversationOperationPendingRef?.current &&
+      !isConversationDeleted(sessionId) &&
       expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
       sessionId === piSessionIdRef.current &&
       isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
@@ -300,6 +358,10 @@ export function usePiSteeringTransport(
         expectedProviderConfig,
         buildProviderConfig(activePresetRef?.current ?? activePreset),
       );
+    const ownsConversationPanel = () =>
+      !isConversationDeleted(sessionId) &&
+      sessionId === piSessionIdRef.current &&
+      isSamePiAuthAccount(expectedAuthIdentity, authIdentityRef.current);
     if (!sessionId || pendingSteerFlushInFlightRef.current) return;
     if (
       !piProviderConfigsMatch(
@@ -424,8 +486,72 @@ export function usePiSteeringTransport(
     setIsLoading(true);
     setIsStreaming(true);
 
+    let rolledBack = false;
+    const rollbackFailedFlush = (description: string) => {
+      if (rolledBack || !ownsConversationPanel()) return;
+      rolledBack = true;
+      pendingNextPiUserIntentRef.current = null;
+      pendingNextPiUserDisplayRef.current = null;
+      optimisticSteerRef.current = null;
+      batch.forEach((item) => removeTurnIntent(item.turnIntentId));
+      setAssistantInterruptedState(interruptedAssistantId, false);
+      const rollbackIds = new Set(labelMarkerIds);
+      if (precreatedSteerAssistantId) {
+        rollbackIds.add(precreatedSteerAssistantId);
+      }
+      batch.forEach((item) => rollbackIds.add(item.optimisticUserId));
+      removeMessagesFromConversation(sessionId, rollbackIds);
+      clearStoredStreamingIfOwned(sessionId, precreatedSteerAssistantId);
+      const ownsForeground = precreatedSteerAssistantId
+        ? piMessageIdRef.current === precreatedSteerAssistantId
+        : !piMessageIdRef.current;
+      if (
+        precreatedSteerAssistantId &&
+        piMessageIdRef.current === precreatedSteerAssistantId
+      ) {
+        piMessageIdRef.current = null;
+        piStreamingTextRef.current = "";
+        piContentBlocksRef.current = [];
+      }
+      const restoredText = batch
+        .map((item) => item.content)
+        .filter(Boolean)
+        .join("\n\n");
+      if (restoredText) {
+        setInput((current) =>
+          mergeRecoveredComposerText(restoredText, current),
+        );
+      }
+      const restoredImages = batch.flatMap((item) => item.images);
+      if (restoredImages.length > 0) {
+        setPastedImages((current) =>
+          mergeRecoveredComposerImages(restoredImages, current),
+        );
+      }
+      const restoredAttachments = batch.flatMap(
+        (item) => item.attachments ?? [],
+      );
+      if (restoredAttachments.length > 0) {
+        mergePendingAttachments(restoredAttachments);
+      }
+      if (ownsForeground) {
+        setIsLoading(false);
+        setIsStreaming(false);
+      }
+      toast({
+        title: "failed to send steered message",
+        description,
+        variant: "destructive",
+      });
+    };
+
     try {
-      if (!boundaryIsCurrent()) return;
+      if (!boundaryIsCurrent()) {
+        rollbackFailedFlush(
+          "AI setup changed before the steered message was sent.",
+        );
+        return;
+      }
       const result = hasActiveAssistant
         ? await commands.piSteer(
             sessionId,
@@ -439,73 +565,14 @@ export function usePiSteeringTransport(
             preview,
           );
 
-      if (!boundaryIsCurrent()) return;
-
       if (result.status !== "ok") {
-        pendingNextPiUserIntentRef.current = null;
-        pendingNextPiUserDisplayRef.current = null;
-        optimisticSteerRef.current = null;
-        removeTurnIntent(latest.turnIntentId);
-        setAssistantInterruptedState(interruptedAssistantId, false);
-        if (labelMarkerIds.size > 0) {
-          setMessages((prev) =>
-            prev.filter((message) => !labelMarkerIds.has(message.id)),
-          );
-        }
-        if (precreatedSteerAssistantId) {
-          setMessages((prev) =>
-            prev.filter((message) => message.id !== precreatedSteerAssistantId),
-          );
-          piMessageIdRef.current = null;
-          piStreamingTextRef.current = "";
-          piContentBlocksRef.current = [];
-        }
-        pendingSteerBatchRef.current = [
-          ...batch,
-          ...pendingSteerBatchRef.current,
-        ];
-        setIsLoading(false);
-        setIsStreaming(false);
-        toast({
-          title: "failed to send steered message",
-          description: result.error,
-          variant: "destructive",
-        });
+        rollbackFailedFlush(result.error);
       }
     } catch (e) {
-      if (!boundaryIsCurrent()) return;
-      pendingNextPiUserIntentRef.current = null;
-      pendingNextPiUserDisplayRef.current = null;
-      optimisticSteerRef.current = null;
-      removeTurnIntent(latest.turnIntentId);
-      setAssistantInterruptedState(interruptedAssistantId, false);
-      if (labelMarkerIds.size > 0) {
-        setMessages((prev) =>
-          prev.filter((message) => !labelMarkerIds.has(message.id)),
-        );
-      }
-      if (precreatedSteerAssistantId) {
-        setMessages((prev) =>
-          prev.filter((message) => message.id !== precreatedSteerAssistantId),
-        );
-        piMessageIdRef.current = null;
-        piStreamingTextRef.current = "";
-        piContentBlocksRef.current = [];
-      }
-      pendingSteerBatchRef.current = [
-        ...batch,
-        ...pendingSteerBatchRef.current,
-      ];
-      setIsLoading(false);
-      setIsStreaming(false);
       const description = e instanceof Error ? e.message : String(e);
-      toast({
-        title: "failed to send steered message",
-        description,
-        variant: "destructive",
-      });
+      rollbackFailedFlush(description);
     } finally {
-      if (boundaryIsCurrent()) {
+      if (ownsConversationPanel()) {
         pendingSteerFlushInFlightRef.current = false;
       }
     }
@@ -526,6 +593,7 @@ export function usePiSteeringTransport(
     if (!expectedProviderConfig) return;
     const boundaryIsCurrent = () =>
       !conversationOperationPendingRef?.current &&
+      !isConversationDeleted(expectedSessionId) &&
       expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
       expectedSessionId === piSessionIdRef.current &&
       isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
@@ -533,6 +601,10 @@ export function usePiSteeringTransport(
         expectedProviderConfig,
         buildProviderConfig(activePresetRef?.current ?? activePreset),
       );
+    const ownsConversationPanel = () =>
+      !isConversationDeleted(expectedSessionId) &&
+      expectedSessionId === piSessionIdRef.current &&
+      isSamePiAuthAccount(expectedAuthIdentity, authIdentityRef.current);
     const hasImages = imageDataUrls
       ? imageDataUrls.length > 0
       : pastedImages.length > 0;
@@ -691,13 +763,14 @@ export function usePiSteeringTransport(
             combinedImages.length > 0 ? combinedImages : null,
           )
           .then((result) => {
-            if (!boundaryIsCurrent()) return;
             if (result.status === "ok") {
+              if (!ownsConversationPanel()) return;
               // Clear the flag — this stop was an internal steering redirect,
               // not a user-initiated stop. Without this the steered response
               // inherits stoppedByUser=true when it completes.
               piActiveStopRequestedRef.current = false;
             } else {
+              if (!ownsConversationPanel()) return;
               console.warn("[steer] piSteer returned non-ok:", result);
               revertFailedComposerSteer(
                 batch,
@@ -708,7 +781,7 @@ export function usePiSteeringTransport(
             }
           })
           .catch((err: unknown) => {
-            if (!boundaryIsCurrent()) return;
+            if (!ownsConversationPanel()) return;
             console.warn("[steer] piSteer failed, reverting", err);
             revertFailedComposerSteer(
               batch,
@@ -739,19 +812,35 @@ export function usePiSteeringTransport(
 
     setAssistantInterruptedState(interruptedAssistantId, false);
 
-    const optimisticId = latest.optimisticUserId;
-    setMessages((prev) =>
-      prev.filter(
-        (message) =>
-          !(
-            message.id === optimisticId &&
-            message.role === "user" &&
-            message.intent === "steer"
-          ),
-      ),
+    const restoredItems = batch;
+    removeMessagesFromConversation(
+      latest.sessionId,
+      new Set(restoredItems.map((item) => item.optimisticUserId)),
     );
 
-    pendingSteerBatchRef.current = [...batch, ...pendingSteerBatchRef.current];
+    // Native rejection is definitive. Remove every optimistic row and restore
+    // the captured user-owned payload to the composer; ref-only requeueing has
+    // no guaranteed wake-up and can cross a later provider/payer boundary.
+    const restoredText = restoredItems
+      .map((item) => item.content)
+      .filter(Boolean)
+      .join("\n\n");
+    setInput((current) => mergeRecoveredComposerText(restoredText, current));
+    const restoredImages = restoredItems.flatMap((item) => item.images);
+    if (restoredImages.length > 0) {
+      setPastedImages((current) =>
+        mergeRecoveredComposerImages(restoredImages, current),
+      );
+    }
+    const restoredAttachments = restoredItems.flatMap(
+      (item) => item.attachments ?? [],
+    );
+    if (restoredAttachments.length > 0) {
+      mergePendingAttachments(restoredAttachments);
+    }
+    pendingSteerBatchRef.current = pendingSteerBatchRef.current.filter(
+      (item) => !batch.some((captured) => captured.turnIntentId === item.turnIntentId),
+    );
 
     toast({
       title: "failed to send steered message",
@@ -771,6 +860,7 @@ export function usePiSteeringTransport(
     if (!expectedProviderConfig) return;
     const boundaryIsCurrent = () =>
       !conversationOperationPendingRef?.current &&
+      !isConversationDeleted(expectedSessionId) &&
       expectedOperationGeneration === piAsyncOperationGenerationRef.current &&
       expectedSessionId === piSessionIdRef.current &&
       isSamePiAuthIdentity(expectedAuthIdentity, authIdentityRef.current) &&
@@ -782,6 +872,10 @@ export function usePiSteeringTransport(
         piRunningConfigRef.current,
         expectedProviderConfig,
       );
+    const ownsConversationPanel = () =>
+      !isConversationDeleted(expectedSessionId) &&
+      expectedSessionId === piSessionIdRef.current &&
+      isSamePiAuthAccount(expectedAuthIdentity, authIdentityRef.current);
     if (!boundaryIsCurrent()) return;
     const queuedDisplay = takeQueuedDisplayById(
       currentQueueSessionId,
@@ -830,6 +924,12 @@ export function usePiSteeringTransport(
       ...(queuedDisplay?.attachments?.length
         ? { attachments: [...queuedDisplay.attachments] }
         : {}),
+      ...(queuedDisplay?.askUserToolCallId
+        ? {
+            askUserToolCallId: queuedDisplay.askUserToolCallId,
+            askUserReplyAccepted: true,
+          }
+        : {}),
       ...((queuedDisplay?.hostedTurnId ?? existingTurnIntent?.hostedTurnId)
         ? {
             hostedTurnId:
@@ -844,6 +944,25 @@ export function usePiSteeringTransport(
       timestamp: Date.now(),
     };
     const interruptedAssistantBeforeSteer = piMessageIdRef.current;
+    let rolledBack = false;
+    const rollbackQueuedSteer = (
+      title: string,
+      description: string,
+      variant?: "destructive",
+    ) => {
+      if (rolledBack || !ownsConversationPanel()) return;
+      rolledBack = true;
+      pendingNextPiUserIntentRef.current = null;
+      pendingNextPiUserDisplayRef.current = null;
+      removeTurnIntent(turnIntentId);
+      removeMessagesFromConversation(
+        expectedSessionId,
+        new Set([optimisticQueuedUser.id]),
+      );
+      restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
+      setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
+      toast({ title, description, ...(variant ? { variant } : {}) });
+    };
     try {
       pendingNextPiUserIntentRef.current = "steer";
       pendingNextPiUserDisplayRef.current = {
@@ -854,6 +973,9 @@ export function usePiSteeringTransport(
         images: queuedDisplay?.images ? [...queuedDisplay.images] : [],
         ...(queuedDisplay?.displayContent
           ? { displayContent: queuedDisplay.displayContent }
+          : {}),
+        ...(queuedDisplay?.askUserToolCallId
+          ? { askUserToolCallId: queuedDisplay.askUserToolCallId }
           : {}),
         optimisticUserId: optimisticQueuedUser.id,
         turnIntentId,
@@ -917,81 +1039,41 @@ export function usePiSteeringTransport(
             .actions.setMessages(sidNow, nextRowsAfterQueuedSteer as any);
         }
       }
-      if (!boundaryIsCurrent()) return;
-      const result = await commands.piSteerQueued(expectedSessionId, prompt.id);
-      if (!boundaryIsCurrent()) return;
-      if (result.status !== "ok") {
-        pendingNextPiUserIntentRef.current = null;
-        pendingNextPiUserDisplayRef.current = null;
-        removeTurnIntent(turnIntentId);
-        setMessages((prev) =>
-          prev.filter(
-            (message) =>
-              !(
-                message.id === optimisticQueuedUser.id &&
-                message.role === "user" &&
-                message.intent === "steer"
-              ),
-          ),
+      if (!boundaryIsCurrent()) {
+        rollbackQueuedSteer(
+          "failed to steer queued message",
+          "AI setup changed before that follow-up was steered.",
+          "destructive",
         );
-        restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
-        setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
-        toast({
-          title: "failed to steer queued message",
-          description: result.error,
-          variant: "destructive",
-        });
+        return;
+      }
+      const result = await commands.piSteerQueued(expectedSessionId, prompt.id);
+      if (result.status !== "ok") {
+        rollbackQueuedSteer(
+          "failed to steer queued message",
+          result.error,
+          "destructive",
+        );
         return;
       }
       if (!result.data) {
-        pendingNextPiUserIntentRef.current = null;
-        pendingNextPiUserDisplayRef.current = null;
-        removeTurnIntent(turnIntentId);
-        setMessages((prev) =>
-          prev.filter(
-            (message) =>
-              !(
-                message.id === optimisticQueuedUser.id &&
-                message.role === "user" &&
-                message.intent === "steer"
-              ),
-          ),
+        rollbackQueuedSteer(
+          "message already started",
+          "That follow-up has moved out of the queue.",
         );
-        restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
-        setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
-        toast({
-          title: "message already started",
-          description: "That follow-up has moved out of the queue.",
-        });
         return;
       }
-      if (currentQueueSessionId) {
+      if (ownsConversationPanel() && currentQueueSessionId) {
         removeQueuedPrompt(currentQueueSessionId, prompt.id);
       }
     } catch (e) {
-      if (!boundaryIsCurrent()) return;
-      pendingNextPiUserIntentRef.current = null;
-      pendingNextPiUserDisplayRef.current = null;
-      removeTurnIntent(turnIntentId);
-      setMessages((prev) =>
-        prev.filter(
-          (message) =>
-            !(
-              message.id === optimisticQueuedUser.id &&
-              message.role === "user" &&
-              message.intent === "steer"
-            ),
-        ),
+      rollbackQueuedSteer(
+        "failed to steer queued message",
+        e instanceof Error ? e.message : String(e),
+        "destructive",
       );
-      restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
-      setAssistantInterruptedState(interruptedAssistantBeforeSteer, false);
-      toast({
-        title: "failed to steer queued message",
-        description: e instanceof Error ? e.message : String(e),
-        variant: "destructive",
-      });
     } finally {
-      if (boundaryIsCurrent()) {
+      if (ownsConversationPanel()) {
         finishQueuedAction(prompt.id);
       }
     }

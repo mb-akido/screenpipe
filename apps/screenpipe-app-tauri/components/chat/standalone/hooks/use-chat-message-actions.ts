@@ -110,6 +110,14 @@ export function useChatMessageActions({
             attachments: message.attachments
               ? message.attachments.map((attachment) => ({ ...attachment }))
               : [],
+            sourceContext: message.sourceContext
+              ? { ...message.sourceContext }
+              : null,
+            sourceFrameId: message.sourceFrameId ?? null,
+            preserveComposer: true,
+            ...(message.askUserToolCallId
+              ? { askUserToolCallId: message.askUserToolCallId }
+              : {}),
           },
         );
         if (!accepted) return;
@@ -233,6 +241,14 @@ export function useChatMessageActions({
             attachments: userMsg.attachments
               ? userMsg.attachments.map((attachment) => ({ ...attachment }))
               : [],
+            sourceContext: userMsg.sourceContext
+              ? { ...userMsg.sourceContext }
+              : null,
+            sourceFrameId: userMsg.sourceFrameId ?? null,
+            preserveComposer: true,
+            ...(userMsg.askUserToolCallId
+              ? { askUserToolCallId: userMsg.askUserToolCallId }
+              : {}),
             ...(userMsg.hostedTurnId
               ? {
                   reuseHostedTurnId: userMsg.hostedTurnId,
@@ -342,9 +358,14 @@ export function useChatMessageActions({
       await sendMessage(prompt, label);
     },
     onDismissConnectionAction: dismissConnectionAction,
-    onAskUserReply: async (reply, label) => {
-      await sendMessage(reply, label);
-    },
+    onAskUserReply: (reply, label, toolCallId) =>
+      sendMessage(reply, label, [], {
+        askUserToolCallId: toolCallId,
+        attachments: [],
+        sourceContext: null,
+        sourceFrameId: null,
+        preserveComposer: true,
+      }),
     suppressSourceFooters: true,
   };
 

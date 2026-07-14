@@ -41,5 +41,43 @@ jobs:
       - name: Test hosted-AI money guards
         run: bun run test:money-guards
 
+      - name: Enforce CREATE-only production migrations
+        run: bun scripts/check-production-migrations.ts
+
+      - name: Smoke production-safe free-chat D1 bootstrap
+        run: |
+          rm -rf /tmp/ai-gateway-incomplete-free-chat-schema
+          bunx wrangler d1 execute DB --config wrangler.toml --local --persist-to /tmp/ai-gateway-incomplete-free-chat-schema --file migrations/0008_free_chat_turns.sql
+          if bunx wrangler d1 execute DB --config wrangler.toml --local --persist-to /tmp/ai-gateway-incomplete-free-chat-schema --file scripts/free-chat-schema-preflight.sql --json
+          then
+            echo "::error::free-chat schema preflight unexpectedly accepted the incomplete 0008 shape"
+            exit 1
+          fi
+          rm -rf /tmp/ai-gateway-free-chat-d1-smoke
+          bunx wrangler d1 migrations apply DB --config wrangler.toml --local --persist-to /tmp/ai-gateway-free-chat-d1-smoke
+          bunx wrangler d1 migrations apply DB --config wrangler.toml --local --persist-to /tmp/ai-gateway-free-chat-d1-smoke > /tmp/ai-gateway-free-chat-d1-reapply.log
+          grep -F "No migrations to apply" /tmp/ai-gateway-free-chat-d1-reapply.log
+          schema_json="$(bunx wrangler d1 execute DB --config wrangler.toml --local --persist-to /tmp/ai-gateway-free-chat-d1-smoke --file scripts/free-chat-schema-preflight.sql --json)"
+          printf '%s\n' "$schema_json" > /tmp/ai-gateway-free-chat-schema.json
+          for index in \
+            idx_free_chat_turns_user_status \
+            idx_free_chat_network_daily_day \
+            idx_free_chat_shadow_reservations_day
+          do
+            grep -F "\"$index\"" /tmp/ai-gateway-free-chat-schema.json
+          done
+          bunx wrangler d1 execute DB --config wrangler.toml --local --persist-to /tmp/ai-gateway-free-chat-d1-smoke --command "SELECT name FROM free_chat_migrations ORDER BY id"
+
+      # This proves new development databases still have a valid full history.
+      # The config uses a local-only database identity and must never be remote.
+      - name: Smoke historical D1 chain on a separate fresh database
+        run: |
+          rm -rf /tmp/ai-gateway-historical-d1-smoke
+          bunx wrangler d1 migrations apply HISTORICAL_DB --config wrangler.historical-migrations.toml --local --persist-to /tmp/ai-gateway-historical-d1-smoke
+          bunx wrangler d1 migrations apply HISTORICAL_DB --config wrangler.historical-migrations.toml --local --persist-to /tmp/ai-gateway-historical-d1-smoke > /tmp/ai-gateway-historical-d1-reapply.log
+          grep -F "No migrations to apply" /tmp/ai-gateway-historical-d1-reapply.log
+          bunx wrangler d1 execute HISTORICAL_DB --config wrangler.historical-migrations.toml --local --persist-to /tmp/ai-gateway-historical-d1-smoke --file scripts/free-chat-schema-preflight.sql
+          bunx wrangler d1 execute HISTORICAL_DB --config wrangler.historical-migrations.toml --local --persist-to /tmp/ai-gateway-historical-d1-smoke --command "SELECT name FROM d1_migrations ORDER BY id"
+
       - name: Verify Worker bundle
         run: bunx wrangler deploy --dry-run --outdir /tmp/ai-gateway-dry-run

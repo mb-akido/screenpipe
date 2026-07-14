@@ -54,13 +54,51 @@ export function canDispatchPiSend({
 }
 
 export function isSamePiAuthIdentity(
-  expected: { token: string | null; generation: number },
-  current: { token: string | null; generation: number },
+  expected: {
+    token: string | null;
+    generation: number;
+    userId?: string | null;
+  },
+  current: {
+    token: string | null;
+    generation: number;
+    userId?: string | null;
+  },
 ): boolean {
   return (
     expected.generation === current.generation &&
     expected.token === current.token
   );
+}
+
+/**
+ * Tests whether an async completion still owns the visible account panel.
+ * Provider dispatch remains bound to `isSamePiAuthIdentity`: a refreshed JWT
+ * must never authorize work captured under the old token. Once native work has
+ * already accepted (or a failed attempt needs local cleanup), the stable user
+ * id lets the same account update its unchanged conversation UI. If either
+ * side lacks a user id, exact-token comparison is the fail-closed fallback.
+ */
+export function isSamePiAuthAccount(
+  expected: {
+    token: string | null;
+    userId?: string | null;
+  },
+  current: {
+    token: string | null;
+    userId?: string | null;
+  },
+): boolean {
+  const expectedAuthenticated = expected.token !== null;
+  const currentAuthenticated = current.token !== null;
+  if (expectedAuthenticated !== currentAuthenticated) return false;
+
+  const expectedUserId = expected.userId ?? null;
+  const currentUserId = current.userId ?? null;
+  if (expectedUserId !== null && currentUserId !== null) {
+    return expectedUserId === currentUserId;
+  }
+  return expected.token === current.token;
 }
 
 /**
@@ -123,7 +161,27 @@ type PiComparableProviderConfig = {
   systemPrompt?: string | null;
 };
 
-/** Exact payer/privacy configuration equality for deferred sends and retries. */
+const SYSTEM_PROMPT_RUNTIME_CLOCK =
+  /(^|\n)Current time: [^\n]*\n(User's timezone: [^\n]*)\nUser's local time: [^\n]*/;
+
+/**
+ * The base system prompt carries a live UTC/local clock. Those two values can
+ * change between an initial send and its async dispatch-boundary check even
+ * though the selected payer and privacy context did not. Normalize only the
+ * first generated three-line clock block; keep timezone, preset instructions,
+ * connection context, and any later clock-like user text exact.
+ */
+function normalizeSystemPromptRuntimeClock(
+  prompt: string | null | undefined,
+): string | null {
+  if (prompt == null) return null;
+  return prompt.replace(
+    SYSTEM_PROMPT_RUNTIME_CLOCK,
+    "$1Current time: <runtime>\n$2\nUser's local time: <runtime>",
+  );
+}
+
+/** Exact payer/privacy equality, excluding only generated runtime clock values. */
 export function piProviderConfigsMatch(
   left: PiComparableProviderConfig | null | undefined,
   right: PiComparableProviderConfig | null | undefined,
@@ -135,7 +193,8 @@ export function piProviderConfigsMatch(
     (left.url ?? "") === (right.url ?? "") &&
     (left.apiKey ?? null) === (right.apiKey ?? null) &&
     (left.maxTokens ?? null) === (right.maxTokens ?? null) &&
-    (left.systemPrompt ?? null) === (right.systemPrompt ?? null)
+    normalizeSystemPromptRuntimeClock(left.systemPrompt) ===
+      normalizeSystemPromptRuntimeClock(right.systemPrompt)
   );
 }
 

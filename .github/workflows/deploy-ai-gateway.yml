@@ -14,10 +14,11 @@
 # Auth differs from local: the manual deploy uses wrangler OAuth (a human login),
 # which can't run headless. CI authenticates wrangler via the CLOUDFLARE_API_TOKEN
 # env var instead. Required repo secrets:
-#   - CLOUDFLARE_API_TOKEN  — token with "Workers Scripts: Edit" (+ the route's
-#                             zone, Workers Routes: Edit). MUST be added; not yet
-#                             present in the repo. Cloudflare → My Profile → API
-#                             Tokens → "Edit Cloudflare Workers" template.
+#   - CLOUDFLARE_API_TOKEN  — token with "Workers Scripts: Edit", "D1: Edit",
+#                             and the route's zone "Workers Routes: Edit". The
+#                             deploy intentionally fails before publishing when
+#                             it cannot apply the production-safe free-chat D1
+#                             bootstrap.
 #   - CLOUDFLARE_ACCOUNT_ID — already present (used by R2 uploads).
 #   - SENTRY_AUTH_TOKEN     — already present (used by release-cli/app); without
 #                             it deploy.sh fails loud rather than shipping
@@ -63,6 +64,9 @@ jobs:
       - name: Test hosted-AI money guards
         run: bun run test:money-guards
 
+      - name: Enforce CREATE-only production migrations
+        run: bun scripts/check-production-migrations.ts
+
       - name: Verify Worker bundle
         run: bunx wrangler deploy --dry-run --outdir /tmp/ai-gateway-dry-run
 
@@ -77,6 +81,31 @@ jobs:
             echo "::error::FREE_CHAT_PREVIEW_EXPECTED=true requires FREE_LOCAL_TIER_ENFORCEMENT_EXPECTED=true"
             exit 1
           fi
+
+      # The main Wrangler binding discovers only migrations-free-chat and uses a
+      # separate free_chat_migrations ledger. Never replay the historical
+      # migrations/ chain against production: prod already has that schema and
+      # its 9+ GB cost_log table cannot safely rebuild the old index in deploy.
+      - name: Apply production-safe free-chat D1 bootstrap
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bunx wrangler d1 migrations apply DB --config wrangler.toml --remote
+
+      - name: Preflight remote free-chat D1 schema
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          schema_json="$(bunx wrangler d1 execute DB --config wrangler.toml --remote --file scripts/free-chat-schema-preflight.sql --json)"
+          printf '%s\n' "$schema_json" > /tmp/free-chat-schema-preflight.json
+          for index in \
+            idx_free_chat_turns_user_status \
+            idx_free_chat_network_daily_day \
+            idx_free_chat_shadow_reservations_day
+          do
+            grep -F "\"$index\"" /tmp/free-chat-schema-preflight.json
+          done
 
       - name: Deploy worker (build + Sentry source maps + wrangler deploy)
         env:

@@ -28,6 +28,8 @@ import {
   requiresScreenpipeCloudLogin,
   resolveScreenpipeCloudModel,
 } from "@/lib/chat/free-tier-turn-marker";
+import { markAskUserQueueCancelled } from "@/lib/chat/ask-user-cancellation-tombstone";
+import { isConversationDeleted } from "@/lib/chat/conversation-delete-tombstone";
 
 type PiRunningConfig = {
   provider: string;
@@ -255,8 +257,10 @@ export function usePiSessionLifecycle({
     ) => {
       const sessionId = boundary?.sessionId ?? piSessionIdRef.current;
       const restartToken = boundary?.userToken ?? userToken ?? null;
-      const restartIsCurrent =
+      const callerBoundaryIsCurrent =
         boundary?.isCurrent ?? (() => sessionId === piSessionIdRef.current);
+      const restartIsCurrent = () =>
+        !isConversationDeleted(sessionId) && callerBoundaryIsCurrent();
       if (!restartIsCurrent()) return;
       // `piInfo` is panel-global and can briefly lag a conversation switch.
       // Never tag another session's PID as intentionally stopped; that could
@@ -413,7 +417,17 @@ export function usePiSessionLifecycle({
         pendingPresetInvalidationRef.current = commands
           .piInvalidateQueuedPrompts(sessionId)
           .then((result) => {
-            if (result.status === "ok") return true;
+            if (result.status === "ok") {
+              for (const promptId of result.data) {
+                markAskUserQueueCancelled(sessionId, promptId);
+                window.dispatchEvent(
+                  new CustomEvent("screenpipe:queued-prompt-cancelled", {
+                    detail: { sessionId, promptId },
+                  }),
+                );
+              }
+              return true;
+            }
             if (presetSwitchRequestIdRef.current !== requestId) return false;
             console.error(
               "[Pi] Could not establish provider boundary:",

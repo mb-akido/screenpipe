@@ -53,10 +53,13 @@ async function waitForCard(slug: string): Promise<void> {
   await browser.waitUntil(
     async () =>
       (await browser.execute(
-        (s: string) => !!document.querySelector(`[data-testid="summary-card-${s}"]`),
+        (s: string) => {
+          const card = document.querySelector(`[data-testid="summary-card-${s}"]`) as HTMLButtonElement | null;
+          return Boolean(card && !card.disabled);
+        },
         slug,
       )) as boolean,
-    { timeout: t(15_000), interval: 300, timeoutMsg: `summary card '${slug}' never rendered` },
+    { timeout: t(30_000), interval: 300, timeoutMsg: `summary card '${slug}' never became ready` },
   );
 }
 

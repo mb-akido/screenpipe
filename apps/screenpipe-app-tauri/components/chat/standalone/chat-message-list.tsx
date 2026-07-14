@@ -24,6 +24,7 @@ import {
 } from "@/lib/chat/message-rendering";
 import { cn } from "@/lib/utils";
 import type { ContentBlock, Message } from "@/lib/chat/types";
+import { collectAskUserReplyStates } from "@/lib/chat/ask-user-reply-state";
 import type { ConnectionListItem } from "@/lib/chat/connection-suggestions";
 import type { InlineConnectStatus } from "@/lib/connections/inline-connect";
 import type { MarkdownCitationPlan } from "@/lib/chat/markdown-export";
@@ -85,7 +86,8 @@ export interface ChatMessageListProps {
   onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
   onContinueConnectionAction?: (prompt: string, label?: string) => void | Promise<void>;
   onDismissConnectionAction?: (messageId: string, connectionId: string) => void;
-  onAskUserReply?: (reply: string, displayLabel: string) => Promise<void> | void;
+  onAskUserReply?: (reply: string, displayLabel: string, toolCallId: string) => Promise<boolean> | boolean;
+  canSendMessages?: boolean;
   suppressSourceFooters?: boolean;
 }
 
@@ -125,8 +127,14 @@ export function ChatMessageList({
   onContinueConnectionAction,
   onDismissConnectionAction,
   onAskUserReply,
+  canSendMessages = true,
   suppressSourceFooters = false,
 }: ChatMessageListProps) {
+  const askUserReplyStates = React.useMemo(
+    () => collectAskUserReplyStates(messages),
+    [messages],
+  );
+
   return (
     <>
       <AnimatePresence mode="popLayout">
@@ -380,6 +388,10 @@ export function ChatMessageList({
                           onContinueConnectionAction={onContinueConnectionAction}
                           onDismissConnectionAction={onDismissConnectionAction}
                           onAskUserReply={onAskUserReply}
+                          answeredAskUserToolCallIds={askUserReplyStates.accepted}
+                          pendingAskUserToolCallIds={askUserReplyStates.pending}
+                          retryAskUserToolCallIds={askUserReplyStates.retry}
+                          canSendMessages={canSendMessages}
                         />
                       )}
                     </div>

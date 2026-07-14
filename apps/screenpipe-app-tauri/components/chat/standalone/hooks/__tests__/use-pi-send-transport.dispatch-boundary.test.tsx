@@ -5,6 +5,10 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { usePiSendTransport } from "../use-pi-send-transport";
+import {
+  __resetConversationDeleteTombstonesForTests,
+  markConversationDeleted,
+} from "@/lib/chat/conversation-delete-tombstone";
 
 const mocks = vi.hoisted(() => ({
   homeDir: vi.fn(async () => "/Users/test"),
@@ -31,6 +35,12 @@ const mocks = vi.hoisted(() => ({
   })),
   getChatState: vi.fn(),
   hasCloudEntitlement: vi.fn(() => false),
+  piImageFromFrameId: vi.fn(async (frameId: number) => ({
+    type: "image",
+    mimeType: "image/jpeg",
+    data: `frame-${frameId}`,
+  })),
+  commitCapturedNativeTurnInConversationFile: vi.fn(async () => true),
 }));
 
 vi.mock("@tauri-apps/api/path", () => ({
@@ -70,6 +80,11 @@ vi.mock("@/lib/stores/chat-store", () => ({
   useChatStore: { getState: mocks.getChatState },
 }));
 
+vi.mock("@/lib/chat-storage", () => ({
+  commitCapturedNativeTurnInConversationFile:
+    mocks.commitCapturedNativeTurnInConversationFile,
+}));
+
 vi.mock("../use-pi-live-send", () => ({
   usePiLiveSendControls: vi.fn(() => ({
     handleStop: vi.fn(),
@@ -102,7 +117,7 @@ vi.mock("../pi-message-preparation", () => ({
     }),
   ),
   piImageFromDataUrl: vi.fn(() => null),
-  piImageFromFrameId: vi.fn(async () => null),
+  piImageFromFrameId: mocks.piImageFromFrameId,
   promptWithConversationHistory: vi.fn((message: string) => message),
 }));
 
@@ -135,28 +150,57 @@ const providerConfig = {
 
 function createFixture({
   running = false,
+  activeTurn = false,
+  sessionId = "session-c1",
+  authToken = "token-c1",
+  authGeneration = 1,
+  authUserId = "account-c1",
+  deferMessageUpdates = false,
+  prefillContext = null,
+  prefillFrameId = null,
+  prefillSource = "search",
   initialMessages = [],
   selectedPreset = preset,
   selectedProviderConfig = providerConfig,
 }: {
   running?: boolean;
+  activeTurn?: boolean;
+  sessionId?: string;
+  authToken?: string;
+  authGeneration?: number;
+  authUserId?: string;
+  deferMessageUpdates?: boolean;
+  prefillContext?: string | null;
+  prefillFrameId?: number | null;
+  prefillSource?: string;
   initialMessages?: any[];
   selectedPreset?: any;
   selectedProviderConfig?: any;
 } = {}) {
   const authIdentityRef = {
-    current: { token: "token-c1", generation: 1 },
+    current: {
+      token: authToken,
+      generation: authGeneration,
+      userId: authUserId,
+    },
   };
   const piAsyncOperationGenerationRef = { current: 1 };
-  const piSessionIdRef = { current: "session-c1" };
+  const piSessionIdRef = { current: sessionId };
   const piStartInFlightRef = { current: false };
   const sendDispatchInFlightRef = { current: false };
   const sendDispatchOwnerRef = { current: null as string | null };
-  const piMessageIdRef = { current: null as string | null };
+  const piMessageIdRef = {
+    current: activeTurn ? "active-assistant" : (null as string | null),
+  };
   const setIsLoading = vi.fn();
   const setIsStreaming = vi.fn();
   let renderedMessages: any[] = [...initialMessages];
+  const deferredMessageUpdates: any[] = [];
   const setMessages = vi.fn((update: any) => {
+    if (deferMessageUpdates) {
+      deferredMessageUpdates.push(update);
+      return;
+    }
     renderedMessages =
       typeof update === "function" ? update(renderedMessages) : update;
   });
@@ -164,14 +208,14 @@ function createFixture({
   const setPiStarting = vi.fn();
 
   const chatSession: any = {
-    id: "session-c1",
+    id: sessionId,
     title: "untitled",
     messages: [...initialMessages],
     streamingMessageId: null,
     streamingText: "",
     contentBlocks: [],
     isStreaming: false,
-    isLoading: false,
+    isLoading: activeTurn,
   };
   const chatActions = {
     appendMessage: vi.fn((_sessionId: string, message: any) => {
@@ -198,7 +242,7 @@ function createFixture({
     }),
   };
   mocks.getChatState.mockImplementation(() => ({
-    sessions: { "session-c1": chatSession },
+    sessions: { [sessionId]: chatSession },
     actions: chatActions,
   }));
 
@@ -215,7 +259,8 @@ function createFixture({
     conversationOperationPendingRef: { current: false },
     cancelStreamingMessageRender: vi.fn(),
     consumePendingAttachments: vi.fn(() => undefined),
-    currentQueueSessionId: "session-c1",
+    mergePendingAttachments: vi.fn(),
+    currentQueueSessionId: sessionId,
     beginQueuedAction: vi.fn(),
     finishQueuedAction: vi.fn(),
     forceQueueModeRef: { current: false },
@@ -241,7 +286,7 @@ function createFixture({
           running: true,
           projectDir: "/Users/test/.screenpipe/pi-chat",
           pid: 42,
-          sessionId: "session-c1",
+          sessionId,
         }
       : null,
     piMessageIdRef,
@@ -252,9 +297,9 @@ function createFixture({
     piSessionSyncedRef: { current: false },
     piStartInFlightRef,
     piStreamingTextRef: { current: "" },
-    prefillContext: null,
-    prefillFrameId: null,
-    prefillSource: "search",
+    prefillContext,
+    prefillFrameId,
+    prefillSource,
     queuedPrompts: [],
     registerTurnIntent: vi.fn(),
     markTurnIntentConsumed: vi.fn(),
@@ -304,14 +349,48 @@ function createFixture({
     chatActions,
     chatSession,
     getRenderedMessages: () => renderedMessages,
+    flushDeferredMessageUpdates: () => {
+      for (const update of deferredMessageUpdates.splice(0)) {
+        renderedMessages =
+          typeof update === "function" ? update(renderedMessages) : update;
+      }
+    },
     replaceRenderedMessages: (messages: any[]) => {
       renderedMessages = messages;
     },
   };
 }
 
+function expectRetryStatePersisted(
+  fixture: ReturnType<typeof createFixture>,
+  retryPrompt: string,
+  errorMessage: string,
+) {
+  const rendered = fixture.getRenderedMessages();
+  expect(fixture.chatSession.messages).toEqual(rendered);
+
+  const saveCalls = fixture.options.saveConversation.mock.calls;
+  expect(saveCalls.length).toBeGreaterThanOrEqual(2);
+  const [persistedMessages, saveOptions] = saveCalls[saveCalls.length - 1];
+  expect(persistedMessages).toEqual(rendered);
+  expect(saveOptions).toMatchObject({ idOverride: "session-c1" });
+
+  const persistedAssistant = persistedMessages.find(
+    (message: any) => message.role === "assistant",
+  );
+  expect(persistedAssistant).toMatchObject({
+    content: errorMessage,
+    retryPrompt,
+  });
+  expect(persistedAssistant.content).not.toBe("Processing...");
+  expect(fixture.chatSession.streamingMessageId).toBeNull();
+  expect(fixture.chatSession.isLoading).toBe(false);
+  expect(fixture.chatSession.isStreaming).toBe(false);
+}
+
 describe("usePiSendTransport immutable dispatch boundary", () => {
   beforeEach(() => {
+    __resetConversationDeleteTombstonesForTests();
     vi.clearAllMocks();
     mocks.homeDir.mockResolvedValue("/Users/test");
     mocks.join.mockImplementation(async (...parts: string[]) =>
@@ -678,6 +757,1035 @@ describe("usePiSendTransport immutable dispatch boundary", () => {
     expect(fixture.chatSession.isStreaming).toBe(false);
   });
 
+  it("persists a retryable local turn but reports false when Pi startup fails", async () => {
+    mocks.piStart.mockResolvedValueOnce({
+      status: "error",
+      error: "provider process unavailable",
+    } as any);
+    const fixture = createFixture();
+
+    let accepted = false;
+    await act(async () => {
+      accepted = await fixture.result.current.sendMessage(
+        "keep this accepted action",
+      );
+    });
+
+    expect(accepted).toBe(false);
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    expect(fixture.getRenderedMessages()).toHaveLength(2);
+    expect(fixture.getRenderedMessages()[0]).toMatchObject({
+      role: "user",
+      content: "keep this accepted action",
+    });
+    expect(fixture.getRenderedMessages()[1]).toMatchObject({
+      role: "assistant",
+      retryPrompt: "keep this accepted action",
+    });
+    expect(fixture.getRenderedMessages()[1].content).not.toBe("Processing...");
+    expect(fixture.chatSession.messages).toEqual(fixture.getRenderedMessages());
+    expect(fixture.options.saveConversation).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "user",
+          content: "keep this accepted action",
+        }),
+      ]),
+      expect.objectContaining({ idOverride: "session-c1" }),
+    );
+    expect(fixture.piMessageIdRef.current).toBeNull();
+    expect(fixture.chatSession.streamingMessageId).toBeNull();
+    expect(fixture.chatSession.isLoading).toBe(false);
+    expect(fixture.chatSession.isStreaming).toBe(false);
+  });
+
+  it("marks an Ask User reply accepted only after native dispatch", async () => {
+    const failed = createFixture();
+    mocks.piStart.mockResolvedValueOnce({
+      status: "error",
+      error: "provider process unavailable",
+    } as any);
+
+    let failedAccepted = true;
+    await act(async () => {
+      failedAccepted = await failed.result.current.sendMessage(
+        "structured answer",
+        "Answered Ask user: Subagents",
+        undefined,
+        { askUserToolCallId: "tool-ask-1" },
+      );
+    });
+
+    expect(failedAccepted).toBe(false);
+    expect(failed.getRenderedMessages()[0]).toMatchObject({
+      askUserToolCallId: "tool-ask-1",
+    });
+    expect(failed.getRenderedMessages()[0].askUserReplyAccepted).toBeUndefined();
+    expect(failed.getRenderedMessages()[1]).toHaveProperty(
+      "retryPrompt",
+      "structured answer",
+    );
+
+    const accepted = createFixture({ running: true });
+    let nativeAccepted = false;
+    await act(async () => {
+      nativeAccepted = await accepted.result.current.sendMessage(
+        "structured answer",
+        "Answered Ask user: Subagents",
+        undefined,
+        { askUserToolCallId: "tool-ask-1" },
+      );
+    });
+
+    expect(nativeAccepted).toBe(true);
+    expect(accepted.getRenderedMessages()[0]).toMatchObject({
+      askUserToolCallId: "tool-ask-1",
+      askUserReplyAccepted: true,
+    });
+    expect(accepted.chatSession.messages[0]).toMatchObject({
+      askUserToolCallId: "tool-ask-1",
+      askUserReplyAccepted: true,
+    });
+    await waitFor(() =>
+      expect(accepted.options.saveConversation).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({
+            askUserToolCallId: "tool-ask-1",
+            askUserReplyAccepted: true,
+          }),
+        ]),
+        expect.objectContaining({ idOverride: "session-c1" }),
+      ),
+    );
+  });
+
+  it("commits a natively accepted Ask User reply to its captured chat after a provider switch", async () => {
+    const prompt = deferred<{ status: "ok"; data: null }>();
+    mocks.piPrompt.mockImplementationOnce(() => prompt.promise);
+    const fixture = createFixture({ running: true });
+
+    let send!: Promise<boolean>;
+    act(() => {
+      send = fixture.result.current.sendMessage(
+        "structured answer",
+        "Answered Ask user: Main agent",
+        undefined,
+        { askUserToolCallId: "tool-ask-1" },
+      );
+    });
+    await waitFor(() => expect(mocks.piPrompt).toHaveBeenCalledTimes(1));
+
+    const presetC2 = {
+      ...preset,
+      id: "openai-c2",
+      provider: "openai",
+      model: "gpt-c2",
+      apiKey: "key-c2",
+    };
+    const providerConfigC2 = {
+      ...providerConfig,
+      provider: "openai",
+      model: "gpt-c2",
+      apiKey: "key-c2",
+      systemPrompt: "system-c2",
+    };
+    fixture.options.activePresetRef.current = presetC2;
+    fixture.options.buildProviderConfig.mockImplementation(
+      (selectedPreset: typeof preset | typeof presetC2 | undefined) =>
+        selectedPreset?.id === presetC2.id ? providerConfigC2 : providerConfig,
+    );
+
+    prompt.resolve({ status: "ok", data: null });
+    let accepted = true;
+    await act(async () => {
+      accepted = await send;
+    });
+
+    expect(accepted).toBe(true);
+    expect(fixture.getRenderedMessages()[0]).toMatchObject({
+      content: "structured answer",
+      askUserToolCallId: "tool-ask-1",
+      askUserReplyAccepted: true,
+    });
+    expect(
+      mocks.commitCapturedNativeTurnInConversationFile,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "session-c1",
+        markAskUserAccepted: true,
+        userMessage: expect.objectContaining({
+          content: "structured answer",
+          askUserToolCallId: "tool-ask-1",
+        }),
+        assistantMessage: expect.objectContaining({
+          role: "assistant",
+          content: "Processing...",
+        }),
+      }),
+    );
+  });
+
+  it("keeps a natively accepted Ask User reply locked after a same-account token refresh", async () => {
+    const prompt = deferred<{ status: "ok"; data: null }>();
+    mocks.piPrompt.mockImplementationOnce(() => prompt.promise);
+    const fixture = createFixture({ running: true });
+
+    let send!: Promise<boolean>;
+    act(() => {
+      send = fixture.result.current.sendMessage(
+        "structured answer",
+        "Answered Ask user: Main agent",
+        undefined,
+        { askUserToolCallId: "tool-ask-refresh" },
+      );
+    });
+    await waitFor(() => expect(mocks.piPrompt).toHaveBeenCalledTimes(1));
+
+    fixture.authIdentityRef.current = {
+      token: "token-c1-refreshed",
+      generation: 2,
+      userId: "account-c1",
+    };
+    prompt.resolve({ status: "ok", data: null });
+
+    let accepted = false;
+    await act(async () => {
+      accepted = await send;
+    });
+
+    expect(accepted).toBe(true);
+    expect(fixture.getRenderedMessages()[0]).toMatchObject({
+      content: "structured answer",
+      askUserToolCallId: "tool-ask-refresh",
+      askUserReplyAccepted: true,
+    });
+    expect(
+      mocks.commitCapturedNativeTurnInConversationFile,
+    ).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({
+            askUserToolCallId: "tool-ask-refresh",
+            askUserReplyAccepted: true,
+          }),
+        ]),
+        expect.objectContaining({ idOverride: "session-c1" }),
+      ),
+    );
+  });
+
+  it("cleans up a rejected replacement after a same-account token refresh", async () => {
+    const preflight = deferred<{ ok: true }>();
+    mocks.preflightChatProvider.mockImplementationOnce(() => preflight.promise);
+    const initialMessages = [
+      { id: "u0", role: "user", content: "first", timestamp: 1 },
+      { id: "a0", role: "assistant", content: "first answer", timestamp: 2 },
+      { id: "u1", role: "user", content: "retry me", timestamp: 3 },
+      { id: "a1", role: "assistant", content: "failed", timestamp: 4 },
+    ];
+    const fixture = createFixture({ running: true, initialMessages });
+
+    let send!: Promise<boolean>;
+    act(() => {
+      send = fixture.result.current.sendMessage(
+        "provisional replacement",
+        undefined,
+        undefined,
+        { replaceFromMessageId: "u1" },
+      );
+    });
+    await waitFor(() =>
+      expect(mocks.preflightChatProvider).toHaveBeenCalledTimes(1),
+    );
+    expect(fixture.getRenderedMessages()).toHaveLength(6);
+
+    fixture.authIdentityRef.current = {
+      token: "token-c1-refreshed",
+      generation: 2,
+      userId: "account-c1",
+    };
+    preflight.resolve({ ok: true });
+    let accepted = true;
+    await act(async () => {
+      accepted = await send;
+    });
+
+    expect(accepted).toBe(false);
+    expect(fixture.getRenderedMessages()).toEqual(initialMessages);
+    expect(fixture.chatSession.messages).toEqual(initialMessages);
+    expect(fixture.piMessageIdRef.current).toBeNull();
+    expect(fixture.setIsLoading).toHaveBeenLastCalledWith(false);
+    expect(fixture.setIsStreaming).toHaveBeenLastCalledWith(false);
+  });
+
+  it("commits a natively accepted retry branch in the visible chat after a provider switch", async () => {
+    const prompt = deferred<{ status: "ok"; data: null }>();
+    mocks.piPrompt.mockImplementationOnce(() => prompt.promise);
+    const initialMessages = [
+      { id: "u0", role: "user", content: "first", timestamp: 1 },
+      { id: "a0", role: "assistant", content: "first answer", timestamp: 2 },
+      { id: "u1", role: "user", content: "retry me", timestamp: 3 },
+      { id: "a1", role: "assistant", content: "failed", timestamp: 4 },
+    ];
+    const fixture = createFixture({ running: true, initialMessages });
+
+    let send!: Promise<boolean>;
+    act(() => {
+      send = fixture.result.current.sendMessage(
+        "replacement survives the switch",
+        undefined,
+        undefined,
+        { replaceFromMessageId: "u1" },
+      );
+    });
+    await waitFor(() => expect(mocks.piPrompt).toHaveBeenCalledTimes(1));
+
+    const presetC2 = {
+      ...preset,
+      id: "openai-c2",
+      provider: "openai",
+      model: "gpt-c2",
+      apiKey: "key-c2",
+    };
+    const providerConfigC2 = {
+      ...providerConfig,
+      provider: "openai",
+      model: "gpt-c2",
+      apiKey: "key-c2",
+      systemPrompt: "system-c2",
+    };
+    fixture.options.activePresetRef.current = presetC2;
+    fixture.options.buildProviderConfig.mockImplementation(
+      (selectedPreset: typeof preset | typeof presetC2 | undefined) =>
+        selectedPreset?.id === presetC2.id ? providerConfigC2 : providerConfig,
+    );
+
+    prompt.resolve({ status: "ok", data: null });
+    let accepted = true;
+    await act(async () => {
+      accepted = await send;
+    });
+
+    expect(accepted).toBe(true);
+    expect(fixture.getRenderedMessages().slice(0, 2)).toEqual(
+      initialMessages.slice(0, 2),
+    );
+    expect(fixture.getRenderedMessages()[2]).toMatchObject({
+      role: "user",
+      content: "replacement survives the switch",
+    });
+    expect(fixture.getRenderedMessages()[3]).toMatchObject({
+      role: "assistant",
+      content: "Processing...",
+    });
+    expect(fixture.getRenderedMessages()).toHaveLength(4);
+    expect(
+      mocks.commitCapturedNativeTurnInConversationFile,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "session-c1",
+        replaceFromMessageId: "u1",
+        markAskUserAccepted: false,
+        userMessage: expect.objectContaining({
+          content: "replacement survives the switch",
+        }),
+        assistantMessage: expect.objectContaining({
+          role: "assistant",
+          content: "Processing...",
+        }),
+      }),
+    );
+  });
+
+  it("persists a natively accepted retry in its old chat without touching a successor panel", async () => {
+    const prompt = deferred<{ status: "ok"; data: null }>();
+    mocks.piPrompt.mockImplementationOnce(() => prompt.promise);
+    const initialMessages = [
+      { id: "u0", role: "user", content: "first", timestamp: 1 },
+      { id: "a0", role: "assistant", content: "first answer", timestamp: 2 },
+      { id: "u1", role: "user", content: "retry me", timestamp: 3 },
+      { id: "a1", role: "assistant", content: "failed", timestamp: 4 },
+    ];
+    const fixture = createFixture({ running: true, initialMessages });
+
+    let send!: Promise<boolean>;
+    act(() => {
+      send = fixture.result.current.sendMessage(
+        "old chat accepted replacement",
+        undefined,
+        undefined,
+        { replaceFromMessageId: "u1" },
+      );
+    });
+    await waitFor(() => expect(mocks.piPrompt).toHaveBeenCalledTimes(1));
+
+    const successorRows = [
+      {
+        id: "successor-user",
+        role: "user",
+        content: "successor chat",
+        timestamp: 10,
+      },
+    ];
+    fixture.replaceRenderedMessages(successorRows);
+    fixture.piAsyncOperationGenerationRef.current = 2;
+    fixture.piSessionIdRef.current = "session-c2";
+
+    prompt.resolve({ status: "ok", data: null });
+    let accepted = true;
+    await act(async () => {
+      accepted = await send;
+    });
+
+    expect(accepted).toBe(false);
+    expect(fixture.getRenderedMessages()).toEqual(successorRows);
+    expect(
+      mocks.commitCapturedNativeTurnInConversationFile,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "session-c1",
+        replaceFromMessageId: "u1",
+        markAskUserAccepted: false,
+        userMessage: expect.objectContaining({
+          content: "old chat accepted replacement",
+        }),
+      }),
+    );
+  });
+
+  it("does not dispatch or spend a hosted preview turn when Pi startup fails", async () => {
+    mocks.piStart.mockResolvedValueOnce({
+      status: "error",
+      error: "hosted provider unavailable",
+    } as any);
+    const fixture = createFixture({
+      selectedPreset: cloudPreset,
+      selectedProviderConfig: cloudProviderConfig,
+    });
+
+    await act(async () => {
+      await fixture.result.current.sendMessage("hosted action stays local");
+    });
+
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    expect(fixture.getRenderedMessages()[0]).toMatchObject({
+      role: "user",
+      content: "hosted action stays local",
+    });
+    expect(fixture.getRenderedMessages()[0].hostedTurnId).toEqual(
+      expect.any(String),
+    );
+    expect(fixture.getRenderedMessages()[1]).toMatchObject({
+      role: "assistant",
+      retryPrompt: "hosted action stays local",
+    });
+  });
+
+  it("preserves BYO-AI timeline context and frame across startup failure and retry", async () => {
+    mocks.piStart.mockResolvedValueOnce({
+      status: "error",
+      error: "local provider unavailable",
+    } as any);
+    const first = createFixture({
+      prefillContext: "selected OCR and transcript",
+      prefillFrameId: 4242,
+      prefillSource: "timeline",
+    });
+
+    let firstAccepted = true;
+    await act(async () => {
+      firstAccepted = await first.result.current.sendMessage(
+        "explain this moment",
+      );
+    });
+
+    expect(firstAccepted).toBe(false);
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    const failedRows = first.getRenderedMessages();
+    expect(failedRows[0]).toMatchObject({
+      role: "user",
+      content: "explain this moment",
+      sourceContext: {
+        label: "timeline selection",
+        text: "selected OCR and transcript",
+      },
+      sourceFrameId: 4242,
+    });
+    expect(failedRows[1]).toMatchObject({
+      role: "assistant",
+      retryPrompt: "explain this moment",
+    });
+
+    mocks.piPrompt.mockClear();
+    mocks.piImageFromFrameId.mockClear();
+    mocks.commitCapturedNativeTurnInConversationFile.mockClear();
+    const retry = createFixture({
+      running: true,
+      initialMessages: failedRows,
+      // A retry must not inherit unrelated live composer context.
+      prefillContext: "unrelated search selection",
+      prefillFrameId: 999,
+      prefillSource: "search",
+    });
+    let retryAccepted = false;
+    await act(async () => {
+      retryAccepted = await retry.result.current.sendMessage(
+        failedRows[0].content,
+        failedRows[0].displayContent,
+        failedRows[0].images ?? [],
+        {
+          replaceFromMessageId: failedRows[0].id,
+          attachments: failedRows[0].attachments ?? [],
+          sourceContext: failedRows[0].sourceContext,
+          sourceFrameId: failedRows[0].sourceFrameId,
+        },
+      );
+    });
+
+    expect(retryAccepted).toBe(true);
+    expect(mocks.piPrompt).toHaveBeenCalledWith(
+      "session-c1",
+      "[Context from timeline selection: selected OCR and transcript]\n\nexplain this moment",
+      [
+        {
+          type: "image",
+          mimeType: "image/jpeg",
+          data: "frame-4242",
+        },
+      ],
+      "explain this moment",
+    );
+    expect(mocks.piImageFromFrameId).toHaveBeenCalledTimes(1);
+    expect(mocks.piImageFromFrameId).toHaveBeenCalledWith(4242);
+    expect(retry.options.setPrefillContext).not.toHaveBeenCalled();
+    expect(retry.options.setPrefillFrameId).not.toHaveBeenCalled();
+    expect(retry.getRenderedMessages()[0]).toMatchObject({
+      sourceContext: failedRows[0].sourceContext,
+      sourceFrameId: 4242,
+    });
+  });
+
+  it("commits a failed startup replacement exactly once with retry UI", async () => {
+    const initialMessages = [
+      { id: "u0", role: "user", content: "first", timestamp: 1 },
+      { id: "a0", role: "assistant", content: "first answer", timestamp: 2 },
+      { id: "u1", role: "user", content: "old retry", timestamp: 3 },
+      { id: "a1", role: "assistant", content: "old answer", timestamp: 4 },
+    ];
+    mocks.piStart.mockResolvedValueOnce({
+      status: "error",
+      error: "provider process unavailable",
+    } as any);
+    const fixture = createFixture({ initialMessages });
+
+    let accepted = false;
+    await act(async () => {
+      accepted = await fixture.result.current.sendMessage(
+        "replacement survives startup failure",
+        undefined,
+        [],
+        { replaceFromMessageId: "u1", attachments: [] },
+      );
+    });
+
+    expect(accepted).toBe(true);
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    const rendered = fixture.getRenderedMessages();
+    expect(rendered).toHaveLength(4);
+    expect(rendered.slice(0, 2)).toEqual(initialMessages.slice(0, 2));
+    expect(
+      rendered.filter((message: any) => message.role === "user"),
+    ).toHaveLength(2);
+    expect(
+      rendered.filter(
+        (message: any) =>
+          message.content === "replacement survives startup failure",
+      ),
+    ).toHaveLength(1);
+    expect(rendered[2]).toMatchObject({
+      role: "user",
+      content: "replacement survives startup failure",
+    });
+    expect(rendered[3]).toMatchObject({
+      role: "assistant",
+      retryPrompt: "replacement survives startup failure",
+    });
+    expect(rendered.map((message: any) => message.id)).not.toContain("u1");
+    expect(rendered.map((message: any) => message.id)).not.toContain("a1");
+    expect(fixture.chatSession.messages).toEqual(rendered);
+    expect(fixture.options.saveConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the accepted turn when a running provider cannot be restarted", async () => {
+    const fixture = createFixture({ running: true });
+    fixture.options.piRunningConfigRef.current = {
+      ...providerConfig,
+      model: "stale-model",
+    };
+    fixture.options.restartCurrentPiSession.mockRejectedValueOnce(
+      new Error("restart failed"),
+    );
+
+    await act(async () => {
+      await fixture.result.current.sendMessage("persist before restart");
+    });
+
+    expect(fixture.options.restartCurrentPiSession).toHaveBeenCalledTimes(1);
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    expect(fixture.getRenderedMessages()[0]).toMatchObject({
+      role: "user",
+      content: "persist before restart",
+    });
+    expect(fixture.getRenderedMessages()[1]).toMatchObject({
+      role: "assistant",
+      retryPrompt: "persist before restart",
+    });
+    expect(fixture.chatSession.messages).toEqual(fixture.getRenderedMessages());
+  });
+
+  it("persists the retry row when normal-send provider preflight fails", async () => {
+    mocks.preflightChatProvider.mockResolvedValueOnce({
+      ok: false,
+      message: "provider preflight unavailable",
+    } as any);
+    const fixture = createFixture({ running: true });
+
+    let accepted = true;
+    await act(async () => {
+      accepted = await fixture.result.current.sendMessage(
+        "retry after preflight",
+      );
+    });
+
+    expect(accepted).toBe(false);
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    expectRetryStatePersisted(
+      fixture,
+      "retry after preflight",
+      "provider preflight unavailable",
+    );
+  });
+
+  it("persists the retry row when native prompt dispatch returns an error", async () => {
+    mocks.piPrompt.mockResolvedValueOnce({
+      status: "error",
+      error: "native rejected prompt",
+    } as any);
+    const fixture = createFixture({ running: true });
+
+    let accepted = true;
+    await act(async () => {
+      accepted = await fixture.result.current.sendMessage(
+        "retry native rejection",
+      );
+    });
+
+    expect(accepted).toBe(false);
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+    expectRetryStatePersisted(
+      fixture,
+      "retry native rejection",
+      "native rejected prompt",
+    );
+  });
+
+  it("persists the retry row when native prompt dispatch throws", async () => {
+    mocks.piPrompt.mockRejectedValueOnce(new Error("transport exploded"));
+    const fixture = createFixture({ running: true });
+
+    await act(async () => {
+      await fixture.result.current.sendMessage("retry thrown transport");
+    });
+
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+    expectRetryStatePersisted(
+      fixture,
+      "retry thrown transport",
+      "Error: transport exploded",
+    );
+  });
+
+  it("creates the durability gate even when React defers the message updater", async () => {
+    const initialMessages = [
+      { id: "u0", role: "user", content: "prior question", timestamp: 1 },
+      { id: "a0", role: "assistant", content: "prior answer", timestamp: 2 },
+    ];
+    const fixture = createFixture({
+      running: true,
+      deferMessageUpdates: true,
+      initialMessages,
+    });
+
+    await act(async () => {
+      await fixture.result.current.sendMessage("accepted while React batches");
+    });
+
+    // The mocked React setter has not executed yet. Persistence must still be
+    // based on the current render snapshot, not a side effect inside that
+    // deferred updater.
+    expect(fixture.getRenderedMessages()).toEqual(initialMessages);
+    expect(fixture.options.saveConversation).toHaveBeenCalledTimes(1);
+    expect(fixture.options.saveConversation).toHaveBeenCalledWith(
+      [
+        ...initialMessages,
+        expect.objectContaining({
+          role: "user",
+          content: "accepted while React batches",
+        }),
+        expect.objectContaining({
+          role: "assistant",
+          content: "Processing...",
+        }),
+      ],
+      expect.objectContaining({ idOverride: "session-c1" }),
+    );
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+
+    fixture.flushDeferredMessageUpdates();
+    expect(fixture.getRenderedMessages()).toHaveLength(4);
+    expect(fixture.chatSession.messages).toEqual(fixture.getRenderedMessages());
+  });
+
+  it("accepts a send when only the generated system-prompt clock advances", async () => {
+    const firstConfig = {
+      ...providerConfig,
+      systemPrompt:
+        "system\nCurrent time: 2026-07-13T17:00:00.000Z\n" +
+        "User's timezone: America/Los_Angeles (UTC-7)\n" +
+        "User's local time: 7/13/2026, 10:00:00 AM\n\nPrivate preset",
+    };
+    const secondConfig = {
+      ...firstConfig,
+      systemPrompt: firstConfig.systemPrompt
+        .replace("17:00:00.000Z", "17:00:00.001Z")
+        .replace("10:00:00 AM", "10:00:00.001 AM"),
+    };
+    const fixture = createFixture({
+      running: true,
+      selectedProviderConfig: firstConfig,
+    });
+    let buildCount = 0;
+    fixture.options.buildProviderConfig.mockImplementation(() => {
+      buildCount += 1;
+      return buildCount === 1 ? firstConfig : secondConfig;
+    });
+
+    let accepted = false;
+    await act(async () => {
+      accepted = await fixture.result.current.sendMessage(
+        "persist despite a moving clock",
+      );
+    });
+
+    expect(accepted).toBe(true);
+    expect(fixture.options.saveConversation).toHaveBeenCalledTimes(1);
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+    expect(fixture.getRenderedMessages()[0]).toMatchObject({
+      role: "user",
+      content: "persist despite a moving clock",
+    });
+  });
+
+  it("fails closed and reports false before provider work when the initial local save rejects", async () => {
+    const fixture = createFixture({
+      selectedPreset: cloudPreset,
+      selectedProviderConfig: cloudProviderConfig,
+    });
+    fixture.options.saveConversation.mockRejectedValueOnce(
+      new Error("disk full"),
+    );
+
+    let accepted = false;
+    await act(async () => {
+      accepted = await fixture.result.current.sendMessage(
+        "do not spend an unpersisted hosted turn",
+      );
+    });
+
+    expect(accepted).toBe(false);
+    expect(mocks.piAbort).not.toHaveBeenCalled();
+    expect(mocks.piStart).not.toHaveBeenCalled();
+    expect(mocks.preflightChatProvider).not.toHaveBeenCalled();
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+
+    // The failed attempt does not poison the conversation queue: the terminal
+    // retry snapshot gets a fresh write attempt and can recover immediately.
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledTimes(2),
+    );
+    const rendered = fixture.getRenderedMessages();
+    expect(fixture.chatSession.messages).toEqual(rendered);
+    expect(rendered[0]).toMatchObject({
+      role: "user",
+      content: "do not spend an unpersisted hosted turn",
+    });
+    expect(rendered[1]).toMatchObject({
+      role: "assistant",
+      content:
+        "Couldn't save this chat locally. Check available disk space and storage access, then retry this message.",
+      retryPrompt: "do not spend an unpersisted hosted turn",
+    });
+    expect(fixture.options.saveConversation.mock.calls[1][0]).toEqual(rendered);
+  });
+
+  it("serializes a terminal retry save after a deferred placeholder save", async () => {
+    const firstSave = deferred<void>();
+    mocks.preflightChatProvider.mockResolvedValueOnce({
+      ok: false,
+      message: "ordered provider failure",
+    } as any);
+    const fixture = createFixture({ activeTurn: true });
+    fixture.options.saveConversation.mockImplementationOnce(
+      () => firstSave.promise,
+    );
+
+    let send!: Promise<void>;
+    act(() => {
+      send = fixture.result.current.sendMessage("persist in order");
+    });
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledTimes(1),
+    );
+
+    // Local UI/store acceptance is immediate, but no interrupt, provider
+    // process, or hosted dispatch may overtake its durable placeholder save.
+    expect(mocks.piAbort).not.toHaveBeenCalled();
+    expect(mocks.piStart).not.toHaveBeenCalled();
+    expect(mocks.preflightChatProvider).not.toHaveBeenCalled();
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    expect(
+      fixture.options.saveConversation.mock.calls[0][0].find(
+        (message: any) => message.role === "assistant",
+      ),
+    ).toMatchObject({ content: "Processing..." });
+    expect(fixture.chatSession.messages).toEqual(fixture.getRenderedMessages());
+
+    firstSave.resolve(undefined);
+    await act(async () => {
+      await send;
+    });
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledTimes(2),
+    );
+
+    expect(mocks.piAbort).toHaveBeenCalledTimes(1);
+    expect(mocks.piStart).toHaveBeenCalledTimes(1);
+    expect(mocks.preflightChatProvider).toHaveBeenCalledTimes(1);
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    expectRetryStatePersisted(
+      fixture,
+      "persist in order",
+      "ordered provider failure",
+    );
+  });
+
+  it("does not dispatch when the boundary changes during durable acceptance", async () => {
+    const firstSave = deferred<void>();
+    const fixture = createFixture({ activeTurn: true });
+    fixture.options.saveConversation.mockImplementationOnce(
+      () => firstSave.promise,
+    );
+
+    let send!: Promise<void>;
+    act(() => {
+      send = fixture.result.current.sendMessage("stale while saving");
+    });
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledTimes(1),
+    );
+
+    fixture.piAsyncOperationGenerationRef.current += 1;
+    firstSave.resolve(undefined);
+    await act(async () => {
+      await send;
+    });
+
+    expect(mocks.piAbort).not.toHaveBeenCalled();
+    expect(mocks.piStart).not.toHaveBeenCalled();
+    expect(mocks.preflightChatProvider).not.toHaveBeenCalled();
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledTimes(2),
+    );
+    const rendered = fixture.getRenderedMessages();
+    expect(fixture.chatSession.messages).toEqual(rendered);
+    const saveCalls = fixture.options.saveConversation.mock.calls;
+    expect(saveCalls[saveCalls.length - 1][0]).toEqual(rendered);
+    expect(rendered[1]).toMatchObject({
+      content:
+        "AI setup changed before this message was sent. Retry to send it with the selected provider.",
+      retryPrompt: "stale while saving",
+    });
+    // The stale operation must not clear the still-active foreground owner.
+    expect(fixture.piMessageIdRef.current).toBe("active-assistant");
+    expect(fixture.chatSession.isLoading).toBe(true);
+    expect(fixture.setIsLoading).not.toHaveBeenCalledWith(false);
+  });
+
+  it("does not start or prompt after deletion wins during the initial save", async () => {
+    const firstSave = deferred<void>();
+    const fixture = createFixture({ activeTurn: true });
+    fixture.options.saveConversation.mockImplementationOnce(
+      () => firstSave.promise,
+    );
+
+    let send!: Promise<boolean>;
+    act(() => {
+      send = fixture.result.current.sendMessage("delete while saving");
+    });
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledTimes(1),
+    );
+
+    markConversationDeleted("session-c1");
+    firstSave.resolve(undefined);
+    await act(async () => {
+      await send;
+    });
+
+    expect(mocks.piAbort).not.toHaveBeenCalled();
+    expect(mocks.piStart).not.toHaveBeenCalled();
+    expect(mocks.preflightChatProvider).not.toHaveBeenCalled();
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+  });
+
+  it("serializes an accepted retry commit after the prior failure save", async () => {
+    const oldFailureSave = deferred<void>();
+    mocks.preflightChatProvider.mockResolvedValueOnce({
+      ok: false,
+      message: "old provider failure",
+    } as any);
+    const fixture = createFixture({ running: true });
+    fixture.options.saveConversation.mockImplementation((rows: any[]) => {
+      const assistant = rows.find((message) => message.role === "assistant");
+      return assistant?.content === "old provider failure"
+        ? oldFailureSave.promise
+        : Promise.resolve();
+    });
+
+    await act(async () => {
+      await fixture.result.current.sendMessage("retry this turn");
+    });
+    expect(fixture.options.saveConversation).toHaveBeenCalledTimes(2);
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+
+    const failedBranch = fixture.getRenderedMessages();
+    const failedUserId = failedBranch[0].id;
+    fixture.options.messages = [...failedBranch];
+    fixture.rerender();
+
+    let retry!: Promise<boolean>;
+    act(() => {
+      retry = fixture.result.current.sendMessage(
+        "retry this turn",
+        undefined,
+        [],
+        { replaceFromMessageId: failedUserId, attachments: [] },
+      );
+    });
+    await waitFor(() =>
+      expect(mocks.externalizePreparedMessageIfNeeded).toHaveBeenCalledTimes(2),
+    );
+
+    // The retry shares the conversation queue. It cannot reach native
+    // acceptance or start its own commit save while the older failed branch
+    // is still writing.
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+    expect(fixture.options.saveConversation).toHaveBeenCalledTimes(2);
+
+    oldFailureSave.resolve(undefined);
+    let accepted = false;
+    await act(async () => {
+      accepted = await retry;
+    });
+    await waitFor(() =>
+      expect(fixture.options.saveConversation).toHaveBeenCalledTimes(3),
+    );
+
+    expect(accepted).toBe(true);
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+    const committedRetry = fixture.getRenderedMessages();
+    expect(fixture.chatSession.messages).toEqual(committedRetry);
+    const saveCalls = fixture.options.saveConversation.mock.calls;
+    expect(saveCalls[1][0]).toEqual(failedBranch);
+    expect(saveCalls[2][0]).toEqual(committedRetry);
+    expect(saveCalls[2][0].map((message: any) => message.id)).not.toContain(
+      failedUserId,
+    );
+    expect(saveCalls[2][0][1]).toMatchObject({
+      role: "assistant",
+      content: "Processing...",
+    });
+    expect(saveCalls[2][0][1]).not.toHaveProperty("retryPrompt");
+  });
+
+  it("scopes a stalled save away from a successor account and conversation", async () => {
+    const accountASave = deferred<void>();
+    const accountA = createFixture({
+      running: true,
+      sessionId: "session-a",
+      authToken: "token-a",
+      authGeneration: 1,
+      authUserId: "account-a",
+    });
+    accountA.options.saveConversation.mockImplementationOnce(
+      () => accountASave.promise,
+    );
+
+    let accountASend!: Promise<boolean>;
+    act(() => {
+      accountASend = accountA.result.current.sendMessage(
+        "account A private turn",
+      );
+    });
+    await waitFor(() =>
+      expect(accountA.options.saveConversation).toHaveBeenCalledTimes(1),
+    );
+    expect(mocks.piPrompt).not.toHaveBeenCalled();
+
+    // Simulate the auth-transition remount with a different generation and
+    // conversation. Its persistence queue must not inherit account A's stall.
+    const accountB = createFixture({
+      running: true,
+      sessionId: "session-b",
+      authToken: "token-b",
+      authGeneration: 2,
+      authUserId: "account-b",
+    });
+    await act(async () => {
+      await accountB.result.current.sendMessage("account B turn");
+    });
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+    expect(mocks.piPrompt).toHaveBeenCalledWith(
+      "session-b",
+      "account B turn",
+      null,
+      "account B turn",
+    );
+    const accountBRows = accountB.getRenderedMessages();
+
+    // The abandoned account A continuation may settle its own file, but it
+    // cannot dispatch or mutate the successor panel/foreground ownership.
+    accountA.authIdentityRef.current = {
+      token: "token-b",
+      generation: 2,
+      userId: "account-b",
+    };
+    accountA.piSessionIdRef.current = "session-b";
+    accountA.piAsyncOperationGenerationRef.current += 1;
+    accountASave.resolve(undefined);
+    await act(async () => {
+      await accountASend;
+    });
+
+    expect(mocks.piPrompt).toHaveBeenCalledTimes(1);
+    expect(accountB.getRenderedMessages()).toEqual(accountBRows);
+    expect(JSON.stringify(accountB.getRenderedMessages())).not.toContain(
+      "account A private turn",
+    );
+  });
+
   it("serializes duplicate sends while the first same-boundary start is deferred", async () => {
     const start = deferred<{
       status: "ok";
@@ -974,7 +2082,11 @@ describe("usePiSendTransport immutable dispatch boundary", () => {
       },
     ];
     fixture.replaceRenderedMessages(accountBPanel);
-    fixture.authIdentityRef.current = { token: "token-b", generation: 2 };
+    fixture.authIdentityRef.current = {
+      token: "token-b",
+      generation: 2,
+      userId: "account-b",
+    };
     fixture.piAsyncOperationGenerationRef.current = 2;
     fixture.piSessionIdRef.current = "session-b";
     fixture.piMessageIdRef.current = "account-b-assistant";

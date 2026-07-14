@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => ({
   })),
   piInvalidateQueuedPrompts: vi.fn(async () => ({
     status: "ok" as const,
-    data: 0,
+    data: [],
   })),
   piRequestState: vi.fn(async () => undefined),
   piSetModel: vi.fn(async () => undefined),
@@ -284,7 +284,7 @@ describe("usePiSessionLifecycle provider boundary", () => {
     });
     const invalidation = deferred<{
       status: "ok";
-      data: number;
+      data: string[];
     }>();
     mocks.piInvalidateQueuedPrompts.mockImplementationOnce(
       () => invalidation.promise,
@@ -307,7 +307,7 @@ describe("usePiSessionLifecycle provider boundary", () => {
     expect(mocks.piStart).not.toHaveBeenCalled();
     expect(mocks.piSetModel).not.toHaveBeenCalled();
 
-    invalidation.resolve({ status: "ok", data: 2 });
+    invalidation.resolve({ status: "ok", data: ["queue-1", "queue-2"] });
     await act(async () => {
       await invalidation.promise;
       await Promise.resolve();
@@ -335,7 +335,7 @@ describe("usePiSessionLifecycle provider boundary", () => {
       model: "claude-c",
       apiKey: "key-a",
     });
-    const invalidation = deferred<{ status: "ok"; data: number }>();
+    const invalidation = deferred<{ status: "ok"; data: string[] }>();
     mocks.piInvalidateQueuedPrompts.mockImplementationOnce(
       () => invalidation.promise,
     );
@@ -356,7 +356,7 @@ describe("usePiSessionLifecycle provider boundary", () => {
       model: "claude-c",
     });
 
-    invalidation.resolve({ status: "ok", data: 1 });
+    invalidation.resolve({ status: "ok", data: ["queue-1"] });
     await act(async () => {
       await invalidation.promise;
       await Promise.resolve();

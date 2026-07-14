@@ -109,6 +109,9 @@ import {
   isDevBillingBypassEnabled,
 } from "@/lib/app-entitlement";
 import { buildFreeTierAiSetupPage } from "@/lib/chat/free-tier-provider-setup";
+import { clearPendingAskUserReplyFromConversationFile } from "@/lib/chat-storage";
+import { removePendingAskUserReply } from "@/lib/chat/ask-user-reply-state";
+import { isConversationDeleted } from "@/lib/chat/conversation-delete-tombstone";
 
 // Session ID is per-conversation — set on mount (new conv) and updated on load/new.
 // Stored as a ref so event listeners always see the current value without stale closures.
@@ -244,12 +247,18 @@ export function StandaloneChat({
   const authIdentityRef = useRef({
     token: settings.user?.token ?? null,
     generation: 0,
+    userId: settings.user?.id ?? null,
   });
   const currentAuthToken = settings.user?.token ?? null;
-  if (authIdentityRef.current.token !== currentAuthToken) {
+  const currentAuthUserId = settings.user?.id ?? null;
+  if (
+    authIdentityRef.current.token !== currentAuthToken ||
+    authIdentityRef.current.userId !== currentAuthUserId
+  ) {
     authIdentityRef.current = {
       token: currentAuthToken,
       generation: authIdentityRef.current.generation + 1,
+      userId: currentAuthUserId,
     };
   }
   useTryInChatEvent({
@@ -769,6 +778,7 @@ export function StandaloneChat({
   const {
     clearPendingAttachments,
     consumePendingAttachments,
+    mergePendingAttachments,
     stagePendingAttachments,
   } = useNextTurnAttachments(conversationId);
   const consumeAuthSafePendingAttachments = useCallback(
@@ -1145,6 +1155,58 @@ export function StandaloneChat({
     selectedPresetRef: activePresetRef,
     inlineHistoryEnabled: !hideInlineHistory,
   });
+
+  useEffect(() => {
+    const handleQueuedPromptCancelled = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        sessionId?: string | null;
+        promptId?: string;
+      }>).detail;
+      if (!detail?.promptId || !detail.sessionId) return;
+      const storeState = useChatStore.getState();
+      const ownsLocalPanel = detail.sessionId === currentQueueSessionId;
+      // Queue acceptance patches the store synchronously before React commits
+      // the matching panel update. Prefer that freshest session-addressed
+      // snapshot so a very fast confirmed cancel cannot miss the marker in a
+      // stale effect closure and leave the card locked forever.
+      const storedMessages = storeState.sessions[detail.sessionId]?.messages as
+        | Message[]
+        | undefined;
+      const sourceMessages = storedMessages ?? (ownsLocalPanel ? messages : undefined);
+      if (sourceMessages) {
+        const removed = removePendingAskUserReply(
+          sourceMessages,
+          detail.promptId,
+        );
+        if (removed.changed) {
+          if (ownsLocalPanel) setMessages(removed.messages);
+          storeState.actions.setMessages(detail.sessionId, removed.messages);
+        }
+      }
+
+      // The native cancellation is authoritative. Always address the original
+      // file too—even if neither in-memory snapshot contains the marker yet.
+      // This shares the per-conversation save queue with the acceptance write,
+      // so a delayed save cannot resurrect the pending state afterward.
+      void clearPendingAskUserReplyFromConversationFile(
+        detail.sessionId,
+        detail.promptId,
+      ).catch((error) => {
+        console.warn("failed to clear cancelled Ask User reply:", error);
+      });
+    };
+
+    window.addEventListener(
+      "screenpipe:queued-prompt-cancelled",
+      handleQueuedPromptCancelled,
+    );
+    return () =>
+      window.removeEventListener(
+        "screenpipe:queued-prompt-cancelled",
+        handleQueuedPromptCancelled,
+      );
+  }, [currentQueueSessionId, messages]);
+
   const loadConversationRef = useRef(loadConversation);
   const startNewConversationRef = useRef<() => Promise<void>>(async () => {});
   loadConversationRef.current = loadConversation;
@@ -1317,6 +1379,7 @@ export function StandaloneChat({
     conversationOperationPendingRef,
     cancelStreamingMessageRender,
     consumePendingAttachments: consumeAuthSafePendingAttachments,
+    mergePendingAttachments,
     currentQueueSessionId,
     beginQueuedAction,
     finishQueuedAction,
@@ -1477,6 +1540,7 @@ export function StandaloneChat({
         sessionId: piSessionIdRef.current,
       };
       const boundaryIsCurrent = () =>
+        !isConversationDeleted(boundary.sessionId) &&
         boundary.sessionId === piSessionIdRef.current &&
         isSamePiAuthIdentity(boundary.authIdentity, authIdentityRef.current);
       const connection = allConnectionItems.find(
@@ -1926,6 +1990,7 @@ export function StandaloneChat({
                 })),
             }}
             messageListProps={messageListProps}
+            canSendMessages={Boolean(canChat) && !conversationOperationPending}
             isUserScrolledUp={isUserScrolledUp}
             scrollToBottom={scrollToBottom}
           />

@@ -50,6 +50,8 @@ import {
 import type { Message, ToolCall } from "@/lib/chat/types";
 import type { PiForegroundEventsOptions } from "@/components/chat/standalone/hooks/pi-types";
 import { requestUsageStatusRefresh } from "@/lib/hooks/use-usage-status";
+import { pendingAskUserToolCallForReply } from "@/lib/chat/ask-user-reply-state";
+import { isConversationDeleted } from "@/lib/chat/conversation-delete-tombstone";
 
 const POST_STREAM_SIDE_EFFECT_DELAY_MS = 1_500;
 const PI_FIRST_CALL_RETRY_HISTORY_LIMIT = 128;
@@ -318,6 +320,7 @@ export function usePiForegroundEvents({
     const handlePiEventData = (payload: unknown) => {
       const data = piEventDataFromUnknown(payload);
       if (!data) return;
+      if (isConversationDeleted(piSessionIdRef.current)) return;
 
       const emitSessionActivity = (
         partial: {
@@ -830,6 +833,13 @@ export function usePiForegroundEvents({
             (matchedTurnIntent?.hostedTurnId
               ? matchedTurnIntent.content
               : undefined);
+          const recoveredAskUserToolCallId = queuedDisplay?.askUserToolCallId ??
+            pendingAskUserToolCallForReply(
+              (useChatStore.getState().sessions[sidForStartedUser]?.messages as
+                | Message[]
+                | undefined) ?? messages,
+              text,
+            );
           const startedUser: Message | null = isOptimisticSteerEcho
             ? null
             : {
@@ -842,6 +852,12 @@ export function usePiForegroundEvents({
                 ...(queuedImages.length ? { images: [...queuedImages] } : {}),
                 ...(queuedDisplay?.attachments?.length
                   ? { attachments: [...queuedDisplay.attachments] }
+                  : {}),
+                ...(recoveredAskUserToolCallId
+                  ? {
+                      askUserToolCallId: recoveredAskUserToolCallId,
+                      askUserReplyAccepted: true,
+                    }
                   : {}),
                 ...(nextUserIntent === "steer"
                   ? { intent: "steer" as const }
@@ -1557,6 +1573,7 @@ export function usePiForegroundEvents({
             : null;
           const terminationStillCurrent = () =>
             mounted &&
+            !isConversationDeleted(terminatedSessionId) &&
             terminatedOperationGeneration ===
               piAsyncOperationGenerationRef.current &&
             piSessionIdRef.current === terminatedSessionId &&

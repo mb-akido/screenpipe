@@ -44,4 +44,25 @@ describe("SummaryCards", () => {
       expect.any(String),
     );
   });
+
+  it("keeps send shortcuts disabled until chat is ready", () => {
+    const onSendMessage = vi.fn();
+    const props = {
+      onSendMessage,
+      customTemplates: [],
+      onSaveCustomTemplate: vi.fn(),
+      onDeleteCustomTemplate: vi.fn(),
+    };
+    const { rerender } = render(<SummaryCards {...props} canSend={false} />);
+    const card = screen.getByRole("button", { name: /automate my work/i });
+
+    expect(card).toBeDisabled();
+    fireEvent.click(card);
+    expect(onSendMessage).not.toHaveBeenCalled();
+
+    rerender(<SummaryCards {...props} canSend />);
+    expect(card).toBeEnabled();
+    fireEvent.click(card);
+    expect(onSendMessage).toHaveBeenCalledTimes(1);
+  });
 });

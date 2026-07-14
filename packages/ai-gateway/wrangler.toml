@@ -111,6 +111,11 @@ binding = "AI"
 binding = "DB"
 database_name = "screenpipe-usage"
 database_id = "5496f4b2-03c9-496f-b8ca-675961c0622a"
+# Production deploys must only discover the additive, CREATE-only free-chat
+# bootstrap. The historical migrations are intentionally isolated in
+# wrangler.historical-migrations.toml and must never be replayed against prod.
+migrations_dir = "migrations-free-chat"
+migrations_table = "free_chat_migrations"
 
 # Bind a dispatch namespace. Use Workers for Platforms to deploy serverless functions programmatically on behalf of your customers.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#dispatch-namespace-bindings-workers-for-platforms

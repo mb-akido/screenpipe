@@ -38,4 +38,33 @@ describe("chat conversation history helpers", () => {
     expect(withConversationHistory("next", messages)).toContain("<conversation_history>");
     expect(withConversationHistory("next", messages)).toContain("[tool: search]");
   });
+
+  it("restores persisted source context exactly once in later prompts", () => {
+    const messages: Message[] = [
+      {
+        id: "contextual-turn",
+        role: "user",
+        content: "Explain this",
+        sourceContext: {
+          label: "timeline selection",
+          text: "selected persisted text",
+        },
+        timestamp: 1,
+      },
+      {
+        id: "answer",
+        role: "assistant",
+        content: "Done",
+        timestamp: 2,
+      },
+    ];
+
+    const prompt = withConversationHistory("What next?", messages);
+    const wrapper =
+      "[Context from timeline selection: selected persisted text]";
+
+    expect(prompt.split(wrapper)).toHaveLength(2);
+    expect(prompt).toContain(`${wrapper}\n\nExplain this`);
+    expect(prompt).toContain("What next?");
+  });
 });

@@ -20,6 +20,7 @@ import { CustomSummaryBuilder } from "./custom-summary-builder";
 
 interface SummaryCardsProps {
   onSendMessage: (message: string, displayLabel?: string) => void;
+  canSend?: boolean;
   customTemplates: CustomTemplate[];
   onSaveCustomTemplate: (template: CustomTemplate) => void;
   onDeleteCustomTemplate: (id: string) => void;
@@ -39,6 +40,7 @@ export interface ConnectionSetupSuggestion {
 
 export function SummaryCards({
   onSendMessage,
+  canSend = true,
   customTemplates,
   onSaveCustomTemplate,
   onDeleteCustomTemplate,
@@ -66,6 +68,7 @@ export function SummaryCards({
   const discover: TemplatePipe[] = [];
 
   const handleCardClick = (pipe: TemplatePipe) => {
+    if (!canSend) return;
     posthog.capture("home_card_clicked", {
       kind: pipe.featured ? "template_featured" : "template_discover",
       template_name: pipe.name,
@@ -79,6 +82,7 @@ export function SummaryCards({
   };
 
   const handleCustomTemplateClick = (template: CustomTemplate) => {
+    if (!canSend) return;
     posthog.capture("home_card_clicked", {
       kind: "custom_template",
       template_id: template.id,
@@ -101,7 +105,7 @@ export function SummaryCards({
         {userName ? `How can I help, ${userName}?` : "How can I help today?"}
       </h3>
       <p className="text-xs text-muted-foreground mb-2">
-        From everything you've seen, said, or heard
+        From everything you&apos;ve seen, said, or heard
       </p>
 
       {/* Hero card — Automate My Work */}
@@ -109,7 +113,8 @@ export function SummaryCards({
         <button
           data-testid={`summary-card-${featured[0].name}`}
           onClick={() => handleCardClick(featured[0])}
-          className="group w-full max-w-lg mb-1.5 text-left px-4 py-3.5 border border-border/40 bg-amber-500/[0.06] dark:bg-amber-400/[0.08] hover:!bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer"
+          disabled={!canSend}
+          className="group w-full max-w-lg mb-1.5 text-left px-4 py-3.5 border border-border/40 bg-amber-500/[0.06] dark:bg-amber-400/[0.08] hover:!bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer disabled:cursor-wait disabled:opacity-60"
         >
           <div className="flex items-center gap-3">
             <Zap className="h-5 w-5 shrink-0 text-foreground/70 group-hover:text-background" strokeWidth={1.5} />
@@ -133,7 +138,8 @@ export function SummaryCards({
           <button
             data-testid={`summary-card-${dayRecap.name}`}
             onClick={() => handleCardClick(dayRecap)}
-            className="group w-full max-w-lg mb-1.5 text-left px-3 py-2.5 border border-border/20 hover:bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer"
+            disabled={!canSend}
+            className="group w-full max-w-lg mb-1.5 text-left px-3 py-2.5 border border-border/20 hover:bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer disabled:cursor-wait disabled:opacity-60"
           >
             <div className="flex items-center gap-2">
               <CalendarDays className="h-4 w-4 shrink-0 text-muted-foreground group-hover:text-background" strokeWidth={1.5} />
@@ -159,7 +165,8 @@ export function SummaryCards({
             key={pipe.name}
             data-testid={`summary-card-${pipe.name}`}
             onClick={() => handleCardClick(pipe)}
-            className="px-2 py-0.5 text-[11px] bg-muted/20 hover:bg-foreground hover:text-background border border-border/30 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer"
+            disabled={!canSend}
+            className="px-2 py-0.5 text-[11px] bg-muted/20 hover:bg-foreground hover:text-background border border-border/30 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer disabled:cursor-wait disabled:opacity-60"
           >
             {pipe.title}
           </button>
@@ -171,6 +178,7 @@ export function SummaryCards({
         ].map((qt) => (
           <button
             key={qt.label}
+            disabled={!canSend}
             onClick={() => {
               posthog.capture("home_card_clicked", {
                 kind: "quick_summary_chip",
@@ -185,6 +193,7 @@ export function SummaryCards({
           </button>
         ))}
         <button
+          disabled={!canSend}
           onClick={() => {
             posthog.capture("home_card_clicked", { kind: "custom_summary_open" });
             setShowBuilder(true);
@@ -207,6 +216,7 @@ export function SummaryCards({
             <button
               key={pipe.name}
               onClick={() => handleCardClick(pipe)}
+              disabled={!canSend}
               className="group text-left p-2 border border-border/30 bg-muted/10 hover:bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer"
             >
               <div className="text-sm mb-0.5">{pipe.icon}</div>
@@ -232,9 +242,10 @@ export function SummaryCards({
               <div
                 key={ct.id}
                 role="button"
-                tabIndex={0}
+                aria-disabled={!canSend}
+                tabIndex={canSend ? 0 : -1}
                 onClick={() => handleCustomTemplateClick(ct)}
-                onKeyDown={(e) => e.key === "Enter" && handleCustomTemplateClick(ct)}
+                onKeyDown={(e) => canSend && e.key === "Enter" && handleCustomTemplateClick(ct)}
                 className="group text-left p-2 border border-border/30 bg-muted/10 hover:bg-foreground hover:text-background hover:border-foreground transition-all duration-150 cursor-pointer relative"
               >
                 <div className="text-sm mb-0.5">{"\u{1F4CC}"}</div>
@@ -266,6 +277,7 @@ export function SummaryCards({
           open={showBuilder}
           onClose={() => setShowBuilder(false)}
           onGenerate={(prompt, timeRange) => {
+            if (!canSend) return;
             posthog.capture("home_card_clicked", {
               kind: "custom_summary_generate",
               time_range: timeRange,

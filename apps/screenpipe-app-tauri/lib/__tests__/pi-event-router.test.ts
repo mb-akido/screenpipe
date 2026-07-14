@@ -28,6 +28,10 @@ vi.mock("@/lib/chat-storage", () => ({
 
 import { saveConversationFile } from "@/lib/chat-storage";
 import {
+  __resetConversationDeleteTombstonesForTests,
+  markConversationDeleted,
+} from "@/lib/chat/conversation-delete-tombstone";
+import {
   flushPendingSaves,
   handlePiEvent,
   handleTerminated,
@@ -44,6 +48,7 @@ function piEvt(sessionId: string, event: AgentInnerEvent): AgentEventEnvelope {
 
 function reset() {
   vi.clearAllMocks();
+  __resetConversationDeleteTombstonesForTests();
   deleteCachedBrowserState("A");
   useChatStore.setState({
     sessions: {},
@@ -106,6 +111,29 @@ describe("pi-event-router: envelope destructuring (the actual day-1 bug)", () =>
       event: { type: "message_start", message: { role: "assistant" } },
     });
     expect(useChatStore.getState().sessions["pipe:my-pipe:42"]).toBeUndefined();
+  });
+
+  it("never recreates or persists a deleted session from late Pi events", async () => {
+    seed("A", {
+      status: "streaming",
+      messages: [
+        { id: "u1", role: "user", content: "delete me", timestamp: 1 },
+      ],
+    });
+    markConversationDeleted("A");
+    useChatStore.getState().actions.drop("A");
+
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "late text" },
+      }),
+    );
+    await handlePiEvent(piEvt("A", { type: "agent_end" }));
+    await flushPendingSaves();
+
+    expect(useChatStore.getState().sessions.A).toBeUndefined();
+    expect(saveConversationFile).not.toHaveBeenCalled();
   });
 });
 
@@ -325,6 +353,46 @@ describe("pi-event-router: background content accumulation (the parallel-chat re
           }),
         ]),
       }),
+    );
+  });
+
+  it("recovers Ask User identity when a queued reply starts in the background after remount", async () => {
+    const reply = "Here are my answers to your ask_user questions:\n- Scope: Main agent";
+    seed("A", {
+      messages: [
+        {
+          id: "assistant-ask",
+          role: "assistant",
+          content: "Choose a scope",
+          timestamp: 1,
+          pendingAskUserReplies: [
+            {
+              toolCallId: "ask-1",
+              queueId: "queue-1",
+              replyText: reply,
+            },
+          ],
+        },
+      ] as any,
+    });
+    useChatStore.setState({ currentId: "B" });
+
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_start",
+        message: { role: "user", content: reply },
+      }),
+    );
+
+    expect(useChatStore.getState().sessions.A.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "user",
+          content: reply,
+          askUserToolCallId: "ask-1",
+          askUserReplyAccepted: true,
+        }),
+      ]),
     );
   });
 

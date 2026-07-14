@@ -353,9 +353,14 @@ impl PiQueueState {
         }
     }
 
-    fn invalidate_provider_epoch(&self) -> usize {
+    fn invalidate_provider_epoch(&self) -> Vec<String> {
         self.provider_epoch.fetch_add(1, Ordering::SeqCst);
-        let visible = self.queued.borrow().len();
+        let visible = self
+            .queued
+            .borrow()
+            .iter()
+            .map(|prompt| prompt.id.clone())
+            .collect::<Vec<_>>();
         self.queued.send_modify(|queued| queued.clear());
         if let Ok(mut payloads) = self.queued_payloads.lock() {
             payloads.clear();
@@ -452,7 +457,7 @@ impl PiQueueHandle {
     /// yet, and advance the provider generation. Holding stdin while the epoch
     /// changes means a racing drain has exactly two outcomes: it wrote under
     /// the old provider first, or it observes the new epoch and rejects.
-    pub async fn invalidate_pending_prompts(&self) -> Result<usize, String> {
+    pub async fn invalidate_pending_prompts(&self) -> Result<Vec<String>, String> {
         let _epoch_guard = self.state.prompt_epoch_transition.lock().await;
         let stdin = self
             .stdin
@@ -495,7 +500,7 @@ impl PiQueueHandle {
             }))
             .await
             .map_err(|_| "Pi command queue closed".to_string())?;
-        Ok((invalidated, rx))
+        Ok((invalidated.len(), rx))
     }
 
     /// Remove a queued prompt and return its original command payload. Used
@@ -1295,7 +1300,7 @@ mod tests {
         let (handle, join) = spawn_queue(stdin, state.clone(), 0);
 
         state.mark_agent_active();
-        let (_first_id, first_rx) = handle
+        let (first_id, first_rx) = handle
             .send_prompt(
                 json!({ "type": "prompt", "text": "provider-a-first" }),
                 WaitMode::Prompt,
@@ -1304,7 +1309,7 @@ mod tests {
             )
             .await
             .expect("enqueue first provider-a prompt");
-        let (_second_id, second_rx) = handle
+        let (second_id, second_rx) = handle
             .send_prompt(
                 json!({ "type": "prompt", "text": "provider-a-second" }),
                 WaitMode::Prompt,
@@ -1319,7 +1324,9 @@ mod tests {
             .invalidate_pending_prompts()
             .await
             .expect("establish provider boundary");
-        assert_eq!(invalidated, 2);
+        assert_eq!(invalidated.len(), 2);
+        assert!(invalidated.contains(&first_id));
+        assert!(invalidated.contains(&second_id));
         assert!(state.queued_snapshot().is_empty());
 
         state.mark_agent_idle();

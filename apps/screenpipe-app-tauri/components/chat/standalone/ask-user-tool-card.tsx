@@ -94,6 +94,20 @@ function normalizeQuestion(value: unknown, index: number): AskUserQuestion | nul
   };
 }
 
+function ensureUniqueQuestionIds(questions: AskUserQuestion[]): AskUserQuestion[] {
+  const used = new Set<string>();
+  return questions.map((question) => {
+    let id = question.id;
+    let suffix = 2;
+    while (used.has(id)) {
+      id = `${question.id}-${suffix}`;
+      suffix += 1;
+    }
+    used.add(id);
+    return id === question.id ? question : { ...question, id };
+  });
+}
+
 export function isAskUserToolCall(toolCall: Pick<ToolCall, "toolName">): boolean {
   return toolCall.toolName.replace(/[^a-z0-9]/gi, "").toLowerCase() === "askuser";
 }
@@ -101,9 +115,11 @@ export function isAskUserToolCall(toolCall: Pick<ToolCall, "toolName">): boolean
 export function parseAskUserToolCall(toolCall: Pick<ToolCall, "args">): ParsedAskUserToolCall | null {
   const args = isRecord(toolCall.args) ? toolCall.args : {};
   const title = stringValue(args.title);
-  const questions = Array.isArray(args.questions)
-    ? args.questions.map(normalizeQuestion).filter((q): q is AskUserQuestion => Boolean(q))
-    : [];
+  const questions = ensureUniqueQuestionIds(
+    Array.isArray(args.questions)
+      ? args.questions.map(normalizeQuestion).filter((q): q is AskUserQuestion => Boolean(q))
+      : [],
+  );
 
   if (questions.length > 0) return { title, questions };
 
@@ -168,9 +184,17 @@ function toolResultNeedsManualFollowup(result?: string): boolean {
 export function AskUserToolCard({
   toolCall,
   onSubmit,
+  disabled = false,
+  alreadySubmitted = false,
+  deliveryPending = false,
+  retryRequired = false,
 }: {
   toolCall: ToolCall;
-  onSubmit?: (reply: string, displayLabel: string) => Promise<void> | void;
+  onSubmit?: (reply: string, displayLabel: string, toolCallId: string) => Promise<boolean> | boolean;
+  disabled?: boolean;
+  alreadySubmitted?: boolean;
+  deliveryPending?: boolean;
+  retryRequired?: boolean;
 }) {
   const argsSignature = React.useMemo(() => {
     try {
@@ -191,12 +215,10 @@ export function AskUserToolCard({
     initialAnswers(parsed?.questions ?? []),
   );
   const [submitting, setSubmitting] = React.useState(false);
-  const [submitted, setSubmitted] = React.useState(false);
 
   React.useEffect(() => {
     setAnswers(initialAnswers(parsed?.questions ?? []));
     setActiveIndex(0);
-    setSubmitted(false);
   }, [argsSignature, parsed]);
 
   if (!parsed) return null;
@@ -205,7 +227,21 @@ export function AskUserToolCard({
   const activeQuestion = questions[Math.min(activeIndex, Math.max(0, questions.length - 1))];
   const activeAnswer = answers[activeQuestion.id] ?? { values: [], customText: "" };
   const selectedOption = activeQuestion.options.find((option) => option.value === activeAnswer.values[0]);
-  const canSubmit = Boolean(formatAskUserReply(parsed, answers)) && !submitting && !submitted && Boolean(onSubmit);
+  const requiredAnswersComplete = questions.every(
+    (question) =>
+      !question.required ||
+      answerLabels(
+        question,
+        answers[question.id] ?? { values: [], customText: "" },
+      ).length > 0,
+  );
+  const controlsLocked = submitting || alreadySubmitted || retryRequired;
+  const canSubmit =
+    Boolean(formatAskUserReply(parsed, answers)) &&
+    requiredAnswersComplete &&
+    !disabled &&
+    !controlsLocked &&
+    Boolean(onSubmit);
   const needsManualFollowup = toolResultNeedsManualFollowup(toolCall.result);
 
   const updateAnswer = (questionId: string, next: Partial<AskUserAnswer>) => {
@@ -222,11 +258,14 @@ export function AskUserToolCard({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     const reply = formatAskUserReply(parsed, answers);
-    if (!reply || !onSubmit) return;
+    if (!reply || !requiredAnswersComplete || !onSubmit || disabled || controlsLocked) return;
     setSubmitting(true);
     try {
-      await onSubmit(reply, formatAskUserDisplayLabel(parsed, answers));
-      setSubmitted(true);
+      await onSubmit(
+        reply,
+        formatAskUserDisplayLabel(parsed, answers),
+        toolCall.id,
+      );
     } finally {
       setSubmitting(false);
     }
@@ -244,8 +283,12 @@ export function AskUserToolCard({
             {parsed.title || "Ask user"}
           </div>
           <div className="mt-0.5 text-[11px] text-muted-foreground">
-            {submitted
+            {alreadySubmitted && deliveryPending
+              ? "Answer queued — retry is locked to prevent duplicates"
+              : alreadySubmitted
               ? "Answer sent"
+              : retryRequired
+                ? "Answer saved — use Try again below"
               : toolCall.isRunning
                 ? "Pi is waiting for your input"
                 : needsManualFollowup
@@ -253,10 +296,14 @@ export function AskUserToolCard({
                   : "Ready to answer"}
           </div>
         </div>
-        {submitted ? (
+        {alreadySubmitted || retryRequired ? (
           <span className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] text-muted-foreground">
             <Check className="h-3 w-3" />
-            sent
+            {alreadySubmitted
+              ? deliveryPending
+                ? "queued"
+                : "sent"
+              : "retry"}
           </span>
         ) : null}
       </div>
@@ -285,6 +332,13 @@ export function AskUserToolCard({
         </div>
       ) : null}
 
+      {alreadySubmitted && deliveryPending ? (
+        <div className="mt-3 rounded-md border border-border/60 bg-background px-3 py-2 text-[11px] text-muted-foreground">
+          If Screenpipe restarted before this reply appeared in chat, delivery
+          is uncertain. Start a new chat instead of sending this answer again.
+        </div>
+      ) : null}
+
       <div className="mt-3 space-y-2">
         <div>
           <div className="text-sm font-medium leading-snug text-foreground">
@@ -307,6 +361,7 @@ export function AskUserToolCard({
                   <input
                     type="checkbox"
                     checked={checked}
+                    disabled={controlsLocked}
                     onChange={(event) => {
                       const nextValues = event.target.checked
                         ? [...activeAnswer.values, option.value]
@@ -331,6 +386,7 @@ export function AskUserToolCard({
               aria-label={`Answer ${activeQuestion.label}`}
               data-testid={`ask-user-answer-${activeQuestion.id}`}
               value={activeAnswer.values[0] ?? ""}
+              disabled={controlsLocked}
               onChange={(event) => {
                 updateAnswer(activeQuestion.id, {
                   values: event.target.value ? [event.target.value] : [],
@@ -366,6 +422,7 @@ export function AskUserToolCard({
         <textarea
           aria-label={`Custom answer ${activeQuestion.label}`}
           value={activeAnswer.customText}
+          disabled={controlsLocked}
           onChange={(event) => updateAnswer(activeQuestion.id, { customText: event.target.value })}
           rows={2}
           placeholder={activeQuestion.options.length > 0 ? "Type your own answer or add nuance..." : "Type your answer..."}
@@ -375,9 +432,13 @@ export function AskUserToolCard({
 
       <div className="mt-3 flex items-center justify-between gap-3">
         <div className="min-w-0 text-[11px] text-muted-foreground">
-          {needsManualFollowup
-            ? "Screenpipe will send this as the next chat message."
-            : "Your selection is sent back into this chat."}
+          {disabled
+            ? "Chat isn't ready to send your reply yet."
+            : retryRequired
+              ? "The saved answer was not accepted. Use Try again on its error message."
+            : needsManualFollowup
+              ? "Screenpipe will send this as the next chat message."
+              : "Your selection is sent back into this chat."}
         </div>
         <button
           type="submit"
