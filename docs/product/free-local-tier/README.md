@@ -23,7 +23,7 @@ This evidence says a two-turn launch reaches a majority of observed light usage 
 
 ## Product contract
 
-| Capability | Free / Local | Business / enterprise |
+| Capability | Free / Local | Paid (Business / Team / enterprise) |
 |---|---:|---:|
 | Local screen + audio capture | Yes, forever | Yes |
 | Local search, timeline, meetings | Yes, forever | Yes |
@@ -179,7 +179,7 @@ These are conceptual, static launch-review mockups rather than pixel claims abou
 | Authenticated free account, marked hosted turn 1–2 | Allowed and recorded once per explicit user message |
 | Free old client without the turn marker while preview is on | `426 free_chat_client_update_required` before rate limits, D1 reservation, or inference; never silently metered |
 | Free old client while enforcement is on and preview is off | `402 hosted_ai_subscription_required`; local/user-owned AI remains available |
-| Active Business/enterprise on an old client | Paid hosted route continues without requiring the free-preview marker |
+| Active Business/Team/enterprise on an old client | Paid hosted route continues without requiring the free-preview marker |
 | Active Basic/app-only/lifetime/manual row with modern `cloud=false`, even if a stale top-level cloud boolean says true | Remains on the free-preview path; the explicit modern denial wins and raw subscription-row existence never grants unlimited hosted AI |
 | Enterprise seat plus an app-only lifetime primary entitlement | Canonical enterprise-account override preserves paid hosted AI even though the primary entitlement object's cloud feature is false |
 | Positive prepaid-credit balance without Business/enterprise | Does not bypass enforcement or the two-turn ledger |
@@ -255,7 +255,7 @@ These are conceptual, static launch-review mockups rather than pixel claims abou
 
 Set the expected repository variables whenever the intended production state changes, and verify the live headers immediately after a dashboard-only change as well as after a deploy. A post-deploy verification failure reports a mismatch; it does not undo a Worker version that has already deployed.
 
-Old free clients do not have the opaque turn marker or new modal. With enforcement and preview on, they receive `426` and must update; they are not silently charged, counted, or inferred. With enforcement on and preview off, they receive the ordinary hosted-subscription requirement. Their recorder, local data, local API/MCP, and user-owned providers remain usable. Active Business/enterprise clients bypass the free-preview marker requirement and continue through paid limits.
+Old free clients do not have the opaque turn marker or new modal. With enforcement and preview on, they receive `426` and must update; they are not silently charged, counted, or inferred. With enforcement on and preview off, they receive the ordinary hosted-subscription requirement. Their recorder, local data, local API/MCP, and user-owned providers remain usable. Active Business/Team/enterprise clients bypass the free-preview marker requirement and continue through paid limits.
 
 ## Rollback
 
