@@ -9,8 +9,9 @@ import { toast } from "@/components/ui/use-toast";
 import { buildAppAwarenessContext, buildConnectionsContext, buildSystemPrompt } from "@/lib/chat/system-prompt";
 import { commands, type AIPreset, type PiInfo, type PiProviderConfig } from "@/lib/utils/tauri";
 import type { ActivityAppItem, ConnectedIntegration, ConnectionListItem } from "@/lib/chat/connection-suggestions";
+import { isDevBillingBypassEnabled } from "@/lib/app-entitlement";
 import {
-  isScreenpipeCloudProvider,
+  requiresScreenpipeCloudLogin,
   resolveScreenpipeCloudModel,
 } from "@/lib/chat/free-tier-turn-marker";
 
@@ -120,7 +121,11 @@ export function usePiSessionLifecycle({
 
   const hasPresets = Boolean(aiPresets && aiPresets.length > 0);
   const hasValidModel = Boolean(activePreset?.model && activePreset.model.trim() !== "");
-  const needsLogin = isScreenpipeCloudProvider(activePreset?.provider) && !userToken;
+  const needsLogin = requiresScreenpipeCloudLogin(
+    activePreset?.provider,
+    userToken,
+    isDevBillingBypassEnabled(),
+  );
   const canChat = hasPresets && hasValidModel && !needsLogin && !piStarting;
 
   const disabledReason = (() => {

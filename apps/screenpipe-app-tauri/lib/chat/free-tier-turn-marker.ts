@@ -7,6 +7,20 @@ export function isScreenpipeCloudProvider(provider: string | null | undefined): 
 }
 
 /**
+ * Hosted preview needs an authenticated account so the lifetime turn limit is
+ * enforceable. Debug/E2E builds already have an explicit billing bypass for
+ * exercising feature flows; honor that same boundary instead of disabling
+ * synthetic chat interactions that never reach the hosted gateway.
+ */
+export function requiresScreenpipeCloudLogin(
+  provider: string | null | undefined,
+  userToken: string | null | undefined,
+  billingBypassEnabled: boolean,
+): boolean {
+  return isScreenpipeCloudProvider(provider) && !userToken && !billingBypassEnabled;
+}
+
+/**
  * Invisible helpers such as AI-generated chat titles must never consume a
  * free user's visible hosted preview. User-owned providers may run because the
  * user pays them directly; Screenpipe Cloud auxiliary calls require Business.

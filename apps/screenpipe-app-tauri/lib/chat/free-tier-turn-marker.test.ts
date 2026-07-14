@@ -8,6 +8,7 @@ import {
   isScreenpipeCloudProvider,
   markScreenpipeCloudTurn,
   payerSafePiAutoStartPresets,
+  requiresScreenpipeCloudLogin,
   resolvePiDispatchProvider,
   resolveScreenpipeCloudModel,
 } from "./free-tier-turn-marker";
@@ -25,6 +26,13 @@ describe("markScreenpipeCloudTurn", () => {
     expect(canUseProviderForAuxiliaryAI("screenpipe-cloud", true)).toBe(true);
     expect(canUseProviderForAuxiliaryAI("openai-chatgpt", false)).toBe(true);
     expect(canUseProviderForAuxiliaryAI("native-ollama", false)).toBe(true);
+  });
+
+  it("requires authentication for hosted preview except in the explicit test bypass", () => {
+    expect(requiresScreenpipeCloudLogin("screenpipe-cloud", null, false)).toBe(true);
+    expect(requiresScreenpipeCloudLogin("pi", "signed-token", false)).toBe(false);
+    expect(requiresScreenpipeCloudLogin("openai-chatgpt", null, false)).toBe(false);
+    expect(requiresScreenpipeCloudLogin("screenpipe-cloud", null, true)).toBe(false);
   });
 
   it("forces only free hosted requests onto the bounded Auto lane", () => {
