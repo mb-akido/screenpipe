@@ -23,8 +23,27 @@ jobs:
       - name: Create dummy signing inputs
         shell: pwsh
         run: |
-          Copy-Item "C:\Windows\System32\notepad.exe" "$env:RUNNER_TEMP\test-signing.exe"
-          Copy-Item "C:\Windows\System32\notepad.exe" "$env:RUNNER_TEMP\nst-uninstaller.tmp"
+          $unsignedSource = "$env:RUNNER_TEMP\unsigned-source.exe"
+          Copy-Item "C:\Windows\System32\notepad.exe" $unsignedSource
+
+          $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction Stop |
+            Where-Object { $_.DirectoryName -match "\\x64$" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) {
+            throw 'signtool.exe was not found'
+          }
+
+          & $signtool.FullName remove /s $unsignedSource
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not remove the source Authenticode signature (exit $LASTEXITCODE)"
+          }
+          if ((Get-AuthenticodeSignature $unsignedSource).Status -ne 'NotSigned') {
+            throw 'Test source is still signed'
+          }
+
+          Copy-Item $unsignedSource "$env:RUNNER_TEMP\test-signing.exe"
+          Copy-Item $unsignedSource "$env:RUNNER_TEMP\nst-uninstaller.tmp"
 
       - name: Install CodeSignTool
         shell: pwsh
@@ -59,5 +78,8 @@ jobs:
             Write-Host "$inputPath signer: $($signature.SignerCertificate.Subject)"
             if ($signature.Status -ne 'Valid') {
               throw "Authenticode signature is $($signature.Status) for $inputPath"
+            }
+            if ($signature.SignerCertificate.Subject -notmatch 'Mediar') {
+              throw "Unexpected Authenticode signer for ${inputPath}: $($signature.SignerCertificate.Subject)"
             }
           }
