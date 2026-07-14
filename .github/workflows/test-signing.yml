@@ -23,19 +23,19 @@ jobs:
       - name: Create dummy signing inputs
         shell: pwsh
         run: |
-          $unsignedSource = "$env:RUNNER_TEMP\unsigned-source.exe"
+          $unsignedSource = "$env:RUNNER_TEMP\unsigned-source.dll"
           Add-Type -TypeDefinition @'
           public static class Program
           {
               public static void Main() { }
           }
-          '@ -OutputAssembly $unsignedSource -OutputType ConsoleApplication
+          '@ -OutputAssembly $unsignedSource
 
           if ((Get-AuthenticodeSignature $unsignedSource).Status -ne 'NotSigned') {
             throw 'Test source is still signed'
           }
 
-          Copy-Item $unsignedSource "$env:RUNNER_TEMP\test-signing.exe"
+          Copy-Item $unsignedSource "$env:RUNNER_TEMP\test-signing.dll"
           Copy-Item $unsignedSource "$env:RUNNER_TEMP\nst-uninstaller.tmp"
 
       - name: Install CodeSignTool
@@ -56,7 +56,7 @@ jobs:
           ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
         run: |
           $inputs = @(
-            "$env:RUNNER_TEMP\test-signing.exe",
+            "$env:RUNNER_TEMP\test-signing.dll",
             "$env:RUNNER_TEMP\nst-uninstaller.tmp"
           )
 
