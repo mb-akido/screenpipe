@@ -57,13 +57,14 @@ describe("buildDailyLimitMessage", () => {
   });
 
   it("tailors copy by tier", () => {
-    expect(buildDailyLimitMessage('{"tier":"subscribed"}')).toContain("daily limit");
-    expect(buildDailyLimitMessage('{"tier":"logged_in"}')).toContain("upgrade to Business");
-    expect(buildDailyLimitMessage('{"tier":"anonymous"}')).toContain("Sign in for more");
+    expect(buildDailyLimitMessage('{"tier":"subscribed"}')).toContain("daily hosted AI limit");
+    expect(buildDailyLimitMessage('{"tier":"logged_in"}')).toContain("Upgrade to Business");
+    expect(buildDailyLimitMessage('{"tier":"anonymous"}')).toContain("Hosted AI requires sign-in");
   });
 
-  it("falls back to a generic message for unknown shapes", () => {
-    expect(buildDailyLimitMessage("???")).toContain("free queries");
+  it("falls back to sign-in and own-provider guidance for unknown shapes", () => {
+    expect(buildDailyLimitMessage("???")).toContain("Hosted AI requires sign-in");
+    expect(buildDailyLimitMessage("???")).toContain("connect your own AI provider");
   });
 });
 
