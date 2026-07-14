@@ -25,6 +25,7 @@ pub mod financialsense;
 pub mod fireflies;
 pub mod github_issues;
 pub mod glean;
+pub mod gmail;
 pub mod google_calendar;
 pub mod google_docs;
 pub mod granola;
@@ -321,6 +322,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(calcom::CalCom),
         Box::new(calendly::Calendly),
         Box::new(glean::Glean),
+        Box::new(gmail::Gmail),
         Box::new(google_calendar::GoogleCalendar),
         Box::new(google_docs::GoogleDocs),
         Box::new(quickbooks::QuickBooks),
