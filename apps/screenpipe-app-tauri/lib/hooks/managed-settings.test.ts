@@ -135,6 +135,23 @@ describe("computeManagedSettingUpdates", () => {
     expect(r.engineChanged).toBe(true);
   });
 
+  it("keeps the PII master and AI workers consistent", () => {
+    expect(
+      computeManagedSettingUpdates({ asyncImagePiiRedaction: "true" }, {}).engineUpdates,
+    ).toMatchObject({ asyncImagePiiRedaction: true, usePiiRemoval: true });
+
+    expect(
+      computeManagedSettingUpdates(
+        { usePiiRemoval: "false", asyncPiiRedaction: "true", asyncImagePiiRedaction: "true" },
+        {},
+      ).engineUpdates,
+    ).toMatchObject({
+      usePiiRemoval: false,
+      asyncPiiRedaction: false,
+      asyncImagePiiRedaction: false,
+    });
+  });
+
   it("forcing a value equal to the current/default does NOT trigger a restart", () => {
     // disabled toggles default to false; forcing false on a fresh device = no change
     expect(computeManagedSettingUpdates({ disableVision: "false" }, {}).engineChanged).toBe(false);

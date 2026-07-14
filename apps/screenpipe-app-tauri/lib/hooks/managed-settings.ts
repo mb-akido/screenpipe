@@ -237,6 +237,19 @@ export function computeManagedSettingUpdates(
     target[definition.deviceKey] = value;
   }
 
+  // Keep the user-facing PII hierarchy coherent even for policies written by
+  // older dashboards or direct API clients. Master off wins; an AI worker on
+  // otherwise implies the cheap deterministic baseline is on too.
+  if (engineUpdates.usePiiRemoval === false) {
+    engineUpdates.asyncPiiRedaction = false;
+    engineUpdates.asyncImagePiiRedaction = false;
+  } else if (
+    engineUpdates.asyncPiiRedaction === true ||
+    engineUpdates.asyncImagePiiRedaction === true
+  ) {
+    engineUpdates.usePiiRemoval = true;
+  }
+
   const effective = (key: string): unknown =>
     current[key] !== undefined ? current[key] : defaults.get(key);
   const changed = ([key, value]: [string, ManagedSettingValue]) =>
