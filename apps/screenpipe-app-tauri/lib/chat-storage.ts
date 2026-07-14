@@ -63,6 +63,10 @@ export interface ConversationListOptions {
   hiddenOnly?: boolean;
   /** Restrict results to one conversation surface. Undefined means all kinds. */
   kind?: ConversationKind | "all";
+  /** Restrict pipe conversations to one installed pipe. Applied while scanning
+   *  so callers can lazily load a pipe's recent runs without hydrating every
+   *  saved conversation into the global chat store. */
+  pipeName?: string;
 }
 
 async function getChatsDir(): Promise<string> {
@@ -377,6 +381,9 @@ function matchesConversationOptions(
     return false;
   }
   if (options.kind && options.kind !== "all" && meta.kind !== options.kind) {
+    return false;
+  }
+  if (options.pipeName && meta.pipeContext?.pipeName !== options.pipeName) {
     return false;
   }
   return true;

@@ -89,6 +89,7 @@ function putConversation(
     title?: string;
     hidden?: boolean;
     kind?: "chat" | "pipe-watch" | "pipe-run";
+    pipeName?: string;
     createdAt?: number;
     titleSource?: "fallback" | "ai" | "user";
     /** When set, append an assistant message with this content. */
@@ -122,6 +123,9 @@ function putConversation(
     updatedAt: opts.updatedAt,
     hidden: opts.hidden,
     kind: opts.kind,
+    ...(opts.pipeName
+      ? { pipeContext: { pipeName: opts.pipeName, executionId: opts.updatedAt } }
+      : {}),
     lastContentAt: opts.lastContentAt,
     lastViewedAt: opts.lastViewedAt,
   };
@@ -207,6 +211,36 @@ describe("chat-storage bounded history", () => {
     });
 
     expect(rows.map((row) => row.id)).toEqual(["visible-old"]);
+  });
+
+  it("lazily fills a pipe-specific page even when its runs are older than boot history", async () => {
+    for (let i = 0; i < 60; i += 1) {
+      putConversation(`new-chat-${i}`, { updatedAt: 1_000 + i });
+    }
+    for (let i = 0; i < 12; i += 1) {
+      putConversation(`target-run-${i}`, {
+        updatedAt: 100 + i,
+        kind: "pipe-run",
+        pipeName: "target-pipe",
+      });
+    }
+    putConversation("other-run", {
+      updatedAt: 500,
+      kind: "pipe-run",
+      pipeName: "other-pipe",
+    });
+
+    const rows = await listConversations({
+      limit: 10,
+      includeHidden: false,
+      kind: "pipe-run",
+      pipeName: "target-pipe",
+    });
+
+    expect(rows).toHaveLength(10);
+    expect(rows[0].id).toBe("target-run-11");
+    expect(rows.at(-1)?.id).toBe("target-run-2");
+    expect(rows.every((row) => row.pipeContext?.pipeName === "target-pipe")).toBe(true);
   });
 
   it("repairs stale persisted lastUserMessageAt from newer user-message timestamps", () => {

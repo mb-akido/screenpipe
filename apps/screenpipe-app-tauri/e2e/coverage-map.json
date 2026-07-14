@@ -243,6 +243,16 @@
       "notes": "Pipe auto-grouping (collapse, badge, expand/collapse, localStorage persistence) and manual sidebar groups (move-to-group, section headers, remove-from-group cleanup). 8 tests."
     },
     {
+      "spec": "chat-sidebar-pipe-inventory.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "pipes", "real-ui-e2e"],
+      "features": ["chat", "pipes", "chat-sidebar-groups"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "mixed",
+      "notes": "A collapsed Pipes section avoids loading run history; expanding it lists the complete installed-pipe inventory, and expanding a pipe lazily loads only its newest 10 saved runs."
+    },
+    {
       "spec": "chat-parallel-jobs-duplicate.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["chat-ai"],

@@ -6,9 +6,9 @@ and layer declared in the manifest, weighted by confidence and criticality.
 
 - Manifest: `e2e/coverage-map.json`
 - Specs directory: `e2e/specs`
-- Mapped specs: 65
-- Declared test blocks: 204
-- Weighted coverage points: 157.3
+- Mapped specs: 66
+- Declared test blocks: 206
+- Weighted coverage points: 159.3
 
 Confidence weights: strong=1.0, partial=0.7, conditional=0.4, smoke=0.3.
 Criticality weights: high=1.0, medium=0.7, low=0.4.
@@ -19,9 +19,9 @@ can execute more runtime cases than this number shows.
 
 | Platform | Specs | Declared tests | Weighted points | Layers | Features | Critical score |
 | --- | --- | --- | --- | --- | --- | --- |
-| windows | 56 | 191 | 152.4 | 15 | 61 | 92% |
-| macos | 62 | 170 | 129.9 | 17 | 63 | 89% |
-| linux | 48 | 155 | 124.4 | 13 | 58 | 86% |
+| windows | 57 | 193 | 154.4 | 15 | 61 | 92% |
+| macos | 63 | 172 | 131.9 | 17 | 63 | 89% |
+| linux | 49 | 157 | 126.4 | 13 | 58 | 86% |
 
 ## Runtime Results
 
@@ -37,15 +37,15 @@ pass/fail/skip counts.
 | auth | - | 1 specs / 1 tests / 1.0 pts | - |
 | billing | 4 specs / 5 tests / 4.7 pts | 4 specs / 5 tests / 4.7 pts | 4 specs / 5 tests / 4.7 pts |
 | capture-ocr | 2 specs / 14 tests / 5.6 pts | 2 specs / 4 tests / 1.6 pts | 1 specs / 3 tests / 1.2 pts |
-| chat-ai | 14 specs / 23 tests / 14.4 pts | 17 specs / 27 tests / 15.7 pts | 13 specs / 22 tests / 13.9 pts |
+| chat-ai | 15 specs / 24 tests / 15.4 pts | 18 specs / 28 tests / 16.7 pts | 14 specs / 23 tests / 14.9 pts |
 | entitlement | - | 1 specs / 1 tests / 1.0 pts | - |
-| local-api | 14 specs / 92 tests / 76.6 pts | 13 specs / 67 tests / 57.6 pts | 11 specs / 66 tests / 57.2 pts |
+| local-api | 14 specs / 93 tests / 77.6 pts | 13 specs / 68 tests / 58.6 pts | 11 specs / 67 tests / 58.2 pts |
 | notifications | 2 specs / 11 tests / 10.1 pts | 2 specs / 4 tests / 2.4 pts | 1 specs / 3 tests / 2.1 pts |
 | onboarding | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts |
 | os-integration | 4 specs / 16 tests / 15.1 pts | 4 specs / 3 tests / 0.9 pts | - |
-| performance | 2 specs / 43 tests / 43.0 pts | 4 specs / 33 tests / 29.5 pts | 1 specs / 28 tests / 28.0 pts |
-| pipes | 2 specs / 11 tests / 11.0 pts | 2 specs / 11 tests / 11.0 pts | 2 specs / 11 tests / 11.0 pts |
-| real-ui-e2e | 35 specs / 111 tests / 88.2 pts | 36 specs / 98 tests / 77.7 pts | 32 specs / 92 tests / 75.8 pts |
+| performance | 2 specs / 44 tests / 44.0 pts | 4 specs / 34 tests / 30.5 pts | 1 specs / 29 tests / 29.0 pts |
+| pipes | 3 specs / 12 tests / 12.0 pts | 3 specs / 12 tests / 12.0 pts | 3 specs / 12 tests / 12.0 pts |
+| real-ui-e2e | 36 specs / 112 tests / 89.2 pts | 37 specs / 99 tests / 78.7 pts | 33 specs / 93 tests / 76.8 pts |
 | settings | 13 specs / 31 tests / 28.6 pts | 14 specs / 25 tests / 21.9 pts | 12 specs / 23 tests / 20.6 pts |
 | storage-privacy | 6 specs / 20 tests / 19.1 pts | 5 specs / 12 tests / 11.1 pts | 4 specs / 12 tests / 11.1 pts |
 | tauri-command | 8 specs / 17 tests / 10.3 pts | 9 specs / 19 tests / 10.8 pts | 8 specs / 17 tests / 10.3 pts |
@@ -68,7 +68,7 @@ pass/fail/skip counts.
 | Window lifecycle, focus, and dedupe | window-lifecycle | covered (strong; windows-system-integration, window-lifecycle) | covered (strong; window-lifecycle, viewer-deeplink) | covered (strong; window-lifecycle, viewer-deeplink) |
 | Meeting note creation and editing | real-ui-e2e | covered (strong; windows-user-journey, meeting-note-bottom-click) | covered (strong; meeting-note-bottom-click) | covered (strong; meeting-note-bottom-click) |
 | Pipes discover, install, and play | pipes | covered (strong; pipes, pipes-mcp-connections) | covered (strong; pipes, pipes-mcp-connections) | covered (strong; pipes, pipes-mcp-connections) |
-| Chat window, composer, and streaming state | chat-ai | covered (strong; chat-sidebar-groups, chat-settings-background-stream) | covered (strong; chat-sidebar-groups, chat-settings-background-stream) | covered (strong; chat-sidebar-groups, chat-settings-background-stream) |
+| Chat window, composer, and streaming state | chat-ai | covered (strong; chat-sidebar-groups, chat-sidebar-pipe-inventory) | covered (strong; chat-sidebar-groups, chat-sidebar-pipe-inventory) | covered (strong; chat-sidebar-groups, chat-sidebar-pipe-inventory) |
 | Tray/search window behavior | window-lifecycle | covered (strong; window-lifecycle, tray-search) | covered (strong; window-lifecycle, tray-search) | covered (strong; window-lifecycle, tray-search) |
 | Storage retention safety UX | storage-privacy | covered (strong; settings-sections, windows-user-journey) | covered (strong; settings-sections) | covered (strong; settings-sections) |
 | Updater install and rollback safety | os-integration | gap | gap | gap |
@@ -93,7 +93,7 @@ pass/fail/skip counts.
 | Spec | Platforms | Layers | Features | Criticality | Confidence | UX | Tests | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | api-key-cold-spawn.spec.ts | windows, macos, linux | local-api, tauri-command | local-api-auth, app-launch | medium | partial | command | 3 | Cold-spawn local API config regression coverage. |
-| api-search-stress.spec.ts | windows, macos, linux | local-api, performance | local-api-auth, local-api-search, health, audio-device-health, local-api-load | high | strong | api | 28 | Broad readonly API, auth, search, and load coverage. |
+| api-search-stress.spec.ts | windows, macos, linux | local-api, performance | local-api-auth, local-api-search, health, audio-device-health, local-api-load | high | strong | api | 29 | Broad readonly API, auth, search, and load coverage. |
 | api.spec.ts | windows, macos, linux | local-api | health, audio-device-health, connections, local-api-auth | high | partial | api | 7 | Smoke coverage for local HTTP API shape and auth behavior. |
 | app-lifecycle.spec.ts | windows, macos, linux | real-ui-e2e, window-lifecycle | app-launch, home-navigation, webview-stability, route-churn, browser-storage | high | strong | mixed | 14 | Home webview, routing, reload, focus, resize, and storage stability. |
 | artifacts-api.spec.ts | windows, macos, linux | local-api | local-api-auth, artifacts | medium | strong | api | 7 | CRUD coverage for artifact registration, validation, unified listing, upsert, and delete. |
@@ -110,6 +110,7 @@ pass/fail/skip counts.
 | chat-prefill-duplicate.spec.ts | macos | chat-ai | chat, chat-prefill | medium | partial | synthetic | 1 | QUARANTINED (#4610): cross-window prefill duplicate regression. The autoSend persist precondition is racy in CI — times out with 0 conversations (not the duplicate=2 it guards) ~100% Linux + ~33% macOS. Re-enable once it seeds the persisted conversation deterministically. |
 | chat-settings-background-stream.spec.ts | windows, macos, linux | chat-ai, settings, real-ui-e2e | chat, chat-streaming, settings | high | strong | real-user-flow | 1 | Opening the standalone Settings route mid-stream must not abort the chat: a long synthetic stream keeps running while the user round-trips to Settings, remains live in Recents, and restores the full response (early + final tokens) after the row is clicked. |
 | chat-sidebar-groups.spec.ts | windows, macos, linux | chat-ai, real-ui-e2e | chat, chat-sidebar-groups | medium | strong | real-user-flow | 9 | Pipe auto-grouping (collapse, badge, expand/collapse, localStorage persistence) and manual sidebar groups (move-to-group, section headers, remove-from-group cleanup). 8 tests. |
+| chat-sidebar-pipe-inventory.spec.ts | windows, macos, linux | chat-ai, pipes, real-ui-e2e | chat, pipes, chat-sidebar-groups | high | strong | mixed | 1 | A collapsed Pipes section avoids loading run history; expanding it lists the complete installed-pipe inventory, and expanding a pipe lazily loads only its newest 10 saved runs. |
 | chat-sidebar-stub-dedup.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Listener-order regression for metadata-only sidebar stubs gaining dedup keys. |
 | chat-source-file-preview.spec.ts | windows, macos, linux | chat-ai, real-ui-e2e | chat | medium | strong | real-user-flow | 1 | Clicking a chat file source opens it in the preview sidebar with rendered markdown + syntax-highlighted code. |
 | chat-streaming-performance.spec.ts | macos | chat-ai, performance | chat, chat-streaming | medium | conditional | performance | 2 | macOS-only chat streaming responsiveness. |
