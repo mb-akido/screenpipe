@@ -21,6 +21,7 @@ import { trackResponseUsage } from './utils/stream-usage-tracker';
 import { pruneModelHealth } from './services/model-health';
 import { resolveLatencyClass, isBackgroundRequest } from './utils/latency';
 import { enforceDailyCostCap } from './services/cost-cap';
+import { completeFreeChatTurn, releaseFreeChatTurn, reserveFreeChatTurn } from './services/free-chat-turns';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
 
 export { RateLimiter };
@@ -190,6 +191,42 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 				})));
 			}
 
+			const backgroundRequest = isBackgroundRequest(request);
+			const hasPaidCredits = (usage.creditsRemaining ?? 0) > 0;
+			if (authResult.tier === 'logged_in' && backgroundRequest && !hasPaidCredits) {
+				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
+					error: 'hosted_automation_subscription_required',
+					message: 'Hosted AI automations require Business or prepaid credits. Local and BYOK pipes remain free.',
+					upgrade_url: 'https://screenpi.pe/onboarding',
+					free_options: ['anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+				})));
+			}
+
+			// The Free/Local desktop tier includes two lifetime hosted-AI user
+			// turns. This is intentionally separate from daily model/rate limits:
+			// a Pi tool loop can make many requests for one user message, while a
+			// new user turn must consume exactly one preview slot. Run this after
+			// all other preflights so rejected requests never reserve a turn.
+			// Subscribers, anonymous API traffic, and background automation keep
+			// their existing policies. BYOK/ChatGPT/Claude/Ollama never reach here.
+			const freeTurn = await reserveFreeChatTurn(
+				env,
+				authResult,
+				body.messages ?? [],
+				backgroundRequest,
+				hasPaidCredits,
+			);
+			if (freeTurn.applies && !freeTurn.allowed) {
+				return addCorsHeaders(createErrorResponse(402, JSON.stringify({
+					error: 'free_chat_limit_exhausted',
+					message: `You've used your ${freeTurn.limit} included Screenpipe Cloud chat turns. Upgrade, or keep using local/BYOK AI at no charge.`,
+					used: freeTurn.used,
+					limit: freeTurn.limit,
+					upgrade_url: 'https://screenpi.pe/onboarding',
+					free_options: ['chatgpt-codex', 'anthropic-api-key', 'openai-api-key', 'ollama', 'custom'],
+				})));
+			}
+
 			// Route latency-tolerant (background) traffic to the cheaper flex tier.
 			const latency = resolveLatencyClass(request, body, env);
 
@@ -198,6 +235,13 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 			// total for non-stream. Includes any router/embed overhead.
 			const reqStart = Date.now();
 			let response = await handleChatCompletions(body, env, latency, authResult.deviceId);
+			if (freeTurn.applies && freeTurn.allowed && freeTurn.isNew && authResult.userId) {
+				if (response.ok) {
+					ctx.waitUntil(completeFreeChatTurn(env, authResult.userId, freeTurn.turnHash));
+				} else {
+					ctx.waitUntil(releaseFreeChatTurn(env, authResult.userId, freeTurn.turnHash));
+				}
+			}
 			const latencyMs = Date.now() - reqStart;
 			// Difficulty-router decision (null unless the router ran) for A/B measurement.
 			const routerTier = response.headers.get('x-screenpipe-router-tier');

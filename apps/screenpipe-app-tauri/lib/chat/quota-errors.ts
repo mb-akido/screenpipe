@@ -5,8 +5,16 @@
 // Pure helpers for classifying and presenting AI quota / rate-limit errors.
 // Extracted verbatim from standalone-chat.tsx (no behavior change).
 
+export const FREE_CHAT_LIMIT_MESSAGE =
+  "You've used your 2 included Screenpipe Cloud chats. Upgrade for hosted AI, or connect ChatGPT/Codex, your own Claude/OpenAI key, or Ollama to keep using screenpipe free.";
+
+export function isFreeChatLimitError(errorStr: string): boolean {
+  return errorStr.toLowerCase().includes("free_chat_limit_exhausted");
+}
+
 export function buildDailyLimitMessage(errorStr: string): string {
   try {
+    if (isFreeChatLimitError(errorStr)) return FREE_CHAT_LIMIT_MESSAGE;
     const isCostLimit = errorStr.includes("daily_cost_limit_exceeded");
     const isRateLimit = errorStr.includes("rate limit") || errorStr.includes("Rate limit");
 
@@ -39,6 +47,7 @@ export function buildDailyLimitMessage(errorStr: string): string {
 export function classifyQuotaError(errorStr: string): "daily" | "rate" | "none" {
   const normalized = errorStr.toLowerCase();
   const isDailyLimit =
+    normalized.includes("free_chat_limit_exhausted") ||
     normalized.includes("credits_exhausted") ||
     normalized.includes("daily_limit_exceeded") ||
     normalized.includes("daily_cost_limit_exceeded");

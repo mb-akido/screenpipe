@@ -212,6 +212,8 @@ export interface Env {
 	LIMIT_ANONYMOUS_FREE_RPM?: string;
 	LIMIT_LOGGED_IN_FREE_RPM?: string;
 	LIMIT_SUBSCRIBED_FREE_RPM?: string;
+	// Lifetime hosted-AI preview for signed-in, non-subscribed users.
+	FREE_CHAT_TURN_LIMIT?: string;
 }
 
 // User tier for rate limiting and model access

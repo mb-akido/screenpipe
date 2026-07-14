@@ -115,15 +115,13 @@ describe("AppEntitlementGate", () => {
     vi.unstubAllEnvs();
   });
 
-  it("asks a signed-out user to sign in and never reveals the app", () => {
+  it("opens the Free/Local app for a signed-out consumer", () => {
     mocks.state.user = null;
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    expect(screen.getByText(/sign in required/i)).toBeInTheDocument();
-    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
-    expect(mocks.openLoginWindow).toHaveBeenCalled();
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(screen.queryByText(/sign in required/i)).not.toBeInTheDocument();
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 
   it("forces enterprise sign-in when the account section is visible even if billing is bypassed", async () => {
@@ -162,16 +160,17 @@ describe("AppEntitlementGate", () => {
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 
-  it("blocks an unentitled account and pauses the engine", async () => {
+  it("keeps an unentitled consumer on the Free/Local tier", async () => {
     mocks.state.user = baseUser();
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    expect(screen.getByText(/subscription required/i)).toBeInTheDocument();
-    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
-    await waitFor(() => expect(mocks.stopScreenpipe).toHaveBeenCalled());
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(screen.queryByText(/subscription required/i)).not.toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 
-  it("does not trust cloud_subscribed when app entitlement is explicitly denied", async () => {
+  it("does not globally gate local access when cloud entitlement is denied", async () => {
     mocks.state.user = baseUser({
       cloud_subscribed: true,
       app_entitled: false,
@@ -180,9 +179,10 @@ describe("AppEntitlementGate", () => {
     });
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    expect(screen.getByText(/subscription required/i)).toBeInTheDocument();
-    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
-    await waitFor(() => expect(mocks.stopScreenpipe).toHaveBeenCalled());
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(screen.queryByText(/subscription required/i)).not.toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 
   it("renders the app for a fresh entitled account without stopping capture", () => {
@@ -240,11 +240,12 @@ describe("AppEntitlementGate", () => {
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
   });
 
-  it("auto-verifies a just-paid account against Stripe (verify=true)", async () => {
+  it("does not poll Stripe for a Free/Local consumer", async () => {
     mocks.state.user = baseUser(); // signed in, webhook not landed yet
     render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    await waitFor(() => expect(mocks.loadUser).toHaveBeenCalledWith("tok", true));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.loadUser).not.toHaveBeenCalled();
   });
 
   it("keeps recording for an entitled account whose token failed to hydrate (corrupt secret store)", async () => {
@@ -307,7 +308,7 @@ describe("AppEntitlementGate", () => {
     expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 
-  it("still walls and stops on a real sign-out, even after a prior entitled session", async () => {
+  it("keeps Free/Local recording available after a consumer signs out", async () => {
     mocks.state.user = baseUser({
       id: "u1",
       app_entitled: true,
@@ -327,13 +328,20 @@ describe("AppEntitlementGate", () => {
     mocks.state.user = null;
     rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-    expect(screen.getByText(/sign in required/i)).toBeInTheDocument();
-    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
-    await waitFor(() => expect(mocks.stopScreenpipe).toHaveBeenCalled());
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
+    expect(screen.queryByText(/sign in required/i)).not.toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.stopScreenpipe).not.toHaveBeenCalled();
   });
 
-  it("reports the gate once across re-renders of the same gated state", () => {
-    mocks.state.user = baseUser(); // signed in, unentitled → gated
+  it("reports a mandatory enterprise gate once across re-renders", () => {
+    mocks.enterprise = {
+      isEnterprise: true,
+      hiddenSections: [],
+      needsLicenseKey: false,
+      orgName: "Required Workspace",
+    };
+    mocks.state.user = null;
     const { rerender } = render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
     rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
     rerender(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
@@ -351,24 +359,15 @@ describe("AppEntitlementGate", () => {
       toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
     });
 
-  it("keeps re-verifying a still-unentitled member on a backoff instead of giving up after one check (#4161)", async () => {
+  it("does not run the old entitlement backoff for a Free/Local consumer", async () => {
     fakeTimersNoDate();
     try {
       mocks.state.user = baseUser(); // signed in, not entitled → gated
       render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
 
-      // First verify is immediate and uses the Stripe fallback (verify=true).
-      await vi.advanceTimersByTimeAsync(0);
-      expect(mocks.loadUser).toHaveBeenNthCalledWith(1, "tok", true);
-
-      // The old gate stopped here forever. It must keep checking so a backend
-      // grant that lands seconds later (eager/lazy enterprise upgrade, webhook)
-      // reaches the app on its own.
-      await vi.advanceTimersByTimeAsync(3_000);
-      await vi.advanceTimersByTimeAsync(6_000);
-      expect(mocks.loadUser.mock.calls.length).toBeGreaterThanOrEqual(3);
-      // Later ticks skip verify=true to spare the per-poll Stripe round-trip.
-      expect(mocks.loadUser).toHaveBeenNthCalledWith(2, "tok", false);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mocks.loadUser).not.toHaveBeenCalled();
+      expect(screen.getByTestId("protected-app")).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
@@ -406,15 +405,14 @@ describe("AppEntitlementGate", () => {
     }
   });
 
-  it("bounds the re-verify poll so a never-entitled session can't hammer the server", async () => {
+  it("does not start a delayed entitlement poll for a Free/Local consumer", async () => {
     fakeTimersNoDate();
     try {
       mocks.state.user = baseUser(); // never becomes entitled
       render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
       await vi.advanceTimersByTimeAsync(30 * 60_000); // 30 minutes
       const total = mocks.loadUser.mock.calls.length;
-      expect(total).toBeLessThanOrEqual(12);
-      expect(total).toBeGreaterThanOrEqual(3); // but it did retry, not one-shot
+      expect(total).toBe(0);
       await vi.advanceTimersByTimeAsync(30 * 60_000); // 30 more minutes
       expect(mocks.loadUser.mock.calls.length).toBe(total); // stopped, no growth
     } finally {
@@ -555,8 +553,14 @@ describe("AppEntitlementGate", () => {
     expect(screen.getByTestId("protected-app")).toBeInTheDocument();
   });
 
-  it("resumes recording when access transitions to entitled", async () => {
-    mocks.state.user = baseUser(); // unentitled first
+  it("resumes recording when a mandatory enterprise sign-in gate clears", async () => {
+    mocks.enterprise = {
+      isEnterprise: true,
+      hiddenSections: [],
+      needsLicenseKey: false,
+      orgName: "Required Workspace",
+    };
+    mocks.state.user = null;
     const { rerender } = render(
       <AppEntitlementGate>{protectedApp}</AppEntitlementGate>,
     );

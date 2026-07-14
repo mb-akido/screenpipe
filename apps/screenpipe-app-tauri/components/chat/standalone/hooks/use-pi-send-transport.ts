@@ -22,6 +22,7 @@ import {
 } from "@/components/chat/standalone/hooks/pi-message-preparation";
 import type { Message } from "@/lib/chat/types";
 import type { PiSendTransportOptions } from "@/components/chat/standalone/hooks/pi-types";
+import { markScreenpipeCloudTurn } from "@/lib/chat/free-tier-turn-marker";
 
 export function usePiSendTransport(options: PiSendTransportOptions) {
   const {
@@ -464,7 +465,10 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       // `piSessionSyncedRef` is kept around because other code paths
       // (preset change, reauth, the conversation-load handler) still
       // toggle it for diagnostics, but it no longer gates injection.
-      const promptMessage = promptWithConversationHistory(userMessage, messages);
+      const promptMessage = markScreenpipeCloudTurn(
+        promptWithConversationHistory(userMessage, messages),
+        getActivePreset(),
+      );
       piSessionSyncedRef.current = true;
 
       // E2E test hook — write to __e2ePiPromptCaptures when the recorder is installed

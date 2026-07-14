@@ -116,7 +116,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const [devSubmitting, setDevSubmitting] = useState(false);
   const [devError, setDevError] = useState<string | null>(null);
   const stoppedForGateRef = useRef(false);
-  const prevEntitledRef = useRef<boolean | null>(null);
+  const prevGateRef = useRef<boolean | null>(null);
   const skipNextResumeForE2ESeedRef = useRef(false);
   const resumingRef = useRef(false);
   const everEntitledRef = useRef(false);
@@ -176,10 +176,13 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     enterpriseAccount?.requires_enterprise_app === true;
   const shouldGateForEntitlement =
     !devBypass && !isEntitled && !failOpenForTransientAccessLoss;
+  // Consumer builds now have a permanent Free/Local tier. Keep recording,
+  // timeline, local search, meetings, MCP, and BYOK/local AI accessible even
+  // when the account has no paid app entitlement. Cloud features continue to
+  // use their feature-level checks; enterprise policy gates remain mandatory.
   const shouldGate =
     shouldGateForEnterpriseApp ||
-    shouldGateForEnterpriseLogin ||
-    shouldGateForEntitlement;
+    shouldGateForEnterpriseLogin;
   const email = user?.email || "this account";
   const enterpriseOrgName = enterpriseAccount?.org_name || "your workspace";
   const planLabel = useMemo(
@@ -379,7 +382,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     // signed in, and gated *specifically* on a missing entitlement — not on a
     // required enterprise login (no token), and not while failing open on a
     // transient token loss (that path has its own re-hydration loop above).
-    if (!isSettingsLoaded || devBypass || isEntitled) return;
+    if (!isSettingsLoaded || devBypass || !shouldGate || isEntitled) return;
     if (!user?.token || !shouldGateForEntitlement) return;
     const token = user.token;
 
@@ -421,12 +424,11 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     // so a poll tick that writes settings doesn't restart the poll. When the
     // grant lands, isEntitled flips → this effect tears down and stops.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSettingsLoaded, devBypass, isEntitled, user?.token, shouldGateForEntitlement]);
+  }, [isSettingsLoaded, devBypass, shouldGate, isEntitled, user?.token, shouldGateForEntitlement]);
 
-  // Resume capture when access transitions to entitled within a session (after
-  // sign-in, purchase, or a successful refresh). Native autostart only runs once
-  // at launch, so without this a freshly-paid user would see the app but get no
-  // recording until they restarted it.
+  // Resume capture when a mandatory enterprise gate clears. Consumer billing
+  // changes no longer affect local app access, so they must not bounce the
+  // recorder or restart an in-progress meeting.
   //
   // This must use the SAME recipe as the reliable settings restart
   // (display-section / recording-settings): one owner, guarded against
@@ -437,16 +439,14 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   useEffect(() => {
     if (!isSettingsLoaded || devBypass) return;
     if (skipNextResumeForE2ESeedRef.current) {
-      prevEntitledRef.current = isEntitled;
-      if (isEntitled) skipNextResumeForE2ESeedRef.current = false;
+      prevGateRef.current = shouldGate;
+      if (!shouldGate) skipNextResumeForE2ESeedRef.current = false;
       return;
     }
-    const previouslyEntitled = prevEntitledRef.current;
-    prevEntitledRef.current = isEntitled;
-    if (previouslyEntitled !== false || !isEntitled) return;
-    // Access was restored in-session (auto-verify poll, manual refresh, sign-in,
-    // or purchase). Tracked so we can confirm gated members actually escape the
-    // wall on their own rather than churning at sign-in (issue #4161).
+    const previouslyGated = prevGateRef.current;
+    prevGateRef.current = shouldGate;
+    if (previouslyGated !== true || shouldGate) return;
+    // A required enterprise sign-in/app gate was cleared in-session.
     posthog.capture("app_entitlement_restored", {
       plan: user?.subscription_plan ?? null,
     });
@@ -467,7 +467,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
         resumingRef.current = false;
       }
     })();
-  }, [devBypass, isEntitled, isSettingsLoaded]);
+  }, [devBypass, shouldGate, isSettingsLoaded, user?.subscription_plan]);
 
   const devLoginBlock = isDevLoginEnabled() ? (
     <div className="mt-5 border-t border-border pt-4">

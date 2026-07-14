@@ -82,6 +82,8 @@ import {
 import type { ContentBlock, Message } from "@/lib/chat/types";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { AGENT_TOPICS, type AgentEventEnvelope } from "@/lib/events/types";
+import { FREE_CHAT_LIMIT_MESSAGE } from "@/lib/chat/quota-errors";
+import { FreeTierUpgradeDialog } from "@/components/chat/free-tier-upgrade-dialog";
 
 // Session ID is per-conversation — set on mount (new conv) and updated on load/new.
 // Stored as a ref so event listeners always see the current value without stale closures.
@@ -198,6 +200,7 @@ export function StandaloneChat({
   const [isStreaming, setIsStreaming] = useState(false);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
+  const [freeTierDialogOpen, setFreeTierDialogOpen] = useState(false);
   const activePresetRef = useRef<AIPreset | undefined>(activePreset);
   activePresetRef.current = activePreset;
 
@@ -529,6 +532,14 @@ export function StandaloneChat({
       : undefined,
   );
   const messages = (pipeWatchMessages ?? localMessages) as Message[];
+
+  useEffect(() => {
+    if (activePreset?.provider !== "screenpipe-cloud") return;
+    const hitFreeLimit = messages.some(
+      (message) => message.role === "assistant" && message.content === FREE_CHAT_LIMIT_MESSAGE,
+    );
+    if (hitFreeLimit) setFreeTierDialogOpen(true);
+  }, [messages, activePreset?.provider]);
 
   const {
     consumePendingAttachments,
@@ -1565,6 +1576,14 @@ export function StandaloneChat({
         <SchedulePromptDialog {...scheduleDialogProps} />
       )}
       <ImageViewerDialog {...imageViewerProps} />
+      <FreeTierUpgradeDialog
+        open={freeTierDialogOpen}
+        onOpenChange={setFreeTierDialogOpen}
+        onChooseOwnAI={async () => {
+          setFreeTierDialogOpen(false);
+          await commands.showWindow({ Home: { page: "ai" } });
+        }}
+      />
 
     </div>
   );
