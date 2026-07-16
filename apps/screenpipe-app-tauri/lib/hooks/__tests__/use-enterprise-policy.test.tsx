@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     settings,
+    cloudUser: { token: null as string | null },
     store,
     isEnterprise: { value: true },
     commands: {
@@ -54,6 +55,9 @@ vi.mock("@/lib/hooks/use-is-enterprise-build", () => ({
 
 vi.mock("@/lib/hooks/use-settings", () => ({
   getStore: vi.fn(async () => mocks.store),
+  useSettings: () => ({
+    settings: { user: mocks.cloudUser.token ? { token: mocks.cloudUser.token } : null },
+  }),
 }));
 
 vi.mock("@/lib/utils/tauri", () => ({
@@ -106,13 +110,17 @@ function heartbeatResponse(status = 200) {
 
 function mockEnterpriseApi(opts: {
   policyStatus?: number;
+  policyErrorCode?: string;
   policy?: Record<string, unknown>;
   heartbeatStatus?: number;
 }) {
   mocks.tauriFetch.mockImplementation(async (url: string) => {
     if (url.includes("/api/enterprise/policy")) {
       if (opts.policyStatus && opts.policyStatus !== 200) {
-        return new Response(JSON.stringify({ error: "bad key" }), { status: opts.policyStatus });
+        return new Response(
+          JSON.stringify({ error: "bad key", code: opts.policyErrorCode }),
+          { status: opts.policyStatus },
+        );
       }
       return policyResponse(opts.policy);
     }
@@ -134,6 +142,7 @@ describe("useEnterprisePolicy manual activation", () => {
     vi.clearAllMocks();
     vi.useRealTimers();
     mocks.isEnterprise.value = true;
+    mocks.cloudUser.token = null;
     Object.keys(mocks.settings).forEach((k) => delete mocks.settings[k]);
     Object.assign(mocks.settings, { deviceId: "device-1" });
     mocks.localFetch.mockResolvedValue(
@@ -231,8 +240,8 @@ describe("useEnterprisePolicy manual activation", () => {
       ok: false,
       error: "license seat limit reached - contact your admin to add seats",
     });
-    expect(result.current.needsLicenseKey).toBe(true);
-    expect(result.current.licenseStatus).toBe("required");
+    expect(result.current.needsLicenseKey).toBe(false);
+    expect(result.current.licenseStatus).toBe("member_login");
     expect(mocks.commands.saveEnterpriseLicenseKey).not.toHaveBeenCalled();
     expect(mocks.commands.setEnterprisePolicy).not.toHaveBeenCalled();
   });
@@ -247,7 +256,7 @@ describe("useEnterprisePolicy manual activation", () => {
     });
 
     expect(activation).toEqual({ ok: false, error: "invalid or expired license key" });
-    expect(result.current.needsLicenseKey).toBe(true);
+    expect(result.current.needsLicenseKey).toBe(false);
     expect(mocks.commands.saveEnterpriseLicenseKey).not.toHaveBeenCalled();
   });
 
@@ -263,5 +272,52 @@ describe("useEnterprisePolicy manual activation", () => {
     expect(activation).toEqual({ ok: true });
     expect(result.current.needsLicenseKey).toBe(false);
     expect(mocks.commands.saveEnterpriseLicenseKey).toHaveBeenCalledWith(KEY);
+  });
+
+  it("loads member policy with the signed-in session and no organization key", async () => {
+    mocks.cloudUser.token = "member-token";
+    mocks.settings.user = { token: "member-token" };
+    mockEnterpriseApi({ policy: { enrollmentMode: "member_sign_in" } });
+
+    const { result } = await renderEnterprisePolicy();
+
+    expect(result.current.licenseStatus).toBe("active");
+    expect(result.current.policy.enrollmentMode).toBe("member_sign_in");
+    expect(mocks.tauriFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/api/enterprise/policy"),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer member-token" }),
+      }),
+    );
+    const request = mocks.tauriFetch.mock.calls.find(([url]) =>
+      String(url).includes("/api/enterprise/policy"),
+    );
+    expect(request?.[1]?.headers).not.toHaveProperty("X-License-Key");
+  });
+
+  it("honors organization-key mode returned by the workspace policy", async () => {
+    mockEnterpriseApi({ policy: { enrollmentMode: "organization_key" } });
+    const { result } = await renderEnterprisePolicy();
+
+    await act(async () => {
+      await result.current.submitLicenseKey(KEY);
+    });
+
+    expect(result.current.policy.enrollmentMode).toBe("organization_key");
+    expect(result.current.licenseStatus).toBe("active");
+  });
+
+  it("switches a signed-in device to key enrollment when the org requires it", async () => {
+    mocks.cloudUser.token = "member-token";
+    mocks.settings.user = { token: "member-token" };
+    mockEnterpriseApi({
+      policyStatus: 403,
+      policyErrorCode: "organization_key_required",
+    });
+
+    const { result } = await renderEnterprisePolicy();
+
+    expect(result.current.needsLicenseKey).toBe(true);
+    expect(result.current.licenseStatus).toBe("required");
   });
 });

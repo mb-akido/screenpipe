@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
     hiddenSections: [] as string[],
     needsLicenseKey: false,
     orgName: "",
+    enrollmentMode: "member_sign_in" as "organization_key" | "member_sign_in",
   },
 }));
 
@@ -55,7 +56,10 @@ vi.mock("@/lib/hooks/use-enterprise-policy", () => ({
     isEnterprise: mocks.enterprise.isEnterprise,
     isSectionHidden: (sectionId: string) => mocks.enterprise.hiddenSections.includes(sectionId),
     needsLicenseKey: mocks.enterprise.needsLicenseKey,
-    policy: { orgName: mocks.enterprise.orgName },
+    policy: {
+      orgName: mocks.enterprise.orgName,
+      enrollmentMode: mocks.enterprise.enrollmentMode,
+    },
   }),
 }));
 
@@ -107,6 +111,7 @@ describe("AppEntitlementGate", () => {
       hiddenSections: [],
       needsLicenseKey: false,
       orgName: "",
+      enrollmentMode: "member_sign_in",
     };
   });
 
@@ -133,6 +138,7 @@ describe("AppEntitlementGate", () => {
       hiddenSections: ["referral"],
       needsLicenseKey: false,
       orgName: "Our Future Foundation",
+      enrollmentMode: "member_sign_in",
     };
     mocks.state.user = null;
 
@@ -152,6 +158,7 @@ describe("AppEntitlementGate", () => {
       hiddenSections: ["account", "referral"],
       needsLicenseKey: false,
       orgName: "Locked Workspace",
+      enrollmentMode: "organization_key",
     };
     mocks.state.user = null;
 
@@ -429,6 +436,7 @@ describe("AppEntitlementGate", () => {
         hiddenSections: [],
         needsLicenseKey: false,
         orgName: "Acme",
+        enrollmentMode: "member_sign_in",
       };
       mocks.state.user = null; // no token → enterprise-login gate, not entitlement
       render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);

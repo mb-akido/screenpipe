@@ -45,7 +45,11 @@ export default function OnboardingPage() {
   const [isTransitioning, setIsTransitioning] = useState(false);
   const { onboardingData, isLoading } = useOnboarding();
   const enterpriseBuild = useEnterpriseBuildStatus();
-  const { licenseStatus, submitLicenseKey } = useEnterprisePolicy();
+  const {
+    licenseStatus,
+    policy: enterprisePolicy,
+    submitLicenseKey,
+  } = useEnterprisePolicy();
 
   // Restore saved step on mount
   useEffect(() => {
@@ -147,6 +151,7 @@ export default function OnboardingPage() {
       enterpriseBuild.resolved &&
       enterpriseBuild.isEnterprise &&
       licenseStatus === "active" &&
+      enterprisePolicy.enrollmentMode === "organization_key" &&
       !isTransitioning
     ) {
       void handleNextSlide();
@@ -156,6 +161,7 @@ export default function OnboardingPage() {
     enterpriseBuild.isEnterprise,
     enterpriseBuild.resolved,
     licenseStatus,
+    enterprisePolicy.enrollmentMode,
     isTransitioning,
     handleNextSlide,
   ]);
@@ -186,8 +192,11 @@ export default function OnboardingPage() {
                 <EnterpriseLicensePrompt
                   embedded
                   onSubmit={submitLicenseKey}
-                  onActivated={handleNextSlide}
                 />
+              ) : (licenseStatus === "active" &&
+                  enterprisePolicy.enrollmentMode === "member_sign_in") ||
+                licenseStatus === "member_login" ? (
+                <OnboardingLogin handleNextSlide={handleNextSlide} />
               ) : (
                 <div className="flex min-h-[400px] items-center justify-center">
                   <div className="h-6 w-6 animate-spin rounded-full border border-foreground border-t-transparent" />

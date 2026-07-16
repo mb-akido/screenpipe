@@ -166,7 +166,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     isEnterprise &&
     enterpriseAccountPolicyLoaded &&
     !needsLicenseKey &&
-    !isSectionHidden("account");
+    enterprisePolicy.enrollmentMode === "member_sign_in";
   const shouldGateForEnterpriseLogin = enterpriseRequiresLogin && !user?.token;
   const shouldGateForEnterpriseApp =
     !devBypass &&

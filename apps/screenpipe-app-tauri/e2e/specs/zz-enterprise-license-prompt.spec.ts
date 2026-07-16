@@ -49,6 +49,7 @@ async function configureEnterpriseMocks(heartbeatStatus: number): Promise<void> 
             managedAiPreset: null,
             managedPipes: [],
             orgName: 'Bungalow',
+            enrollmentMode: 'organization_key',
             syncStreams: {
               frames: true,
               audio: true,

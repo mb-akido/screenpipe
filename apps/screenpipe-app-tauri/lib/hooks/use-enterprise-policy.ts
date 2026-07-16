@@ -6,7 +6,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useIsEnterpriseBuild } from "./use-is-enterprise-build";
 import { commands } from "@/lib/utils/tauri";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
-import { getStore } from "./use-settings";
+import { getStore, useSettings } from "./use-settings";
 import { computeManagedSettingUpdates } from "./managed-settings";
 import { getVersion } from "@tauri-apps/api/app";
 import { localFetch } from "@/lib/api";
@@ -36,6 +36,7 @@ interface EnterprisePolicy {
   appUpdatePolicy: EnterpriseAppUpdatePolicy;
   managedPipes: ManagedPipe[];
   orgName: string;
+  enrollmentMode: "organization_key" | "member_sign_in";
 }
 
 const EMPTY_POLICY: EnterprisePolicy = {
@@ -46,6 +47,7 @@ const EMPTY_POLICY: EnterprisePolicy = {
   appUpdatePolicy: DEFAULT_ENTERPRISE_APP_UPDATE_POLICY,
   managedPipes: [],
   orgName: "",
+  enrollmentMode: "member_sign_in",
 };
 
 // Sections always hidden in enterprise builds (regardless of policy).
@@ -445,7 +447,7 @@ function loadCachedPolicy(): EnterprisePolicy | null {
 
 type FetchResult =
   | { ok: true; policy: EnterprisePolicy }
-  | { ok: false; reason: "invalid_key" | "network_error" };
+  | { ok: false; reason: "invalid_key" | "key_required" | "login_required" | "network_error" };
 
 interface FetchPolicyOptions {
   applyLocalPolicy?: boolean;
@@ -467,18 +469,20 @@ interface FetchPolicyOptions {
  */
 export function useEnterprisePolicy() {
   const isEnterprise = useIsEnterpriseBuild();
+  const { settings } = useSettings();
+  const cloudUserToken = settings.user?.token ?? null;
   const [policy, setPolicy] = useState<EnterprisePolicy>(() => {
     return loadCachedPolicy() ?? EMPTY_POLICY;
   });
   const [needsLicenseKey, setNeedsLicenseKey] = useState(false);
   const [licenseStatus, setLicenseStatus] = useState<
-    "loading" | "required" | "active"
+    "loading" | "required" | "member_login" | "active"
   >("loading");
   const licenseKeyRef = useRef<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchPolicy = useCallback(async (
-    licenseKey: string,
+    licenseKey: string | null,
     options: FetchPolicyOptions = {}
   ): Promise<FetchResult> => {
     try {
@@ -514,15 +518,16 @@ export function useEnterprisePolicy() {
         }
       }
 
-      const headers: Record<string, string> = {
-        "X-License-Key": licenseKey,
-        "X-Device-Id": deviceId,
-      };
+      if (!licenseKey && !cloudToken) {
+        return { ok: false, reason: "login_required" };
+      }
+      const headers: Record<string, string> = { "X-Device-Id": deviceId };
+      if (licenseKey) headers["X-License-Key"] = licenseKey;
       if (cloudToken) {
         headers["Authorization"] = `Bearer ${cloudToken}`;
       }
       let data: any;
-      const e2ePolicy = readE2ePolicyMock(licenseKey);
+      const e2ePolicy = readE2ePolicyMock(licenseKey ?? "");
       if (e2ePolicy.present) {
         if (!e2ePolicy.ok) {
           return { ok: false, reason: e2ePolicy.reason };
@@ -536,6 +541,12 @@ export function useEnterprisePolicy() {
         if (res.status === 401 || res.status === 402) {
           console.error(`[enterprise] policy fetch: key rejected (${res.status})`);
           return { ok: false, reason: "invalid_key" };
+        }
+        if (res.status === 403) {
+          const error = await res.json().catch(() => null);
+          if (error?.code === "organization_key_required") {
+            return { ok: false, reason: "key_required" };
+          }
         }
         if (!res.ok) {
           console.error(`[enterprise] policy fetch failed: ${res.status} ${res.statusText}`);
@@ -563,6 +574,13 @@ export function useEnterprisePolicy() {
         appUpdatePolicy,
         managedPipes: data.managedPipes || [],
         orgName: data.orgName || "",
+        enrollmentMode:
+          data.enrollmentMode === "organization_key" ||
+          data.enrollmentMode === "member_sign_in"
+            ? data.enrollmentMode
+            : allHidden.includes("account")
+              ? "organization_key"
+              : "member_sign_in",
       };
       console.log(
         `[enterprise] policy loaded: org=${result.orgName}, hidden=[${result.hiddenSections.join(",")}], locked=[${lockedKeys.join(",")}]`
@@ -603,11 +621,13 @@ export function useEnterprisePolicy() {
       }
 
       // Fire-and-forget heartbeat
-      sendHeartbeat(licenseKey).then((heartbeat) => {
-        if (!heartbeat.ok) {
-          console.warn("[enterprise] heartbeat failed:", heartbeat.reason, heartbeat.error);
-        }
-      });
+      if (licenseKey) {
+        sendHeartbeat(licenseKey).then((heartbeat) => {
+          if (!heartbeat.ok) {
+            console.warn("[enterprise] heartbeat failed:", heartbeat.reason, heartbeat.error);
+          }
+        });
+      }
 
       // Sync managed pipes to local filesystem. Always runs (even with an
       // empty list) so pipes removed from the policy get disabled on devices.
@@ -716,21 +736,42 @@ export function useEnterprisePolicy() {
     }
   }, []);
 
-  const startPolling = useCallback((key: string) => {
+  const startPolling = useCallback((key: string | null) => {
     stopPolling();
     intervalRef.current = setInterval(async () => {
       const result = await fetchPolicy(key);
       if (result.ok) {
         setPolicy(result.policy);
-      } else if (result.reason === "invalid_key") {
-        // Key was revoked/expired — stop polling and prompt for new key
-        console.warn("[enterprise] saved key is no longer valid, prompting for new one");
+      } else if (result.reason === "invalid_key" || result.reason === "key_required") {
+        // Auth mode changed or the key was revoked — stop polling and show
+        // the enrollment method now required by the workspace.
+        console.warn("[enterprise] enrollment credentials no longer satisfy policy");
         stopPolling();
-        setNeedsLicenseKey(true);
+        const requiresKey = Boolean(key) || result.reason === "key_required";
+        setNeedsLicenseKey(requiresKey);
+        setLicenseStatus(requiresKey ? "required" : "member_login");
       }
       // network_error: silently keep polling, use cached policy
     }, POLL_INTERVAL_MS);
   }, [fetchPolicy, stopPolling]);
+
+  const initWithMember = useCallback(async () => {
+    licenseKeyRef.current = null;
+    const result = await fetchPolicy(null);
+    if (result.ok) {
+      setNeedsLicenseKey(false);
+      setLicenseStatus("active");
+      setPolicy(result.policy);
+      startPolling(null);
+      return;
+    }
+
+    const requiresKey = result.reason === "key_required";
+    setNeedsLicenseKey(requiresKey);
+    setLicenseStatus(requiresKey ? "required" : "member_login");
+    const cached = loadCachedPolicy();
+    setPolicy(cached ?? EMPTY_POLICY);
+  }, [fetchPolicy, startPolling]);
 
   const initWithKey = useCallback(async (key: string) => {
     licenseKeyRef.current = key;
@@ -854,11 +895,15 @@ export function useEnterprisePolicy() {
       if (cancelled) return;
 
       if (!key) {
-        console.warn("[enterprise] no license key — prompting user to enter one");
-        setNeedsLicenseKey(true);
-        setLicenseStatus("required");
         const cached = loadCachedPolicy();
-        setPolicy(cached ?? { ...EMPTY_POLICY, hiddenSections: ENTERPRISE_DEFAULT_HIDDEN });
+        if (cached?.enrollmentMode === "organization_key") {
+          console.warn("[enterprise] organization key required by cached policy");
+          setNeedsLicenseKey(true);
+          setLicenseStatus("required");
+          setPolicy(cached);
+          return;
+        }
+        await initWithMember();
         return;
       }
 
@@ -869,7 +914,7 @@ export function useEnterprisePolicy() {
       cancelled = true;
       stopPolling();
     };
-  }, [isEnterprise, initWithKey, stopPolling]);
+  }, [isEnterprise, cloudUserToken, initWithKey, initWithMember, stopPolling]);
 
   // Consumer builds: stable no-op functions (no network calls, no re-renders)
   const noop = useCallback(() => false, []);
