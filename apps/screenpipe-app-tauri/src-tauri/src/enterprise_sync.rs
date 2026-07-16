@@ -74,6 +74,19 @@ mod imp {
                 None => req,
             }
         }
+
+        fn image_uploads_allowed(&self) -> bool {
+            let settings = crate::store::SettingsStore::get(&self.app).ok().flatten();
+            image_uploads_allowed(settings.as_ref())
+        }
+    }
+
+    fn image_uploads_allowed(settings: Option<&crate::store::SettingsStore>) -> bool {
+        settings.is_some_and(|settings| !settings.recording.disable_screenshots)
+    }
+
+    fn exact_frame_url(api_url_base: &str, frame_id: i64) -> String {
+        format!("{api_url_base}/frames/{frame_id}?fallback=false")
     }
 
     // Minimal response shape — only the fields we forward upstream. Decoupled
@@ -323,6 +336,13 @@ mod imp {
         }
 
         async fn fetch_latest_snapshot(&self) -> Result<Option<SnapshotRow>, EnterpriseSyncError> {
+            // `disableScreenshots` is a hard privacy boundary, not only a
+            // capture hint. Fail closed when settings are unavailable and do
+            // not export old pixels that may still exist in local retention.
+            if !self.image_uploads_allowed() {
+                return Ok(None);
+            }
+
             // Step 1: ask /search for the most recent OCR frames. We request a
             // small page rather than just limit=1 because the single newest
             // frame is usually still in the in-progress (unfinalized) video
@@ -370,7 +390,11 @@ mod imp {
                 // local retention. Skip to the next (older) candidate instead of
                 // failing the tick, mirroring `fetch_frame_jpeg`'s Ok(None)
                 // contract for unavailable frames.
-                let img_url = format!("{}/frames/{}", self.api_url_base, frame_id);
+                // Exact-only is load-bearing: `/frames/{id}` normally falls
+                // back to nearby historical pixels when this frame has no
+                // image. Accessibility-only frames must never inherit those
+                // pixels for enterprise upload.
+                let img_url = exact_frame_url(&self.api_url_base, frame_id);
                 let resp = self
                     .auth(self.http.get(&img_url))
                     .send()
@@ -430,11 +454,15 @@ mod imp {
             &self,
             frame_id: i64,
         ) -> Result<Option<Vec<u8>>, EnterpriseSyncError> {
+            if !self.image_uploads_allowed() {
+                return Ok(None);
+            }
+
             // Same image `/frames/{id}` serves in the UI — decoded from local
             // video, with capture-time PII redaction already applied when the
             // org policy enables it. Full resolution here; the core fulfiller
             // downscales + bounds size before upload.
-            let img_url = format!("{}/frames/{}", self.api_url_base, frame_id);
+            let img_url = exact_frame_url(&self.api_url_base, frame_id);
             let resp = self
                 .auth(self.http.get(&img_url))
                 .send()
@@ -729,7 +757,9 @@ mod imp {
 
     #[cfg(test)]
     mod device_id_tests {
-        use super::{choose_device_id, enterprise_license_hash};
+        use super::{
+            choose_device_id, enterprise_license_hash, exact_frame_url, image_uploads_allowed,
+        };
 
         #[test]
         fn settings_id_wins_so_sync_matches_heartbeat() {
@@ -768,6 +798,21 @@ mod imp {
             assert!(first.starts_with("ent_"));
             assert!(!first.contains("sek_live_acme"));
             assert_eq!(enterprise_license_hash("   "), None);
+        }
+
+        #[test]
+        fn enterprise_images_require_screenshots_and_exact_frames() {
+            assert!(!image_uploads_allowed(None));
+
+            let mut settings = crate::store::SettingsStore::default();
+            assert!(image_uploads_allowed(Some(&settings)));
+            settings.recording.disable_screenshots = true;
+            assert!(!image_uploads_allowed(Some(&settings)));
+
+            assert_eq!(
+                exact_frame_url("http://localhost:3030", 42),
+                "http://localhost:3030/frames/42?fallback=false"
+            );
         }
     }
 }

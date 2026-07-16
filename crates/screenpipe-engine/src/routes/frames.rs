@@ -150,6 +150,19 @@ pub struct FrameThumbnailQuery {
     pub quality: u8,
 }
 
+#[derive(Debug, Deserialize, OaSchema)]
+pub struct FrameDataQuery {
+    /// Whether a missing/corrupt exact frame may return nearby pixels.
+    /// Timeline callers keep the historical default; truth-sensitive callers
+    /// such as enterprise export and search can opt out with `fallback=false`.
+    #[serde(default = "default_frame_fallback")]
+    pub fallback: bool,
+}
+
+fn default_frame_fallback() -> bool {
+    true
+}
+
 fn default_thumbnail_width() -> u32 {
     DEFAULT_THUMBNAIL_WIDTH
 }
@@ -467,6 +480,7 @@ fn thumbnail_response(
 pub async fn get_frame_data(
     State(state): State<Arc<AppState>>,
     Path(frame_id): Path<i64>,
+    Query(query): Query<FrameDataQuery>,
 ) -> Result<Response<Body>, (StatusCode, JsonResponse<Value>)> {
     let start_time = Instant::now();
 
@@ -579,8 +593,10 @@ pub async fn get_frame_data(
                                 "Snapshot file missing for frame {}, trying nearest frame",
                                 frame_id
                             );
-                            if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
-                                return Ok(fallback);
+                            if query.fallback {
+                                if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
+                                    return Ok(fallback);
+                                }
                             }
                             return Err((
                                 StatusCode::NOT_FOUND,
@@ -608,8 +624,10 @@ pub async fn get_frame_data(
                             "Frame {} extraction failed ({}), trying nearest frame",
                             frame_id, e
                         );
-                        if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
-                            return Ok(fallback);
+                        if query.fallback {
+                            if let Some(fallback) = try_nearest_frame(&state, frame_id).await {
+                                return Ok(fallback);
+                            }
                         }
 
                         // No fallback found either
