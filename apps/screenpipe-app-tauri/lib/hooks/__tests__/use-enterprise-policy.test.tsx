@@ -141,6 +141,7 @@ describe("useEnterprisePolicy manual activation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useRealTimers();
+    window.localStorage?.removeItem("enterprise-policy-cache");
     mocks.isEnterprise.value = true;
     mocks.cloudUser.token = null;
     Object.keys(mocks.settings).forEach((k) => delete mocks.settings[k]);
