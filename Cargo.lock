@@ -8491,13 +8491,13 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "reqwest 0.13.3",
+ "screenpipe-resource",
  "screenpipe-rfdetr-mlx",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "sqlx",
- "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
  "tinfoil",
@@ -8506,6 +8506,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "screenpipe-resource"
+version = "0.4.25"
+dependencies = [
+ "sysinfo",
+ "tokio",
 ]
 
 [[package]]

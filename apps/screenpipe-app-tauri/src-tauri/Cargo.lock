@@ -11371,19 +11371,27 @@ dependencies = [
  "rand 0.9.2",
  "regex",
  "reqwest 0.13.3",
+ "screenpipe-resource",
  "screenpipe-rfdetr-mlx",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.9",
  "sqlx",
- "sysinfo",
  "thiserror 1.0.69",
  "tinfoil",
  "tokenizers 0.21.4",
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "screenpipe-resource"
+version = "0.4.25"
+dependencies = [
+ "sysinfo",
+ "tokio",
 ]
 
 [[package]]

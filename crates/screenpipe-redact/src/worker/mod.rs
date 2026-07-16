@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use screenpipe_resource::ResourceGovernor;
 use sqlx::SqlitePool;
-use sysinfo::{PidExt, ProcessExt, ProcessRefreshKind, System, SystemExt};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -58,15 +58,14 @@ pub struct WorkerConfig {
     pub idle_between_batches: Duration,
     /// Sleep when the queue IS empty (poll interval).
     pub poll_interval: Duration,
-    /// Target for the WHOLE screenpipe process, in Activity Monitor-style CPU
-    /// percent (100% = one fully occupied core). The worker measures idle and
-    /// active process CPU around each batch and spends only the remaining
-    /// budget. Default: 30%.
-    pub max_process_cpu_percent: f32,
     /// Safety ceiling for a single adaptive cooldown. This must be much larger
     /// than `poll_interval`: a multi-core batch may need tens of seconds of
     /// rest to average below the process CPU target.
     pub max_cpu_cooldown: Duration,
+    /// Shared process resource governor. `Some` by default so all production
+    /// background workers coordinate through one CPU lane. Tests may set this
+    /// to `None` when they need deterministic, unthrottled completion.
+    pub resource_governor: Option<Arc<ResourceGovernor>>,
     /// Tables to reconcile. Default: all of [`ALL_TARGET_TABLES`]
     /// (frames:full_text, audio, accessibility, ui_events, elements).
     pub tables: Vec<TargetTable>,
@@ -95,77 +94,14 @@ impl Default for WorkerConfig {
             batch_size: 16,
             idle_between_batches: Duration::from_millis(50),
             poll_interval: Duration::from_secs(5),
-            max_process_cpu_percent: 30.0,
             max_cpu_cooldown: Duration::from_secs(60),
+            resource_governor: Some(ResourceGovernor::global()),
             tables: ALL_TARGET_TABLES.to_vec(),
             columns: RedactColumns::default(),
             session_dir: None,
             session_min_idle: Duration::from_secs(10 * 60),
         }
     }
-}
-
-/// Per-process CPU sampler. Sampling just before and just after a batch gives
-/// the process's idle baseline and its active redaction cost. `sysinfo`
-/// reports process CPU in Activity Monitor semantics and can exceed 100%.
-struct ProcessCpuSampler {
-    system: System,
-    pid: sysinfo::Pid,
-    last_sample_at: std::time::Instant,
-}
-
-impl ProcessCpuSampler {
-    fn new() -> Self {
-        let mut system = System::new();
-        let pid = sysinfo::Pid::from_u32(std::process::id());
-        system.refresh_process_specifics(pid, ProcessRefreshKind::new().with_cpu());
-        Self {
-            system,
-            pid,
-            last_sample_at: std::time::Instant::now(),
-        }
-    }
-
-    fn sample(&mut self) -> Option<f32> {
-        let now = std::time::Instant::now();
-        let interval = now.duration_since(self.last_sample_at);
-        self.system
-            .refresh_process_specifics(self.pid, ProcessRefreshKind::new().with_cpu());
-        self.last_sample_at = now;
-        if interval < System::MINIMUM_CPU_UPDATE_INTERVAL {
-            return None;
-        }
-        self.system.process(self.pid).map(ProcessExt::cpu_usage)
-    }
-}
-
-/// Solve for the rest interval that keeps the whole-process average at the
-/// configured target:
-///
-///     (active * work + idle * rest) / (work + rest) <= target
-///
-/// If non-redaction work already consumes the budget, use the maximum
-/// cooldown. Missing samples fall back conservatively to one busy core.
-fn cooldown_after_cpu(
-    worked: Duration,
-    active_cpu_percent: Option<f32>,
-    idle_cpu_percent: Option<f32>,
-    cfg: &WorkerConfig,
-) -> Duration {
-    let target = cfg.max_process_cpu_percent.clamp(5.0, 100.0) as f64;
-    let active = active_cpu_percent.unwrap_or(100.0).max(0.0) as f64;
-    let idle = idle_cpu_percent.unwrap_or(0.0).max(0.0) as f64;
-
-    let rest = if idle >= target {
-        cfg.max_cpu_cooldown
-    } else if active <= target {
-        cfg.idle_between_batches
-    } else {
-        let multiplier = (active - target) / (target - idle);
-        worked.mul_f64(multiplier)
-    };
-
-    rest.max(cfg.idle_between_batches).min(cfg.max_cpu_cooldown)
 }
 
 /// Public status the worker exposes (used by Settings UI).
@@ -301,8 +237,6 @@ impl Worker {
             .map(|_| Pipeline::regex_only());
         let mut session_seen: HashMap<PathBuf, SystemTime> = HashMap::new();
         let mut last_session_scan: Option<std::time::Instant> = None;
-        let mut cpu_sampler = ProcessCpuSampler::new();
-        let mut idle_cpu_percent: Option<f32> = None;
 
         loop {
             if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
@@ -314,7 +248,6 @@ impl Worker {
                     info!("redact worker: shutdown signal received, exiting");
                     return;
                 }
-                idle_cpu_percent = cpu_sampler.sample();
                 continue;
             }
             self.set_paused(false).await;
@@ -326,10 +259,22 @@ impl Worker {
                 if disabled.contains(table) {
                     continue;
                 }
+                // Serialize optional CPU-heavy work through the process-wide
+                // governor. Capture itself never enters this background lane.
+                let cpu_permit = match (&self.cfg.resource_governor, shutdown.as_ref()) {
+                    (Some(governor), Some(n)) => tokio::select! {
+                        permit = governor.acquire_background_cpu() => Some(permit),
+                        _ = n.notified() => {
+                            info!("redact worker: shutdown signal received while waiting for CPU budget");
+                            return;
+                        }
+                    },
+                    (Some(governor), None) => Some(governor.acquire_background_cpu().await),
+                    (None, _) => None,
+                };
+
                 // Race the table work against shutdown so a long redact batch
-                // doesn't hold us through tokio teardown. `idle_cpu_percent`
-                // was sampled after the preceding cooldown, so empty table
-                // probes cannot accidentally reset the CPU measurement window.
+                // doesn't hold us through tokio teardown.
                 let batch_start = std::time::Instant::now();
                 let result = match shutdown.as_ref() {
                     Some(n) => tokio::select! {
@@ -348,33 +293,41 @@ impl Worker {
                         corruption_logged = false; // DB readable again
 
                         let worked = batch_start.elapsed();
-                        let active_cpu_percent = cpu_sampler.sample();
-                        let nap = cooldown_after_cpu(
-                            worked,
-                            active_cpu_percent,
-                            idle_cpu_percent,
-                            &self.cfg,
-                        );
+                        let cpu_sample = cpu_permit.as_ref().map(|permit| {
+                            permit.finish(
+                                worked,
+                                self.cfg.idle_between_batches,
+                                self.cfg.max_cpu_cooldown,
+                            )
+                        });
+                        let nap = cpu_sample
+                            .map(|sample| sample.cooldown)
+                            .unwrap_or(self.cfg.idle_between_batches);
                         debug!(
                             table = ?table,
                             rows = n,
-                            active_cpu_percent,
-                            idle_cpu_percent,
+                            active_cpu_percent = cpu_sample.and_then(|sample| sample.active_cpu_percent),
+                            idle_cpu_percent = cpu_sample.and_then(|sample| sample.idle_cpu_percent),
                             worked_ms = worked.as_millis(),
                             cooldown_ms = nap.as_millis(),
-                            target_cpu_percent = self.cfg.max_process_cpu_percent,
+                            target_cpu_percent = cpu_sample.map(|sample| sample.target_cpu_percent),
                             "redact worker: adaptive CPU cooldown"
                         );
+                        // Keep `cpu_permit` alive during the cooldown. Otherwise
+                        // another background subsystem could fill our rest
+                        // interval and defeat the process-wide budget.
                         if race(time::sleep(nap), shutdown.as_ref()).await.is_none() {
                             info!("redact worker: shutdown signal received, exiting");
                             return;
                         }
-                        idle_cpu_percent = cpu_sampler.sample();
                     }
                     Some(Ok(_)) => {
                         corruption_logged = false; // DB readable again
                     }
                     Some(Err(e)) => {
+                        // Error backoffs are not CPU-budget cooldowns; release
+                        // the shared lane before waiting seconds or minutes.
+                        drop(cpu_permit);
                         {
                             let mut s = self.status.lock().await;
                             s.last_error = Some(e.to_string());
@@ -416,7 +369,6 @@ impl Worker {
                             {
                                 return;
                             }
-                            idle_cpu_percent = cpu_sampler.sample();
                             break;
                         }
                         warn!(table = ?table, error = %e, "reconciliation error; will retry");
@@ -427,7 +379,6 @@ impl Worker {
                         {
                             return;
                         }
-                        idle_cpu_percent = cpu_sampler.sample();
                     }
                 }
             }
@@ -467,9 +418,6 @@ impl Worker {
             {
                 info!("redact worker: shutdown signal received, exiting");
                 return;
-            }
-            if !any_work {
-                idle_cpu_percent = cpu_sampler.sample();
             }
         }
     }
@@ -1103,45 +1051,5 @@ impl Worker {
         s.last_redacted_at = Some(chrono::Utc::now());
         s.last_error = None;
         Ok(n)
-    }
-}
-
-#[cfg(test)]
-mod cpu_throttle_tests {
-    use super::*;
-
-    fn config() -> WorkerConfig {
-        WorkerConfig {
-            idle_between_batches: Duration::from_millis(50),
-            max_process_cpu_percent: 30.0,
-            max_cpu_cooldown: Duration::from_secs(60),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn one_busy_core_gets_enough_rest_to_average_thirty_percent() {
-        let nap = cooldown_after_cpu(Duration::from_secs(1), Some(100.0), Some(0.0), &config());
-        assert!(nap >= Duration::from_millis(2_333));
-        assert!(nap <= Duration::from_millis(2_334));
-    }
-
-    #[test]
-    fn existing_process_cpu_reduces_redaction_budget() {
-        let nap = cooldown_after_cpu(Duration::from_secs(1), Some(200.0), Some(20.0), &config());
-        assert_eq!(nap, Duration::from_secs(17));
-    }
-
-    #[test]
-    fn baseline_at_target_uses_maximum_cooldown() {
-        let cfg = config();
-        let nap = cooldown_after_cpu(Duration::from_secs(1), Some(100.0), Some(30.0), &cfg);
-        assert_eq!(nap, cfg.max_cpu_cooldown);
-    }
-
-    #[test]
-    fn missing_cpu_sample_falls_back_to_one_busy_core() {
-        let nap = cooldown_after_cpu(Duration::from_secs(1), None, None, &config());
-        assert!(nap >= Duration::from_millis(2_333));
     }
 }
