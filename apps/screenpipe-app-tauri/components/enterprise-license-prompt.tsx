@@ -9,6 +9,8 @@ import { Loader2 } from "lucide-react";
 
 interface EnterpriseLicensePromptProps {
   onSubmit: (key: string) => Promise<{ ok: boolean; error?: string }>;
+  embedded?: boolean;
+  onActivated?: () => void;
 }
 
 const LICENSE_KEY_PATTERN = /^ENT-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
@@ -18,7 +20,11 @@ function normalizeLicenseKey(value: string): string {
   return value.trim().toUpperCase();
 }
 
-export function EnterpriseLicensePrompt({ onSubmit }: EnterpriseLicensePromptProps) {
+export function EnterpriseLicensePrompt({
+  onSubmit,
+  embedded = false,
+  onActivated,
+}: EnterpriseLicensePromptProps) {
   const [key, setKey] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,6 +45,8 @@ export function EnterpriseLicensePrompt({ onSubmit }: EnterpriseLicensePromptPro
       const result = await onSubmit(normalized);
       if (!result.ok) {
         setError(result.error || "failed to validate license key");
+      } else {
+        onActivated?.();
       }
     } catch (e) {
       console.error("[enterprise] license activation failed:", e);
@@ -49,11 +57,17 @@ export function EnterpriseLicensePrompt({ onSubmit }: EnterpriseLicensePromptPro
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-background/80 px-4 pt-12 pb-6 backdrop-blur-sm">
+    <div
+      className={
+        embedded
+          ? "flex w-full items-center justify-center"
+          : "fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-background/80 px-4 pt-12 pb-6 backdrop-blur-sm"
+      }
+    >
       <div className="w-full max-w-sm border border-border bg-background p-6 rounded-lg shadow-lg">
-        <h2 className="text-lg font-semibold mb-1">enterprise license</h2>
+        <h2 className="text-lg font-semibold mb-1">activate this device</h2>
         <p className="text-sm text-muted-foreground mb-4">
-          enter the license key provided by your IT admin to configure this device
+          enter the organization key provided by your IT admin
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-3">
@@ -93,7 +107,7 @@ export function EnterpriseLicensePrompt({ onSubmit }: EnterpriseLicensePromptPro
         </form>
 
         <p className="text-[11px] text-muted-foreground mt-3">
-          contact your admin if you don&apos;t have a license key
+          no employee account is required for managed devices
         </p>
       </div>
     </div>

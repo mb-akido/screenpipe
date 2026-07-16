@@ -45,7 +45,14 @@ describe("EnterpriseLicensePrompt", () => {
 
   it("normalizes lowercase and surrounding spaces before submit", async () => {
     const onSubmit = vi.fn(async () => ({ ok: true }));
-    render(<EnterpriseLicensePrompt onSubmit={onSubmit} />);
+    const onActivated = vi.fn();
+    render(
+      <EnterpriseLicensePrompt
+        embedded
+        onSubmit={onSubmit}
+        onActivated={onActivated}
+      />,
+    );
 
     fireEvent.change(screen.getByPlaceholderText("ENT-XXXX-XXXX-XXXX-XXXX"), {
       target: { value: "  ent-gwxx-rnub-lw9f-3ya6  " },
@@ -53,6 +60,8 @@ describe("EnterpriseLicensePrompt", () => {
     fireEvent.click(screen.getByRole("button", { name: /activate/i }));
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("ENT-GWXX-RNUB-LW9F-3YA6"));
+    expect(onActivated).toHaveBeenCalledOnce();
+    expect(screen.getByText("no employee account is required for managed devices")).toBeInTheDocument();
   });
 
   it("rejects malformed license keys locally", async () => {

@@ -175,7 +175,10 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     !hasConsumerSubscription &&
     enterpriseAccount?.requires_enterprise_app === true;
   const shouldGateForEntitlement =
-    !devBypass && !isEntitled && !failOpenForTransientAccessLoss;
+    !devBypass &&
+    !isEnterprise &&
+    !isEntitled &&
+    !failOpenForTransientAccessLoss;
   const shouldGate =
     shouldGateForEnterpriseApp ||
     shouldGateForEnterpriseLogin ||

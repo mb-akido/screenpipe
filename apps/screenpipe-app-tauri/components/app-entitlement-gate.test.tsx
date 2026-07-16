@@ -146,8 +146,7 @@ describe("AppEntitlementGate", () => {
     expect(mocks.openLoginWindow).toHaveBeenCalled();
   });
 
-  it("does not force enterprise sign-in when the account section is hidden by policy", () => {
-    vi.stubEnv("TAURI_ENV_DEBUG", "true");
+  it("lets managed enterprise devices run without an employee account", () => {
     mocks.enterprise = {
       isEnterprise: true,
       hiddenSections: ["account", "referral"],

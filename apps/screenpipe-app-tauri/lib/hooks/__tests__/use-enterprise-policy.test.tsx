@@ -195,6 +195,7 @@ describe("useEnterprisePolicy manual activation", () => {
     expect(activation).toEqual({ ok: true });
     expect(mocks.commands.saveEnterpriseLicenseKey).toHaveBeenCalledWith(KEY);
     expect(result.current.needsLicenseKey).toBe(false);
+    expect(result.current.licenseStatus).toBe("active");
     expect(result.current.policy.orgName).toBe("Bungalow");
   });
 
@@ -231,6 +232,7 @@ describe("useEnterprisePolicy manual activation", () => {
       error: "license seat limit reached - contact your admin to add seats",
     });
     expect(result.current.needsLicenseKey).toBe(true);
+    expect(result.current.licenseStatus).toBe("required");
     expect(mocks.commands.saveEnterpriseLicenseKey).not.toHaveBeenCalled();
     expect(mocks.commands.setEnterprisePolicy).not.toHaveBeenCalled();
   });

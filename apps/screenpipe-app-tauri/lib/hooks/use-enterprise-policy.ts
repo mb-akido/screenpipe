@@ -471,6 +471,9 @@ export function useEnterprisePolicy() {
     return loadCachedPolicy() ?? EMPTY_POLICY;
   });
   const [needsLicenseKey, setNeedsLicenseKey] = useState(false);
+  const [licenseStatus, setLicenseStatus] = useState<
+    "loading" | "required" | "active"
+  >("loading");
   const licenseKeyRef = useRef<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -735,17 +738,20 @@ export function useEnterprisePolicy() {
     const result = await fetchPolicy(key);
     if (result.ok) {
       setNeedsLicenseKey(false);
+      setLicenseStatus("active");
       setPolicy(result.policy);
       startPolling(key);
     } else if (result.reason === "invalid_key") {
       // Saved key is bad — prompt for a new one
       console.warn("[enterprise] saved key is invalid, prompting for new one");
       setNeedsLicenseKey(true);
+      setLicenseStatus("required");
       const cached = loadCachedPolicy();
       setPolicy(cached ?? { ...EMPTY_POLICY, hiddenSections: ENTERPRISE_DEFAULT_HIDDEN });
     } else {
       // Network error — use cached policy, keep trying
       setNeedsLicenseKey(false);
+      setLicenseStatus("active");
       const cached = loadCachedPolicy();
       setPolicy(cached ?? { ...EMPTY_POLICY, hiddenSections: ENTERPRISE_DEFAULT_HIDDEN });
       startPolling(key);
@@ -805,6 +811,7 @@ export function useEnterprisePolicy() {
     // Apply the policy and start polling
     licenseKeyRef.current = key;
     setNeedsLicenseKey(false);
+    setLicenseStatus("active");
     setPolicy(result.policy);
     startPolling(key);
 
@@ -849,6 +856,7 @@ export function useEnterprisePolicy() {
       if (!key) {
         console.warn("[enterprise] no license key — prompting user to enter one");
         setNeedsLicenseKey(true);
+        setLicenseStatus("required");
         const cached = loadCachedPolicy();
         setPolicy(cached ?? { ...EMPTY_POLICY, hiddenSections: ENTERPRISE_DEFAULT_HIDDEN });
         return;
@@ -890,6 +898,7 @@ export function useEnterprisePolicy() {
     isSettingLocked: isEnterprise ? checkLocked : noop,
     getManagedValue: isEnterprise ? getManagedValue : noopGet,
     needsLicenseKey: isEnterprise ? needsLicenseKey : false,
+    licenseStatus: isEnterprise ? licenseStatus : "active",
     submitLicenseKey,
   };
 }

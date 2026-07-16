@@ -8,6 +8,12 @@
 // - retrying after seats are added must activate without a reload.
 
 import { openHomeWindow, waitForAppReady, t } from '../helpers/test-utils.js';
+import {
+  closeWindow,
+  invokeOrThrow,
+  showWindow,
+  waitForWindowHandle,
+} from '../helpers/tauri.js';
 
 const FORCE_ENTERPRISE_BUILD_KEY = 'screenpipe_e2e_force_enterprise_build';
 const POLICY_KEY = 'screenpipe_e2e_enterprise_policy';
@@ -67,6 +73,10 @@ async function configureEnterpriseMocks(heartbeatStatus: number): Promise<void> 
 
   await browser.pause(t(2500));
   await browser.switchToWindow('home').catch(() => {});
+  await invokeOrThrow('reset_onboarding');
+  await showWindow('Onboarding');
+  await waitForWindowHandle('onboarding', t(15000));
+  await browser.switchToWindow('onboarding');
 }
 
 async function setHeartbeatStatus(status: number): Promise<void> {
@@ -78,6 +88,7 @@ async function setHeartbeatStatus(status: number): Promise<void> {
 }
 
 async function clearEnterpriseMocks(): Promise<void> {
+  await invokeOrThrow('complete_onboarding').catch(() => {});
   await browser.execute(
     (keys: string[], policyCacheKey: string) => {
       for (const key of keys) {
@@ -92,6 +103,7 @@ async function clearEnterpriseMocks(): Promise<void> {
 
   await browser.pause(t(2000));
   await browser.switchToWindow('home').catch(() => {});
+  await closeWindow('Onboarding').catch(() => {});
 }
 
 async function waitForBodyText(text: string): Promise<void> {
@@ -135,7 +147,7 @@ async function submitLicense(value: string): Promise<void> {
   await button.click();
 }
 
-describe('Enterprise license prompt', () => {
+describe('Enterprise onboarding activation', () => {
   before(async () => {
     await waitForAppReady();
     await openHomeWindow();
@@ -147,7 +159,11 @@ describe('Enterprise license prompt', () => {
   });
 
   it('handles invalid key, seat-limit, and retry success without sticking on validating', async () => {
-    await waitForBodyText('enterprise license');
+    await waitForBodyText('activate this device');
+    const initialText = ((await browser.execute(
+      () => document.body.innerText.toLowerCase(),
+    )) as string);
+    expect(initialText).not.toContain('sign in to activate your plan');
 
     await submitLicense(WRONG_LICENSE);
     await waitForBodyText('invalid or expired license key');
@@ -159,10 +175,7 @@ describe('Enterprise license prompt', () => {
 
     await setHeartbeatStatus(200);
     await submitLicense(VALID_LICENSE);
-    await waitForBodyTextGone('enterprise license');
-
-    const homePage = await $('[data-testid="home-page"]');
-    await homePage.waitForExist({ timeout: t(15000) });
-    expect(await homePage.isExisting()).toBe(true);
+    await waitForBodyTextGone('activate this device');
+    await waitForBodyText('permissions');
   });
 });
