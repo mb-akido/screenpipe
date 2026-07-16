@@ -69,13 +69,13 @@ const CLASSES: [SpanLabel; NUM_CLASSES] = [
 ];
 
 /// Per-class score floors applied on top of `conf_threshold` (the higher
-/// wins). `secret` demands 0.85: on the held-out eval every observed
-/// secret-class false fire scored ≤ 0.80, so this floor eliminates them
-/// with no measured recall cost — and `secret` is the one class the
+/// wins). `secret` demands 0.92: across 385 zero-PII eval pages/frames
+/// the largest observed secret-class false fire scored 0.892, and the
+/// floor costs no measured recall — `secret` is the one class the
 /// default [`crate::image::ImageRedactionPolicy`] acts on.
 #[cfg(feature = "onnx-cpu")]
 const CLASS_MIN_SCORE: [f32; NUM_CLASSES] =
-    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.85];
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.92];
 
 /// Configuration for [`RfdetrRedactor`].
 #[derive(Debug, Clone)]
