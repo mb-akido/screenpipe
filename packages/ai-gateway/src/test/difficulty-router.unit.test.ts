@@ -116,6 +116,13 @@ describe('config sanity', () => {
   it('TIER_HEAD covers all tiers', () => {
     expect(Object.keys(TIER_HEAD).sort()).toEqual(['hard', 'normal', 'trivial']);
   });
+  it('keeps Auto on GPT-5.6 and reserves Sol for hard prompts', () => {
+    expect(TIER_HEAD).toEqual({
+      trivial: 'gpt-5.6-luna',
+      normal: 'gpt-5.6-luna',
+      hard: 'gpt-5.6-sol',
+    });
+  });
   it('lastUserText handles string + multimodal content', () => {
     expect(lastUserText([{ role: 'user', content: 'hello' }])).toBe('hello');
     expect(lastUserText([{ role: 'user', content: [{ type: 'text', text: 'multi' }, { type: 'image_url' }] }])).toBe('multi');

@@ -17,6 +17,7 @@
 import { describe, it, expect } from 'bun:test';
 import { resolveServedModel, hasPricing, getModelCost, inferProvider } from '../services/cost-tracker';
 import { AUTO_WATERFALL, AUTO_WATERFALL_VISION, AUTO_WATERFALL_BACKGROUND, MODEL_FALLBACKS } from '../handlers/chat';
+import { TIER_HEAD } from '../handlers/difficulty-router';
 
 describe('resolveServedModel', () => {
 	it('prefers the x-screenpipe-model header set by the chat handler', () => {
@@ -42,6 +43,7 @@ describe('routing chains stay priceable (no silent $0.01 fallback rows)', () => 
 		...AUTO_WATERFALL,
 		...AUTO_WATERFALL_VISION,
 		...AUTO_WATERFALL_BACKGROUND,
+		...Object.values(TIER_HEAD),
 		...Object.keys(MODEL_FALLBACKS),
 		...Object.values(MODEL_FALLBACKS).flat(),
 	];

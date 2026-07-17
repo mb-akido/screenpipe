@@ -500,9 +500,9 @@ export async function handleChatCompletions(
     let chain = hasImages(body)
       ? AUTO_WATERFALL_VISION
       : (useBackgroundChain ? AUTO_WATERFALL_BACKGROUND : AUTO_WATERFALL);
-    // Difficulty router (interactive text only). A/B by device: arm 'on' runs the
-    // router and promotes a tier head (opus for hard, gpt-5-nano for trivial), arm
-    // 'off' is the control baseline (chain unchanged = today's behavior). We tag
+    // Difficulty router (interactive text only). A/B by device: arm 'on' keeps
+    // trivial/normal requests on Luna and promotes hard requests to GPT-5.6 Sol;
+    // arm 'off' is the control baseline (chain unchanged = today's behavior). We tag
     // router_tier on the response so the cost log can measure ON vs control.
     let routerTier: string | null = null;
     if (!hasImages(body) && !useBackgroundChain) {
