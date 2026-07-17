@@ -37,6 +37,7 @@ export default defineConfig({
 			"lib/hooks/__tests__/timeline-reconnection.test.ts",
 			"lib/hooks/__tests__/timeline-liveness.test.ts",
 			"lib/hooks/__tests__/timeline-store-logic.test.ts",
+			"lib/hooks/__tests__/timeline-audio-update.test.ts",
 			"lib/hooks/__tests__/server-push-old-frames.test.ts",
 			"lib/hooks/__tests__/window-focus-refresh.test.ts",
 			"lib/hooks/__tests__/timeline-ui-issues.test.ts",

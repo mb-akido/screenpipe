@@ -52,7 +52,7 @@ use crate::{
     },
     device::device_manager::DeviceManager,
     meeting_detector::MeetingDetector,
-    meeting_streaming::{start_meeting_streaming_loop, MeetingAudioTap},
+    meeting_streaming::{start_meeting_streaming_loop_with_callback, MeetingAudioTap},
     metrics::AudioPipelineMetrics,
     segmentation::segmentation_manager::SegmentationManager,
     transcription::{
@@ -153,9 +153,10 @@ pub struct AudioManager {
     meeting_audio_tap: MeetingAudioTap,
     /// Whether transcription is currently paused (legacy, always false — deferral removed).
     pub transcription_paused: Arc<AtomicBool>,
-    /// Optional callback invoked after each audio transcription DB insert.
-    /// Used by the hot frame cache to receive live audio updates.
+    /// Optional callback invoked after each background audio DB insert.
     on_transcription_insert: Option<crate::transcription::AudioInsertCallback>,
+    /// Optional callback invoked after each durable live meeting final.
+    on_meeting_transcript_insert: Option<crate::meeting_streaming::MeetingTranscriptInsertCallback>,
     /// Unified transcription engine. Set after model loading in start_audio_receiver_handler.
     engine: Arc<RwLock<Option<TranscriptionEngine>>>,
     /// Owns model construction independently from whichever caller requested it.
@@ -372,6 +373,7 @@ impl AudioManager {
             meeting_audio_tap,
             transcription_paused: Arc::new(AtomicBool::new(false)),
             on_transcription_insert: None,
+            on_meeting_transcript_insert: None,
             engine: Arc::new(RwLock::new(None)),
             engine_builds: EngineBuildCoordinator::new(),
             reconciliation_handle: Arc::new(RwLock::new(None)),
@@ -446,10 +448,32 @@ impl AudioManager {
         Ok(())
     }
 
-    /// Set a callback that fires after each audio transcription is inserted into DB.
+    /// Set a callback that fires after each background transcription is inserted into DB.
     /// Must be called before `start()`.
     pub fn set_on_transcription_insert(&mut self, cb: crate::transcription::AudioInsertCallback) {
         self.on_transcription_insert = Some(cb);
+    }
+
+    /// Set a callback that fires after each live meeting final is inserted.
+    /// Must be called before `start()`.
+    pub fn set_on_meeting_transcript_insert(
+        &mut self,
+        cb: crate::meeting_streaming::MeetingTranscriptInsertCallback,
+    ) {
+        self.on_meeting_transcript_insert = Some(cb);
+    }
+
+    async fn spawn_meeting_streaming_coordinator(&self) -> JoinHandle<()> {
+        let config = self.options.read().await.meeting_streaming.clone();
+        let audio_rx = self.meeting_audio_tap.subscribe();
+        start_meeting_streaming_loop_with_callback(
+            config,
+            self.meeting_audio_tap.clone(),
+            audio_rx,
+            self.db.clone(),
+            self.engine.clone(),
+            self.on_meeting_transcript_insert.clone(),
+        )
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -478,15 +502,7 @@ impl AudioManager {
         {
             let mut meeting_streaming_handle = self.meeting_streaming_handle.write().await;
             if meeting_streaming_handle.is_none() {
-                let config = self.options.read().await.meeting_streaming.clone();
-                let audio_rx = self.meeting_audio_tap.subscribe();
-                *meeting_streaming_handle = Some(start_meeting_streaming_loop(
-                    config,
-                    self.meeting_audio_tap.clone(),
-                    audio_rx,
-                    self.db.clone(),
-                    self.engine.clone(),
-                ));
+                *meeting_streaming_handle = Some(self.spawn_meeting_streaming_coordinator().await);
             }
         }
 
@@ -2155,7 +2171,13 @@ impl Drop for AudioManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::device::{AudioDevice, DeviceType};
+    use crate::{
+        audio_manager::AudioManagerBuilder,
+        core::device::{AudioDevice, DeviceType},
+        meeting_streaming::{
+            MeetingStreamingConfig, MeetingStreamingProvider, MeetingTranscriptInsertCallback,
+        },
+    };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -2173,6 +2195,76 @@ mod tests {
             config,
             identity: Arc::new(()),
         }
+    }
+
+    #[tokio::test]
+    async fn meeting_streaming_final_uses_manager_transcription_callback() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let meeting_id = db
+            .insert_meeting("Google Meet", "test", None, None)
+            .await
+            .unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let transcript = format!("manager callback live final {unique}");
+        let mut manager = AudioManagerBuilder::new()
+            .is_disabled(true)
+            .meeting_streaming(
+                MeetingStreamingConfig::default().with_provider(MeetingStreamingProvider::Disabled),
+            )
+            .output_path(std::env::temp_dir().join(format!(
+                "screenpipe-manager-live-final-{}-{unique}",
+                std::process::id()
+            )))
+            .build(db)
+            .await
+            .unwrap();
+
+        let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
+        let callback: MeetingTranscriptInsertCallback = Arc::new(move |info| {
+            let _ = callback_tx.send(info);
+        });
+        manager.set_on_meeting_transcript_insert(callback);
+        let coordinator = manager.spawn_meeting_streaming_coordinator().await;
+
+        let captured_at = Utc::now();
+        screenpipe_events::send_event(
+            "meeting_transcript_final",
+            serde_json::json!({
+                "meeting_id": meeting_id,
+                "provider": "selected-engine",
+                "model": "test-model",
+                "item_id": format!("manager-callback-{unique}"),
+                "device_name": "System Audio",
+                "device_type": "output",
+                "speaker_name": "Speaker 2",
+                "transcript": transcript,
+                "captured_at": captured_at,
+            }),
+        )
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let info = callback_rx.recv().await.expect("callback channel closed");
+                if info.transcription == transcript {
+                    return info;
+                }
+            }
+        })
+        .await
+        .expect("AudioManager should forward persisted live finals to its callback");
+
+        assert!(received.segment_id > 0);
+        assert_eq!(received.speaker_name.as_deref(), Some("Speaker 2"));
+        assert_eq!(received.captured_at, captured_at);
+        coordinator.abort();
     }
 
     #[tokio::test]

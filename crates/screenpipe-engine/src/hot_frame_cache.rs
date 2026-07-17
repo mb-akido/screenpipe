@@ -9,7 +9,7 @@
 //! This eliminates the heavy `find_video_chunks` polling that starved the DB pool.
 
 use chrono::{DateTime, Datelike, Utc};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{info, warn};
@@ -79,6 +79,28 @@ pub struct HotFrameCache {
     warm_ready_rx: watch::Receiver<bool>,
 }
 
+fn audio_only_hot_frame(
+    frame_id: i64,
+    timestamp: DateTime<Utc>,
+    offset_index: i64,
+    fps: f64,
+) -> HotFrame {
+    HotFrame {
+        frame_id,
+        timestamp,
+        device_name: Arc::from("audio-only"),
+        app_name: Arc::from("Audio Recording"),
+        window_name: Arc::from(""),
+        ocr_text_preview: Arc::from(""),
+        snapshot_path: Arc::from(""),
+        browser_url: None,
+        capture_trigger: Arc::from("audio"),
+        offset_index,
+        fps,
+        machine_id: None,
+    }
+}
+
 impl Default for HotFrameCache {
     fn default() -> Self {
         Self::new()
@@ -146,7 +168,85 @@ impl HotFrameCache {
             .entry(audio.timestamp)
             .or_default()
             .push(audio.clone());
+
+        // Static meetings can go minutes without a new screenshot, and audio-
+        // only recording has no visual frames at all. Mirror the DB Timeline's
+        // audio-only fallback so this transcript has a durable in-memory point
+        // to attach to for both current subscribers and later reconnects.
+        // Audio is associated with visual frames across a wider ±60s window,
+        // but a Timeline scrub point must stay close enough for live-follow and
+        // the subtitle lookahead. Match the DB fallback's 15s anchor window so
+        // a static meeting cannot remain stuck on an old marker for a minute.
+        let anchor_pad = chrono::Duration::seconds(15);
+        let has_nearby_frame = {
+            let frames = self.frames.read().await;
+            frames
+                .range(
+                    (audio.timestamp - anchor_pad, i64::MIN)
+                        ..=(audio.timestamp + anchor_pad, i64::MAX),
+                )
+                .next()
+                .is_some()
+        };
+        if !has_nearby_frame {
+            self.push_frame(audio_only_hot_frame(
+                -audio.timestamp.timestamp_millis(),
+                audio.timestamp,
+                -1,
+                0.0,
+            ))
+            .await;
+        }
+
         let _ = self.audio_notify.send(audio);
+    }
+
+    /// Convert a background transcription callback payload into a cached
+    /// Timeline audio entry, preserving its original capture time.
+    pub async fn push_transcription_insert(
+        &self,
+        info: screenpipe_audio::transcription::AudioInsertInfo,
+    ) {
+        let timestamp = i64::try_from(info.capture_timestamp)
+            .ok()
+            .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+            .unwrap_or_else(Utc::now);
+        self.push_audio(HotAudio {
+            audio_chunk_id: info.audio_chunk_id,
+            timestamp,
+            transcription: info.transcription.into(),
+            device_name: info.device_name.into(),
+            is_input: info.is_input,
+            audio_file_path: info.audio_file_path.into(),
+            duration_secs: info.duration_secs,
+            start_time: info.start_time,
+            end_time: info.end_time,
+            speaker_id: info.speaker_id,
+            speaker_name: None,
+        })
+        .await;
+    }
+
+    /// Cache a durable live meeting final without forcing its provider speaker
+    /// metadata through the public background-audio callback payload.
+    pub async fn push_meeting_transcript_insert(
+        &self,
+        info: screenpipe_audio::meeting_streaming::MeetingTranscriptInsertInfo,
+    ) {
+        self.push_audio(HotAudio {
+            audio_chunk_id: -info.segment_id,
+            timestamp: info.captured_at,
+            transcription: info.transcription.into(),
+            device_name: info.device_name.into(),
+            is_input: info.is_input,
+            audio_file_path: Arc::from(""),
+            duration_secs: 0.0,
+            start_time: None,
+            end_time: None,
+            speaker_id: None,
+            speaker_name: info.speaker_name.as_deref().map(Arc::from),
+        })
+        .await;
     }
 
     /// Subscribe to live frame updates (for WS handlers).
@@ -218,6 +318,35 @@ impl HotFrameCache {
 
         info!("hot_frame_cache: warming from DB ({} to {})", start, end);
 
+        // `find_video_chunks` deliberately attaches an audio row to every
+        // nearby visual frame and its public AudioEntry shape predates an
+        // exact source timestamp. Recover live-final capture times by their
+        // stable negative segment ids so cold warm-up does not shift captions
+        // to whichever carrier frame happens to be visited first.
+        let live_timestamps: HashMap<i64, DateTime<Utc>> =
+            match sqlx::query_as::<_, (i64, DateTime<Utc>)>(
+                "SELECT id, captured_at FROM meeting_transcript_segments \
+                 WHERE julianday(captured_at) >= julianday(?1) \
+                   AND julianday(captured_at) <= julianday(?2)",
+            )
+            .bind(start)
+            .bind(end)
+            .fetch_all(&db.pool)
+            .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter_map(|(id, timestamp)| id.checked_neg().map(|key| (key, timestamp)))
+                    .collect(),
+                Err(error) => {
+                    warn!(
+                        "hot_frame_cache: failed to load live transcript timestamps: {}",
+                        error
+                    );
+                    HashMap::new()
+                }
+            };
+
         match db.find_video_chunks(start, end).await {
             Ok(chunks) => {
                 let mut frame_count = 0;
@@ -229,6 +358,7 @@ impl HotFrameCache {
 
                 for frame_data in chunks.frames {
                     // Convert FrameData to HotFrames
+                    let mut inserted_visible_frame = false;
                     for ocr_entry in &frame_data.ocr_entries {
                         // Skip screenpipe's own frames
                         if is_screenpipe_app(&ocr_entry.app_name) {
@@ -254,6 +384,26 @@ impl HotFrameCache {
                             machine_id: frame_data.machine_id.as_deref().map(Arc::from),
                         };
                         frames.insert((hot.timestamp, hot.frame_id), hot);
+                        inserted_visible_frame = true;
+                        frame_count += 1;
+                        earliest_frame_ts =
+                            Some(earliest_frame_ts.map_or(frame_data.timestamp, |existing| {
+                                existing.min(frame_data.timestamp)
+                            }));
+                    }
+
+                    // DB audio-only rows intentionally have no OCR entries.
+                    // Preserve their synthetic Timeline marker during cold
+                    // warm-up, otherwise today's transcript disappears after
+                    // an app restart even though the audio map was restored.
+                    if !inserted_visible_frame && !frame_data.audio_entries.is_empty() {
+                        let hot = audio_only_hot_frame(
+                            frame_data.frame_id,
+                            frame_data.timestamp,
+                            frame_data.offset_index,
+                            frame_data.fps,
+                        );
+                        frames.insert((hot.timestamp, hot.frame_id), hot);
                         frame_count += 1;
                         earliest_frame_ts =
                             Some(earliest_frame_ts.map_or(frame_data.timestamp, |existing| {
@@ -276,7 +426,10 @@ impl HotFrameCache {
                         }
                         let hot_audio = HotAudio {
                             audio_chunk_id: audio_entry.audio_chunk_id,
-                            timestamp: frame_data.timestamp,
+                            timestamp: live_timestamps
+                                .get(&audio_entry.audio_chunk_id)
+                                .copied()
+                                .unwrap_or(frame_data.timestamp),
                             transcription: Arc::from(audio_entry.transcription.as_str()),
                             device_name: Arc::from(audio_entry.device_name.as_str()),
                             is_input: audio_entry.is_input,
@@ -403,6 +556,7 @@ fn find_audio_for_frame(
                 speaker_name: a.speaker_name.as_deref().map(String::from),
                 start_time: a.start_time,
                 end_time: a.end_time,
+                audio_timestamp: Some(a.timestamp),
             });
         }
     }
@@ -521,6 +675,141 @@ mod tests {
             result[0].frame_data[0].audio_entries[0].transcription,
             "hello"
         );
+    }
+
+    #[tokio::test]
+    async fn test_audio_without_visual_frame_creates_live_timeline_marker() {
+        let cache = HotFrameCache::new();
+        let now = Utc::now();
+        let mut frame_rx = cache.subscribe_frames();
+
+        cache
+            .push_audio(HotAudio {
+                audio_chunk_id: -42,
+                timestamp: now,
+                transcription: "audio-only live caption".into(),
+                device_name: "System Audio".into(),
+                is_input: false,
+                audio_file_path: "".into(),
+                duration_secs: 0.0,
+                start_time: None,
+                end_time: None,
+                speaker_id: None,
+                speaker_name: Some("Speaker 1".into()),
+            })
+            .await;
+
+        let broadcast_frame = frame_rx.recv().await.unwrap();
+        assert_eq!(broadcast_frame.timestamp, now);
+        assert_eq!(broadcast_frame.device_name.as_ref(), "audio-only");
+        assert!(broadcast_frame.frame_id < 0);
+
+        let frames = cache
+            .get_frames_in_range(
+                now - chrono::Duration::seconds(1),
+                now + chrono::Duration::seconds(1),
+            )
+            .await;
+        assert_eq!(frames.len(), 1);
+        let device = &frames[0].frame_data[0];
+        assert_eq!(device.device_id, "audio-only");
+        assert_eq!(device.metadata.app_name, "Audio Recording");
+        assert_eq!(device.audio_entries.len(), 1);
+        assert_eq!(
+            device.audio_entries[0].transcription,
+            "audio-only live caption"
+        );
+        assert_eq!(
+            device.audio_entries[0].speaker_name.as_deref(),
+            Some("Speaker 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_static_meeting_creates_a_fresh_marker_before_subtitle_gap() {
+        let cache = HotFrameCache::new();
+        let first_timestamp = Utc::now();
+        let second_timestamp = first_timestamp + chrono::Duration::seconds(31);
+
+        for (audio_chunk_id, timestamp, transcription) in [
+            (-42, first_timestamp, "first static caption"),
+            (-43, second_timestamp, "second static caption"),
+        ] {
+            cache
+                .push_audio(HotAudio {
+                    audio_chunk_id,
+                    timestamp,
+                    transcription: transcription.into(),
+                    device_name: "System Audio".into(),
+                    is_input: false,
+                    audio_file_path: "".into(),
+                    duration_secs: 0.0,
+                    start_time: None,
+                    end_time: None,
+                    speaker_id: None,
+                    speaker_name: Some("Speaker 1".into()),
+                })
+                .await;
+        }
+
+        let frames = cache
+            .get_frames_in_range(
+                first_timestamp - chrono::Duration::seconds(1),
+                second_timestamp + chrono::Duration::seconds(1),
+            )
+            .await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].timestamp, first_timestamp);
+        assert_eq!(frames[1].timestamp, second_timestamp);
+        assert!(frames[1].frame_data[0]
+            .audio_entries
+            .iter()
+            .any(|audio| audio.transcription == "second static caption"));
+    }
+
+    #[tokio::test]
+    async fn test_cold_warm_restores_audio_only_live_final_at_capture_time() {
+        let db = screenpipe_db::DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        let meeting_id = db
+            .insert_meeting("Google Meet", "test", None, None)
+            .await
+            .unwrap();
+        let captured_at = Utc::now() - chrono::Duration::milliseconds(250);
+        let segment_id = db
+            .insert_meeting_transcript_segment(
+                meeting_id,
+                "selected-engine",
+                Some("test-model"),
+                "cold-warm-live-final",
+                "System Audio",
+                "output",
+                Some("Speaker 1"),
+                "caption survives app restart",
+                captured_at,
+            )
+            .await
+            .unwrap();
+
+        let cache = HotFrameCache::new();
+        cache.warm_from_db(&db, 1).await;
+
+        let frames = cache
+            .get_frames_in_range(
+                captured_at - chrono::Duration::seconds(1),
+                captured_at + chrono::Duration::seconds(1),
+            )
+            .await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].timestamp, captured_at);
+        let device = &frames[0].frame_data[0];
+        assert_eq!(device.device_id, "audio-only");
+        assert_eq!(device.audio_entries.len(), 1);
+        let audio = &device.audio_entries[0];
+        assert_eq!(audio.audio_chunk_id, -segment_id);
+        assert_eq!(audio.audio_timestamp, Some(captured_at));
+        assert_eq!(audio.speaker_name.as_deref(), Some("Speaker 1"));
     }
 
     #[tokio::test]

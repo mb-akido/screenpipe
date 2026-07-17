@@ -4,7 +4,12 @@
 "use client";
 import { useMemo, useRef, useEffect, useState } from "react";
 import { Mic, Volume2, ChevronDown, X, Loader2, MessageSquareText } from "lucide-react";
-import { StreamTimeSeriesResponse, AudioData } from "@/components/rewind/timeline";
+import { StreamTimeSeriesResponse } from "@/components/rewind/timeline";
+import {
+	collectSubtitleEntries,
+	selectVisibleSubtitleEntries,
+	type SubtitleAudioEntry,
+} from "./subtitle-entries";
 
 interface SubtitleBarProps {
 	frames: StreamTimeSeriesResponse[];
@@ -13,25 +18,10 @@ interface SubtitleBarProps {
 	onClick?: () => void;
 	transcriptionPaused?: boolean;
 	meetingApp?: string;
+	timelineVersion?: number;
 }
 
-interface AudioEntry extends AudioData {
-	timestamp: Date;
-	audio_chunk_id: number;
-	is_input: boolean;
-	transcription: string;
-}
-
-/** Max number of subtitle lines visible at once (active + lookahead) */
-const MAX_LINES = 4;
-
-/** How many seconds a line stays visible after its audio ends */
-const LINGER_SECS = 4;
-
-/** How far ahead (ms) to show upcoming transcriptions */
-const LOOKAHEAD_MS = 30_000;
-
-export function SubtitleBar({ frames, currentIndex, isPlaying, onClick, transcriptionPaused, meetingApp }: SubtitleBarProps) {
+export function SubtitleBar({ frames, currentIndex, isPlaying, onClick, transcriptionPaused, meetingApp, timelineVersion }: SubtitleBarProps) {
 	const [isHovered, setIsHovered] = useState(false);
 	const [isCollapsed, setIsCollapsed] = useState(false);
 
@@ -43,88 +33,16 @@ export function SubtitleBar({ frames, currentIndex, isPlaying, onClick, transcri
 	}, [frames, currentIndex]);
 
 	// Collect and deduplicate all audio entries within a wide window
-	const allEntries = useMemo(() => {
-		if (!currentTime) return [];
-		const windowMs = 60_000; // ±60s to catch active + lookahead
-
-		const entries: AudioEntry[] = [];
-		for (let i = frames.length - 1; i >= 0; i--) {
-			const f = frames[i];
-			const ft = new Date(f.timestamp).getTime();
-			if (ft < currentTime - windowMs) continue;
-			if (ft > currentTime + windowMs) continue;
-
-			for (const device of f.devices) {
-				for (const audio of device.audio ?? []) {
-					entries.push({
-						...audio,
-						transcription: audio.transcription?.trim() || "",
-						timestamp: new Date(ft),
-					});
-				}
-			}
-		}
-
-		if (entries.length === 0) return [];
-
-		// Dedup pass 1: by audio_chunk_id — keep earliest timestamp
-		const byChunk = new Map<number, AudioEntry>();
-		for (const entry of entries) {
-			const existing = byChunk.get(entry.audio_chunk_id);
-			if (!existing) {
-				byChunk.set(entry.audio_chunk_id, entry);
-			} else if (entry.timestamp < existing.timestamp) {
-				byChunk.set(entry.audio_chunk_id, { ...existing, timestamp: entry.timestamp });
-			}
-		}
-
-		// Dedup pass 2: by text prefix — keep longer text, earliest timestamp
-		// Untranscribed chunks use chunk id as key so they don't merge
-		const normalize = (t: string) => t.trim().toLowerCase();
-		const byPrefix = new Map<string, AudioEntry>();
-		for (const entry of byChunk.values()) {
-			const key = entry.transcription
-				? `${entry.is_input}-${normalize(entry.transcription).slice(0, 60)}`
-				: `pending-${entry.audio_chunk_id}`;
-			const existing = byPrefix.get(key);
-			if (!existing) {
-				byPrefix.set(key, entry);
-			} else if (entry.transcription && normalize(entry.transcription).length > normalize(existing.transcription).length) {
-				const ts = entry.timestamp < existing.timestamp ? entry.timestamp : existing.timestamp;
-				byPrefix.set(key, { ...entry, timestamp: ts });
-			}
-		}
-
-		// Sort chronologically
-		const sorted = Array.from(byPrefix.values());
-		sorted.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
-		return sorted;
-	}, [frames, currentIndex, currentTime]);
+	const allEntries = useMemo(
+		() => collectSubtitleEntries(frames, currentTime),
+		[frames, currentTime, timelineVersion],
+	);
 
 	// Split into active (currently speaking / just finished) and lookahead (upcoming)
-	const { activeEntries, lookaheadEntries } = useMemo(() => {
-		const active: AudioEntry[] = [];
-		const lookahead: AudioEntry[] = [];
-
-		for (const entry of allEntries) {
-			const entryStartMs = entry.timestamp.getTime();
-			const entryEndMs = entryStartMs + (entry.duration_secs || 5) * 1000 + LINGER_SECS * 1000;
-
-			// Active: started (with 5s pre-buffer) and not expired
-			if (currentTime >= entryStartMs - 5000 && currentTime <= entryEndMs) {
-				active.push(entry);
-			}
-			// Lookahead: hasn't started yet but within lookahead window
-			else if (entryStartMs > currentTime && entryStartMs - currentTime <= LOOKAHEAD_MS) {
-				lookahead.push(entry);
-			}
-		}
-
-		return {
-			activeEntries: active.slice(-3), // max 3 active
-			lookaheadEntries: lookahead.slice(0, MAX_LINES - Math.min(active.length, 3)), // fill remaining slots
-		};
-	}, [allEntries, currentTime]);
+	const { activeEntries, lookaheadEntries } = useMemo(
+		() => selectVisibleSubtitleEntries(allEntries, currentTime),
+		[allEntries, currentTime],
+	);
 
 	// Auto-scroll
 	const scrollRef = useRef<HTMLDivElement>(null);
@@ -242,7 +160,7 @@ function SubtitleLine({
 	isHovered,
 	isLookahead,
 }: {
-	entry: AudioEntry;
+	entry: SubtitleAudioEntry;
 	currentTime: number;
 	opacity: number;
 	isPlaying?: boolean;

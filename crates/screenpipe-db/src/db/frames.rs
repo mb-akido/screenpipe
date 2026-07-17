@@ -1138,7 +1138,8 @@ impl DatabaseManager {
         // stretch on the timeline even though the in-app Meeting view (which already
         // UNIONs both tables) shows it. Columns are aliased to match audio_query so the
         // same row-processing path below handles both. There is no audio file / chunk for
-        // a live segment, so audio_path='' and audio_chunk_id=-1 (transcript-only entry).
+        // a live segment, so audio_path='' and the stable synthetic audio_chunk_id is the
+        // negative segment id (real audio chunk ids are positive).
         let live_query = format!(
             r#"
 	        SELECT
@@ -1147,7 +1148,7 @@ impl DatabaseManager {
             mts.device_name AS audio_device,
             CASE WHEN mts.device_type = 'input' THEN 1 ELSE 0 END AS is_input_device,
             '' AS audio_path,
-            -1 AS audio_chunk_id,
+            -mts.id AS audio_chunk_id,
             NULL AS start_time,
             NULL AS end_time,
             mts.speaker_name AS speaker_name,

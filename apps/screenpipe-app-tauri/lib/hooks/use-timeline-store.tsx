@@ -15,6 +15,7 @@ import {
 } from "@/lib/api";
 import { mergeTimelineFrames } from "./timeline-frame-merge";
 import { evaluateTimelineLiveness } from "./timeline-liveness";
+import { applyTimelineAudioUpdate } from "./timeline-audio-update";
 
 // Frame buffer for batching updates - reduces 68 re-renders to ~3-5
 let frameBuffer: StreamTimeSeriesResponse[] = [];
@@ -494,27 +495,45 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 				// Mutates frames in-place to avoid cloning the entire 40k+ array
 				// on every audio update (major GC pressure on WebKitGTK/Linux).
 				if (data.type === "audio_update" && data.audio) {
-					const { frames } = get();
-					const audioTs = new Date(data.timestamp).getTime();
-					const pad = 60_000; // ±60s window matching server
-					let updated = false;
-					for (let i = 0; i < frames.length; i++) {
-						const frame = frames[i];
-						const frameTs = new Date(frame.timestamp).getTime();
-						if (Math.abs(frameTs - audioTs) > pad) continue;
-						const isDuplicate = frame.devices?.some((d: any) =>
-							d.audio?.some((a: any) => a.audio_chunk_id === data.audio.audio_chunk_id)
-						);
-						if (isDuplicate) continue;
-						// Mutate in-place — push audio onto each device's audio array
-						for (const d of (frame.devices || [])) {
-							(d as any).audio = [...((d as any).audio || []), data.audio];
-						}
-						updated = true;
+					const { frames, currentDate } = get();
+					const audioDate = new Date(data.timestamp);
+					// A live update can race with navigation to another day. The old
+					// merge naturally ignored it because no past frame was within ±60s;
+					// keep that isolation now that the fallback can create a frame.
+					if (
+						Number.isNaN(audioDate.getTime()) ||
+						audioDate.toDateString() !== currentDate.toDateString()
+					) {
+						return;
 					}
-					// Trigger re-render with a new timestamp (no array clone needed)
-					if (updated) {
-						set({ lastFlushTimestamp: Date.now() });
+					const update = applyTimelineAudioUpdate(
+						frames,
+						data.audio,
+						data.timestamp,
+					);
+					if (update.changed) {
+						set((state) => {
+							const frameTimestamps = update.insertedTimestamp
+								? new Set(state.frameTimestamps).add(
+										update.insertedTimestamp,
+									)
+								: state.frameTimestamps;
+							return {
+								frames: update.frames,
+								frameTimestamps,
+								isLoading: false,
+								loadingProgress: {
+									loaded: update.frames.length,
+									isStreaming: true,
+								},
+								message: null,
+								newFramesCount: update.newAtFront,
+								lastFlushTimestamp: Math.max(
+									Date.now(),
+									state.lastFlushTimestamp + 1,
+								),
+							};
+						});
 					}
 					return;
 				}

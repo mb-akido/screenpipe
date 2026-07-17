@@ -56,19 +56,34 @@ mod timeline_live_meeting_tests {
             .insert_meeting("zoom.us", "ui_scan", None, None)
             .await
             .unwrap();
-        db.insert_meeting_transcript_segment(
-            meeting_id,
-            "screenpipe-cloud",
-            Some("nova-3"),
-            "deepgram:0:0",
-            "System Audio",
-            "output",
-            Some("Speaker 1"),
-            "audience asked about the roadmap",
-            base + Duration::seconds(2),
-        )
-        .await
-        .unwrap();
+        let first_segment_id = db
+            .insert_meeting_transcript_segment(
+                meeting_id,
+                "screenpipe-cloud",
+                Some("nova-3"),
+                "deepgram:0:0",
+                "System Audio",
+                "output",
+                Some("Speaker 1"),
+                "audience asked about the roadmap",
+                base + Duration::seconds(2),
+            )
+            .await
+            .unwrap();
+        let second_segment_id = db
+            .insert_meeting_transcript_segment(
+                meeting_id,
+                "screenpipe-cloud",
+                Some("nova-3"),
+                "deepgram:0:1",
+                "System Audio",
+                "output",
+                Some("Speaker 1"),
+                "the second live sentence must not replace the first",
+                base + Duration::seconds(4),
+            )
+            .await
+            .unwrap();
 
         let chunks = db
             .find_video_chunks(base - Duration::minutes(1), base + Duration::minutes(1))
@@ -83,6 +98,22 @@ mod timeline_live_meeting_tests {
         assert!(
             found,
             "live meeting transcript should be surfaced on the timeline"
+        );
+
+        let live_ids: std::collections::HashSet<i64> = chunks
+            .frames
+            .iter()
+            .flat_map(|frame| frame.audio_entries.iter())
+            .filter(|audio| {
+                audio.transcription.contains("audience asked")
+                    || audio.transcription.contains("second live sentence")
+            })
+            .map(|audio| audio.audio_chunk_id)
+            .collect();
+        assert_eq!(
+            live_ids,
+            std::collections::HashSet::from([-first_segment_id, -second_segment_id]),
+            "each transcript-only live segment needs a stable unique negative id"
         );
     }
 

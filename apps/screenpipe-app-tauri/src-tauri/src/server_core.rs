@@ -402,24 +402,17 @@ impl ServerCore {
             let rt = tokio::runtime::Handle::current();
             audio_manager.set_on_transcription_insert(Arc::new(move |info| {
                 let cache = cache.clone();
-                let ts = chrono::DateTime::from_timestamp(info.capture_timestamp as i64, 0)
-                    .unwrap_or_else(chrono::Utc::now);
                 rt.spawn(async move {
-                    cache
-                        .push_audio(screenpipe_engine::hot_frame_cache::HotAudio {
-                            audio_chunk_id: info.audio_chunk_id,
-                            timestamp: ts,
-                            transcription: info.transcription.into(),
-                            device_name: info.device_name.into(),
-                            is_input: info.is_input,
-                            audio_file_path: info.audio_file_path.into(),
-                            duration_secs: info.duration_secs,
-                            start_time: info.start_time,
-                            end_time: info.end_time,
-                            speaker_id: info.speaker_id,
-                            speaker_name: None,
-                        })
-                        .await;
+                    cache.push_transcription_insert(info).await;
+                });
+            }));
+
+            let cache = hot_frame_cache.clone();
+            let rt = tokio::runtime::Handle::current();
+            audio_manager.set_on_meeting_transcript_insert(Arc::new(move |info| {
+                let cache = cache.clone();
+                rt.spawn(async move {
+                    cache.push_meeting_transcript_insert(info).await;
                 });
             }));
         }

@@ -7,6 +7,7 @@ import {
 	AudioData,
 	StreamTimeSeriesResponse,
 } from "@/components/rewind/timeline";
+import { getAudioTimestamp } from "./timeline-audio-update";
 
 export interface AudioEntryWithTimestamp extends AudioData {
 	frameTimestamp: Date;
@@ -127,13 +128,12 @@ function detectMeetings(frames: StreamTimeSeriesResponse[]): Meeting[] {
 	const allAudio: AudioEntryWithTimestamp[] = [];
 
 	frames.forEach((frame, frameIndex) => {
-		const frameTime = new Date(frame.timestamp);
 		frame.devices.forEach((device) => {
 			device.audio.forEach((audio) => {
 				if (!audio.transcription || audio.transcription.trim().length === 0) return;
 				allAudio.push({
 					...audio,
-					frameTimestamp: frameTime,
+					frameTimestamp: getAudioTimestamp(audio, frame.timestamp),
 					frameIndex,
 				});
 			});

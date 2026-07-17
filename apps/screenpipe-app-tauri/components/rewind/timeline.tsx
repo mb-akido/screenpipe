@@ -73,6 +73,8 @@ export interface AudioData {
 	device_name: string;
 	is_input: boolean;
 	transcription: string;
+	/** Exact audio capture time when it differs from the carrier frame. */
+	audio_timestamp?: string;
 	audio_file_path: string;
 	duration_secs: number;
 	start_offset: number;
@@ -180,7 +182,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	const { currentDate, setCurrentDate, fetchTimeRange, hasDateBeenFetched, onWindowFocus, clearNewFramesCount, clearSentRequestForDate, clearFramesForNavigation, pendingNavigation, setPendingNavigation } =
 		useTimelineStore();
 
-	const { frames, isLoading, error, message, fetchNextDayData, websocket } =
+	const { frames, isLoading, error, message, fetchNextDayData, websocket, lastFlushTimestamp } =
 		useTimelineData(currentDate, (frame) => {
 			setCurrentFrame(frame);
 		});
@@ -1341,6 +1343,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 						onClick={() => setShowAudioTranscript(true)}
 						transcriptionPaused={health?.audio_pipeline?.transcription_paused && !!health?.audio_pipeline?.meeting_app}
 						meetingApp={health?.audio_pipeline?.meeting_app}
+						timelineVersion={lastFlushTimestamp}
 					/>
 				</div>
 

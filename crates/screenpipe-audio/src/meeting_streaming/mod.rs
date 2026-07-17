@@ -10,8 +10,9 @@ mod net;
 mod selected_engine;
 
 pub use config::{MeetingStreamingConfig, MeetingStreamingProvider};
-pub use controller::start_meeting_streaming_loop;
+pub use controller::{start_meeting_streaming_loop, start_meeting_streaming_loop_with_callback};
 pub use events::{
     MeetingAudioFrame, MeetingAudioTap, MeetingLifecycleEvent, MeetingStreamingSessionEnded,
-    MeetingStreamingSessionStarted, MeetingStreamingStatusChanged,
+    MeetingStreamingSessionStarted, MeetingStreamingStatusChanged, MeetingTranscriptInsertCallback,
+    MeetingTranscriptInsertInfo,
 };

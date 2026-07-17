@@ -22,6 +22,7 @@ use super::{
         MeetingAudioFrame, MeetingAudioTap, MeetingLifecycleEvent, MeetingStreamingError,
         MeetingStreamingSessionEnded, MeetingStreamingSessionStarted,
         MeetingStreamingStatusChanged, MeetingTranscriptDelta, MeetingTranscriptFinal,
+        MeetingTranscriptInsertCallback, MeetingTranscriptInsertInfo,
     },
     selected_engine, MeetingStreamingConfig, MeetingStreamingProvider,
 };
@@ -76,10 +77,45 @@ struct ActiveMeetingStream {
 pub fn start_meeting_streaming_loop(
     config: MeetingStreamingConfig,
     audio_tap: MeetingAudioTap,
-    mut audio_rx: broadcast::Receiver<MeetingAudioFrame>,
+    audio_rx: broadcast::Receiver<MeetingAudioFrame>,
     db: Arc<DatabaseManager>,
     transcription_engine: Arc<RwLock<Option<TranscriptionEngine>>>,
 ) -> JoinHandle<()> {
+    start_meeting_streaming_loop_with_callback(
+        config,
+        audio_tap,
+        audio_rx,
+        db,
+        transcription_engine,
+        None,
+    )
+}
+
+/// Start the coordinator and notify a caller after each durable live final.
+///
+/// The callback variant lets the engine feed today's in-memory Timeline cache
+/// while preserving the original public coordinator API for other consumers.
+pub fn start_meeting_streaming_loop_with_callback(
+    config: MeetingStreamingConfig,
+    audio_tap: MeetingAudioTap,
+    mut audio_rx: broadcast::Receiver<MeetingAudioFrame>,
+    db: Arc<DatabaseManager>,
+    transcription_engine: Arc<RwLock<Option<TranscriptionEngine>>>,
+    on_meeting_transcript_insert: Option<MeetingTranscriptInsertCallback>,
+) -> JoinHandle<()> {
+    // Subscribe before spawning so callers can emit immediately after this
+    // function returns without racing the coordinator's first poll.
+    let mut started_sub =
+        screenpipe_events::subscribe_to_event::<MeetingLifecycleEvent>("meeting_started");
+    let mut ended_sub =
+        screenpipe_events::subscribe_to_event::<MeetingLifecycleEvent>("meeting_ended");
+    let mut delta_sub =
+        screenpipe_events::subscribe_to_event::<MeetingTranscriptDelta>("meeting_transcript_delta");
+    let mut final_sub =
+        screenpipe_events::subscribe_to_event::<MeetingTranscriptFinal>("meeting_transcript_final");
+    let mut error_sub =
+        screenpipe_events::subscribe_to_event::<MeetingStreamingError>("meeting_streaming_error");
+
     tokio::spawn(async move {
         if !config.enabled {
             info!("meeting streaming: coordinator disabled");
@@ -88,19 +124,6 @@ pub fn start_meeting_streaming_loop(
             return;
         }
 
-        let mut started_sub =
-            screenpipe_events::subscribe_to_event::<MeetingLifecycleEvent>("meeting_started");
-        let mut ended_sub =
-            screenpipe_events::subscribe_to_event::<MeetingLifecycleEvent>("meeting_ended");
-        let mut delta_sub = screenpipe_events::subscribe_to_event::<MeetingTranscriptDelta>(
-            "meeting_transcript_delta",
-        );
-        let mut final_sub = screenpipe_events::subscribe_to_event::<MeetingTranscriptFinal>(
-            "meeting_transcript_final",
-        );
-        let mut error_sub = screenpipe_events::subscribe_to_event::<MeetingStreamingError>(
-            "meeting_streaming_error",
-        );
         let mut inactivity_tick = tokio::time::interval(LIVE_INACTIVITY_CHECK_INTERVAL);
         let mut active: Option<ActiveMeetingStream> = None;
 
@@ -205,8 +228,9 @@ pub fn start_meeting_streaming_loop(
                         continue;
                     }
                     let db = db.clone();
+                    let on_insert = on_meeting_transcript_insert.clone();
                     tokio::spawn(async move {
-                        persist_live_final_with_retry(db, event.data).await;
+                        persist_live_final_with_retry(db, event.data, on_insert).await;
                     });
                 }
                 Some(event) = delta_sub.next() => {
@@ -466,9 +490,13 @@ async fn mark_live_covered_chunks(db: &Arc<DatabaseManager>, meeting_id: i64) {
     }
 }
 
-async fn persist_live_final_with_retry(db: Arc<DatabaseManager>, event: MeetingTranscriptFinal) {
+async fn persist_live_final_with_retry(
+    db: Arc<DatabaseManager>,
+    event: MeetingTranscriptFinal,
+    on_insert: Option<MeetingTranscriptInsertCallback>,
+) {
     for attempt in 1..=LIVE_FINAL_PERSIST_ATTEMPTS {
-        match persist_live_final_once(db.clone(), &event).await {
+        match persist_live_final_once(db.clone(), &event, on_insert.as_ref()).await {
             Ok(true) => return,
             Ok(false) if attempt < LIVE_FINAL_PERSIST_ATTEMPTS => {
                 sleep(LIVE_FINAL_PERSIST_RETRY_DELAY).await;
@@ -499,6 +527,7 @@ async fn persist_live_final_with_retry(db: Arc<DatabaseManager>, event: MeetingT
 async fn persist_live_final_once(
     db: Arc<DatabaseManager>,
     event: &MeetingTranscriptFinal,
+    on_insert: Option<&MeetingTranscriptInsertCallback>,
 ) -> Result<bool, String> {
     let transcript = event.transcript.trim();
     if transcript.is_empty() {
@@ -525,6 +554,21 @@ async fn persist_live_final_once(
             "meeting streaming: persisted live final (meeting_id={}, item_id={}, segment_id={})",
             event.meeting_id, event.item_id, id
         );
+
+        // Today's Timeline reads the in-memory hot cache rather than querying
+        // meeting_transcript_segments. Notify the live-final callback so an
+        // already-open WebSocket receives this segment immediately; callers
+        // derive a stable negative Timeline id from the positive segment id.
+        if let Some(callback) = on_insert {
+            callback(MeetingTranscriptInsertInfo {
+                segment_id: id,
+                transcription: transcript.to_string(),
+                device_name: event.device_name.clone(),
+                is_input: event.device_type.eq_ignore_ascii_case("input"),
+                speaker_name: event.speaker_name.clone(),
+                captured_at: event.captured_at,
+            });
+        }
     }
 
     Ok(true)

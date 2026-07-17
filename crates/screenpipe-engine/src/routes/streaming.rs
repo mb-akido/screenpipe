@@ -145,6 +145,8 @@ pub struct AudioData {
     pub audio_chunk_id: i64,
     pub speaker_id: Option<i64>,
     pub speaker_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_timestamp: Option<DateTime<Utc>>,
 }
 
 impl From<TimeSeriesFrame> for StreamTimeSeriesResponse {
@@ -184,6 +186,7 @@ impl From<TimeSeriesFrame> for StreamTimeSeriesResponse {
                                 audio_chunk_id: audio.audio_chunk_id,
                                 speaker_id: audio.speaker_id,
                                 speaker_name: audio.speaker_name,
+                                audio_timestamp: audio.audio_timestamp,
                             })
                             .collect(),
                         machine_id: device_frame.machine_id,
@@ -210,6 +213,7 @@ pub(crate) fn create_time_series_frame(chunk: FrameData) -> TimeSeriesFrame {
             speaker_name: a.speaker_name.clone(),
             start_time: a.start_time,
             end_time: a.end_time,
+            audio_timestamp: None,
         })
         .collect();
 
@@ -607,6 +611,7 @@ async fn handle_stream_frames_socket(
                                             audio_chunk_id: a.audio_chunk_id,
                                             speaker_id: a.speaker_id,
                                             speaker_name: a.speaker_name,
+                                            audio_timestamp: a.audio_timestamp,
                                         })
                                         .collect(),
                                     machine_id: hot_frame.machine_id.as_deref().map(String::from),

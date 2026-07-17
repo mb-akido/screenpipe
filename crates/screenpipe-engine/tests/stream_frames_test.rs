@@ -21,10 +21,24 @@ struct StreamTimeSeriesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use screenpipe_audio::audio_manager::AudioManagerBuilder;
+    use screenpipe_audio::{
+        audio_manager::AudioManagerBuilder,
+        meeting_streaming::{
+            start_meeting_streaming_loop_with_callback, MeetingAudioTap, MeetingStreamingConfig,
+            MeetingStreamingProvider, MeetingTranscriptInsertCallback,
+        },
+        TranscriptionEngine,
+    };
     use screenpipe_db::{DatabaseManager, OcrEngine};
-    use screenpipe_engine::SCServer;
-    use std::{net::SocketAddr, sync::Arc};
+    use screenpipe_engine::{
+        hot_frame_cache::{HotFrame, HotFrameCache},
+        SCServer,
+    };
+    use std::{
+        net::SocketAddr,
+        sync::{atomic::AtomicBool, Arc},
+    };
+    use tokio::sync::{broadcast, RwLock};
 
     #[derive(Debug, Serialize)]
     struct StreamFramesLimitedRequest {
@@ -37,6 +51,7 @@ mod tests {
     async fn setup_stream_test_server() -> (
         String,
         Arc<DatabaseManager>,
+        Arc<HotFrameCache>,
         tokio::task::JoinHandle<Result<(), std::io::Error>>,
     ) {
         let unique_suffix = std::time::SystemTime::now()
@@ -62,7 +77,11 @@ mod tests {
                 .unwrap(),
         );
 
-        let server = SCServer::new(
+        let hot_frame_cache = Arc::new(HotFrameCache::new());
+        // Mark the cache warm even when the DB has no visual frames. This keeps
+        // audio-only current-day tests from waiting on the production warm-up.
+        hot_frame_cache.warm_from_db(&db, 1).await;
+        let mut server = SCServer::new(
             db.clone(),
             SocketAddr::from(([127, 0, 0, 1], 0)),
             screenpipe_dir,
@@ -72,6 +91,7 @@ mod tests {
             false,
             "balanced".to_string(),
         );
+        server.hot_frame_cache = Some(hot_frame_cache.clone());
         let app = server.create_router().await;
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -79,12 +99,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, app).await });
 
-        (format!("ws://{addr}/stream/frames"), db, handle)
+        (
+            format!("ws://{addr}/stream/frames"),
+            db,
+            hot_frame_cache,
+            handle,
+        )
     }
 
     #[tokio::test]
     async fn test_dense_range_stream_spans_full_requested_window() {
-        let (url, db, server_handle) = setup_stream_test_server().await;
+        let (url, db, _hot_frame_cache, server_handle) = setup_stream_test_server().await;
         let device_name = "stream-regression-monitor";
         db.insert_video_chunk("stream-regression.mp4", device_name)
             .await
@@ -164,6 +189,279 @@ mod tests {
         assert_eq!(received_frames.len(), display_limit);
         assert_eq!(first, end);
         assert_eq!(last, start);
+    }
+
+    /// Reproduces the current-day Timeline gap for live meeting transcription:
+    /// the final is durable in `meeting_transcript_segments`, but the open
+    /// hot-cache WebSocket must also receive it immediately as `audio_update`,
+    /// even when no visual frame exists for the static/audio-only period.
+    #[tokio::test]
+    async fn test_live_meeting_final_is_streamed_to_today_timeline() {
+        let (url, db, hot_frame_cache, server_handle) = setup_stream_test_server().await;
+        let now = Utc::now();
+
+        let meeting_id = db
+            .insert_meeting("Google Meet", "ui_scan", None, None)
+            .await
+            .unwrap();
+        let (audio_tx, audio_rx) = broadcast::channel(8);
+        let audio_tap = MeetingAudioTap::new(audio_tx, Arc::new(AtomicBool::new(false)));
+        let callback_cache = hot_frame_cache.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let on_insert: MeetingTranscriptInsertCallback = Arc::new(move |info| {
+            let cache = callback_cache.clone();
+            runtime.spawn(async move {
+                cache.push_meeting_transcript_insert(info).await;
+            });
+        });
+        let coordinator = start_meeting_streaming_loop_with_callback(
+            MeetingStreamingConfig::default().with_provider(MeetingStreamingProvider::Disabled),
+            audio_tap,
+            audio_rx,
+            db.clone(),
+            Arc::new(RwLock::new(None::<TranscriptionEngine>)),
+            Some(on_insert),
+        );
+
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("websocket should connect");
+        let (mut write, mut read) = ws_stream.split();
+        let request = StreamFramesRequest {
+            start_time: (now - Duration::minutes(3)).to_rfc3339(),
+            end_time: (now + Duration::minutes(1)).to_rfc3339(),
+            order: "descending".to_string(),
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&request).unwrap()))
+            .await
+            .expect("current-day request should send");
+
+        // Deterministic subscription handshake: a frame two minutes away from
+        // the transcript is outside the audio association window, but seeing
+        // it proves the WebSocket request loop has enabled live delivery.
+        let handshake_frame = HotFrame {
+            frame_id: 91,
+            timestamp: now - Duration::minutes(2),
+            device_name: "monitor_0".into(),
+            app_name: "Google Chrome".into(),
+            window_name: "Google Meet".into(),
+            ocr_text_preview: "subscription ready".into(),
+            snapshot_path: "/tmp/subscription-ready.jpg".into(),
+            browser_url: Some("https://meet.google.com/test".into()),
+            capture_trigger: "test".into(),
+            offset_index: 0,
+            fps: 1.0,
+            machine_id: None,
+        };
+        timeout(std::time::Duration::from_secs(3), async {
+            let mut retry = tokio::time::interval(std::time::Duration::from_millis(20));
+            loop {
+                tokio::select! {
+                    _ = retry.tick() => {
+                        hot_frame_cache.push_frame(handshake_frame.clone()).await;
+                    }
+                    message = read.next() => {
+                        let Some(message) = message else {
+                            panic!("websocket closed before subscription handshake");
+                        };
+                        let Message::Text(text) = message.expect("subscription handshake should read") else {
+                            continue;
+                        };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        if value.as_array().is_some_and(|frames| {
+                            frames.iter().any(|frame| {
+                                frame
+                                    .pointer("/devices/0/frame_id")
+                                    .and_then(|value| value.as_i64())
+                                    == Some(91)
+                            })
+                        }) {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("current-day live subscription should become ready");
+
+        let transcript = "the live transcript should appear without reopening timeline";
+        screenpipe_events::send_event(
+            "meeting_transcript_final",
+            serde_json::json!({
+                "meeting_id": meeting_id,
+                "provider": "selected-engine",
+                "model": "test-model",
+                "item_id": format!("timeline-e2e-{meeting_id}"),
+                "device_name": "System Audio",
+                "device_type": "output",
+                "speaker_name": "Speaker 1",
+                "transcript": transcript,
+                "captured_at": now,
+            }),
+        )
+        .expect("live final event should send");
+
+        let (update, audio_only_frame) = timeout(std::time::Duration::from_secs(3), async {
+            let mut update = None;
+            let mut audio_only_frame = None;
+            while let Some(message) = read.next().await {
+                let Message::Text(text) = message.expect("live timeline message should read")
+                else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value.get("type").and_then(|v| v.as_str()) == Some("audio_update") {
+                    update = Some(value);
+                } else if let Some(frames) = value.as_array() {
+                    for frame in frames {
+                        let has_transcript = frame
+                            .get("devices")
+                            .and_then(|devices| devices.as_array())
+                            .is_some_and(|devices| {
+                                devices.iter().any(|device| {
+                                    device.get("device_id").and_then(|id| id.as_str())
+                                        == Some("audio-only")
+                                        && device
+                                            .get("audio")
+                                            .and_then(|audio| audio.as_array())
+                                            .is_some_and(|audio| {
+                                                audio.iter().any(|entry| {
+                                                    entry
+                                                        .get("transcription")
+                                                        .and_then(|text| text.as_str())
+                                                        == Some(transcript)
+                                                })
+                                            })
+                                })
+                            });
+                        if has_transcript {
+                            audio_only_frame = Some(frame.clone());
+                            break;
+                        }
+                    }
+                }
+
+                if update.is_some() && audio_only_frame.is_some() {
+                    return (update.unwrap(), audio_only_frame.unwrap());
+                }
+            }
+            panic!("websocket closed before live transcript and audio-only marker");
+        })
+        .await
+        .expect("persisted live final should be visible on the current-day Timeline");
+
+        assert_eq!(
+            audio_only_frame
+                .get("timestamp")
+                .and_then(|value| value.as_str()),
+            update.get("timestamp").and_then(|value| value.as_str()),
+            "the audio-only marker should stay at the live final's capture time"
+        );
+        assert_eq!(
+            audio_only_frame
+                .pointer("/devices/0/audio/0/audio_timestamp")
+                .and_then(|value| value.as_str()),
+            update.get("timestamp").and_then(|value| value.as_str()),
+            "initial/reconnect frame payloads should retain the exact audio time"
+        );
+
+        assert_eq!(
+            update
+                .pointer("/audio/transcription")
+                .and_then(|v| v.as_str()),
+            Some(transcript)
+        );
+        assert!(
+            update
+                .pointer("/audio/audio_chunk_id")
+                .and_then(|v| v.as_i64())
+                .is_some_and(|id| id < 0),
+            "live transcript should use a stable synthetic negative chunk id"
+        );
+        assert_eq!(
+            update
+                .pointer("/audio/speaker_name")
+                .and_then(|v| v.as_str()),
+            Some("Speaker 1"),
+            "the live caption should keep the provider speaker label"
+        );
+        let update_timestamp = update
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .expect("audio update should carry its capture timestamp");
+        assert_eq!(update_timestamp.timestamp(), now.timestamp());
+
+        // The callback that produced both WebSocket messages only fires after
+        // the insert commits, so this read does not race SQLite's writer lock.
+        let persisted = db
+            .list_meeting_transcript_segments(meeting_id)
+            .await
+            .expect("persisted live final should be queryable after its update");
+        assert!(persisted
+            .iter()
+            .any(|segment| segment.transcript == transcript));
+
+        // Reconnect after the broadcast has passed. The initial hot-cache
+        // payload must still contain the marker and exact audio timestamp; a
+        // replayed audio_update will not exist to repair it on the client.
+        let (reconnected, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("timeline should reconnect");
+        let (mut reconnect_write, mut reconnect_read) = reconnected.split();
+        reconnect_write
+            .send(Message::Text(serde_json::to_string(&request).unwrap()))
+            .await
+            .expect("reconnect request should send");
+        let replayed_frame = timeout(std::time::Duration::from_secs(3), async {
+            while let Some(message) = reconnect_read.next().await {
+                let Message::Text(text) = message.expect("reconnect payload should read") else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let Some(frames) = value.as_array() else {
+                    continue;
+                };
+                for frame in frames {
+                    if frame
+                        .pointer("/devices/0/audio/0/transcription")
+                        .and_then(|value| value.as_str())
+                        == Some(transcript)
+                    {
+                        return frame.clone();
+                    }
+                }
+            }
+            panic!("reconnect closed before replaying the live final");
+        })
+        .await
+        .expect("reconnect should replay the cached live final");
+        assert_eq!(
+            replayed_frame
+                .pointer("/devices/0/audio/0/audio_timestamp")
+                .and_then(|value| value.as_str()),
+            update.get("timestamp").and_then(|value| value.as_str())
+        );
+        assert!(
+            db.get_meeting_by_id(meeting_id)
+                .await
+                .expect("meeting should still exist")
+                .meeting_end
+                .is_none(),
+            "regression must pass before the meeting ends"
+        );
+
+        coordinator.abort();
+        server_handle.abort();
     }
 
     /// TEST 1: Reproduce the main issue - new frames after initial fetch are not pushed

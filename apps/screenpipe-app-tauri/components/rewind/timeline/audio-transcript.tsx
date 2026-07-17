@@ -25,6 +25,7 @@ import { Meeting, deduplicateAudioItems } from "@/lib/hooks/use-meetings";
 import { usePipes } from "@/lib/hooks/use-pipes";
 import { localFetch } from "@/lib/api";
 import { commands } from "@/lib/utils/tauri";
+import { getAudioTimestamp } from "@/lib/hooks/timeline-audio-update";
 
 // Extended audio item with timestamp for conversation view
 interface AudioItemWithTimestamp extends AudioData {
@@ -235,7 +236,10 @@ export function AudioTranscript({
 					device.audio.forEach((audio) => {
 						allAudio.push({
 							...audio,
-							timestamp: frameTime,
+							timestamp: getAudioTimestamp(
+								audio,
+								frame.timestamp,
+							),
 						});
 					});
 				});

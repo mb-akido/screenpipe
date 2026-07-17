@@ -49,6 +49,9 @@ pub struct AudioEntry {
     pub speaker_name: Option<String>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    /// Exact source capture time. Older frame-cache indexes do not contain it.
+    #[serde(default)]
+    pub audio_timestamp: Option<DateTime<Utc>>,
 }
 
 impl From<screenpipe_db::AudioEntry> for AudioEntry {
@@ -64,6 +67,7 @@ impl From<screenpipe_db::AudioEntry> for AudioEntry {
             speaker_name: db_entry.speaker_name,
             start_time: db_entry.start_time,
             end_time: db_entry.end_time,
+            audio_timestamp: None,
         }
     }
 }
@@ -542,6 +546,7 @@ impl FrameCache {
                                     speaker_name: a.speaker_name.clone(),
                                     start_time: a.start_time,
                                     end_time: a.end_time,
+                                    audio_timestamp: None,
                                 })
                                 .collect(),
                             machine_id: chunk.machine_id.clone(),
@@ -850,6 +855,7 @@ async fn extract_frame(
                             speaker_name: a.speaker_name.clone(),
                             start_time: a.start_time,
                             end_time: a.end_time,
+                            audio_timestamp: None,
                         })
                         .collect(),
                     machine_id: chunk.machine_id.clone(),

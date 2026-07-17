@@ -15,6 +15,7 @@ export function useTimelineData(
 		fetchNextDayData,
 		websocket,
 		loadFromCache,
+		lastFlushTimestamp,
 	} = useTimelineStore();
 
 	const hasInitialized = useRef(false);
@@ -47,5 +48,6 @@ export function useTimelineData(
 		message,
 		fetchNextDayData,
 		websocket, // Expose websocket so timeline.tsx can depend on it
+		lastFlushTimestamp,
 	};
 }

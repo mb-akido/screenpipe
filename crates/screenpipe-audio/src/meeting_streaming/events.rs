@@ -177,6 +177,22 @@ pub struct MeetingTranscriptFinal {
     pub captured_at: DateTime<Utc>,
 }
 
+/// A live meeting final after it has been durably inserted.
+///
+/// This stays separate from the background audio insert callback so adding
+/// live-provider metadata does not break `AudioInsertInfo` consumers.
+#[derive(Clone, Debug)]
+pub struct MeetingTranscriptInsertInfo {
+    pub segment_id: i64,
+    pub transcription: String,
+    pub device_name: String,
+    pub is_input: bool,
+    pub speaker_name: Option<String>,
+    pub captured_at: DateTime<Utc>,
+}
+
+pub type MeetingTranscriptInsertCallback = Arc<dyn Fn(MeetingTranscriptInsertInfo) + Send + Sync>;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MeetingStreamingError {
     pub meeting_id: i64,
