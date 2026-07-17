@@ -1056,7 +1056,7 @@ export function PipesSection() {
   const [sharingPublic, setSharingPublic] = useState<string | null>(null);
   const [publishPipeName, setPublishPipeName] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [pipeTypeFilter, setPipeTypeFilter] = useState<"automated" | "manual" | "cloud">("automated");
+  const [pipeTypeFilter, setPipeTypeFilter] = useState<"automated" | "cloud">("automated");
   // "cloud" (the org's cloud runner) is an enterprise-build-only surface
   const isEnterpriseBuild = useIsEnterpriseBuild();
   // Favorites — per-machine preference persisted via /pipes/favorites.
@@ -1086,10 +1086,9 @@ export function PipesSection() {
     !!(p.config.trigger?.sources?.length);
   const isScheduledPipe = (p: PipeStatus) =>
     pipeHasSchedule(p.config) && !isTriggeredPipe(p);
-  const isManualPipe = (p: PipeStatus) =>
-    !pipeHasSchedule(p.config) && !isTriggeredPipe(p);
-  // "Automated" groups scheduled + event/connection-triggered pipes — anything
-  // that runs on its own. Manual (run-on-demand) stands apart.
+  // The My Pipes surface is for agents that run on their own. Manual templates
+  // remain installed because product features can invoke them directly, but
+  // listing them here overwhelms fresh installs with implementation details.
   const isAutomatedPipe = (p: PipeStatus) =>
     isScheduledPipe(p) || isTriggeredPipe(p);
 
@@ -1143,8 +1142,7 @@ export function PipesSection() {
             if (!p.config.name.toLowerCase().includes(q)) return false;
           }
 
-          if (pipeTypeFilter === "automated" && !isAutomatedPipe(p)) return false;
-          if (pipeTypeFilter === "manual" && !isManualPipe(p)) return false;
+          if (!isAutomatedPipe(p)) return false;
 
           // Favorites filter — only applied when the user has toggled the star chip on.
           if (pipeFavorites.showOnly && !pipeFavorites.isFavorite(p.config.name)) return false;
@@ -1176,7 +1174,6 @@ export function PipesSection() {
   const tabCounts = React.useMemo(() => {
     return {
       automated: pipes.filter(isAutomatedPipe).length,
-      manual: pipes.filter(isManualPipe).length,
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pipes]);
@@ -1184,7 +1181,6 @@ export function PipesSection() {
   const starredEmptyTitle = React.useMemo(() => {
     if (!pipeFavorites.showOnly) return null;
 
-    if (pipeTypeFilter === "manual") return "no starred manual pipes";
     return "no starred automated pipes";
   }, [pipeFavorites.showOnly, pipeTypeFilter]);
 
@@ -2129,33 +2125,31 @@ export function PipesSection() {
               autoCorrect="off"
             />
           </div>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="gap-1.5 h-8 text-xs capitalize">
-                {pipeTypeFilter === "cloud" ? "cloud" : `${pipeTypeFilter} (${tabCounts[pipeTypeFilter]})`}
-                <ChevronDown className="h-3 w-3 opacity-50" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {([
-                "automated",
-                "manual",
-                ...(isEnterpriseBuild ? (["cloud"] as const) : []),
-              ] as const).map((tab) => (
-                <DropdownMenuItem
-                  key={tab}
-                  onClick={() => setPipeTypeFilter(tab)}
-                  className={cn("capitalize gap-2", pipeTypeFilter === tab && "font-medium")}
-                >
-                  <span className="flex-1">{tab}</span>
-                  {tab !== "cloud" && (
-                    <span className="text-muted-foreground text-xs">{tabCounts[tab]}</span>
-                  )}
-                  {pipeTypeFilter === tab && <Check className="h-3.5 w-3.5 ml-1" />}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {isEnterpriseBuild && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="gap-1.5 h-8 text-xs capitalize">
+                  {pipeTypeFilter === "cloud" ? "cloud" : `${pipeTypeFilter} (${tabCounts.automated})`}
+                  <ChevronDown className="h-3 w-3 opacity-50" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {(["automated", "cloud"] as const).map((tab) => (
+                  <DropdownMenuItem
+                    key={tab}
+                    onClick={() => setPipeTypeFilter(tab)}
+                    className={cn("capitalize gap-2", pipeTypeFilter === tab && "font-medium")}
+                  >
+                    <span className="flex-1">{tab}</span>
+                    {tab === "automated" && (
+                      <span className="text-muted-foreground text-xs">{tabCounts.automated}</span>
+                    )}
+                    {pipeTypeFilter === tab && <Check className="h-3.5 w-3.5 ml-1" />}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
           <Button
             variant="outline"
             size="icon"
@@ -2265,17 +2259,6 @@ export function PipesSection() {
                   </Button>
                 </div>
               </div>
-            ) : pipeTypeFilter === "manual" ? (
-              <>
-                <p>no manual pipes installed</p>
-                <p className="text-sm mt-2">
-                  manual pipes use{" "}
-                  <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                    schedule: manual
-                  </code>
-                  {" "}in their frontmatter
-                </p>
-              </>
             ) : (
               <div className="space-y-4">
                 <div>
