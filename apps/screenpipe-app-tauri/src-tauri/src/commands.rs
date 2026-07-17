@@ -1057,6 +1057,69 @@ pub async fn e2e_emit_agent_stream(
     })
 }
 
+/// E2E helper for an extension-triggered turn that begins after the original
+/// assistant response has settled. This matches pi-subagents async completion:
+/// Pi persists a visible custom message, then `triggerTurn: true` starts a new
+/// assistant turn without a new user `message_start` event.
+#[tauri::command]
+#[specta::specta]
+pub async fn e2e_emit_settled_agent_follow_up(
+    app_handle: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    if !cfg!(feature = "e2e") {
+        return Err("e2e_emit_settled_agent_follow_up is only available in e2e builds".to_string());
+    }
+
+    let emit_event = |event: serde_json::Value| -> Result<(), String> {
+        app_handle
+            .emit(
+                "agent_event",
+                serde_json::json!({
+                    "source": "pi",
+                    "sessionId": &session_id,
+                    "event": event,
+                }),
+            )
+            .map_err(|e| e.to_string())
+    };
+
+    emit_event(serde_json::json!({
+        "type": "message_start",
+        "message": { "role": "assistant" },
+    }))?;
+    emit_event(serde_json::json!({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "text_delta",
+            "delta": "INITIAL_RESPONSE_SETTLED",
+        },
+    }))?;
+    emit_event(serde_json::json!({ "type": "agent_end" }))?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    emit_event(serde_json::json!({
+        "type": "custom_message",
+        "customType": "subagent-notify",
+        "content": "Background task completed: scout",
+        "display": true,
+    }))?;
+    emit_event(serde_json::json!({ "type": "agent_start" }))?;
+    emit_event(serde_json::json!({
+        "type": "message_start",
+        "message": { "role": "assistant" },
+    }))?;
+    emit_event(serde_json::json!({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "text_delta",
+            "delta": "SUBAGENT_FOLLOW_UP_VISIBLE",
+        },
+    }))?;
+    emit_event(serde_json::json!({ "type": "agent_end" }))?;
+    Ok(())
+}
+
 /// E2E helper for the scheduled-pipe path: feed synthetic pipe stdout
 /// through the same Rust-side callback adapter production uses, then let the
 /// frontend's default pipe handlers record it as a completed pipe run.

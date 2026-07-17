@@ -59,13 +59,22 @@ function PiExtensionRow({
   return (
     <div className="rounded-md border border-border bg-card p-3">
       <div className="flex items-start gap-3">
-        <Switch
-          checked={enabled}
-          disabled={disabled || busy}
-          onCheckedChange={onToggle}
-          aria-label={`${enabled ? "Disable" : "Enable"} ${item.name}`}
-          className="mt-1"
-        />
+        {item.required ? (
+          <Switch
+            checked
+            disabled
+            aria-label={`${item.name} always enabled`}
+            className="mt-1"
+          />
+        ) : (
+          <Switch
+            checked={enabled}
+            disabled={disabled || busy}
+            onCheckedChange={onToggle}
+            aria-label={`${enabled ? "Disable" : "Enable"} ${item.name}`}
+            className="mt-1"
+          />
+        )}
         <div className="min-w-0 flex-1 space-y-2">
           <div className="flex flex-wrap items-center gap-2">
             <h4 className="text-sm font-medium leading-tight text-foreground">
@@ -80,6 +89,11 @@ function PiExtensionRow({
               <span className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[10px] text-muted-foreground">
                 <CheckCircle2 className="h-3 w-3" />
                 on
+              </span>
+            )}
+            {item.required && (
+              <span className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-[10px] text-muted-foreground">
+                required
               </span>
             )}
             {stale && (
@@ -360,7 +374,7 @@ export function PiExtensionsCard({ onChanged }: { onChanged?: () => void }) {
                 <PiExtensionRow
                   key={item.id}
                   item={item}
-                  enabled={configuredSources.has(normalized)}
+                  enabled={item.required || configuredSources.has(normalized)}
                   stale={missingSources.has(normalized)}
                   busy={busySource === item.source}
                   disabled={changingPackage && busySource !== item.source}

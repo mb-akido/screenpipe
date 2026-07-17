@@ -17,6 +17,7 @@ export interface PiExtensionCatalogItem {
   npmUrl: string;
   sourceUrl?: string;
   tags: string[];
+  required?: boolean;
 }
 
 interface NpmSearchPackage {
@@ -68,6 +69,7 @@ export const PI_EXTENSION_CATALOG: PiExtensionCatalogItem[] = [
     npmUrl: "https://www.npmjs.com/package/pi-subagents",
     sourceUrl: "https://github.com/nicobailon/pi-subagents",
     tags: ["subagents", "parallel", "code review"],
+    required: true,
   },
   {
     id: "pi-web-agent",

@@ -379,6 +379,20 @@ async e2eEmitPipeStream(pipeName: string, executionId: number, deltaCount: numbe
 }
 },
 /**
+ * E2E helper for an extension-triggered turn that begins after the original
+ * assistant response has settled. This matches pi-subagents async completion:
+ * Pi persists a visible custom message, then `triggerTurn: true` starts a new
+ * assistant turn without a new user `message_start` event.
+ */
+async e2eEmitSettledAgentFollowUp(sessionId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("e2e_emit_settled_agent_follow_up", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * E2E helper: report whether the main overlay is logically visible.
  *
  * The main window uses platform-specific "hide" semantics (macOS NSPanel with

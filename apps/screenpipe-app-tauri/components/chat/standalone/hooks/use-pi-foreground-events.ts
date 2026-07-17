@@ -47,6 +47,7 @@ export function usePiForegroundEvents({
   lastUserMessageRef,
   markTurnIntentConsumed,
   messages,
+  messagesRef,
   mountedRef,
   optimisticSteerRef,
   pendingNextPiUserDisplayRef,
@@ -121,33 +122,24 @@ export function usePiForegroundEvents({
     const ensureAssistantPlaceholder = (): boolean => {
       if (piMessageIdRef.current) return true;
       const newAssistantId = (Date.now() + 1).toString();
-      let created = false;
-      setMessages((prev) => {
-        let targetIdx = -1;
-        for (let i = prev.length - 1; i >= 0; i--) {
-          if (prev[i]?.role === "user") {
-            targetIdx = i;
-            break;
-          }
-        }
-        if (targetIdx === -1) return prev;
-
-        const target = prev[targetIdx];
-        if (!target || target.role !== "user") return prev;
-        created = true;
-
-        const base = [...prev];
-        base.splice(targetIdx + 1, 0, {
-          id: newAssistantId,
-          role: "assistant",
-          content: "Processing...",
-          timestamp: Date.now(),
-          model: getActivePreset()?.model,
-          provider: getActivePreset()?.provider,
-        });
-        return base;
-      });
-      if (!created) return false;
+      // This effect is intentionally registered once for the lifetime of the
+      // chat surface. Its captured `messages` value is therefore the first
+      // render, which made autonomous turns (for example pi-subagents async
+      // completion notifications) look like they had no conversation to
+      // attach to. React may also defer a functional state updater, so a flag
+      // mutated inside setMessages cannot be read synchronously afterwards.
+      // Read the live ref instead and append the unsolicited follow-up after
+      // the already-settled answer.
+      if (!messagesRef.current.some((message) => message.role === "user")) return false;
+      const assistantPlaceholder: Message = {
+        id: newAssistantId,
+        role: "assistant",
+        content: "Processing...",
+        timestamp: Date.now(),
+        model: getActivePreset()?.model,
+        provider: getActivePreset()?.provider,
+      };
+      setMessages((prev) => [...prev, assistantPlaceholder]);
       piMessageIdRef.current = newAssistantId;
       piStreamingTextRef.current = "";
       piContentBlocksRef.current = [];
@@ -156,14 +148,7 @@ export function usePiForegroundEvents({
       const sidNow = piSessionIdRef.current;
       if (sidNow) {
         const storeState = useChatStore.getState();
-        storeState.actions.appendMessage(sidNow, {
-          id: newAssistantId,
-          role: "assistant",
-          content: "Processing...",
-          timestamp: Date.now(),
-          model: getActivePreset()?.model,
-          provider: getActivePreset()?.provider,
-        } as any);
+        storeState.actions.appendMessage(sidNow, assistantPlaceholder as any);
         storeState.actions.setStreaming(sidNow, {
           streamingMessageId: newAssistantId,
           streamingText: "",

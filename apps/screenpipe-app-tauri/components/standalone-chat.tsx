@@ -1138,6 +1138,7 @@ export function StandaloneChat({
     lastUserMessageRef,
     markTurnIntentConsumed,
     messages,
+    messagesRef,
     mountedRef,
     optimisticSteerRef,
     pendingNextPiUserDisplayRef,

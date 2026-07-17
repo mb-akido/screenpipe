@@ -242,6 +242,7 @@ export type PiForegroundEventsOptions = {
   lastUserMessageRef: PiTransportRefs["lastUserMessageRef"];
   markTurnIntentConsumed: TurnIntentActions["markTurnIntentConsumed"];
   messages: Message[];
+  messagesRef: React.MutableRefObject<Message[]>;
   mountedRef: React.MutableRefObject<boolean>;
   optimisticSteerRef: SteeringRefs["optimisticSteerRef"];
   pendingNextPiUserDisplayRef: SteeringRefs["pendingNextPiUserDisplayRef"];

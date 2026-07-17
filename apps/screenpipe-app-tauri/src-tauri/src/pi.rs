@@ -49,6 +49,7 @@ const TEXT_DELTA_EMIT_BATCH_CHARS: usize = 1_200;
 /// text-delta batching so titles stream visibly token-by-token.
 /// Keep in sync with TypeScript: lib/utils/internal-session.ts → INTERNAL_TITLE_PREFIX
 const TITLE_SESSION_PREFIX: &str = "__title:";
+const REQUIRED_PI_EXTENSION_PACKAGE: &str = "npm:pi-subagents";
 
 struct PendingAgentTextDelta {
     event: Value,
@@ -115,6 +116,8 @@ use tracing::{debug, error, info, warn};
 
 /// Signals that the background Pi install has finished (success or failure).
 static PI_INSTALL_DONE: AtomicBool = AtomicBool::new(false);
+static REQUIRED_PI_PACKAGE_INSTALL_LOCK: std::sync::OnceLock<Mutex<()>> =
+    std::sync::OnceLock::new();
 
 /// Captures the last bun-install error so `pi_start` can surface it to the UI
 /// when the install silently failed (e.g. Windows EPERM on bun's atomic rename).
@@ -1482,6 +1485,12 @@ async fn ensure_pi_config(
         .map_err(|e| format!("Failed to write pi models config: {}", e))?;
     harden_secret_file(&models_path);
 
+    // Subagents are a baseline Screenpipe capability, not an optional Pi
+    // extension. Keep the package in the isolated settings for every user;
+    // `ensure_required_pi_extension_package` repairs the physical install
+    // before a chat process starts.
+    ensure_required_pi_extension_setting()?;
+
     // -- auth.json: merge screenpipe token, preserve other providers --
     let auth_path = config_dir.join("auth.json");
     if let Some(token) = user_token.filter(|token| !token.is_empty()) {
@@ -1722,6 +1731,7 @@ pub async fn pi_start_inner(
 
     // Ensure Pi is configured with the user's provider
     ensure_pi_config(user_token.as_deref(), provider_config.as_ref()).await?;
+    ensure_required_pi_extension_package().await?;
 
     // Determine which Pi provider and model to use
     let (pi_provider, pi_model) = match &provider_config {
@@ -3029,6 +3039,60 @@ fn write_pi_settings(settings: &serde_json::Value) -> Result<(), String> {
     std::fs::write(&settings_path, s).map_err(|e| format!("Failed to write settings.json: {}", e))
 }
 
+fn is_required_pi_extension_package_source(source: &str) -> bool {
+    npm_package_name_from_source(source)
+        .is_some_and(|name| name.eq_ignore_ascii_case("pi-subagents"))
+}
+
+fn normalize_required_pi_extension_setting(
+    settings: &mut serde_json::Value,
+) -> Result<bool, String> {
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let obj = settings
+        .as_object_mut()
+        .ok_or_else(|| "Pi settings must be a JSON object".to_string())?;
+    let packages = obj
+        .entry("packages".to_string())
+        .or_insert_with(|| json!([]));
+    if !packages.is_array() {
+        *packages = json!([]);
+    }
+    let entries = packages
+        .as_array_mut()
+        .ok_or_else(|| "Pi packages must be a JSON array".to_string())?;
+    let already_canonical = entries
+        .iter()
+        .filter(|package| {
+            package_source_string(package).is_some_and(is_required_pi_extension_package_source)
+        })
+        .count()
+        == 1
+        && entries
+            .iter()
+            .any(|package| package.as_str() == Some(REQUIRED_PI_EXTENSION_PACKAGE));
+    if already_canonical {
+        return Ok(false);
+    }
+    // Replace version-pinned or filtered object entries with the canonical,
+    // unrestricted package. A filtered `{ source, extensions: [...] }` entry
+    // can otherwise list pi-subagents while silently hiding its tool.
+    entries.retain(|package| {
+        !package_source_string(package).is_some_and(is_required_pi_extension_package_source)
+    });
+    entries.push(json!(REQUIRED_PI_EXTENSION_PACKAGE));
+    Ok(true)
+}
+
+fn ensure_required_pi_extension_setting() -> Result<(), String> {
+    let mut settings = read_pi_settings()?;
+    if normalize_required_pi_extension_setting(&mut settings)? {
+        write_pi_settings(&settings)?;
+    }
+    Ok(())
+}
+
 fn read_pi_settings() -> Result<serde_json::Value, String> {
     let settings_path = get_pi_config_dir()?.join("settings.json");
     if !settings_path.exists() {
@@ -3360,6 +3424,20 @@ async fn run_pi_package_command(args: Vec<String>) -> Result<(), String> {
         .map_err(|e| format!("Pi package command panicked: {}", e))?
 }
 
+async fn ensure_required_pi_extension_package() -> Result<(), String> {
+    let lock = REQUIRED_PI_PACKAGE_INSTALL_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().await;
+    ensure_required_pi_extension_setting()?;
+    if pi_package_source_looks_installed(REQUIRED_PI_EXTENSION_PACKAGE) {
+        return Ok(());
+    }
+    run_pi_package_command(vec![
+        "install".to_string(),
+        REQUIRED_PI_EXTENSION_PACKAGE.to_string(),
+    ])
+    .await
+}
+
 async fn stop_idle_pi_sessions_for_package_change(state: &PiState) -> Result<(), String> {
     let mut pool = state.0.lock().await;
     let busy_sessions: Vec<String> = pool
@@ -3413,6 +3491,9 @@ pub async fn pi_remove_extension_package(
     source: String,
 ) -> Result<Vec<PiExtensionPackage>, String> {
     let source = validate_pi_extension_package_source(&source)?;
+    if is_required_pi_extension_package_source(&source) {
+        return Err("Subagents are required by screenpipe and cannot be disabled".to_string());
+    }
     stop_idle_pi_sessions_for_package_change(&state).await?;
     run_pi_package_command(vec!["remove".to_string(), source]).await?;
     stop_idle_pi_sessions_for_package_change(&state).await?;
@@ -3952,6 +4033,38 @@ mod tests {
             None
         );
         assert_eq!(super::npm_package_name_from_source("git:repo"), None);
+    }
+
+    #[test]
+    fn recognizes_required_subagents_package_across_versions_and_case() {
+        assert!(super::is_required_pi_extension_package_source(
+            "npm:pi-subagents"
+        ));
+        assert!(super::is_required_pi_extension_package_source(
+            "npm:PI-SUBAGENTS@0.33.1"
+        ));
+        assert!(!super::is_required_pi_extension_package_source(
+            "npm:pi-subagentura"
+        ));
+    }
+
+    #[test]
+    fn normalizes_required_subagents_to_an_unfiltered_package() {
+        let mut settings = json!({
+            "packages": [
+                "npm:other-tool",
+                {
+                    "source": "npm:pi-subagents@0.33.1",
+                    "extensions": ["not-the-subagent-tool"]
+                }
+            ]
+        });
+        assert!(super::normalize_required_pi_extension_setting(&mut settings).unwrap());
+        assert_eq!(
+            settings["packages"],
+            json!(["npm:other-tool", "npm:pi-subagents"])
+        );
+        assert!(!super::normalize_required_pi_extension_setting(&mut settings).unwrap());
     }
 
     #[test]

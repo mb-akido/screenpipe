@@ -65,15 +65,28 @@ describe("PiExtensionsCard", () => {
     render(<PiExtensionsCard />);
 
     expect(await screen.findByText("Subagents")).toBeInTheDocument();
-    expect(screen.getByRole("switch", { name: "Disable Subagents" })).toHaveAttribute(
+    expect(screen.getByRole("switch", { name: "Subagents always enabled" })).toHaveAttribute(
       "aria-checked",
       "true",
     );
+    expect(screen.getByRole("switch", { name: "Subagents always enabled" })).toBeDisabled();
+    expect(screen.getByText("required")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Enable Web agent" })).toHaveAttribute(
       "aria-checked",
       "false",
     );
     expect(commandMocks.piListExtensionPackages).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps subagents on when legacy settings do not list the package", async () => {
+    commandMocks.piListExtensionPackages.mockResolvedValueOnce({ status: "ok", data: [] });
+    render(<PiExtensionsCard />);
+
+    const subagents = await screen.findByRole("switch", { name: "Subagents always enabled" });
+    expect(subagents).toHaveAttribute("aria-checked", "true");
+    expect(subagents).toBeDisabled();
+    fireEvent.click(subagents);
+    expect(commandMocks.piRemoveExtensionPackage).not.toHaveBeenCalled();
   });
 
   it("filters the curated catalog without losing the warning copy", async () => {
@@ -85,7 +98,7 @@ describe("PiExtensionsCard", () => {
     });
 
     expect(screen.getByText("Web agent")).toBeInTheDocument();
-    expect(screen.queryByRole("switch", { name: "Disable Subagents" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "Subagents always enabled" })).not.toBeInTheDocument();
     expect(screen.getByText(/third-party pi packages can execute local code/i)).toBeInTheDocument();
   });
 
