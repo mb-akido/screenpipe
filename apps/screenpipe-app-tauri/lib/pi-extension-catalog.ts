@@ -17,12 +17,14 @@ export interface PiExtensionCatalogItem {
   npmUrl: string;
   sourceUrl?: string;
   tags: string[];
+  publishedAt?: string;
   required?: boolean;
 }
 
 interface NpmSearchPackage {
   name?: string;
   description?: string;
+  date?: string;
   keywords?: string[];
   links?: {
     npm?: string;
@@ -46,7 +48,7 @@ export interface PiExtensionRegistrySearchResult {
 }
 
 const NPM_SEARCH_ENDPOINT = "https://registry.npmjs.org/-/v1/search";
-const NPM_SEARCH_SIZE = 80;
+const NPM_SEARCH_SIZE = 250;
 const DEFAULT_PI_REGISTRY_QUERY = "keywords:pi-package";
 const PI_PACKAGE_KEYWORDS = new Set([
   "pi-package",
@@ -212,6 +214,7 @@ function registryPackageToCatalogItem(pkg: NpmSearchPackage): PiExtensionCatalog
     npmUrl: pkg.links?.npm || `https://www.npmjs.com/package/${name}`,
     sourceUrl: pkg.links?.repository || pkg.links?.homepage,
     tags,
+    publishedAt: pkg.date,
   };
 }
 

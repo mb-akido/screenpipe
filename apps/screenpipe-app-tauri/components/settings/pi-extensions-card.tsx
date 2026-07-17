@@ -7,6 +7,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   CheckCircle2,
+  Clock3,
   ExternalLink,
   Loader2,
   RefreshCw,
@@ -41,6 +42,19 @@ function packageErrorMessage(error: unknown): string {
   return "Something went wrong while changing this Pi extension.";
 }
 
+function relativeDate(value?: string): string | null {
+  if (!value) return null;
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return null;
+  const elapsedMinutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
+  if (elapsedMinutes < 60) return `${elapsedMinutes}m ago`;
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours}h ago`;
+  const elapsedDays = Math.floor(elapsedHours / 24);
+  if (elapsedDays < 30) return `${elapsedDays}d ago`;
+  return `${Math.floor(elapsedDays / 30)}mo ago`;
+}
+
 function PiExtensionRow({
   item,
   enabled,
@@ -56,15 +70,45 @@ function PiExtensionRow({
   disabled: boolean;
   onToggle: (checked: boolean) => void;
 }) {
+  const published = relativeDate(item.publishedAt);
+
   return (
-    <div className="rounded-md border border-border bg-card p-3">
-      <div className="flex items-start gap-3">
+    <article className="flex min-h-[168px] flex-col border border-border bg-card p-3.5 transition-colors hover:border-foreground/30">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 space-y-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <h4 className="min-w-0 break-words text-sm font-medium leading-tight text-foreground">
+              {item.name}
+            </h4>
+            {enabled && (
+              <span className="inline-flex items-center gap-1 border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                <CheckCircle2 className="h-3 w-3" />
+                on
+              </span>
+            )}
+            {item.required && (
+              <span className="border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                required
+              </span>
+            )}
+            {stale && (
+              <span className="border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-800 dark:text-amber-300">
+                repair needed
+              </span>
+            )}
+          </div>
+          <span
+            className={`inline-flex border px-1.5 py-0.5 text-[10px] font-medium ${MODEL_FIT_CLASS[item.modelFit]}`}
+          >
+            {item.modelFitLabel}
+          </span>
+        </div>
         {item.required ? (
           <Switch
             checked
             disabled
             aria-label={`${item.name} always enabled`}
-            className="mt-1"
+            className="shrink-0"
           />
         ) : (
           <Switch
@@ -72,66 +116,70 @@ function PiExtensionRow({
             disabled={disabled || busy}
             onCheckedChange={onToggle}
             aria-label={`${enabled ? "Disable" : "Enable"} ${item.name}`}
-            className="mt-1"
+            className="shrink-0"
           />
         )}
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <h4 className="text-sm font-medium leading-tight text-foreground">
-              {item.name}
-            </h4>
-            <span
-              className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${MODEL_FIT_CLASS[item.modelFit]}`}
-            >
-              {item.modelFitLabel}
-            </span>
-            {enabled && (
-              <span className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[10px] text-muted-foreground">
-                <CheckCircle2 className="h-3 w-3" />
-                on
-              </span>
-            )}
-            {item.required && (
-              <span className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-[10px] text-muted-foreground">
-                required
-              </span>
-            )}
-            {stale && (
-              <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-800 dark:text-amber-300">
-                repair needed
-              </span>
-            )}
-          </div>
-          <p className="text-xs leading-relaxed text-foreground">{item.summary}</p>
-          <p className="text-[11px] leading-relaxed text-muted-foreground">
-            {item.details}
-          </p>
-          <div className="rounded-md border border-border bg-muted/25 px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
-            {item.modelFitCopy}
-          </div>
-          <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-            <span className="font-mono">{item.source}</span>
-            <button
-              type="button"
-              onClick={() => openUrl(item.npmUrl)}
-              className="inline-flex items-center gap-1 underline-offset-4 hover:underline"
-            >
-              npm <ExternalLink className="h-3 w-3" />
-            </button>
-            {item.sourceUrl && (
-              <button
-                type="button"
-                onClick={() => openUrl(item.sourceUrl!)}
-                className="inline-flex items-center gap-1 underline-offset-4 hover:underline"
-              >
-                source <ExternalLink className="h-3 w-3" />
-              </button>
-            )}
-          </div>
-        </div>
         {busy && <Loader2 className="mt-1 h-4 w-4 animate-spin text-muted-foreground" />}
       </div>
-    </div>
+
+      <p className="mt-2.5 line-clamp-3 text-xs leading-relaxed text-muted-foreground">
+        {item.summary}
+      </p>
+
+      <div className="mt-auto flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-t border-border pt-2.5 text-[10px] text-muted-foreground">
+        <span className="max-w-full truncate font-mono">{item.source}</span>
+        {published && (
+          <span className="inline-flex items-center gap-1">
+            <Clock3 className="h-3 w-3" />
+            {published}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => openUrl(item.npmUrl)}
+          className="ml-auto inline-flex items-center gap-1 underline-offset-4 hover:underline"
+        >
+          npm <ExternalLink className="h-3 w-3" />
+        </button>
+        {item.sourceUrl && (
+          <button
+            type="button"
+            onClick={() => openUrl(item.sourceUrl!)}
+            className="inline-flex items-center gap-1 underline-offset-4 hover:underline"
+          >
+            source <ExternalLink className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function PiExtensionRecentCard({ item }: { item: PiExtensionCatalogItem }) {
+  const published = relativeDate(item.publishedAt);
+
+  return (
+    <button
+      type="button"
+      onClick={() => openUrl(item.npmUrl)}
+      className="min-w-0 border border-border bg-card p-3 text-left transition-colors hover:border-foreground/30 hover:bg-muted/30"
+    >
+      <div className="flex items-start justify-between gap-2">
+        <span className="min-w-0 truncate font-mono text-xs font-medium text-foreground">
+          {item.source.replace(/^npm:/, "")}
+        </span>
+        <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+      </div>
+      <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-muted-foreground">
+        {item.summary}
+      </p>
+      {published && (
+        <span className="mt-2 inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+          <Clock3 className="h-3 w-3" />
+          {published}
+        </span>
+      )}
+    </button>
   );
 }
 
@@ -221,6 +269,16 @@ export function PiExtensionsCard({ onChanged }: { onChanged?: () => void }) {
       ),
     [registryItems, visibleSources],
   );
+  const recentRegistryItems = useMemo(() => {
+    if (query.trim()) return [];
+    return [...visibleRegistryItems]
+      .filter((item) => item.publishedAt)
+      .sort(
+        (a, b) =>
+          new Date(b.publishedAt!).getTime() - new Date(a.publishedAt!).getTime(),
+      )
+      .slice(0, 8);
+  }, [query, visibleRegistryItems]);
 
   const unknownPackages = useMemo(() => {
     const catalogSources = installedPiPackageSourceSet(
@@ -367,21 +425,30 @@ export function PiExtensionsCard({ onChanged }: { onChanged?: () => void }) {
       ) : (
         <div className="space-y-4">
           <div className="space-y-2">
-            <h4 className="text-xs font-medium text-muted-foreground">Curated</h4>
-            {visibleItems.map((item) => {
-              const normalized = normalizePiPackageSource(item.source);
-              return (
-                <PiExtensionRow
-                  key={item.id}
-                  item={item}
-                  enabled={item.required || configuredSources.has(normalized)}
-                  stale={missingSources.has(normalized)}
-                  busy={busySource === item.source}
-                  disabled={changingPackage && busySource !== item.source}
-                  onToggle={(checked) => togglePackage(item, checked)}
-                />
-              );
-            })}
+            <div className="flex items-center justify-between gap-3">
+              <h4 className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                Curated
+              </h4>
+              <span className="text-[11px] tabular-nums text-muted-foreground">
+                {visibleItems.length}
+              </span>
+            </div>
+            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+              {visibleItems.map((item) => {
+                const normalized = normalizePiPackageSource(item.source);
+                return (
+                  <PiExtensionRow
+                    key={item.id}
+                    item={item}
+                    enabled={item.required || configuredSources.has(normalized)}
+                    stale={missingSources.has(normalized)}
+                    busy={busySource === item.source}
+                    disabled={changingPackage && busySource !== item.source}
+                    onToggle={(checked) => togglePackage(item, checked)}
+                  />
+                );
+              })}
+            </div>
             {visibleItems.length === 0 && (
               <div className="rounded-md border border-border bg-muted/25 p-3 text-xs text-muted-foreground">
                 No matching curated Pi extensions.
@@ -389,9 +456,29 @@ export function PiExtensionsCard({ onChanged }: { onChanged?: () => void }) {
             )}
           </div>
 
+          {recentRegistryItems.length > 0 && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <h4 className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                  Recently published
+                </h4>
+                <span className="text-[11px] text-muted-foreground">
+                  from npm
+                </span>
+              </div>
+              <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
+                {recentRegistryItems.map((item) => (
+                  <PiExtensionRecentCard key={`recent-${item.id}`} item={item} />
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3">
-              <h4 className="text-xs font-medium text-muted-foreground">From npm</h4>
+              <h4 className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                All packages
+              </h4>
               <span className="text-[11px] text-muted-foreground">
                 {registryLoading
                   ? "searching..."
@@ -405,20 +492,22 @@ export function PiExtensionsCard({ onChanged }: { onChanged?: () => void }) {
                 Could not search npm right now. Curated packages are still available.
               </div>
             )}
-            {visibleRegistryItems.map((item) => {
-              const normalized = normalizePiPackageSource(item.source);
-              return (
-                <PiExtensionRow
-                  key={item.id}
-                  item={item}
-                  enabled={configuredSources.has(normalized)}
-                  stale={missingSources.has(normalized)}
-                  busy={busySource === item.source}
-                  disabled={changingPackage && busySource !== item.source}
-                  onToggle={(checked) => togglePackage(item, checked)}
-                />
-              );
-            })}
+            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+              {visibleRegistryItems.map((item) => {
+                const normalized = normalizePiPackageSource(item.source);
+                return (
+                  <PiExtensionRow
+                    key={item.id}
+                    item={item}
+                    enabled={configuredSources.has(normalized)}
+                    stale={missingSources.has(normalized)}
+                    busy={busySource === item.source}
+                    disabled={changingPackage && busySource !== item.source}
+                    onToggle={(checked) => togglePackage(item, checked)}
+                  />
+                );
+              })}
+            </div>
             {!registryLoading && !registryError && visibleRegistryItems.length === 0 && (
               <div className="rounded-md border border-border bg-muted/25 p-3 text-xs text-muted-foreground">
                 No npm Pi packages matched this search.

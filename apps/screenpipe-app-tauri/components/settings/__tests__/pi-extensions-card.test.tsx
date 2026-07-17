@@ -145,7 +145,7 @@ describe("PiExtensionsCard", () => {
     } as Response);
     render(<PiExtensionsCard />);
 
-    expect(await screen.findByText("From npm")).toBeInTheDocument();
+    expect(await screen.findByText("All packages")).toBeInTheDocument();
     expect(await screen.findByText("Reflag")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("switch", { name: "Enable Reflag" }));

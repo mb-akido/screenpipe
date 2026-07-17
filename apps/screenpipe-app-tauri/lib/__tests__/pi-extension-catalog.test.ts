@@ -55,6 +55,7 @@ describe("Pi extension catalog", () => {
             package: {
               name: "@piotr-oles/pi-reflag",
               description: "Pi Agent extension: transparently rewrite grep commands to rg.",
+              date: "2026-07-17T16:00:00.000Z",
               keywords: ["pi-package"],
               links: {
                 npm: "https://www.npmjs.com/package/@piotr-oles/pi-reflag",
@@ -83,5 +84,10 @@ describe("Pi extension catalog", () => {
     expect(result.total).toBe(4894);
     expect(result.items.map((item) => item.source)).toEqual(["npm:@piotr-oles/pi-reflag"]);
     expect(result.items[0].name).toBe("Reflag");
+    expect(result.items[0].publishedAt).toBe("2026-07-17T16:00:00.000Z");
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("size=250"),
+      expect.any(Object),
+    );
   });
 });
