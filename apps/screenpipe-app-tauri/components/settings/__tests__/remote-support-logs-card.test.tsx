@@ -202,7 +202,9 @@ describe("RemoteSupportLogsCard", () => {
       screen.getByText(/Your organization can request diagnostic logs/i),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/automatically when managed data uploads keep failing/i),
+      screen.getByText(
+        /Nothing is uploaded unless an administrator sends a request/i,
+      ),
     ).toBeInTheDocument();
   });
 

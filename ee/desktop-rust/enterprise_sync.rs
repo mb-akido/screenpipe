@@ -69,15 +69,6 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// retrying every interval.
 const RETRY_AFTER_AUTH_FAIL: Duration = Duration::from_secs(60 * 60);
 
-/// Stalled-upload watchdog: an enrolled device that's been failing to land data
-/// in the org's storage for this long auto-submits its logs to support (the
-/// same endpoint the in-app "send logs" button uses — no UI, so it works on
-/// "run hidden" managed devices). Several missed 5-min ticks past first-run lag.
-const UPLOAD_STALL_THRESHOLD: Duration = Duration::from_secs(30 * 60);
-/// Re-arm window for the auto-submit, so a persistently-broken device reports at
-/// most ~twice a day instead of every tick.
-const AUTO_LOG_COOLDOWN: Duration = Duration::from_secs(12 * 60 * 60);
-
 /// Admin-triggered log collection must keep working while telemetry sync is in
 /// exponential backoff. Otherwise the machines we most need logs from can sit
 /// on the request for up to an hour.
@@ -106,9 +97,8 @@ pub struct EnterpriseSyncConfig {
     pub cursor_path: PathBuf,
     /// Hosted plaintext ingest or direct encrypted customer-storage upload.
     pub upload_mode: EnterpriseUploadMode,
-    /// Directories to scan for `*.log` files when the stalled-upload watchdog
-    /// auto-submits diagnostics. Empty = watchdog can still fire but ships a
-    /// "no log files found" marker. Set by the caller to the app's log dirs.
+    /// Directories to scan for `*.log` files when an admin requests diagnostics.
+    /// Set by the caller to the app's log dirs.
     pub log_dirs: Vec<PathBuf>,
 }
 
@@ -1223,67 +1213,9 @@ pub async fn fulfill_frame_requests(
 
 /// Run the sync forever (or until shutdown signal fires). Resilient to all
 /// transient errors. Idempotent across restarts via the cursor file.
-/// Decide whether to auto-submit diagnostic logs for a stalled upload pipeline.
-/// Pure so it unit-tests without a clock. Fires only when ALL hold:
-///   - the sync has run long enough to have had a fair shot (startup grace);
-///   - no data has actually landed in the org's storage within the stall window
-///     (`since_last_data` = None means it never has);
-///   - we've seen an actionable upload failure since data last landed — so a
-///     genuinely idle/paused device and an org that intentionally left
-///     centralized data disabled never phone home; and
-///   - we're past the cooldown since the last auto-submit.
-fn should_auto_submit_stall_logs(
-    running_for: Duration,
-    since_last_data: Option<Duration>,
-    saw_failure_since_data: bool,
-    since_last_submit: Option<Duration>,
-) -> bool {
-    if running_for < UPLOAD_STALL_THRESHOLD {
-        return false;
-    }
-    let stale = since_last_data.map_or(true, |d| d >= UPLOAD_STALL_THRESHOLD);
-    if !stale || !saw_failure_since_data {
-        return false;
-    }
-    since_last_submit.map_or(true, |d| d >= AUTO_LOG_COOLDOWN)
-}
-
-/// Whether a sync error represents a broken pipeline worth collecting device
-/// diagnostics for. Centralized data being disabled is an org-level privacy
-/// choice; device logs cannot fix it and auto-submitting them creates a false
-/// enterprise incident for every enrolled device.
-fn is_actionable_sync_failure(error: &EnterpriseSyncError) -> bool {
-    !matches!(error, EnterpriseSyncError::CentralizedDataDisabled)
-}
-
-/// Path of the persisted last-auto-submit marker (next to the sync cursor). The
-/// cooldown is persisted so it survives app restarts — otherwise a crash-looping
-/// or frequently-restarting stuck device would re-submit logs on every boot.
-fn stall_marker_path(cfg: &EnterpriseSyncConfig) -> PathBuf {
-    cfg.cursor_path.with_file_name(".enterprise-stall-log")
-}
-
-/// Load the persisted last-auto-submit time (unix seconds). None when never
-/// submitted / unreadable / malformed.
-fn load_last_auto_submit(cfg: &EnterpriseSyncConfig) -> Option<std::time::SystemTime> {
-    let secs: u64 = std::fs::read_to_string(stall_marker_path(cfg))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(std::time::UNIX_EPOCH + Duration::from_secs(secs))
-}
-
-/// Persist the last-auto-submit time (best-effort; a write failure only risks an
-/// earlier retry, never a crash).
-fn save_last_auto_submit(cfg: &EnterpriseSyncConfig, when: std::time::SystemTime) {
-    if let Ok(d) = when.duration_since(std::time::UNIX_EPOCH) {
-        let _ = std::fs::write(stall_marker_path(cfg), d.as_secs().to_string());
-    }
-}
 
 /// Stable, regex-safe identifier (`^[A-Za-z0-9._:-]+$`, ≤128) for the logs API.
-fn stall_log_identifier(device_id: &str) -> String {
+fn enterprise_log_identifier(device_id: &str) -> String {
     let safe: String = device_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
@@ -1307,7 +1239,7 @@ async fn submit_device_logs(
     // malformed/on-prem ingest URL fails closed instead of leaking logs to the
     // vendor production endpoint.
     let base = control_plane_base(&cfg.ingest_url)?;
-    let identifier = stall_log_identifier(&cfg.device_id);
+    let identifier = enterprise_log_identifier(&cfg.device_id);
 
     // 1. signed upload URL
     let signed: serde_json::Value = match http
@@ -1383,48 +1315,6 @@ async fn submit_device_logs(
         return None;
     }
     Some(path)
-}
-
-/// Auto-submit on the stalled-upload watchdog (device enrolled but not landing
-/// data). Thin wrapper over [`submit_device_logs`] with the stall reason.
-fn stall_log_feedback(cfg: &EnterpriseSyncConfig, last_error: Option<&str>) -> String {
-    format!(
-        "auto: enterprise device recording but not landing data in org storage (device {}, mode {}); last sync error: {}",
-        cfg.device_id,
-        cfg.upload_mode.label(),
-        last_error.unwrap_or("unknown")
-    )
-}
-
-fn sync_failure_feedback_summary(error: &EnterpriseSyncError) -> String {
-    match error {
-        EnterpriseSyncError::LocalApi(_) => "local API request failed".to_string(),
-        EnterpriseSyncError::Ingest(_) => "ingest request failed".to_string(),
-        EnterpriseSyncError::IngestAuthRejected => {
-            "ingest auth rejected (license invalid / revoked)".to_string()
-        }
-        EnterpriseSyncError::CentralizedDataDisabled => {
-            "centralized data not enabled for this org".to_string()
-        }
-        EnterpriseSyncError::IngestServerError(status) => {
-            format!("ingest server error: status {status}")
-        }
-        EnterpriseSyncError::Network(_) => "control-plane network error".to_string(),
-        EnterpriseSyncError::Io(_) => "local I/O error".to_string(),
-    }
-}
-
-async fn submit_stall_logs(
-    cfg: &EnterpriseSyncConfig,
-    http: &reqwest::Client,
-    last_error: Option<&str>,
-) {
-    let feedback = stall_log_feedback(cfg, last_error);
-    if submit_device_logs(cfg, http, &feedback).await.is_some() {
-        info!(
-            "enterprise sync: auto-submitted diagnostic logs (device enrolled but not uploading)"
-        );
-    }
 }
 
 /// Server's answer to the device's log-request poll.
@@ -1583,48 +1473,21 @@ pub async fn run(
         shutdown.clone(),
     ));
 
-    // Stalled-upload watchdog state. `last_auto_submit` is persisted (wall-clock)
-    // so the cooldown survives app restarts; the rest is in-memory (a fresh start
-    // re-applies the startup grace, which is the desired behavior).
-    let started = std::time::Instant::now();
-    let mut last_data_upload: Option<std::time::Instant> = None;
-    let mut saw_failure_since_data = false;
-    let mut last_auto_submit: Option<std::time::SystemTime> = load_last_auto_submit(&cfg);
-
     loop {
         let result = run_one_sync(&cfg, &mut cursor, local.as_ref(), &http).await;
 
-        // Watchdog bookkeeping: a data-bearing success clears the failure flag;
-        // actionable errors set it, while expected org configuration states do
-        // not. Then maybe phone home.
         match &result {
-            Ok(report) if report.bytes > 0 => {
-                last_data_upload = Some(std::time::Instant::now());
-                saw_failure_since_data = false;
-            }
-            Ok(_) => {}
-            Err(error) => saw_failure_since_data = is_actionable_sync_failure(error),
-        }
-
-        // Emit the failure before the watchdog snapshots the log files. The
-        // old ordering collected diagnostics first and only logged `tick
-        // failed` afterward, so first-failure bundles (especially on macOS)
-        // omitted the one line support needed. The feedback also carries the
-        // summary in case the tracing appender has not flushed to disk yet.
-        let failure_summary = match &result {
-            Err(error @ EnterpriseSyncError::IngestAuthRejected) => {
+            Err(EnterpriseSyncError::IngestAuthRejected) => {
                 error!(
                     "enterprise sync: license rejected by ingest endpoint (license invalid / revoked), sleeping {}s",
                     RETRY_AFTER_AUTH_FAIL.as_secs()
                 );
-                Some(sync_failure_feedback_summary(error))
             }
-            Err(error @ EnterpriseSyncError::CentralizedDataDisabled) => {
+            Err(EnterpriseSyncError::CentralizedDataDisabled) => {
                 error!(
                     "enterprise sync: centralized data is NOT enabled for this org — an admin must enable it in the dashboard before devices can upload; pausing {}s",
                     RETRY_AFTER_AUTH_FAIL.as_secs()
                 );
-                Some(sync_failure_feedback_summary(error))
             }
             Err(error) => {
                 warn!(
@@ -1632,31 +1495,8 @@ pub async fn run(
                     error,
                     backoff.as_secs()
                 );
-                Some(sync_failure_feedback_summary(error))
             }
-            Ok(_) => None,
-        };
-        // Wall-clock elapsed since the persisted last submit. A clock that moved
-        // backwards (Err) is treated as "just submitted" (Duration::ZERO) so we
-        // never spam on a clock glitch.
-        let since_last_submit = last_auto_submit.map(|t| {
-            std::time::SystemTime::now()
-                .duration_since(t)
-                .unwrap_or(Duration::ZERO)
-        });
-        if should_auto_submit_stall_logs(
-            started.elapsed(),
-            last_data_upload.map(|t| t.elapsed()),
-            saw_failure_since_data,
-            since_last_submit,
-        ) {
-            submit_stall_logs(&cfg, &http, failure_summary.as_deref()).await;
-            // Persist BEFORE updating memory so a restart right after still honors
-            // the cooldown. Set regardless of submit success → a fully-offline
-            // device retries next window rather than hammering every tick.
-            let now = std::time::SystemTime::now();
-            save_last_auto_submit(&cfg, now);
-            last_auto_submit = Some(now);
+            Ok(_) => {}
         }
 
         match result {
@@ -1749,131 +1589,9 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    const MIN: Duration = Duration::from_secs(60);
-
     #[test]
-    fn watchdog_ignores_centralized_data_opt_out() {
-        assert!(!is_actionable_sync_failure(
-            &EnterpriseSyncError::CentralizedDataDisabled
-        ));
-    }
-
-    #[test]
-    fn watchdog_keeps_real_sync_failures_actionable() {
-        assert!(is_actionable_sync_failure(
-            &EnterpriseSyncError::IngestAuthRejected
-        ));
-        assert!(is_actionable_sync_failure(
-            &EnterpriseSyncError::IngestServerError(503)
-        ));
-        assert!(is_actionable_sync_failure(&EnterpriseSyncError::Ingest(
-            "connection reset".to_string()
-        )));
-    }
-
-    #[test]
-    fn watchdog_fires_when_stalled_with_failures_past_grace() {
-        // running long enough, no data ever, saw a failure, never submitted
-        assert!(should_auto_submit_stall_logs(40 * MIN, None, true, None));
-        // last data is old + a failure since → fire
-        assert!(should_auto_submit_stall_logs(
-            2 * 60 * MIN,
-            Some(35 * MIN),
-            true,
-            None
-        ));
-    }
-
-    #[test]
-    fn watchdog_feedback_carries_the_failure_that_triggered_collection() {
-        let dir = TempDir::new().unwrap();
-        let cfg = test_cfg(&dir, "http://localhost/ingest".into());
-        let summary = sync_failure_feedback_summary(&EnterpriseSyncError::LocalApi(
-            "OCR backlog request timed out".to_string(),
-        ));
-        let feedback = stall_log_feedback(&cfg, Some(&summary));
-
-        assert!(feedback.contains("device dev-1"));
-        assert!(feedback.contains("mode hosted_ingest"));
-        assert!(feedback.contains("last sync error: local API request failed"));
-        assert!(!feedback.contains("OCR backlog request timed out"));
-    }
-
-    #[test]
-    fn watchdog_silent_during_startup_grace() {
-        // only just started — give the first ticks a chance even with no data
-        assert!(!should_auto_submit_stall_logs(5 * MIN, None, true, None));
-    }
-
-    #[test]
-    fn watchdog_silent_for_idle_device_no_failures() {
-        // no data recently but NO upload failure → genuinely idle/paused, not broken
-        assert!(!should_auto_submit_stall_logs(
-            60 * MIN,
-            Some(40 * MIN),
-            false,
-            None
-        ));
-        assert!(!should_auto_submit_stall_logs(60 * MIN, None, false, None));
-    }
-
-    #[test]
-    fn watchdog_silent_when_data_is_flowing() {
-        // recent successful upload → healthy even if a failure was seen
-        assert!(!should_auto_submit_stall_logs(
-            60 * MIN,
-            Some(2 * MIN),
-            true,
-            None
-        ));
-    }
-
-    #[test]
-    fn watchdog_respects_cooldown() {
-        // stalled + failing, but submitted recently → wait
-        assert!(!should_auto_submit_stall_logs(
-            5 * 60 * MIN,
-            Some(40 * MIN),
-            true,
-            Some(60 * MIN)
-        ));
-        // cooldown elapsed → fire again
-        assert!(should_auto_submit_stall_logs(
-            20 * 60 * MIN,
-            Some(40 * MIN),
-            true,
-            Some(13 * 60 * MIN)
-        ));
-    }
-
-    #[test]
-    fn cooldown_persists_across_restarts() {
-        // The crash-loop guard: a restart must NOT reset the cooldown, or a
-        // stuck device would re-submit on every boot.
-        let dir = TempDir::new().unwrap();
-        let cfg = test_cfg(&dir, "http://x".into());
-        assert!(load_last_auto_submit(&cfg).is_none()); // nothing yet
-
-        let now = std::time::SystemTime::now();
-        save_last_auto_submit(&cfg, now);
-
-        // a fresh process reloads the marker and is still within cooldown
-        let loaded = load_last_auto_submit(&cfg).expect("persisted");
-        let since = std::time::SystemTime::now()
-            .duration_since(loaded)
-            .unwrap_or(Duration::ZERO);
-        assert!(since < AUTO_LOG_COOLDOWN);
-        assert!(!should_auto_submit_stall_logs(
-            60 * MIN,
-            None,
-            true,
-            Some(since)
-        ));
-    }
-
-    #[test]
-    fn stall_log_identifier_is_regex_safe() {
-        let id = stall_log_identifier("AB-12 34/xy");
+    fn enterprise_log_identifier_is_regex_safe() {
+        let id = enterprise_log_identifier("AB-12 34/xy");
         assert!(id.starts_with("enterprise-auto-"));
         assert!(id
             .chars()
