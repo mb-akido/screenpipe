@@ -789,11 +789,16 @@ mod runtime {
                 #[allow(unused_mut)]
                 let mut builder = Session::builder()?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
+                    // Every captured row produces a different sequence length.
+                    // ORT documents its memory-pattern planner for stable input
+                    // shapes and recommends disabling it when input sizes vary.
+                    .with_memory_pattern(false)?
                     // This session serves a background batch worker — never let the
                     // intra-op pool busy-spin between ops. A spinning full-width
                     // pool burned ~4 cores in ThreadPoolTempl::WorkerLoop while the
                     // redaction backlog drained (340% CPU regression after 3b9a1a105).
                     .with_intra_op_spinning(false)?
+                    .with_inter_op_spinning(false)?
                     // This is background reconciliation, so latency is a
                     // non-goal. A single ORT thread prevents one inference from
                     // fanning out to 100-300% CPU before the worker's adaptive
@@ -808,7 +813,16 @@ mod runtime {
                 #[cfg(feature = "onnx-directml")]
                 let mut builder = builder.with_execution_providers([
                     ort::ep::DirectML::default().with_device_id(0).build(),
-                    ort::ep::CPU::default().build(),
+                    ort::ep::CPU::default().with_arena_allocator(false).build(),
+                ])?;
+                #[cfg(not(feature = "onnx-directml"))]
+                let mut builder = builder.with_execution_providers([
+                    // The default CPU BFC arena pre-allocates and retains tensor
+                    // buffers for future runs. That is useful for fixed-shape,
+                    // latency-sensitive inference, but this background redactor
+                    // sees dynamic text lengths and reached a 5 GB retained
+                    // activation high-water mark in a live 2.5.117 process.
+                    ort::ep::CPU::default().with_arena_allocator(false).build(),
                 ])?;
                 builder.commit_from_file(model_path)
             },
