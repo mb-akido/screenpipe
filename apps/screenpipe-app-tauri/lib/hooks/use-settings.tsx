@@ -284,10 +284,6 @@ export type Settings = SettingsStore & {
 	filterMusic?: boolean;
 	/** Maximum batch transcription duration in seconds (0 = engine default: Deepgram 5000s, OpenAI 3000s, Whisper 600s) */
 	batchMaxDurationSecs?: number;
-	/** Show periodic notifications suggesting pipe ideas based on user's data (default: true) */
-	pipeSuggestionsEnabled?: boolean;
-	/** Hours between pipe suggestion notifications (default: 24) */
-	pipeSuggestionFrequencyHours?: number;
 	/** User's power mode preference — persisted so it survives app restarts */
 	powerMode?: "auto" | "performance" | "battery_saver";
 	/** Show restart notifications when audio/vision capture stalls (default: false for now) */
@@ -367,7 +363,6 @@ export type Settings = SettingsStore & {
 		allowDuringPause?: string[];
 		captureStalls: boolean;
 		appUpdates: boolean;
-		pipeSuggestions: boolean;
 		pipeNotifications: boolean;
 		/** Toast when a monitor is plugged, unplugged, or switched (clamshell, dock). Default true. */
 		displayChanges?: boolean;

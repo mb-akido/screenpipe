@@ -2785,7 +2785,7 @@ pub async fn show_notification_panel(
     info!("show_notification_panel called");
 
     // Delivery gate — the single choke point that catches both `/notify` and
-    // the direct callers (pipe suggestions, audio device/health toasts,
+    // the direct callers (audio device/health toasts,
     // capture-stall). Honors master-off, snooze, and quiet hours. The critical
     // `capture_stall` recording-stopped alert is exempt so we never silently
     // hide it.
