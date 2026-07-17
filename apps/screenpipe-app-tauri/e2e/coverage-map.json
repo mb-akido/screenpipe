@@ -113,6 +113,16 @@
   ],
   "specs": [
     {
+      "spec": "acp-backend.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "tauri-command", "os-integration"],
+      "features": ["chat", "acp-backend", "agent-streaming", "agent-permissions", "agent-cancellation", "process-supervision"],
+      "criticality": "high",
+      "confidence": "partial",
+      "ux": "mixed",
+      "notes": "Real Rust-to-ACP bridge and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, and supervised shutdown. Curated third-party adapters remain manual smoke coverage."
+    },
+    {
       "spec": "api.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["local-api"],
@@ -311,6 +321,16 @@
       "confidence": "conditional",
       "ux": "performance",
       "notes": "macOS-only chat streaming responsiveness."
+    },
+    {
+      "spec": "chat-subagent-async-completion.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "real-ui-e2e"],
+      "features": ["chat", "chat-streaming", "async-subagents"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "synthetic",
+      "notes": "A settled assistant turn must accept a later async subagent completion as a distinct visible assistant message without another user prompt."
     },
     {
       "spec": "zzz-browser-state-chat-switch.spec.ts",
