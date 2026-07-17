@@ -964,6 +964,42 @@ pub fn e2e_main_overlay_visible(app_handle: tauri::AppHandle) -> bool {
     }
 }
 
+/// E2E helper: drive the health-to-native-tray status transition.
+#[tauri::command]
+#[specta::specta]
+pub async fn e2e_set_tray_recording_status(
+    app_handle: tauri::AppHandle,
+    status: String,
+) -> Result<(), String> {
+    if !cfg!(feature = "e2e") {
+        return Err("E2E feature is disabled".to_string());
+    }
+
+    let status = match status.as_str() {
+        "starting" => crate::health::RecordingStatus::Starting,
+        "recording" => crate::health::RecordingStatus::Recording,
+        "paused" => crate::health::RecordingStatus::Paused,
+        "stopped" => crate::health::RecordingStatus::Stopped,
+        "error" => crate::health::RecordingStatus::Error,
+        other => return Err(format!("unsupported E2E tray status: {other}")),
+    };
+
+    crate::tray::set_tray_recording_status_for_e2e(&app_handle, status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// E2E helper: read the status text from the menu that was successfully
+/// installed into the native tray, not merely the desired health state.
+#[tauri::command]
+#[specta::specta]
+pub fn e2e_installed_tray_recording_status() -> Result<Option<String>, String> {
+    if !cfg!(feature = "e2e") {
+        return Err("E2E feature is disabled".to_string());
+    }
+    crate::tray::installed_recording_status_text().map_err(|e| e.to_string())
+}
+
 /// E2E helper: report whether the shortcut reminder overlay is visibly shown.
 ///
 /// The reminder window is hidden rather than destroyed, so WebDriver can keep a

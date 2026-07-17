@@ -93,6 +93,12 @@
       "layers": ["window-lifecycle"]
     },
     {
+      "id": "tray-recording-status",
+      "label": "Native tray recording status refresh",
+      "platforms": ["windows"],
+      "layers": ["os-integration"]
+    },
+    {
       "id": "storage-retention",
       "label": "Storage retention safety UX",
       "platforms": ["windows", "macos", "linux"],
@@ -311,6 +317,16 @@
       "confidence": "conditional",
       "ux": "performance",
       "notes": "macOS-only chat streaming responsiveness."
+    },
+    {
+      "spec": "chat-subagent-async-completion.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "real-ui-e2e", "tauri-command"],
+      "features": ["chat"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Verifies an asynchronous subagent completion appears as a second assistant turn after the original answer settles."
     },
     {
       "spec": "zzz-browser-state-chat-switch.spec.ts",
@@ -591,6 +607,16 @@
       "confidence": "partial",
       "ux": "command",
       "notes": "Invokes open_search_window and verifies focused floating Search."
+    },
+    {
+      "spec": "tray-recording-status.spec.ts",
+      "platforms": ["windows"],
+      "layers": ["os-integration", "tauri-command"],
+      "features": ["tray-recording-status"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "command",
+      "notes": "Drives Starting to Recording and reads back the status item from the successfully installed native tray menu."
     },
     {
       "spec": "viewer-deeplink.spec.ts",
