@@ -491,6 +491,19 @@ fn native_shortcut_action_callback_inner(action_ptr: *const std::os::raw::c_char
                     let _ = app_clone.emit("native-shortcut-close", "");
                     native_shortcut_reminder::hide();
                 }
+                "restart_recording" => {
+                    // Recording-health overlay: restart the engine in place.
+                    // Same flow as the webview's overlay_restart_recording
+                    // command; the health loop confirms the recovery.
+                    tauri::async_runtime::spawn(crate::overlay_health::restart_recording(
+                        app_clone.clone(),
+                    ));
+                }
+                "dismiss_incident" => {
+                    tauri::async_runtime::spawn(crate::overlay_health::dismiss_incident(
+                        app_clone.clone(),
+                    ));
+                }
                 "toggle_meeting" => {
                     // Directly call the meetings API instead of relying on JS
                     // (the Main window may not be loaded when using the Swift overlay)

@@ -525,6 +525,8 @@ void shortcut_set_action_callback(action_callback_t cb) { (void)cb; }
 int shortcut_show(const char* json) { (void)json; return -2; }
 int shortcut_hide(void) { return -2; }
 int shortcut_is_available(void) { return 0; }
+void shortcut_set_meeting_active(int active) { (void)active; }
+int shortcut_set_health_state(const char* state) { (void)state; return -2; }
 "#,
     )
     .expect("failed to write shortcut reminder stub");

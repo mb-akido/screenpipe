@@ -12,7 +12,7 @@ import posthog from "posthog-js";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { getStore, saveAndEncrypt } from "@/lib/hooks/use-settings";
 import { commands } from "@/lib/utils/tauri";
-import { X, Phone } from "lucide-react";
+import { X, Phone, RotateCw, Loader2, CheckCircle2 } from "lucide-react";
 import { useOverlayData } from "./use-overlay-data";
 import { AudioEqualizer } from "./audio-equalizer";
 import { ScreenMatrix } from "./screen-matrix";
@@ -112,8 +112,12 @@ function useMeetingState() {
   return { active: meetingState.active, loading, toggle };
 }
 
+type RecordingHealthState = "normal" | "failure" | "fixing" | "recovered";
+
 export default function ShortcutReminderPage() {
   const { isMac, isLoading } = usePlatform();
+  const [healthState, setHealthState] = useState<RecordingHealthState>("normal");
+  const [healthDetail, setHealthDetail] = useState("");
   const [overlayShortcut, setOverlayShortcut] = useState<string | null>(null);
   const [chatShortcut, setChatShortcut] = useState<string | null>(null);
   const [searchShortcut, setSearchShortcut] = useState<string | null>(null);
@@ -213,6 +217,55 @@ export default function ShortcutReminderPage() {
     };
   }, [loadShortcutsFromFile]);
 
+  // Recording-health state (issue #5127): the Rust health loop owns detection,
+  // debounce, and recovery confirmation — this page only renders the pushed
+  // state. Pull once on mount (emits sent before mount are lost), then stay
+  // current via the event.
+  useEffect(() => {
+    let mounted = true;
+    // Payload is "state" or "state|detail" (detail = boot-phase label while fixing).
+    const apply = (payload: string) => {
+      const [state, detail = ""] = payload.split("|", 2);
+      setHealthState(state as RecordingHealthState);
+      setHealthDetail(detail);
+    };
+    commands
+      .getRecordingHealthState()
+      .then((s) => {
+        if (mounted) apply(s);
+      })
+      .catch(() => {});
+    const unlisten = listen<string>("recording-health-state", (event) => {
+      apply(event.payload);
+    });
+    return () => {
+      mounted = false;
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const handleRestartRecording = useCallback(async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Optimistic — Rust pushes the authoritative "fixing" immediately after.
+    setHealthState("fixing");
+    try {
+      await commands.overlayRestartRecording();
+    } catch (err) {
+      console.error("overlay restart failed:", err);
+    }
+  }, []);
+
+  const handleDismissIncident = useCallback(async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      await commands.overlayDismissIncident();
+    } catch (err) {
+      console.error("overlay dismiss failed:", err);
+    }
+  }, []);
+
   // Use Tauri's native startDragging for window movement
   const handleMouseDown = useCallback(async (e: React.MouseEvent) => {
     if (e.button === 0) {
@@ -260,6 +313,125 @@ export default function ShortcutReminderPage() {
   const gap = 2 * overlayScale;
   const smIconPx = 10 * overlayScale;
   const dotPx = Math.max(5 * overlayScale, 5);
+
+  // Recording-health states replace the shortcut grid inside the same fixed
+  // window (160x40 x scale) — no resize needed: message row on top, actions
+  // row below.
+  if (healthState === "failure") {
+    return (
+      <div
+        className="w-full h-full flex items-center justify-center"
+        style={{ background: "transparent" }}
+      >
+        <div
+          onMouseDown={handleMouseDown}
+          className="select-none w-full h-full border border-red-500/40 flex flex-col"
+          style={{ background: "rgba(0, 0, 0, 0.88)", cursor: "grab" }}
+        >
+          <div
+            className="flex items-center justify-center flex-1 min-h-0"
+            style={{ gap: `${gap * 2}px`, padding: `${padY}px ${padX}px` }}
+          >
+            <div
+              className="rounded-full bg-red-500 animate-pulse shrink-0"
+              style={{ width: `${dotPx}px`, height: `${dotPx}px` }}
+            />
+            <span
+              className="font-mono text-white/90 whitespace-nowrap truncate"
+              style={{ fontSize: `${fontPx}px` }}
+            >
+              recording needs help
+            </span>
+          </div>
+          <div className="bg-white/15" style={{ height: "1px" }} />
+          <div className="flex items-stretch justify-center flex-1 min-h-0">
+            <button
+              onClick={handleRestartRecording}
+              onMouseDown={(e) => e.stopPropagation()}
+              className="flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer text-white/90 flex-1"
+              style={{ gap: `${gap}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+              title="Restart recording"
+            >
+              <RotateCw style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} className="shrink-0" />
+              <span className="font-mono font-bold" style={{ fontSize: `${fontPx}px` }}>
+                restart
+              </span>
+            </button>
+            <div className="bg-white/15" style={{ width: "1px" }} />
+            <button
+              onClick={handleDismissIncident}
+              onMouseDown={(e) => e.stopPropagation()}
+              className="flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer text-white/60 hover:text-white"
+              style={{ padding: `${padY}px ${padX * 2}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+              title="Dismiss"
+            >
+              <X style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }} />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (healthState === "fixing") {
+    return (
+      <div
+        className="w-full h-full flex items-center justify-center"
+        style={{ background: "transparent" }}
+      >
+        <div
+          onMouseDown={handleMouseDown}
+          className="select-none w-full h-full border border-white/25 flex items-center justify-center"
+          style={{
+            background: "rgba(0, 0, 0, 0.88)",
+            cursor: "grab",
+            gap: `${gap * 2}px`,
+          }}
+        >
+          <Loader2
+            className="animate-spin text-white/70 shrink-0"
+            style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }}
+          />
+          <span
+            className="font-mono text-white/90 whitespace-nowrap truncate"
+            style={{ fontSize: `${fontPx}px` }}
+          >
+            {healthDetail ? `fixing — ${healthDetail}...` : "fixing recording..."}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  if (healthState === "recovered") {
+    return (
+      <div
+        className="w-full h-full flex items-center justify-center"
+        style={{ background: "transparent" }}
+      >
+        <div
+          onMouseDown={handleMouseDown}
+          className="select-none w-full h-full border border-green-500/40 flex items-center justify-center"
+          style={{
+            background: "rgba(0, 0, 0, 0.88)",
+            cursor: "grab",
+            gap: `${gap * 2}px`,
+          }}
+        >
+          <CheckCircle2
+            className="text-green-500 shrink-0"
+            style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }}
+          />
+          <span
+            className="font-mono text-white/90 whitespace-nowrap"
+            style={{ fontSize: `${fontPx}px` }}
+          >
+            recording again
+          </span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div

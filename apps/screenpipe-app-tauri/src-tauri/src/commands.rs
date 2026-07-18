@@ -2443,6 +2443,20 @@ pub async fn show_shortcut_reminder(
     app_handle: tauri::AppHandle,
     _shortcut: String,
 ) -> Result<(), String> {
+    show_shortcut_reminder_impl(app_handle, true, true).await
+}
+
+/// Shared body of `show_shortcut_reminder`.
+///
+/// The recording-health incident path (overlay_health.rs) calls this with both
+/// flags false: a confirmed incident must surface even when the timeline (and
+/// thus the normal reminder) is disabled, and it must not block on the
+/// wait-for-server handshake — the server being down is often the incident.
+pub(crate) async fn show_shortcut_reminder_impl(
+    app_handle: tauri::AppHandle,
+    respect_timeline_disabled: bool,
+    wait_for_server: bool,
+) -> Result<(), String> {
     use tauri::{Emitter, WebviewWindowBuilder};
 
     let label = "shortcut-reminder";
@@ -2455,7 +2469,7 @@ pub async fn show_shortcut_reminder(
     let store = crate::store::SettingsStore::get(&app_handle)
         .unwrap_or_default()
         .unwrap_or_default();
-    if store.recording.disable_timeline {
+    if respect_timeline_disabled && store.recording.disable_timeline {
         info!("timeline disabled: skipping shortcut reminder overlay");
         return Ok(());
     }
@@ -2477,7 +2491,7 @@ pub async fn show_shortcut_reminder(
             // `metrics_ws_url` and retries /ws/metrics without ?token= when API auth is on.
             // Wait for server **core** (not only API key): when auth is disabled, key may stay
             // None and we must not spin until the 90s timeout.
-            {
+            if wait_for_server {
                 const MAX_WAIT: Duration = Duration::from_secs(90);
                 const STEP: Duration = Duration::from_millis(250);
                 let mut waited = Duration::ZERO;
@@ -2527,6 +2541,11 @@ pub async fn show_shortcut_reminder(
             }
             let native_payload = serde_json::Value::Object(map).to_string();
             if native_shortcut_reminder::show(Some(&native_payload)) {
+                // A recording incident may already be active (e.g. this show IS
+                // the incident reveal) — sync the panel's health state.
+                native_shortcut_reminder::set_health_state(
+                    &crate::overlay_health::current_state_payload(),
+                );
                 return Ok(());
             }
             warn!("Native shortcut reminder failed, falling back to webview");
@@ -2769,6 +2788,34 @@ pub async fn hide_shortcut_reminder(app_handle: tauri::AppHandle) -> Result<(), 
             });
         }
     }
+    Ok(())
+}
+
+/// Current recording-health overlay state: "normal" | "failure" | "fixing" |
+/// "recovered", optionally suffixed "|<detail>" (boot-phase label while
+/// fixing). The shortcut-reminder webview pulls this on mount, then stays
+/// current via the "recording-health-state" event.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_recording_health_state() -> String {
+    crate::overlay_health::current_state_payload()
+}
+
+/// Restart the recording engine from the overlay's failure state. Runs the
+/// same stop → settle → spawn sequence as the native panel's restart action;
+/// the health loop confirms recovery and pushes "recovered" to the overlay.
+#[tauri::command]
+#[specta::specta]
+pub async fn overlay_restart_recording(app_handle: tauri::AppHandle) -> Result<(), String> {
+    crate::overlay_health::restart_recording(app_handle).await;
+    Ok(())
+}
+
+/// Dismiss the current recording incident shown in the overlay.
+#[tauri::command]
+#[specta::specta]
+pub async fn overlay_dismiss_incident(app_handle: tauri::AppHandle) -> Result<(), String> {
+    crate::overlay_health::dismiss_incident(app_handle).await;
     Ok(())
 }
 

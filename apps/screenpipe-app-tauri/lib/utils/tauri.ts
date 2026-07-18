@@ -225,8 +225,12 @@ async checkPermission(permission: OSPermission) : Promise<OSPermissionStatus> {
     return await TAURI_INVOKE("check_permission", { permission });
 },
 /**
- * Check only screen recording permission (no dialog trigger)
- * Uses CGPreflightScreenCaptureAccess which is safe to poll repeatedly
+ * Check only screen recording permission without triggering a dialog.
+ *
+ * This command is polled as soon as onboarding renders, before the user has
+ * clicked anything. It must use preflight directly: the broader core Tauri
+ * check may perform a real capture probe in debug builds, which macOS treats
+ * as a permission request.
  */
 async checkScreenRecordingPermission() : Promise<OSPermissionStatus> {
     return await TAURI_INVOKE("check_screen_recording_permission");
@@ -395,6 +399,18 @@ async e2eEmitSettledAgentFollowUp(sessionId: string) : Promise<Result<null, stri
 }
 },
 /**
+ * E2E helper: read the status text from the menu that was successfully
+ * installed into the native tray, not merely the desired health state.
+ */
+async e2eInstalledTrayRecordingStatus() : Promise<Result<string | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("e2e_installed_tray_recording_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * E2E helper: report whether the main overlay is logically visible.
  *
  * The main window uses platform-specific "hide" semantics (macOS NSPanel with
@@ -430,6 +446,17 @@ async e2eOwnedBrowserDetach() : Promise<Result<null, string>> {
  */
 async e2eOwnedBrowserVisible() : Promise<boolean> {
     return await TAURI_INVOKE("e2e_owned_browser_visible");
+},
+/**
+ * E2E helper: drive the health-to-native-tray status transition.
+ */
+async e2eSetTrayRecordingStatus(status: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("e2e_set_tray_recording_status", { status }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 /**
  * E2E helper: report whether the shortcut reminder overlay is visibly shown.
@@ -734,6 +761,15 @@ async getPendingUpdate() : Promise<Result<PendingUpdateSnapshot | null, null>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Current recording-health overlay state: "normal" | "failure" | "fixing" |
+ * "recovered", optionally suffixed "|<detail>" (boot-phase label while
+ * fixing). The shortcut-reminder webview pulls this on mount, then stays
+ * current via the "recording-health-state" event.
+ */
+async getRecordingHealthState() : Promise<string> {
+    return await TAURI_INVOKE("get_recording_health_state");
 },
 /**
  * Tauri command: absolute path of the screenpipe base dir (where store.bin
@@ -1164,6 +1200,30 @@ async openViewerWindow(path: string) : Promise<Result<null, string>> {
 async openWindowsShellTarget(target: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_windows_shell_target", { target }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Dismiss the current recording incident shown in the overlay.
+ */
+async overlayDismissIncident() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("overlay_dismiss_incident") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Restart the recording engine from the overlay's failure state. Runs the
+ * same stop → settle → spawn sequence as the native panel's restart action;
+ * the health loop confirms recovery and pushes "recovered" to the overlay.
+ */
+async overlayRestartRecording() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("overlay_restart_recording") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

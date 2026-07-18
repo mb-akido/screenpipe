@@ -66,6 +66,7 @@ mod meeting_export;
 mod meeting_live_notes;
 mod meeting_stall_notifications;
 mod oauth;
+mod overlay_health;
 mod owned_browser;
 mod owned_browser_transport;
 // Cross-platform shape: macOS reads Arc/Chrome/Brave/Edge cookies and
