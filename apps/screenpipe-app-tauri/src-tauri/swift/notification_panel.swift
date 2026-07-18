@@ -1106,6 +1106,20 @@ fileprivate func inboxSendPayload(_ payload: [String: String]) {
     inboxSendJson(json)
 }
 
+extension View {
+    /// Kill the blue macOS focus ring inside the inbox — the panel becomes
+    /// key for scrolling/Esc, and SwiftUI hands default focus to the first
+    /// button ("clear all"), painting it with the accent ring on every open.
+    @ViewBuilder
+    fileprivate func inboxNoFocusRing() -> some View {
+        if #available(macOS 14.0, *) {
+            self.focusEffectDisabled()
+        } else {
+            self
+        }
+    }
+}
+
 /// Actions worth rendering as row buttons — mirrors the webview bell's
 /// filter: dismiss (the row ✕ covers it), copy and source (dedicated
 /// affordances) are excluded.
@@ -1501,6 +1515,7 @@ class InboxPanelController: NSObject {
                     .stroke(Color.primary.opacity(0.15), lineWidth: 1)
             )
             .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
+            .inboxNoFocusRing()
 
         if let hosting = hostingView {
             hosting.rootView = AnyView(framed)

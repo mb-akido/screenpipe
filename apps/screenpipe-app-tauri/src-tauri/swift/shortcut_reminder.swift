@@ -502,8 +502,8 @@ struct ShortcutReminderView: View {
 
             Rectangle().fill(.white.opacity(0.15)).frame(width: 0.5)
 
-            HoverIconButton(icon: "phone.fill", isActive: metrics.meetingActive, edge: nil, scale: scale) {
-                onAction("toggle_meeting")
+            HoverIconButton(icon: "bell.fill", isActive: metrics.inboxUnread, edge: nil, scale: scale) {
+                onAction("open_inbox")
             }
             HoverIconButton(icon: "xmark", isActive: false, edge: .trailing, scale: scale) {
                 onAction("close")
