@@ -307,22 +307,22 @@ export default function EngineStartup({ handleNextSlide }: EngineStartupProps) {
     setState("stuck");
   }, [state, bootPhase?.phase, bootPhase?.error]);
 
-  // Transition from "running" to "live-feed" instead of auto-advancing
+  // Move on as soon as the engine is ready. The activity recap that used to
+  // follow this screen added another wait before users could finish setup.
   useEffect(() => {
-    if (state !== "running") return;
+    if (state !== "running" || hasAdvancedRef.current) return;
+    hasAdvancedRef.current = true;
 
     posthog.capture("onboarding_engine_started", {
       time_spent_ms: Date.now() - mountTimeRef.current,
     });
-    // Small delay so user sees the completed progress, then transition to live feed
+
+    // Keep the completed progress visible briefly before advancing.
     const elapsed = Date.now() - mountTimeRef.current;
     const delay = Math.max(0, 1200 - elapsed);
-    const timer = setTimeout(() => {
-      feedStartRef.current = Date.now();
-      setState("live-feed");
-    }, delay);
+    const timer = setTimeout(() => handleNextSlide(), delay);
     return () => clearTimeout(timer);
-  }, [state]);
+  }, [state, handleNextSlide]);
 
   // Live feed: poll search for recent activity + thumbnails
   const emptyPollCountRef = useRef(0);
