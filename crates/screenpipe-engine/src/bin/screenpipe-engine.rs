@@ -1042,7 +1042,11 @@ async fn main() -> anyhow::Result<()> {
                 manager.set_on_transcription_insert(std::sync::Arc::new(move |info| {
                     let cache = cache.clone();
                     rt.spawn(async move {
-                        cache.push_transcription_insert(info).await;
+                        cache
+                            .push_audio(screenpipe_engine::timeline_audio::from_background_insert(
+                                info,
+                            ))
+                            .await;
                     });
                 }));
 
@@ -1051,7 +1055,11 @@ async fn main() -> anyhow::Result<()> {
                 manager.set_on_meeting_transcript_insert(std::sync::Arc::new(move |info| {
                     let cache = cache.clone();
                     rt.spawn(async move {
-                        cache.push_meeting_transcript_insert(info).await;
+                        cache
+                            .push_audio(screenpipe_engine::timeline_audio::from_meeting_insert(
+                                info,
+                            ))
+                            .await;
                     });
                 }));
             }

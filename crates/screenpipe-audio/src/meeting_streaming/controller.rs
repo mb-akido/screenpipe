@@ -933,6 +933,83 @@ mod tests {
     use super::*;
     use crate::transcription::deepgram::DeepgramTranscriptionConfig;
 
+    #[tokio::test]
+    async fn persisted_final_callback_fires_once_only_after_a_new_insert() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let meeting_id = db
+            .insert_meeting("Google Meet", "test", None, None)
+            .await
+            .unwrap();
+        let event = MeetingTranscriptFinal {
+            meeting_id,
+            provider: "selected-engine".to_string(),
+            model: Some("test-model".to_string()),
+            item_id: "durable-final-contract".to_string(),
+            device_name: "System Audio".to_string(),
+            device_type: "output".to_string(),
+            speaker_name: Some("Speaker 1".to_string()),
+            transcript: " durable live final ".to_string(),
+            captured_at: Utc::now(),
+        };
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_received = received.clone();
+        let callback: MeetingTranscriptInsertCallback = Arc::new(move |info| {
+            callback_received.lock().unwrap().push(info);
+        });
+
+        assert!(persist_live_final_once(db.clone(), &event, Some(&callback))
+            .await
+            .unwrap());
+        assert!(persist_live_final_once(db.clone(), &event, Some(&callback))
+            .await
+            .unwrap());
+
+        let inserted = db
+            .list_meeting_transcript_segments(meeting_id)
+            .await
+            .unwrap();
+        let received = received.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(received.len(), 1);
+        assert!(received[0].segment_id > 0);
+        assert_eq!(received[0].transcription, "durable live final");
+        assert_eq!(received[0].speaker_name.as_deref(), Some("Speaker 1"));
+    }
+
+    #[tokio::test]
+    async fn empty_final_does_not_insert_or_notify() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_notifications = notifications.clone();
+        let callback: MeetingTranscriptInsertCallback = Arc::new(move |_| {
+            callback_notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let event = MeetingTranscriptFinal {
+            meeting_id: 1,
+            provider: "selected-engine".to_string(),
+            model: None,
+            item_id: "empty-final".to_string(),
+            device_name: "System Audio".to_string(),
+            device_type: "output".to_string(),
+            speaker_name: None,
+            transcript: "   ".to_string(),
+            captured_at: Utc::now(),
+        };
+
+        assert!(persist_live_final_once(db, &event, Some(&callback))
+            .await
+            .unwrap());
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     fn test_session(now: Instant, live: bool) -> ActiveMeetingStream {
         ActiveMeetingStream {
             meeting_id: 42,

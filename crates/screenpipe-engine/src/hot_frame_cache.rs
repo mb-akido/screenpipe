@@ -201,54 +201,6 @@ impl HotFrameCache {
         let _ = self.audio_notify.send(audio);
     }
 
-    /// Convert a background transcription callback payload into a cached
-    /// Timeline audio entry, preserving its original capture time.
-    pub async fn push_transcription_insert(
-        &self,
-        info: screenpipe_audio::transcription::AudioInsertInfo,
-    ) {
-        let timestamp = i64::try_from(info.capture_timestamp)
-            .ok()
-            .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
-            .unwrap_or_else(Utc::now);
-        self.push_audio(HotAudio {
-            audio_chunk_id: info.audio_chunk_id,
-            timestamp,
-            transcription: info.transcription.into(),
-            device_name: info.device_name.into(),
-            is_input: info.is_input,
-            audio_file_path: info.audio_file_path.into(),
-            duration_secs: info.duration_secs,
-            start_time: info.start_time,
-            end_time: info.end_time,
-            speaker_id: info.speaker_id,
-            speaker_name: None,
-        })
-        .await;
-    }
-
-    /// Cache a durable live meeting final without forcing its provider speaker
-    /// metadata through the public background-audio callback payload.
-    pub async fn push_meeting_transcript_insert(
-        &self,
-        info: screenpipe_audio::meeting_streaming::MeetingTranscriptInsertInfo,
-    ) {
-        self.push_audio(HotAudio {
-            audio_chunk_id: -info.segment_id,
-            timestamp: info.captured_at,
-            transcription: info.transcription.into(),
-            device_name: info.device_name.into(),
-            is_input: info.is_input,
-            audio_file_path: Arc::from(""),
-            duration_secs: 0.0,
-            start_time: None,
-            end_time: None,
-            speaker_id: None,
-            speaker_name: info.speaker_name.as_deref().map(Arc::from),
-        })
-        .await;
-    }
-
     /// Subscribe to live frame updates (for WS handlers).
     pub fn subscribe_frames(&self) -> broadcast::Receiver<HotFrame> {
         self.frame_notify.subscribe()

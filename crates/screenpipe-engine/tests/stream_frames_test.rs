@@ -211,7 +211,9 @@ mod tests {
         let on_insert: MeetingTranscriptInsertCallback = Arc::new(move |info| {
             let cache = callback_cache.clone();
             runtime.spawn(async move {
-                cache.push_meeting_transcript_insert(info).await;
+                cache
+                    .push_audio(screenpipe_engine::timeline_audio::from_meeting_insert(info))
+                    .await;
             });
         });
         let coordinator = start_meeting_streaming_loop_with_callback(
