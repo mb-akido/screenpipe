@@ -51,6 +51,7 @@ mod diagnostic_logs;
 mod disk_usage;
 mod e2e_seed;
 mod embedded_server;
+mod enterprise;
 mod enterprise_install_metadata;
 mod enterprise_policy;
 mod enterprise_sync;

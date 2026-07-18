@@ -20,7 +20,7 @@ import type { SourceCitation } from "@/lib/source-citations";
 import type {
 	EnterpriseAppUpdatePolicy,
 	EnterpriseInstallMetadata,
-} from "@ee/lib/app-update-policy";
+} from "@/lib/enterprise/app-update-policy";
 import { type FontSize, applyFontSize } from "@/lib/utils/font-size";
 import {
 	applyManagedOverrides,
