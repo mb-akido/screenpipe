@@ -134,12 +134,18 @@ fn store_json_has_presets(data: &[u8]) -> bool {
 /// crash can never destroy both the live file and its backup at once.
 fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".durable.tmp");
-    let tmp = std::path::PathBuf::from(tmp);
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".durable.tmp.")
+        .tempfile_in(parent)
+        .map_err(|e| std::io::Error::new(e.kind(), e))?;
 
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let f = tmp.as_file_mut();
         f.write_all(bytes)?;
         f.sync_all()?; // contents + metadata to stable storage before the rename
     }
@@ -147,12 +153,9 @@ fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         // store.bin and its snapshots hold API keys — keep them owner-only.
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600));
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    tmp.persist(path).map_err(|e| e.error)?;
     // fsync the directory so the rename itself survives a crash. Best-effort:
     // not all platforms allow opening a dir for sync (Windows), and rename is
     // already atomic there via MoveFileEx.
@@ -2254,11 +2257,15 @@ mod tests {
         );
 
         // The atomic temp must be gone — never left as a torn sibling.
-        let mut tmp_path = p.clone().into_os_string();
-        tmp_path.push(".durable.tmp");
+        let lingering: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .filter(|n| n.contains(".durable.tmp"))
+            .collect();
         assert!(
-            !std::path::Path::new(&tmp_path).exists(),
-            "durable .tmp must not linger after a successful write"
+            lingering.is_empty(),
+            "durable .tmp must not linger after a successful write: {lingering:?}"
         );
 
         #[cfg(unix)]
@@ -2299,7 +2306,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().into_string().unwrap_or_default())
-            .filter(|n| n.ends_with(".durable.tmp"))
+            .filter(|n| n.contains(".durable.tmp"))
             .collect();
         assert!(
             lingering.is_empty(),
