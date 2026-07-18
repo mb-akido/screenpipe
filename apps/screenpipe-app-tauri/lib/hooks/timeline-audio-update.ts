@@ -27,17 +27,6 @@ function normalizeAudioTimestamp(timestamp: string): string | null {
 	return timestamp;
 }
 
-export function getAudioTimestamp(
-	audio: Pick<AudioData, "audio_timestamp">,
-	frameTimestamp: string,
-): Date {
-	if (audio.audio_timestamp) {
-		const exactTimestamp = new Date(audio.audio_timestamp);
-		if (!Number.isNaN(exactTimestamp.getTime())) return exactTimestamp;
-	}
-	return new Date(frameTimestamp);
-}
-
 function createAudioOnlyFrame(
 	timestamp: string,
 	audio: AudioData,
@@ -119,6 +108,9 @@ function stampExistingAudio(
 
 /**
  * Apply the lightweight `audio_update` WebSocket message to timeline frames.
+ * Existing carrier-frame device audio arrays are updated in place to avoid
+ * cloning the full timeline; a new top-level frame array is returned only when
+ * an audio-only anchor must be inserted.
  *
  * The server intentionally associates audio with every frame in a ±60 second
  * window. Keep that behaviour for transcript discovery, but retain the audio's
@@ -126,7 +118,7 @@ function stampExistingAudio(
  * When screen capture is static/disabled and there is no carrier frame, create
  * the same audio-only marker used by the database timeline response.
  */
-export function applyTimelineAudioUpdate(
+export function applyTimelineAudioUpdateInPlace(
 	frames: StreamTimeSeriesResponse[],
 	audio: AudioData,
 	timestamp: string,

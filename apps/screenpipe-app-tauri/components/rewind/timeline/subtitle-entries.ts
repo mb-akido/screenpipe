@@ -6,7 +6,7 @@ import type {
 	AudioData,
 	StreamTimeSeriesResponse,
 } from "@/components/rewind/timeline";
-import { getAudioTimestamp } from "@/lib/hooks/timeline-audio-update";
+import { getAudioTimestamp } from "@/lib/hooks/timeline-audio-time";
 
 export interface SubtitleAudioEntry extends AudioData {
 	timestamp: Date;
@@ -94,6 +94,8 @@ export function collectSubtitleEntries(
 					? entry.timestamp
 					: existing.timestamp;
 			byPrefix.set(key, { ...entry, timestamp });
+		} else if (entry.timestamp < existing.timestamp) {
+			byPrefix.set(key, { ...existing, timestamp: entry.timestamp });
 		}
 	}
 

@@ -8,7 +8,7 @@ import type {
 	AudioData,
 	StreamTimeSeriesResponse,
 } from "@/components/rewind/timeline";
-import { applyTimelineAudioUpdate } from "@/lib/hooks/timeline-audio-update";
+import { applyTimelineAudioUpdateInPlace } from "@/lib/hooks/timeline-audio-update";
 import { SubtitleBar } from "./subtitle-bar";
 
 const EVENT_TIMESTAMP = "2026-07-17T15:16:35.000Z";
@@ -63,7 +63,7 @@ describe("SubtitleBar live audio updates", () => {
 			start_offset: 0,
 			audio_chunk_id: -42,
 		};
-		const update = applyTimelineAudioUpdate(
+		const update = applyTimelineAudioUpdateInPlace(
 			frames,
 			audio,
 			EVENT_TIMESTAMP,

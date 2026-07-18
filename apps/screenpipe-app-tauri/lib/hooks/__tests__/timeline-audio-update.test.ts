@@ -7,11 +7,7 @@ import type {
 	AudioData,
 	StreamTimeSeriesResponse,
 } from "@/components/rewind/timeline";
-import {
-	collectSubtitleEntries,
-	selectVisibleSubtitleEntries,
-} from "@/components/rewind/timeline/subtitle-entries";
-import { applyTimelineAudioUpdate } from "../timeline-audio-update";
+import { applyTimelineAudioUpdateInPlace } from "../timeline-audio-update";
 import { mergeTimelineFrames } from "../timeline-frame-merge";
 
 const EVENT_TIMESTAMP = "2026-07-17T15:16:35.000Z";
@@ -55,98 +51,97 @@ function secondsFromEvent(seconds: number): string {
 }
 
 describe("live timeline audio_update", () => {
-	it("keeps the caption at the audio event time instead of the earliest ±60s frame", () => {
+	it("stamps every carrier copy with the exact audio event time", () => {
 		const frames = [frameAt(EVENT_TIMESTAMP), frameAt(secondsFromEvent(-30)), frameAt(secondsFromEvent(-60))];
 
-		const update = applyTimelineAudioUpdate(
+		const update = applyTimelineAudioUpdateInPlace(
 			frames,
 			liveFinal,
 			EVENT_TIMESTAMP,
 		);
-		const entries = collectSubtitleEntries(
-			update.frames,
-			Date.parse(EVENT_TIMESTAMP),
-		);
-		const visible = selectVisibleSubtitleEntries(
-			entries,
-			Date.parse(EVENT_TIMESTAMP),
-		);
-
 		expect(update.changed).toBe(true);
-		expect(entries).toHaveLength(1);
-		expect(entries[0].timestamp.toISOString()).toBe(EVENT_TIMESTAMP);
-		expect(visible.activeEntries.map((entry) => entry.transcription)).toEqual([
-			liveFinal.transcription,
-		]);
+		expect(update.frames).toBe(frames);
+		expect(update.insertedTimestamp).toBeNull();
+		expect(
+			frames.flatMap((frame) => frame.devices[0].audio),
+		).toHaveLength(3);
+		for (const frame of frames) {
+			expect(frame.devices[0].audio[0].audio_timestamp).toBe(EVENT_TIMESTAMP);
+		}
 	});
 
-	it("keeps a caption visible when its only carrier is at the edge of the ±60s window", () => {
+	it("fans out to a carrier at the ±60s edge and adds a fresh scrub anchor", () => {
 		const carrier = frameAt(secondsFromEvent(-60));
-		const update = applyTimelineAudioUpdate(
+		const update = applyTimelineAudioUpdateInPlace(
 			[carrier],
 			liveFinal,
 			EVENT_TIMESTAMP,
 		);
-		const fiveSecondsLater = Date.parse(EVENT_TIMESTAMP) + 5_000;
-		const entries = collectSubtitleEntries(update.frames, fiveSecondsLater);
-		const visible = selectVisibleSubtitleEntries(entries, fiveSecondsLater);
-
-		expect(visible.activeEntries.map((entry) => entry.transcription)).toEqual([
-			liveFinal.transcription,
-		]);
+		expect(carrier.devices[0].audio).toHaveLength(1);
+		expect(update.insertedTimestamp).toBe(EVENT_TIMESTAMP);
+		expect(update.frames).toHaveLength(2);
 	});
 
 	it("creates a fresh static-meeting anchor for a second caption inside the 60s fan-out window", () => {
-		const first = applyTimelineAudioUpdate(
+		const first = applyTimelineAudioUpdateInPlace(
 			[],
 			{ ...liveFinal, audio_chunk_id: -41, transcription: "first caption" },
 			secondsFromEvent(-31),
 		);
-		const second = applyTimelineAudioUpdate(
+		const second = applyTimelineAudioUpdateInPlace(
 			first.frames,
 			liveFinal,
 			EVENT_TIMESTAMP,
 		);
-		const entries = collectSubtitleEntries(
-			second.frames,
-			Date.parse(EVENT_TIMESTAMP),
-		);
-		const visible = selectVisibleSubtitleEntries(
-			entries,
-			Date.parse(EVENT_TIMESTAMP),
-		);
-
 		expect(second.insertedTimestamp).toBe(EVENT_TIMESTAMP);
 		expect(second.frames).toHaveLength(2);
-		expect(visible.activeEntries.map((entry) => entry.transcription)).toContain(
+		expect(second.frames[0].devices[0].audio[0].transcription).toBe(
 			liveFinal.transcription,
 		);
 	});
 
 	it("creates a scrubbable audio-only frame when no screen frame can carry the update", () => {
-		const update = applyTimelineAudioUpdate(
+		const update = applyTimelineAudioUpdateInPlace(
 			[],
 			liveFinal,
 			EVENT_TIMESTAMP,
 		);
-		const entries = collectSubtitleEntries(
-			update.frames,
-			Date.parse(EVENT_TIMESTAMP),
-		);
-		const visible = selectVisibleSubtitleEntries(
-			entries,
-			Date.parse(EVENT_TIMESTAMP),
-		);
-
 		expect(update.insertedTimestamp).toBe(EVENT_TIMESTAMP);
 		expect(update.newAtFront).toBe(1);
 		expect(update.frames).toHaveLength(1);
 		expect(update.frames[0].timestamp).toBe(EVENT_TIMESTAMP);
 		expect(update.frames[0].devices[0].device_id).toBe("audio-only");
 		expect(update.frames[0].devices[0].metadata.file_path).toBe("");
-		expect(visible.activeEntries).toHaveLength(1);
-		expect(visible.activeEntries[0].timestamp.toISOString()).toBe(
+	});
+
+	it("rejects an invalid event timestamp without mutating frames", () => {
+		const frame = frameAt(EVENT_TIMESTAMP);
+		const before = structuredClone(frame);
+
+		const update = applyTimelineAudioUpdateInPlace(
+			[frame],
+			liveFinal,
+			"not-a-timestamp",
+		);
+
+		expect(update.changed).toBe(false);
+		expect(frame).toEqual(before);
+	});
+
+	it("updates a duplicate with a more complete transcript without adding another copy", () => {
+		const frame = frameAt(EVENT_TIMESTAMP);
+		frame.devices[0].audio = [{ ...liveFinal, transcription: "partial" }];
+
+		const update = applyTimelineAudioUpdateInPlace(
+			[frame],
+			liveFinal,
 			EVENT_TIMESTAMP,
+		);
+
+		expect(update.changed).toBe(true);
+		expect(frame.devices[0].audio).toHaveLength(1);
+		expect(frame.devices[0].audio[0].transcription).toBe(
+			liveFinal.transcription,
 		);
 	});
 
@@ -154,7 +149,7 @@ describe("live timeline audio_update", () => {
 		const carrier = frameAt(secondsFromEvent(-60));
 		carrier.devices[0].audio = [{ ...liveFinal }];
 
-		const update = applyTimelineAudioUpdate(
+		const update = applyTimelineAudioUpdateInPlace(
 			[carrier],
 			liveFinal,
 			EVENT_TIMESTAMP,
@@ -169,7 +164,7 @@ describe("live timeline audio_update", () => {
 
 	it("preserves the server timestamp spelling so the DB frame merges at the same instant", () => {
 		const serverTimestamp = "2026-07-17T15:16:35Z";
-		const update = applyTimelineAudioUpdate(
+		const update = applyTimelineAudioUpdateInPlace(
 			[],
 			liveFinal,
 			serverTimestamp,

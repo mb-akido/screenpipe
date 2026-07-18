@@ -7,7 +7,7 @@ import {
 	AudioData,
 	StreamTimeSeriesResponse,
 } from "@/components/rewind/timeline";
-import { getAudioTimestamp } from "./timeline-audio-update";
+import { getAudioTimestamp } from "./timeline-audio-time";
 
 export interface AudioEntryWithTimestamp extends AudioData {
 	frameTimestamp: Date;

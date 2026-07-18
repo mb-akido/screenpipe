@@ -25,7 +25,7 @@ import { Meeting, deduplicateAudioItems } from "@/lib/hooks/use-meetings";
 import { usePipes } from "@/lib/hooks/use-pipes";
 import { localFetch } from "@/lib/api";
 import { commands } from "@/lib/utils/tauri";
-import { getAudioTimestamp } from "@/lib/hooks/timeline-audio-update";
+import { getAudioTimestamp } from "@/lib/hooks/timeline-audio-time";
 
 // Extended audio item with timestamp for conversation view
 interface AudioItemWithTimestamp extends AudioData {

@@ -15,7 +15,7 @@ import {
 } from "@/lib/api";
 import { mergeTimelineFrames } from "./timeline-frame-merge";
 import { evaluateTimelineLiveness } from "./timeline-liveness";
-import { applyTimelineAudioUpdate } from "./timeline-audio-update";
+import { applyTimelineAudioUpdateInPlace } from "./timeline-audio-update";
 
 // Frame buffer for batching updates - reduces 68 re-renders to ~3-5
 let frameBuffer: StreamTimeSeriesResponse[] = [];
@@ -506,7 +506,7 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 					) {
 						return;
 					}
-					const update = applyTimelineAudioUpdate(
+					const update = applyTimelineAudioUpdateInPlace(
 						frames,
 						data.audio,
 						data.timestamp,
