@@ -448,7 +448,7 @@ fn event_tool_call_ids(event: &Value) -> Vec<String> {
 pub struct PiManager {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
-    /// ACP is a supervised process tree. Give its bridge a brief chance to
+    /// ACP is a supervised process tree. Give its Rust runtime a brief chance to
     /// close the adapter and terminal descendants before the hard kill.
     is_acp: bool,
     project_dir: Option<String>,
@@ -465,6 +465,37 @@ pub struct PiManager {
     queue_state: Option<Arc<crate::pi_command_queue::PiQueueState>>,
     /// Join handle for the queue drain task (for cleanup).
     queue_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Terminate the process group rooted at the hidden ACP runtime. The runtime
+/// normally shuts its adapter and terminals down on stdin EOF; this is the
+/// final safety net for wedged or unexpectedly terminated harnesses.
+fn terminate_acp_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        let process_group = -(pid as i32);
+        // SAFETY: `pid` is the child we spawned with `process_group(0)`. A
+        // negative pid targets only that process group, never Screenpipe's.
+        unsafe {
+            let _ = libc::kill(process_group, libc::SIGTERM);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        unsafe {
+            let _ = libc::kill(process_group, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 impl PiManager {
@@ -540,6 +571,7 @@ impl PiManager {
         self.queue_handle = None;
 
         if let Some(mut child) = self.child.take() {
+            let mut acp_tree_owned = self.is_acp;
             // Send abort command before killing
             if let Some(ref mut stdin) = self.stdin {
                 let _ = writeln!(stdin, r#"{{"type":"abort"}}"#);
@@ -547,21 +579,35 @@ impl PiManager {
 
             if self.is_acp {
                 // The queue owns stdin. Aborting its task and yielding drops
-                // that pipe, which tells the ACP bridge to shut down its full
+                // that pipe, which tells the ACP runtime to shut down its full
                 // process tree. Bound the grace period so Stop stays prompt
                 // even when a third-party harness is wedged.
                 tokio::task::yield_now().await;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 while std::time::Instant::now() < deadline {
                     match child.try_wait() {
-                        Ok(Some(_)) => break,
+                        Ok(Some(_)) => {
+                            // `try_wait` reaped the runtime. Its internal Unix
+                            // group guards / Windows root Job own descendant
+                            // cleanup; a numeric PID is no longer ours to use.
+                            acp_tree_owned = false;
+                            break;
+                        }
                         Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
                         Err(error) => {
-                            warn!("Failed to check ACP bridge during shutdown: {}", error);
+                            warn!("Failed to check ACP runtime during shutdown: {}", error);
+                            acp_tree_owned = false;
                             break;
                         }
                     }
                 }
+            }
+
+            if acp_tree_owned {
+                // No other task owns or waits on this Child. If it exits after
+                // the last `None`, it remains our unreaped zombie and pins the
+                // PID/PGID until this identity-safe group kill completes.
+                terminate_acp_process_tree(child.id());
             }
 
             if child.try_wait().ok().flatten().is_none() {
@@ -1286,19 +1332,6 @@ fn ensure_connection_gate_extension(project_dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Materialize the bundled ACP compatibility bridge next to the project. The
-/// bridge is versioned with the desktop app and overwritten on every start so
-/// upgrades never leave an old wire-protocol implementation behind.
-fn ensure_acp_bridge(project_dir: &str) -> Result<PathBuf, String> {
-    let bridge_dir = Path::new(project_dir).join(".screenpipe").join("agent");
-    std::fs::create_dir_all(&bridge_dir)
-        .map_err(|e| format!("Failed to create ACP bridge dir: {}", e))?;
-    let bridge_path = bridge_dir.join("acp-bridge.ts");
-    std::fs::write(&bridge_path, include_str!("../assets/acp-bridge.ts"))
-        .map_err(|e| format!("Failed to write ACP bridge: {}", e))?;
-    Ok(bridge_path)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpAgentConfig {
@@ -1329,7 +1362,7 @@ pub enum PiBackend {
 #[serde(rename_all = "camelCase")]
 pub struct PiProviderConfig {
     /// Transport backend. Omitted keeps the native Pi RPC implementation;
-    /// `acp` runs a registry-compatible ACP adapter through the bridge.
+    /// `acp` runs a registry-compatible adapter through the official Rust SDK.
     #[serde(default)]
     pub backend: Option<PiBackend>,
     /// ACP adapter configuration when `backend` is `acp`.
@@ -1842,11 +1875,9 @@ pub async fn pi_start_inner(
     // Ensure screenpipe skills exist in project
     ensure_screenpipe_skill(&project_dir)?;
 
-    if use_acp {
-        // ACP agents receive Screenpipe via MCP during session/new. Pi-only
-        // extensions and packages must not be installed or required here.
-        ensure_acp_bridge(&project_dir)?;
-    } else {
+    // ACP agents receive Screenpipe via MCP during session/new. Pi-only
+    // extensions and packages must not be installed or required there.
+    if !use_acp {
         // Install web-search extension only for screenpipe-cloud presets
         ensure_web_search_extension(&project_dir, provider_config.as_ref())?;
 
@@ -1977,8 +2008,8 @@ pub async fn pi_start_inner(
     pool.sessions
         .insert(sid.clone(), PiManager::new(app.clone()));
 
-    // ACP only needs the bundled Bun runtime for the compatibility bridge; raw
-    // Pi keeps the existing self-healing package installation path.
+    // ACP uses this executable's hidden Rust runtime; raw Pi keeps the existing
+    // self-healing package installation path.
     let pi_path = if use_acp {
         String::new()
     } else {
@@ -2014,22 +2045,27 @@ pub async fn pi_start_inner(
     info!(
         "Starting {} from {} in dir: {} with provider: {} model: {} bun: {}",
         if use_acp { "ACP agent" } else { "pi" },
-        if use_acp { "bundled bridge" } else { &pi_path },
+        if use_acp {
+            "Rust ACP runtime"
+        } else {
+            &pi_path
+        },
         project_dir,
         pi_provider,
         pi_model,
         bun_path
     );
 
-    // Build command. ACP runs the bundled bridge, which in turn supervises the
-    // selected registry adapter. Raw Pi keeps its direct RPC process.
+    // Build command. ACP re-enters this executable in a hidden Rust SDK mode,
+    // which supervises the selected registry adapter. Raw Pi stays direct.
     let mut cmd = if use_acp {
         if bun_path == "NOT FOUND" {
             return Err("ACP requires the bundled Bun runtime, but it was not found".to_string());
         }
-        let bridge_path = ensure_acp_bridge(&project_dir)?;
-        let mut command = bun_command(&bun_path);
-        command.arg(bridge_path);
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Failed to locate Screenpipe ACP runtime: {error}"))?;
+        let mut command = Command::new(executable);
+        command.arg(crate::acp_runtime::RUNTIME_ARG);
         command
     } else {
         let mut command = build_command_for_path(&pi_path);
@@ -2044,6 +2080,15 @@ pub async fn pi_start_inner(
         command
     };
     cmd.current_dir(&project_dir);
+
+    // Isolate the hidden runtime from the desktop process group. The runtime
+    // supervises its adapter and terminals in their own groups and reports
+    // those PIDs back to this reader as an additional crash-cleanup backstop.
+    #[cfg(unix)]
+    if use_acp {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     if use_acp {
         let acp = provider_config
@@ -2073,7 +2118,10 @@ pub async fn pi_start_inner(
             .env(
                 "SCREENPIPE_ACP_ENV_JSON",
                 serde_json::to_string(&resolved_env).map_err(|e| e.to_string())?,
-            );
+            )
+            .env_remove("SCREENPIPE_ACP_COMMAND")
+            .env_remove("SCREENPIPE_ACP_AUTH_METHOD")
+            .env_remove("SCREENPIPE_ACP_SYSTEM_PROMPT");
         if let Some(command) = acp
             .command
             .as_deref()
@@ -2479,18 +2527,13 @@ pub async fn pi_start_inner(
             //                  NOT when it finishes processing it.
             //
             // The "done" type was the original intent but pi-mono never emits it —
-            // it emits "agent_end" instead. Without "agent_end" handling, the queue
-            // was only ever unblocked by the "response" + 500ms path, which fires
-            // ~500ms after command ACK regardless of whether the agent is still
-            // streaming. This caused "Agent is already processing" when a second
-            // prompt was sent while the first was still running.
+            // it emits "agent_end" instead. Prompt completion therefore uses the
+            // durable turn/tool predicate; lifecycle responses are matched by id.
             if let Some(ref qs) = queue_state_for_reader {
                 match event_type.as_deref() {
                     Some("agent_start") => {
                         // A prompt has begun streaming. Suppress the
-                        // response→done fallback below so the prompt's
-                        // mid-stream `response` ACK doesn't unblock the
-                        // queue early.
+                        // A mid-stream `response` ACK must not unblock the queue.
                         qs.mark_agent_active();
                         // If a steer was in flight, it has now started its
                         // agent turn. The drain loop can rely on agent_active
@@ -2558,18 +2601,26 @@ pub async fn pi_start_inner(
                         qs.signal_done_if_idle();
                     }
                     Some("response") => {
-                        // Only meaningful for new_session/abort — those don't
-                        // fire agent_start/agent_end. Suppress while a prompt
-                        // or tool is mid-turn so the queue never advances on
-                        // an ACK while the assistant is still working.
-                        if !qs.has_active_turn_work() {
-                            // Note: this runs on a std::thread (not tokio),
-                            // so use std::thread::spawn + std::thread::sleep.
-                            let qs = qs.clone();
-                            std::thread::spawn(move || {
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                qs.signal_done();
-                            });
+                        // Lifecycle commands are correlated by request id.
+                        // Shared/delayed wakeups can be lost before a waiter is
+                        // armed or can release a later unrelated command.
+                        if let Some(event) = parsed.as_ref() {
+                            if let Some(id) = event.get("id").and_then(Value::as_str) {
+                                let success = event
+                                    .get("success")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(true);
+                                let result = if success {
+                                    Ok(())
+                                } else {
+                                    Err(event
+                                        .get("error")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Pi command failed")
+                                        .to_string())
+                                };
+                                qs.signal_response(id, result);
+                            }
                         }
                     }
                     _ => {}
@@ -2592,7 +2643,13 @@ pub async fn pi_start_inner(
                         }
                     }
 
-                    if let Some(delta) = assistant_text_delta(&event).map(str::to_owned) {
+                    if matches!(
+                        event_type.as_deref(),
+                        Some("acp_process_started" | "acp_process_stopped")
+                    ) {
+                        // Internal process-supervision events are consumed by
+                        // this reader and are not part of the webview contract.
+                    } else if let Some(delta) = assistant_text_delta(&event).map(str::to_owned) {
                         // Title sessions bypass batching — they produce ≤50 chars
                         // and must stream token-by-token for visible animation.
                         if sid_clone.starts_with(TITLE_SESSION_PREFIX) {
@@ -2641,7 +2698,12 @@ pub async fn pi_start_inner(
                     warn!("Pi stdout not JSON: (line: {})", &line[..end]);
                 }
             }
-            if !is_stdout_text_delta {
+            let is_internal_acp_process_event = use_acp
+                && matches!(
+                    event_type.as_deref(),
+                    Some("acp_process_started" | "acp_process_stopped")
+                );
+            if !is_stdout_text_delta && !is_internal_acp_process_event {
                 let event_name = format!("pi_output:{}", sid_clone);
                 if let Err(e) = app_handle.emit(&event_name, &line) {
                     error!("Failed to emit pi_output: {}", e);
@@ -2653,6 +2715,14 @@ pub async fn pi_start_inner(
             "Pi stdout reader ended (pid: {}, session: {}), processed {} lines",
             pid, sid_clone, line_count
         );
+        if !ready_signalled {
+            if let Ok(mut startup) = startup_result_reader.lock() {
+                *startup = Some(Err(
+                    "ACP runtime exited before initialization completed".into()
+                ));
+            }
+            ready_notify_reader.notify_one();
+        }
         // Signal the command queue that the process is dead
         if let Some(ref qs) = queue_state_for_reader {
             qs.signal_terminated();
@@ -2764,7 +2834,10 @@ pub async fn pi_start_inner(
             } else {
                 PiInfo::default()
             };
-            if error.to_ascii_lowercase().contains("authentication cancelled") {
+            if error
+                .to_ascii_lowercase()
+                .contains("authentication cancelled")
+            {
                 return Ok(PiInfo {
                     startup_error: Some(error),
                     ..stopped
@@ -3143,7 +3216,7 @@ pub async fn pi_extension_ui_response(
 }
 
 /// Abort current Pi operation. Priority command — cancels all pending commands
-/// in the queue and sends abort directly. Waits for the SDK's done event.
+/// in the queue and sends abort directly. Waits for its exact SDK response.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_abort(state: State<'_, PiState>, session_id: Option<String>) -> Result<(), String> {
@@ -3186,7 +3259,7 @@ pub async fn pi_abort_active(
 
 /// Start a new Pi session (clears conversation history).
 /// Serialized through the queue — waits for any in-flight work to complete,
-/// then sends new_session and waits for the SDK's done event before returning.
+/// then sends new_session and waits for its exact SDK response before returning.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_new_session(

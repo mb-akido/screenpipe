@@ -122,11 +122,11 @@
       "spec": "acp-backend.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["chat-ai", "tauri-command", "os-integration"],
-      "features": ["chat", "acp-backend", "agent-streaming", "agent-permissions", "agent-cancellation", "process-supervision"],
+      "features": ["chat", "acp-backend", "agent-streaming", "agent-permissions", "agent-cancellation", "agent-terminal", "mcp-registration", "process-supervision"],
       "criticality": "high",
       "confidence": "partial",
       "ux": "mixed",
-      "notes": "Real Rust-to-ACP bridge and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, and supervised shutdown. Curated third-party adapters remain manual smoke coverage."
+      "notes": "Official Rust ACP SDK runtime and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, exact adapter/descendant reaping, terminal lifecycle/output draining, and a real authenticated local API MCP health call. Curated third-party adapters remain manual smoke coverage."
     },
     {
       "spec": "api.spec.ts",

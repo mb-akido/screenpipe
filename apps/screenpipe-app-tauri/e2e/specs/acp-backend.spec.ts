@@ -4,6 +4,8 @@
 
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { openHomeWindow, waitForAppReady, t } from "../helpers/test-utils.js";
@@ -28,6 +30,20 @@ type PiStartValue = {
   startupError?: string | null;
 };
 
+type LocalApiConfig = {
+  key: string | null;
+  port: number;
+  auth_enabled: boolean;
+};
+
+type ProcessMarker = {
+  token: string;
+  pid: number;
+  descendantPid?: number;
+};
+
+type AcpScenario = "normal" | "malformed" | "exit" | "auth" | "mcp" | "tree" | "terminal";
+
 const fixturePath = fileURLToPath(new URL("../fixtures/mock-acp-agent.ts", import.meta.url));
 const normalSession = "77777777-accc-accc-accc-777777777777";
 const malformedSession = "88888888-accc-accc-accc-888888888888";
@@ -35,9 +51,15 @@ const exitSession = "99999999-accc-accc-accc-999999999999";
 const authSession = "aaaaaaaa-accc-accc-accc-aaaaaaaaaaaa";
 const authCancelSession = "bbbbbbbb-accc-accc-accc-bbbbbbbbbbbb";
 const uiParkingSession = "cccccccc-accc-accc-accc-cccccccccccc";
+const treeSession = "dddddddd-accc-accc-accc-dddddddddddd";
+const mcpSession = "eeeeeeee-accc-accc-accc-eeeeeeeeeeee";
+const terminalSession = "ffffffff-accc-accc-accc-ffffffffffff";
+const treeMarkerPrefix = path.join(os.tmpdir(), `screenpipe-acp-process-${treeSession}`);
+const treeMarkerToken = randomUUID();
 
 function acpProviderConfig(
-  scenario: "normal" | "malformed" | "exit" | "auth",
+  scenario: AcpScenario,
+  env: Record<string, string> = {},
 ): Record<string, unknown> {
   return {
     backend: "acp",
@@ -45,7 +67,7 @@ function acpProviderConfig(
       id: "custom",
       command: process.execPath,
       args: [fixturePath, `--scenario=${scenario}`],
-      env: {},
+      env,
     },
     provider: "acp",
     url: "",
@@ -211,16 +233,24 @@ async function answerAgentAction(
   }
 }
 
-async function startAcp(sessionId: string, scenario: "normal" | "malformed"): Promise<void> {
+async function startAcp(
+  sessionId: string,
+  scenario: "normal" | "malformed" | "mcp" | "tree" | "terminal",
+  env: Record<string, string> = {},
+): Promise<void> {
   const projectDir = path.join(os.tmpdir(), `screenpipe-acp-e2e-${sessionId}`);
+  rmSync(projectDir, { recursive: true, force: true });
   const info = await invokeOrThrow<{ running: boolean; sessionId?: string }>("pi_start", {
     sessionId,
     projectDir,
     userToken: null,
-    providerConfig: acpProviderConfig(scenario),
+    providerConfig: acpProviderConfig(scenario, env),
   });
   expect(info.running).toBe(true);
   expect(info.sessionId).toBe(sessionId);
+  // The official SDK runs inside the signed app; the removed TypeScript
+  // compatibility artifact must never be copied back into a user's project.
+  expect(existsSync(path.join(projectDir, ".screenpipe", "agent", "acp-bridge.ts"))).toBe(false);
 
   await browser.waitUntil(
     async () =>
@@ -228,7 +258,7 @@ async function startAcp(sessionId: string, scenario: "normal" | "malformed"): Pr
     {
       timeout: t(20_000),
       interval: 100,
-      timeoutMsg: `ACP bridge did not become ready for ${scenario}`,
+      timeoutMsg: `ACP runtime did not become ready for ${scenario}`,
     },
   );
 }
@@ -313,6 +343,64 @@ async function beginAcpStart(sessionId: string, scenario: "auth"): Promise<void>
   );
 }
 
+async function beginNewSession(sessionId: string): Promise<void> {
+  await browser.execute((id: string) => {
+    const invoke = ((window as any).__TAURI__?.core?.invoke ??
+      (window as any).__TAURI_INTERNALS__?.invoke) as
+      | ((command: string, args: object) => Promise<unknown>)
+      | undefined;
+    (window as any).__e2eAcpNewSessionState = { done: false } satisfies StartState;
+    if (!invoke) {
+      (window as any).__e2eAcpNewSessionState = {
+        done: true,
+        error: "Tauri invoke unavailable",
+      } satisfies StartState;
+      return;
+    }
+    void invoke("pi_new_session", { sessionId: id })
+      .then((value) => {
+        (window as any).__e2eAcpNewSessionState = { done: true, value } satisfies StartState;
+      })
+      .catch((error: unknown) => {
+        (window as any).__e2eAcpNewSessionState = {
+          done: true,
+          error: error instanceof Error ? error.message : String(error),
+        } satisfies StartState;
+      });
+  }, sessionId);
+}
+
+async function newSessionState(): Promise<StartState> {
+  return (await browser.execute(() =>
+    (window as any).__e2eAcpNewSessionState ?? { done: false })) as StartState;
+}
+
+async function abortTwice(sessionId: string): Promise<Array<{ ok: boolean; error?: string }>> {
+  return (await browser.executeAsync((id: string, done: (value: unknown) => void) => {
+    const invoke = ((window as any).__TAURI__?.core?.invoke ??
+      (window as any).__TAURI_INTERNALS__?.invoke) as
+      | ((command: string, args: object) => Promise<unknown>)
+      | undefined;
+    if (!invoke) {
+      done([{ ok: false, error: "Tauri invoke unavailable" }]);
+      return;
+    }
+    void Promise.allSettled([
+      invoke("pi_abort", { sessionId: id }),
+      invoke("pi_abort", { sessionId: id }),
+    ]).then((results) => done(results.map((result) =>
+      result.status === "fulfilled"
+        ? { ok: true }
+        : {
+            ok: false,
+            error: result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason),
+          }
+    )));
+  }, sessionId)) as Array<{ ok: boolean; error?: string }>;
+}
+
 async function promptState(): Promise<PromptState> {
   return (await browser.execute(() =>
     (window as any).__e2eAcpPromptState ?? { done: false })) as PromptState;
@@ -339,8 +427,35 @@ async function stopAndAssertGone(sessionId: string): Promise<void> {
       const info = await invokeOrThrow<{ running: boolean }>("pi_info", { sessionId });
       return !info.running;
     },
-    { timeout: t(10_000), interval: 100, timeoutMsg: "ACP child stayed alive after pi_stop" },
+    { timeout: t(10_000), interval: 100, timeoutMsg: "ACP runtime stayed alive after pi_stop" },
   );
+}
+
+function processMarkerPath(kind: "adapter" | "descendant"): string {
+  return `${treeMarkerPrefix}.${kind}.json`;
+}
+
+function readProcessMarker(kind: "adapter" | "descendant"): ProcessMarker {
+  return JSON.parse(readFileSync(processMarkerPath(kind), "utf8")) as ProcessMarker;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForExactProcessExit(label: string, pid: number): Promise<void> {
+  await browser.waitUntil(async () => !processIsAlive(pid), {
+    timeout: t(10_000),
+    interval: 100,
+    timeoutMsg: `${label} process ${pid} stayed alive after pi_stop`,
+  });
+  expect(processIsAlive(pid)).toBe(false);
 }
 
 describe("ACP backend", function () {
@@ -357,6 +472,11 @@ describe("ACP backend", function () {
     await invokeOrThrow("pi_stop", { sessionId: exitSession }).catch(() => undefined);
     await invokeOrThrow("pi_stop", { sessionId: authSession }).catch(() => undefined);
     await invokeOrThrow("pi_stop", { sessionId: authCancelSession }).catch(() => undefined);
+    await invokeOrThrow("pi_stop", { sessionId: treeSession }).catch(() => undefined);
+    await invokeOrThrow("pi_stop", { sessionId: mcpSession }).catch(() => undefined);
+    await invokeOrThrow("pi_stop", { sessionId: terminalSession }).catch(() => undefined);
+    rmSync(processMarkerPath("adapter"), { force: true });
+    rmSync(processMarkerPath("descendant"), { force: true });
   });
 
   it("offers curated and custom ACP agents through settings", async () => {
@@ -400,7 +520,7 @@ describe("ACP backend", function () {
     expect(body).toContain("Your existing sign-in and agent settings stay in that app.");
   });
 
-  it("uses the real Rust/bridge transport for stream, plan, tool, permission, and cancel", async () => {
+  it("uses the official Rust ACP SDK for stream, plan, tool, permission, and cancel", async () => {
     await startAcp(normalSession, "normal");
     const startupEvents = await capturedEvents(normalSession);
     expect(startupEvents.some((envelope) => envelope.event?.type === "agent_start")).toBe(false);
@@ -469,8 +589,8 @@ describe("ACP backend", function () {
     expect(streamedText).toContain("Permission accepted; turn complete");
 
     // The fixture refuses a second session/new unless the previous ACP
-    // session was closed. A successful reset therefore proves that the bridge
-    // used negotiated session/close support. It also reuses the fixture's raw
+    // session was closed. A successful reset therefore proves that the SDK
+    // client used negotiated session/close support. It also reuses the fixture's raw
     // JSON-RPC permission id, so seeing and answering a second card verifies
     // Screenpipe gives each UI request its own id instead of suppressing it as
     // an already-answered request.
@@ -505,7 +625,9 @@ describe("ACP backend", function () {
         ).length > agentStartCount,
       { timeout: t(15_000), interval: 100, timeoutMsg: "cancellable ACP turn did not start" },
     );
-    await invokeOrThrow("pi_abort", { sessionId: normalSession });
+    const abortResults = await abortTwice(normalSession);
+    expect(abortResults).toHaveLength(2);
+    expect(abortResults.every((result) => result.ok)).toBe(true);
     await waitForPromptDone();
 
     await browser.waitUntil(
@@ -526,7 +648,105 @@ describe("ACP backend", function () {
     await stopAndAssertGone(malformedSession);
   });
 
-  it("fails startup promptly and reaps the bridge when the adapter exits", async () => {
+  it("reaps adapter descendants when the Rust ACP runtime stops", async () => {
+    rmSync(processMarkerPath("adapter"), { force: true });
+    rmSync(processMarkerPath("descendant"), { force: true });
+    await startAcp(treeSession, "tree", {
+      SCREENPIPE_MOCK_PROCESS_MARKER_PREFIX: treeMarkerPrefix,
+      SCREENPIPE_MOCK_PROCESS_MARKER_TOKEN: treeMarkerToken,
+    });
+    await browser.waitUntil(
+      async () =>
+        existsSync(processMarkerPath("adapter")) &&
+        existsSync(processMarkerPath("descendant")),
+      {
+        timeout: t(10_000),
+        interval: 100,
+        timeoutMsg: "ACP fixture did not write adapter and descendant PID markers",
+      },
+    );
+
+    const adapter = readProcessMarker("adapter");
+    const descendant = readProcessMarker("descendant");
+    expect(adapter.token).toBe(treeMarkerToken);
+    expect(descendant.token).toBe(treeMarkerToken);
+    expect(adapter.pid).toBeGreaterThan(1);
+    expect(descendant.pid).toBeGreaterThan(1);
+    expect(adapter.descendantPid).toBe(descendant.pid);
+    const ready = (await capturedEvents(treeSession)).find(
+      (envelope) => envelope.event?.type === "acp_ready",
+    )?.event;
+    const descendantPid = Number(ready?.agentInfo?._meta?.descendantPid);
+    expect(descendantPid).toBe(descendant.pid);
+    expect(processIsAlive(adapter.pid)).toBe(true);
+    expect(processIsAlive(descendant.pid)).toBe(true);
+    await stopAndAssertGone(treeSession);
+    await Promise.all([
+      waitForExactProcessExit("ACP adapter", adapter.pid),
+      waitForExactProcessExit("ACP descendant", descendant.pid),
+    ]);
+  });
+
+  it("registers screenpipe MCP with the live local API URL and optional key", async () => {
+    const api = await invokeOrThrow<LocalApiConfig>("get_local_api_config");
+    expect(api.port).toBeGreaterThan(0);
+    expect(api.auth_enabled).toBe(Boolean(api.key));
+    const expectedUrl = `http://localhost:${api.port}`;
+    await browser.waitUntil(async () => {
+      try {
+        const response = await fetch(`${expectedUrl}/health`, {
+          headers: api.key ? { Authorization: `Bearer ${api.key}` } : {},
+        });
+        return response.ok;
+      } catch {
+        return false;
+      }
+    }, {
+      timeout: t(45_000),
+      interval: 250,
+      timeoutMsg: "local API was not healthy before the real MCP probe",
+    });
+    const fixtureEnv: Record<string, string> = {
+      SCREENPIPE_MOCK_EXPECT_MCP_URL: expectedUrl,
+      SCREENPIPE_MOCK_EXPECT_MCP_HAS_KEY: String(Boolean(api.key)),
+    };
+    if (api.key) fixtureEnv.SCREENPIPE_MOCK_EXPECT_MCP_KEY = api.key;
+
+    await startAcp(mcpSession, "mcp", fixtureEnv);
+    const events = await capturedEvents(mcpSession);
+    expect(events.some(
+      (envelope) =>
+        envelope.event?.type === "acp_update" &&
+        envelope.event?.update?.content?.text ===
+          "Mock screenpipe MCP registration verified",
+    )).toBe(true);
+    await stopAndAssertGone(mcpSession);
+  });
+
+  it("runs ACP terminal callbacks and drains final stdout and stderr", async () => {
+    await startAcp(terminalSession, "terminal");
+    await beginPrompt(terminalSession, "exercise terminal callbacks");
+    const prompt = await waitForPromptDone();
+    expect(prompt.error).toBeUndefined();
+    await browser.waitUntil(
+      async () => (await capturedEvents(terminalSession)).some(
+        (envelope) =>
+          envelope.event?.type === "message_update" &&
+          envelope.event?.assistantMessageEvent?.type === "text_delta" &&
+          String(envelope.event?.assistantMessageEvent?.delta).includes(
+            "Mock ACP terminal lifecycle verified",
+          ),
+      ),
+      {
+        timeout: t(10_000),
+        interval: 100,
+        timeoutMsg: "terminal lifecycle verification did not reach agent_event",
+      },
+    );
+    await stopAndAssertGone(terminalSession);
+  });
+
+  it("fails startup promptly and reaps the runtime when the adapter exits", async () => {
     let startupError = "";
     try {
       const result = await invoke("pi_start", {
@@ -594,6 +814,30 @@ describe("ACP backend", function () {
         ),
       { timeout: t(10_000), interval: 100, timeoutMsg: "ACP auth completion was not emitted" },
     );
+
+    // The mock expires its credential when the negotiated session is closed.
+    // A replacement session must reopen the same agent-managed auth flow
+    // instead of tearing down the ACP runtime.
+    await beginNewSession(authSession);
+    await browser.waitUntil(
+      async () =>
+        (await capturedEvents(authSession)).filter(
+          (envelope) =>
+            envelope.event?.type === "extension_ui_request" &&
+            String(envelope.event?.title).startsWith("acp:auth:"),
+        ).length >= 2,
+      { timeout: t(15_000), interval: 100, timeoutMsg: "ACP re-auth choice was not surfaced" },
+    );
+    await answerAgentAction("auth", "Mock browser sign-in");
+    await browser.waitUntil(async () => (await newSessionState()).done, {
+      timeout: t(20_000),
+      interval: 100,
+      timeoutMsg: "ACP replacement session did not resume after re-authentication",
+    });
+    expect((await newSessionState()).error).toBeUndefined();
+    expect((await capturedEvents(authSession)).filter(
+      (envelope) => envelope.event?.type === "acp_authenticated",
+    )).toHaveLength(2);
     await stopAndAssertGone(authSession);
   });
 
@@ -648,7 +892,7 @@ describe("ACP backend", function () {
       {
         timeout: t(10_000),
         interval: 100,
-        timeoutMsg: "cancelled ACP authentication left the bridge running",
+        timeoutMsg: "cancelled ACP authentication left the runtime running",
       },
     );
   });

@@ -33,9 +33,7 @@ type MessageWaiter = {
 };
 
 const fixturePath = path.resolve(process.cwd(), "e2e/fixtures/mock-acp-agent.ts");
-const bridgePath = path.resolve(process.cwd(), "src-tauri/assets/acp-bridge.ts");
 const nodeExecutable = process.env.SCREENPIPE_NODE_PATH || "node";
-const bunExecutable = process.env.SCREENPIPE_BUN_PATH || "bun";
 
 class MockAcpClient {
   readonly child: ChildProcessWithoutNullStreams;
@@ -197,54 +195,6 @@ async function newSession(client: MockAcpClient): Promise<string> {
   return result.sessionId as string;
 }
 
-async function runBridgeMcpProbe(expectedUrl: string): Promise<void> {
-  const env = { ...process.env };
-  delete env.SCREENPIPE_LOCAL_API_KEY;
-  Object.assign(env, {
-    SCREENPIPE_ACP_ID: "custom",
-    SCREENPIPE_ACP_COMMAND: nodeExecutable,
-    SCREENPIPE_ACP_ARGS_JSON: JSON.stringify([fixturePath, "--scenario=mcp"]),
-    SCREENPIPE_ACP_CWD: path.resolve("."),
-    SCREENPIPE_BUN_PATH: bunExecutable,
-    SCREENPIPE_LOCAL_API_URL: expectedUrl,
-    SCREENPIPE_MOCK_EXPECT_MCP_URL: expectedUrl,
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(bunExecutable, [bridgePath], {
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    const stderr: string[] = [];
-    let ready = false;
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`timed out waiting for ACP bridge (${stderr.join("\n")})`));
-    }, 5_000);
-    const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    stdout.on("line", (line) => {
-      const message = JSON.parse(line) as Record<string, any>;
-      if (message.type === "acp_fatal") {
-        clearTimeout(timer);
-        reject(new Error(String(message.error)));
-        child.kill();
-      } else if (message.type === "acp_ready") {
-        ready = true;
-        child.stdin.end();
-      }
-    });
-    child.stderr.on("data", (chunk) => stderr.push(chunk.toString("utf8")));
-    child.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      if (ready && code === 0) resolve();
-      else reject(new Error(
-        `ACP bridge exited before ready (code=${code}, signal=${signal}): ${stderr.join("\n")}`,
-      ));
-    });
-  });
-}
-
 describe("mock ACP agent protocol fixture", () => {
   it("negotiates, streams plans and tools, requests permission, and cancels", async () => {
     const client = new MockAcpClient("normal");
@@ -351,10 +301,6 @@ describe("mock ACP agent protocol fixture", () => {
     } finally {
       await client.stop();
     }
-  }, 10_000);
-
-  it("registers Screenpipe MCP with a custom URL even when local auth is disabled", async () => {
-    await expect(runBridgeMcpProbe("http://localhost:4567")).resolves.toBeUndefined();
   }, 10_000);
 
   it("rejects in-flight requests when the supervised agent exits", async () => {

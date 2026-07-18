@@ -7,8 +7,8 @@ and layer declared in the manifest, weighted by confidence and criticality.
 - Manifest: `e2e/coverage-map.json`
 - Specs directory: `e2e/specs`
 - Mapped specs: 70
-- Declared test blocks: 218
-- Weighted coverage points: 166.8
+- Declared test blocks: 221
+- Weighted coverage points: 168.9
 
 Confidence weights: strong=1.0, partial=0.7, conditional=0.4, smoke=0.3.
 Criticality weights: high=1.0, medium=0.7, low=0.4.
@@ -19,9 +19,9 @@ can execute more runtime cases than this number shows.
 
 | Platform | Specs | Declared tests | Weighted points | Layers | Features | Critical score |
 | --- | --- | --- | --- | --- | --- | --- |
-| windows | 60 | 204 | 161.5 | 15 | 68 | 92% |
-| macos | 66 | 182 | 138.1 | 17 | 69 | 89% |
-| linux | 51 | 166 | 132.1 | 14 | 64 | 86% |
+| windows | 60 | 207 | 163.6 | 15 | 70 | 92% |
+| macos | 66 | 185 | 140.2 | 17 | 71 | 89% |
+| linux | 51 | 169 | 134.2 | 14 | 66 | 86% |
 
 ## Runtime Results
 
@@ -37,18 +37,18 @@ pass/fail/skip counts.
 | auth | - | 1 specs / 1 tests / 1.0 pts | - |
 | billing | 4 specs / 5 tests / 4.7 pts | 4 specs / 5 tests / 4.7 pts | 4 specs / 5 tests / 4.7 pts |
 | capture-ocr | 2 specs / 15 tests / 6.0 pts | 3 specs / 5 tests / 2.0 pts | 1 specs / 3 tests / 1.2 pts |
-| chat-ai | 17 specs / 31 tests / 20.6 pts | 20 specs / 35 tests / 21.9 pts | 16 specs / 30 tests / 20.1 pts |
+| chat-ai | 17 specs / 34 tests / 22.7 pts | 20 specs / 38 tests / 24.0 pts | 16 specs / 33 tests / 22.2 pts |
 | entitlement | - | 1 specs / 1 tests / 1.0 pts | - |
 | local-api | 14 specs / 94 tests / 78.0 pts | 13 specs / 68 tests / 58.6 pts | 11 specs / 67 tests / 58.2 pts |
 | notifications | 2 specs / 11 tests / 10.1 pts | 2 specs / 4 tests / 2.4 pts | 1 specs / 3 tests / 2.1 pts |
 | onboarding | 1 specs / 4 tests / 1.6 pts | 1 specs / 4 tests / 1.6 pts | 1 specs / 4 tests / 1.6 pts |
-| os-integration | 6 specs / 23 tests / 20.3 pts | 5 specs / 9 tests / 5.1 pts | 1 specs / 6 tests / 4.2 pts |
+| os-integration | 6 specs / 26 tests / 22.4 pts | 5 specs / 12 tests / 7.2 pts | 1 specs / 9 tests / 6.3 pts |
 | performance | 2 specs / 44 tests / 44.0 pts | 4 specs / 34 tests / 30.5 pts | 1 specs / 29 tests / 29.0 pts |
 | pipes | 3 specs / 12 tests / 12.0 pts | 3 specs / 12 tests / 12.0 pts | 3 specs / 12 tests / 12.0 pts |
 | real-ui-e2e | 37 specs / 116 tests / 91.1 pts | 39 specs / 103 tests / 80.6 pts | 34 specs / 96 tests / 78.3 pts |
 | settings | 13 specs / 31 tests / 28.6 pts | 15 specs / 26 tests / 22.3 pts | 12 specs / 23 tests / 20.6 pts |
 | storage-privacy | 6 specs / 20 tests / 19.1 pts | 5 specs / 12 tests / 11.1 pts | 4 specs / 12 tests / 11.1 pts |
-| tauri-command | 11 specs / 25 tests / 16.5 pts | 11 specs / 26 tests / 16.0 pts | 10 specs / 24 tests / 15.5 pts |
+| tauri-command | 11 specs / 28 tests / 18.6 pts | 11 specs / 29 tests / 18.1 pts | 10 specs / 27 tests / 17.6 pts |
 | window-lifecycle | 17 specs / 61 tests / 51.6 pts | 17 specs / 42 tests / 30.0 pts | 12 specs / 37 tests / 28.5 pts |
 
 ## Critical Feature Matrix
@@ -68,7 +68,7 @@ pass/fail/skip counts.
 | Window lifecycle, focus, and dedupe | window-lifecycle | covered (strong; windows-system-integration, window-lifecycle) | covered (strong; window-lifecycle, viewer-deeplink) | covered (strong; window-lifecycle, viewer-deeplink) |
 | Meeting note creation and editing | real-ui-e2e | covered (strong; windows-user-journey, meeting-note-bottom-click) | covered (strong; meeting-note-bottom-click) | covered (strong; meeting-note-bottom-click) |
 | Pipes discover, install, and play | pipes | covered (strong; pipes, pipes-mcp-connections) | covered (strong; pipes, pipes-mcp-connections) | covered (strong; pipes, pipes-mcp-connections) |
-| Chat window, composer, and streaming state | chat-ai | covered (strong; chat-sidebar-groups, acp-backend) | covered (strong; chat-sidebar-groups, acp-backend) | covered (strong; chat-sidebar-groups, acp-backend) |
+| Chat window, composer, and streaming state | chat-ai | covered (strong; acp-backend, chat-sidebar-groups) | covered (strong; acp-backend, chat-sidebar-groups) | covered (strong; acp-backend, chat-sidebar-groups) |
 | Tray/search window behavior | window-lifecycle | covered (strong; window-lifecycle, tray-search) | covered (strong; window-lifecycle, tray-search) | covered (strong; window-lifecycle, tray-search) |
 | Native tray recording status refresh | os-integration | covered (strong; tray-recording-status) | - | - |
 | Storage retention safety UX | storage-privacy | covered (strong; settings-sections, windows-user-journey) | covered (strong; settings-sections) | covered (strong; settings-sections) |
@@ -93,7 +93,7 @@ pass/fail/skip counts.
 
 | Spec | Platforms | Layers | Features | Criticality | Confidence | UX | Tests | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| acp-backend.spec.ts | windows, macos, linux | chat-ai, tauri-command, os-integration | chat, acp-backend, agent-streaming, agent-permissions, agent-cancellation, process-supervision | high | partial | mixed | 6 | Real Rust-to-ACP bridge and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, and supervised shutdown. Curated third-party adapters remain manual smoke coverage. |
+| acp-backend.spec.ts | windows, macos, linux | chat-ai, tauri-command, os-integration | chat, acp-backend, agent-streaming, agent-permissions, agent-cancellation, agent-terminal, mcp-registration, process-supervision | high | partial | mixed | 9 | Official Rust ACP SDK runtime and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, exact adapter/descendant reaping, terminal lifecycle/output draining, and a real authenticated local API MCP health call. Curated third-party adapters remain manual smoke coverage. |
 | api-key-cold-spawn.spec.ts | windows, macos, linux | local-api, tauri-command | local-api-auth, app-launch | medium | partial | command | 3 | Cold-spawn local API config regression coverage. |
 | api-search-stress.spec.ts | windows, macos, linux | local-api, performance | local-api-auth, local-api-search, health, audio-device-health, local-api-load | high | strong | api | 29 | Broad readonly API, auth, search, and load coverage. |
 | api.spec.ts | windows, macos, linux | local-api | health, audio-device-health, connections, local-api-auth | high | partial | api | 7 | Smoke coverage for local HTTP API shape and auth behavior. |

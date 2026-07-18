@@ -23,7 +23,7 @@ use specta::Type;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::ChildStdin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
@@ -88,10 +88,32 @@ pub struct PiQueueHandle {
 enum QueueMessage {
     /// A normal command to enqueue.
     Command(PiCommand),
-    /// Priority abort — cancels all pending commands and sends abort to stdin.
+    /// Priority abort cleanup marker. The handle writes abort directly before
+    /// placing this marker so it can interrupt a drain loop waiting on a prompt.
     Abort {
+        permit: AbortPermit,
         reply: oneshot::Sender<Result<(), String>>,
     },
+}
+
+/// RAII ownership for one full abort request. The queue stays gated while any
+/// permit exists, including when a caller future is cancelled or a buffered
+/// cleanup marker is dropped with the queue.
+struct AbortPermit {
+    state: Arc<PiQueueState>,
+}
+
+impl Drop for AbortPermit {
+    fn drop(&mut self) {
+        let released =
+            self.state
+                .abort_requests
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                    pending.checked_sub(1)
+                });
+        debug_assert!(released.is_ok(), "abort permit released more than once");
+        self.state.done_notify.notify_waiters();
+    }
 }
 
 // Note: cancel-one is implemented as a pure tombstone in `PiQueueState` and
@@ -102,8 +124,6 @@ enum QueueMessage {
 pub struct PiQueueState {
     /// Notified by the stdout reader when a `done` event is received.
     done_notify: Notify,
-    /// Notified when the Pi process terminates.
-    terminated_notify: Notify,
     /// Whether the process is still alive.
     alive: watch::Sender<bool>,
     /// Canonical list of user prompts that are enqueued but not yet written
@@ -120,14 +140,14 @@ pub struct PiQueueState {
     /// exact original prompt/images without trusting frontend shadow state.
     queued_payloads: std::sync::Mutex<HashMap<String, Value>>,
     /// True between `agent_start` and `agent_end` — i.e. while the SDK is
-    /// actively processing a `prompt`. Read by the stdout reader to suppress
-    /// the `response → 500ms → signal_done` fallback on prompt ACKs (those
-    /// fire mid-stream and would unblock the drain loop early, causing the
-    /// next queued prompt to race the still-running one and trip the SDK's
-    /// "already processing" error). For prompts, `agent_end` is the
-    /// authoritative done signal; the response-fallback only matters for
-    /// new_session/abort, which never fire agent_start.
+    /// actively processing a `prompt`. Prompt response events are only ACKs,
+    /// so `agent_end` plus the tool/steer state is the durable completion
+    /// predicate; lifecycle responses are correlated separately by request id.
     agent_active: AtomicBool,
+    /// Set before a prompt is written and cleared by its first `agent_start`,
+    /// rejection, write failure, or termination. This reserves the turn
+    /// without pretending the SDK actually accepted the prompt.
+    prompt_pending: AtomicBool,
     /// True while a steer command has been written to stdin via
     /// `send_immediate` but the new turn's `agent_start` has not yet fired.
     /// Prevents the drain loop from writing the next queued prompt during
@@ -138,6 +158,15 @@ pub struct PiQueueState {
     /// boundaries, so this keeps Rust from treating the turn as complete while
     /// the shell/read/edit tool is still running.
     active_tool_calls: std::sync::Mutex<HashSet<String>>,
+    /// Number of full priority aborts that have not completed their FIFO
+    /// cleanup marker. A count (rather than a bool) keeps overlapping aborts
+    /// from reopening the queue while another cancellation is still pending.
+    abort_requests: AtomicUsize,
+    /// Lifecycle commands (new_session, set_model, abort) complete on their
+    /// own response id. A shared Notify is insufficient here: a fast response
+    /// can arrive before a waiter is armed, and a late response from an older
+    /// command can otherwise release unrelated work.
+    response_waiters: std::sync::Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>,
 }
 
 impl PiQueueState {
@@ -146,14 +175,16 @@ impl PiQueueState {
         let (queued_tx, _) = watch::channel(Vec::new());
         Arc::new(Self {
             done_notify: Notify::new(),
-            terminated_notify: Notify::new(),
             alive: alive_tx,
             queued: queued_tx,
             cancelled: std::sync::Mutex::new(HashSet::new()),
             queued_payloads: std::sync::Mutex::new(HashMap::new()),
             agent_active: AtomicBool::new(false),
+            prompt_pending: AtomicBool::new(false),
             steer_in_flight: AtomicBool::new(false),
             active_tool_calls: std::sync::Mutex::new(HashSet::new()),
+            abort_requests: AtomicUsize::new(0),
+            response_waiters: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -164,18 +195,51 @@ impl PiQueueState {
 
     /// Called by the stdout reader on `agent_start` (a prompt has begun streaming).
     pub fn mark_agent_active(&self) {
+        self.prompt_pending.store(false, Ordering::SeqCst);
         self.agent_active.store(true, Ordering::SeqCst);
+        self.done_notify.notify_waiters();
     }
 
     /// Called by the stdout reader on `agent_end` (a prompt has finished).
     pub fn mark_agent_idle(&self) {
+        self.prompt_pending.store(false, Ordering::SeqCst);
         self.agent_active.store(false, Ordering::SeqCst);
     }
 
-    /// Whether a prompt is currently mid-stream. Used by the stdout reader to
-    /// decide whether to fire the `response → 500ms → signal_done` fallback.
+    /// Whether a prompt is currently mid-stream.
     pub fn is_agent_active(&self) -> bool {
         self.agent_active.load(Ordering::SeqCst)
+    }
+
+    fn mark_prompt_pending(&self) {
+        self.prompt_pending.store(true, Ordering::SeqCst);
+        self.done_notify.notify_waiters();
+    }
+
+    fn mark_prompt_rejected(&self) {
+        self.prompt_pending.store(false, Ordering::SeqCst);
+        self.agent_active.store(false, Ordering::SeqCst);
+        if let Ok(mut active_tools) = self.active_tool_calls.lock() {
+            active_tools.clear();
+        }
+        self.done_notify.notify_waiters();
+    }
+
+    fn finish_aborted_turn(&self) {
+        self.prompt_pending.store(false, Ordering::SeqCst);
+        self.agent_active.store(false, Ordering::SeqCst);
+        self.steer_in_flight.store(false, Ordering::SeqCst);
+        if let Ok(mut active_tools) = self.active_tool_calls.lock() {
+            active_tools.clear();
+        }
+        // Tool/agent end events are not guaranteed after cancellation. Wake
+        // the drain loop from its durable idle wait using the state we just
+        // cleared after the exact abort response.
+        self.done_notify.notify_waiters();
+    }
+
+    fn is_prompt_pending(&self) -> bool {
+        self.prompt_pending.load(Ordering::SeqCst)
     }
 
     /// Mark that a steer command is in flight (written to stdin, awaiting
@@ -219,7 +283,10 @@ impl PiQueueState {
     }
 
     pub fn has_active_turn_work(&self) -> bool {
-        self.is_agent_active() || self.is_steer_in_flight() || self.has_active_tools()
+        self.is_agent_active()
+            || self.is_prompt_pending()
+            || self.is_steer_in_flight()
+            || self.has_active_tools()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -232,10 +299,48 @@ impl PiQueueState {
         }
     }
 
+    fn acquire_abort(self: &Arc<Self>) -> AbortPermit {
+        self.abort_requests.fetch_add(1, Ordering::SeqCst);
+        self.done_notify.notify_waiters();
+        AbortPermit {
+            state: self.clone(),
+        }
+    }
+
+    fn is_abort_requested(&self) -> bool {
+        self.abort_requests.load(Ordering::SeqCst) > 0
+    }
+
+    fn register_response(&self, request_id: &str) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut waiters) = self.response_waiters.lock() {
+            waiters.insert(request_id.to_string(), tx);
+        }
+        rx
+    }
+
+    /// Resolve the exact lifecycle command that produced this response.
+    /// Called by the stdout reader before the response is exposed elsewhere.
+    pub fn signal_response(&self, request_id: &str, result: Result<(), String>) {
+        let waiter = self
+            .response_waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(request_id));
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(result);
+        }
+    }
+
+    fn cancel_response(&self, request_id: &str) {
+        if let Ok(mut waiters) = self.response_waiters.lock() {
+            waiters.remove(request_id);
+        }
+    }
+
     /// Called by the stdout reader when the process terminates (EOF).
     pub fn signal_terminated(&self) {
         let _ = self.alive.send(false);
-        self.terminated_notify.notify_one();
         // Also wake anyone waiting for done — they'll see terminated
         self.done_notify.notify_waiters();
         // Drop any queued prompts so subscribers stop showing them — Pi died.
@@ -249,9 +354,13 @@ impl PiQueueState {
         if let Ok(mut active_tools) = self.active_tool_calls.lock() {
             active_tools.clear();
         }
+        if let Ok(mut waiters) = self.response_waiters.lock() {
+            waiters.clear();
+        }
         // Clear the agent-active flag so a future restart doesn't start out
         // in a stuck "active" state if the process died mid-stream.
         self.agent_active.store(false, Ordering::SeqCst);
+        self.prompt_pending.store(false, Ordering::SeqCst);
         self.clear_steer_in_flight();
     }
 
@@ -376,7 +485,7 @@ impl PiQueueHandle {
         };
 
         let (tx, rx) = oneshot::channel();
-        let should_show_in_queue = force_visible_queue || self.state.is_agent_active();
+        let should_show_in_queue = force_visible_queue || self.state.has_active_turn_work();
         let tracked_payload = payload.clone();
 
         if should_show_in_queue {
@@ -478,6 +587,13 @@ impl PiQueueHandle {
     /// clear queued follow-ups, so the queue can continue after the active
     /// reply stops.
     pub async fn abort_active_only(&self) -> Result<(), String> {
+        let handle = self.clone();
+        tokio::spawn(async move { handle.abort_active_only_inner().await })
+            .await
+            .map_err(|error| format!("Pi abort task failed: {error}"))?
+    }
+
+    async fn abort_active_only_inner(&self) -> Result<(), String> {
         let stdin = self
             .stdin
             .as_ref()
@@ -486,21 +602,31 @@ impl PiQueueHandle {
         let req_id = format!("req_{}", uuid::Uuid::new_v4().simple());
         let abort_cmd = json!({"type": "abort", "id": &req_id});
         let cmd_str = serde_json::to_string(&abort_cmd).map_err(|e| e.to_string())?;
+        // Register before the write so even an immediate ACP response is
+        // retained and correlated to this abort rather than a later command.
+        let response_rx = self.state.register_response(&req_id);
 
-        self.state.mark_agent_idle();
-        {
+        let write_result = {
             let mut stdin_guard = stdin.lock().await;
             info!("pi_command_queue: writing active-only abort ({})", req_id);
             writeln!(*stdin_guard, "{}", cmd_str)
                 .and_then(|_| stdin_guard.flush())
-                .map_err(|e| format!("abort write failed: {}", e))?;
+                .map_err(|e| format!("abort write failed: {}", e))
+        };
+        if let Err(error) = write_result {
+            self.state.cancel_response(&req_id);
+            return Err(error);
         }
 
-        if wait_for_done_or_terminated(&self.state, &mut alive_rx, "abort").await {
-            Ok(())
-        } else {
-            Err("Pi process died during abort".to_string())
+        let result = wait_for_response_or_terminated(response_rx, &mut alive_rx, "abort").await;
+        self.state.cancel_response(&req_id);
+        // The exact abort response means cancellation is complete. Clear all
+        // state owned by the cancelled turn: SDKs do not consistently emit a
+        // final agent/tool event after abort.
+        if result.is_ok() {
+            self.state.finish_aborted_turn();
         }
+        result
     }
 
     /// Cancel a single queued prompt by its id. Returns `true` if the prompt
@@ -515,15 +641,31 @@ impl PiQueueHandle {
     }
 
     /// Priority abort — cancels all pending commands and sends abort to Pi.
-    /// Returns when the SDK confirms the abort is complete (done event).
+    /// Returns when the SDK confirms the exact abort request is complete.
     pub async fn abort(&self) -> Result<(), String> {
+        let permit = self.state.acquire_abort();
+        let handle = self.clone();
+        tokio::spawn(async move { handle.abort_owned(permit).await })
+            .await
+            .map_err(|error| format!("Pi abort task failed: {error}"))?
+    }
+
+    async fn abort_owned(self, permit: AbortPermit) -> Result<(), String> {
+        // The normal mpsc drain can be parked waiting for the active prompt's
+        // agent_end, so an abort placed only in that FIFO can never reach the
+        // process it is meant to cancel. Mark the queue first, write the abort
+        // through the shared stdin immediately, and only then enqueue a cleanup
+        // marker that drains/rejects the older FIFO entries.
+        self.abort_active_only().await?;
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(QueueMessage::Abort { reply: tx })
+            .send(QueueMessage::Abort { permit, reply: tx })
             .await
             .map_err(|_| "Pi command queue closed".to_string())?;
-        rx.await
-            .map_err(|_| "Pi command queue dropped".to_string())?
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err("Pi command queue dropped".to_string()),
+        }
     }
 }
 
@@ -562,7 +704,8 @@ pub fn spawn_queue(
                         }
                         let _ = cmd.reply.send(Err("Pi process has died".to_string()));
                     }
-                    QueueMessage::Abort { reply } => {
+                    QueueMessage::Abort { permit, reply } => {
+                        drop(permit);
                         let _ = reply.send(Err("Pi process has died".to_string()));
                     }
                 }
@@ -573,6 +716,14 @@ pub fn spawn_queue(
                 QueueMessage::Command(cmd) => {
                     let prompt_id = cmd.prompt_meta.as_ref().map(|m| m.id.clone());
                     let is_prompt = prompt_id.is_some();
+
+                    if state.is_abort_requested() {
+                        if let Some(pid) = &prompt_id {
+                            state.dequeue_prompt(pid);
+                        }
+                        let _ = cmd.reply.send(Err("aborted".to_string()));
+                        continue;
+                    }
 
                     // Tombstone check — if the user cancelled this prompt
                     // while it was sitting in the channel, drop it without
@@ -616,13 +767,20 @@ pub fn spawn_queue(
                                 && !state.is_agent_active()
                                 && !state.has_active_tools()
                             {
-                                tokio::select! {
-                                    _ = state.done_notify.notified() => {}
-                                    _ = state.terminated_notify.notified() => {
+                                match wait_until_idle_or_terminated(
+                                    &state,
+                                    &mut alive_rx,
+                                    &cmd_type,
+                                    std::time::Duration::from_secs(30),
+                                )
+                                .await
+                                {
+                                    IdleWait::Idle => {}
+                                    IdleWait::Terminated => {
                                         died_during_wait = true;
                                         break;
                                     }
-                                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                                    IdleWait::TimedOut => {
                                         warn!(
                                             "pi_command_queue: steer_in_flight stuck 30s, force-clearing"
                                         );
@@ -630,12 +788,26 @@ pub fn spawn_queue(
                                     }
                                 }
                             } else {
-                                let ok =
-                                    wait_for_done_or_terminated(&state, &mut alive_rx, &cmd_type)
-                                        .await;
-                                if !ok {
-                                    died_during_wait = true;
-                                    break;
+                                match wait_until_idle_or_terminated(
+                                    &state,
+                                    &mut alive_rx,
+                                    &cmd_type,
+                                    std::time::Duration::from_secs(300),
+                                )
+                                .await
+                                {
+                                    IdleWait::Idle => {}
+                                    IdleWait::Terminated => {
+                                        died_during_wait = true;
+                                        break;
+                                    }
+                                    IdleWait::TimedOut => {
+                                        warn!(
+                                            "pi_command_queue: 300s timeout waiting for {} to become idle, proceeding",
+                                            cmd_type
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -650,6 +822,17 @@ pub fn spawn_queue(
                         }
                     }
 
+                    // A priority abort may have arrived while this command was
+                    // already popped and parked behind an active prompt. Drop
+                    // it before it can be written after the cancelled turn.
+                    if state.is_abort_requested() {
+                        if let Some(pid) = &prompt_id {
+                            state.dequeue_prompt(pid);
+                        }
+                        let _ = cmd.reply.send(Err("aborted".to_string()));
+                        continue;
+                    }
+
                     // The first queued prompt can already be popped from
                     // the mpsc channel and parked here waiting for the
                     // current turn to finish. If the user deletes it
@@ -662,6 +845,18 @@ pub fn spawn_queue(
                             let _ = cmd.reply.send(Err("cancelled".to_string()));
                             continue;
                         }
+                    }
+
+                    // Register exact responses before writing. Prompts use the
+                    // response only to catch synchronous/preflight rejection;
+                    // lifecycle commands use it as their completion signal.
+                    let response_rx = if is_prompt || cmd.wait_mode == WaitMode::WaitDone {
+                        Some(state.register_response(&req_id))
+                    } else {
+                        None
+                    };
+                    if is_prompt {
+                        state.mark_prompt_pending();
                     }
 
                     // Write to stdin
@@ -682,6 +877,11 @@ pub fn spawn_queue(
 
                     if let Err(e) = write_result {
                         error!("pi_command_queue: stdin write failed: {}", e);
+                        state.cancel_response(&req_id);
+                        if is_prompt {
+                            state.mark_prompt_rejected();
+                            state.signal_done_if_idle();
+                        }
                         if let Some(pid) = &prompt_id {
                             state.dequeue_prompt(pid);
                         }
@@ -689,23 +889,50 @@ pub fn spawn_queue(
                         continue;
                     }
 
-                    // `agent_start` can arrive a little later than the write.
-                    // Mark active optimistically for prompt commands so the
-                    // next queued prompt cannot slip through this tiny window.
-                    if is_prompt {
-                        state.mark_agent_active();
-                    }
-
                     match cmd.wait_mode {
                         WaitMode::Prompt => {
+                            let Some(response_rx) = response_rx else {
+                                state.mark_prompt_rejected();
+                                if let Some(pid) = &prompt_id {
+                                    state.dequeue_prompt(pid);
+                                }
+                                let _ = cmd
+                                    .reply
+                                    .send(Err("missing prompt response waiter".to_string()));
+                                continue;
+                            };
+                            let (accepted, remaining_response) = wait_for_prompt_acceptance(
+                                &state,
+                                &mut alive_rx,
+                                &cmd_type,
+                                response_rx,
+                            )
+                            .await;
                             // The prompt has now left the waiting queue and
-                            // entered the transcript as the active turn.
+                            // either entered the transcript or was rejected.
                             if let Some(pid) = &prompt_id {
                                 state.dequeue_prompt(pid);
                             }
-                            let _ = cmd.reply.send(Ok(()));
-                            let _ =
-                                wait_for_done_or_terminated(&state, &mut alive_rx, &cmd_type).await;
+                            let rejected = accepted.is_err();
+                            let _ = cmd.reply.send(accepted);
+                            if rejected {
+                                state.cancel_response(&req_id);
+                                continue;
+                            }
+                            let wait = wait_for_prompt_idle_or_rejected(
+                                &state,
+                                &mut alive_rx,
+                                remaining_response,
+                                std::time::Duration::from_secs(300),
+                            )
+                            .await;
+                            if let PromptWait::Rejected(error) = wait {
+                                warn!(
+                                    "pi_command_queue: {} was rejected after starting: {}",
+                                    cmd_type, error
+                                );
+                            }
+                            state.cancel_response(&req_id);
                         }
                         WaitMode::WaitDone => {
                             // Successful write — for blocking commands the
@@ -715,23 +942,30 @@ pub fn spawn_queue(
                             if let Some(pid) = &prompt_id {
                                 state.dequeue_prompt(pid);
                             }
-                            // Block until done, then reply
-                            let ok =
-                                wait_for_done_or_terminated(&state, &mut alive_rx, &cmd_type).await;
-                            if ok {
-                                let _ = cmd.reply.send(Ok(()));
-                            } else {
-                                let _ = cmd
-                                    .reply
-                                    .send(Err("Pi process died while processing".to_string()));
-                            }
+                            // Block on the response with this exact request id.
+                            // A shared done event can be stale or belong to a
+                            // different abort/new_session command.
+                            let result = match response_rx {
+                                Some(response_rx) => {
+                                    wait_for_response_or_terminated(
+                                        response_rx,
+                                        &mut alive_rx,
+                                        &cmd_type,
+                                    )
+                                    .await
+                                }
+                                None => Err("missing lifecycle response waiter".to_string()),
+                            };
+                            state.cancel_response(&req_id);
+                            let _ = cmd.reply.send(result);
                         }
                     }
                 }
 
-                QueueMessage::Abort { reply } => {
+                QueueMessage::Abort { permit, reply } => {
                     // Drain and cancel all pending commands in the channel
                     let mut cancelled = 0u32;
+                    let mut aborts = vec![(permit, reply)];
                     while let Ok(queued) = rx.try_recv() {
                         match queued {
                             QueueMessage::Command(cmd) => {
@@ -741,9 +975,8 @@ pub fn spawn_queue(
                                 let _ = cmd.reply.send(Err("aborted".to_string()));
                                 cancelled += 1;
                             }
-                            QueueMessage::Abort { reply: r } => {
-                                // Coalesce multiple aborts
-                                let _ = r.send(Ok(()));
+                            QueueMessage::Abort { permit, reply } => {
+                                aborts.push((permit, reply));
                             }
                         }
                     }
@@ -757,11 +990,6 @@ pub fn spawn_queue(
                     if let Ok(mut tombstones) = state.cancelled.lock() {
                         tombstones.clear();
                     }
-                    // Abort halts the agent loop. Clear the active flag so
-                    // the abort's `response` ACK is allowed to fire the
-                    // done-fallback (otherwise the wait below hangs until
-                    // the 300s safety timeout — abort would never reply).
-                    state.mark_agent_idle();
                     if cancelled > 0 {
                         info!(
                             "pi_command_queue: abort cancelled {} pending commands",
@@ -769,30 +997,11 @@ pub fn spawn_queue(
                         );
                     }
 
-                    // Write abort to stdin
-                    request_id += 1;
-                    let req_id = format!("req_{}", request_id);
-                    let abort_cmd = json!({"type": "abort", "id": &req_id});
-                    let write_result = {
-                        let mut stdin_guard = stdin.lock().await;
-                        let cmd_str =
-                            serde_json::to_string(&abort_cmd).unwrap_or_else(|_| "{}".to_string());
-                        info!("pi_command_queue: writing abort ({})", req_id);
-                        writeln!(*stdin_guard, "{}", cmd_str).and_then(|_| stdin_guard.flush())
-                    };
-
-                    if let Err(e) = write_result {
-                        error!("pi_command_queue: abort stdin write failed: {}", e);
-                        let _ = reply.send(Err(format!("abort write failed: {}", e)));
-                        continue;
-                    }
-
-                    // Wait for done
-                    let ok = wait_for_done_or_terminated(&state, &mut alive_rx, "abort").await;
-                    if ok {
+                    // Release every coalesced owner only after their shared
+                    // FIFO cleanup is complete.
+                    for (permit, reply) in aborts {
+                        drop(permit);
                         let _ = reply.send(Ok(()));
-                    } else {
-                        let _ = reply.send(Err("Pi process died during abort".to_string()));
                     }
                 }
             }
@@ -804,42 +1013,196 @@ pub fn spawn_queue(
     (handle, join)
 }
 
-/// Wait for either a `done` signal or process termination.
-/// Returns `true` if done was received, `false` if terminated.
-async fn wait_for_done_or_terminated(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleWait {
+    Idle,
+    Terminated,
+    TimedOut,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PromptWait {
+    Idle,
+    Terminated,
+    TimedOut,
+    Rejected(String),
+}
+
+/// Wait until the SDK either accepts a prompt (`agent_start` or a successful
+/// response) or rejects that exact request. Keeping the request waiter armed
+/// before stdin is written catches raw Pi preflight failures that do not emit
+/// `agent_start`/`agent_end` and would otherwise strand the queue as busy.
+async fn wait_for_prompt_acceptance(
     state: &PiQueueState,
     alive_rx: &mut watch::Receiver<bool>,
     cmd_type: &str,
-) -> bool {
-    // Fast path: already terminated
-    if !*alive_rx.borrow() {
-        warn!(
-            "pi_command_queue: process already dead, skipping wait for {}",
-            cmd_type
-        );
-        return false;
-    }
+    mut response_rx: oneshot::Receiver<Result<(), String>>,
+) -> (
+    Result<(), String>,
+    Option<oneshot::Receiver<Result<(), String>>>,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if !*alive_rx.borrow() {
+            state.mark_prompt_rejected();
+            return (Err(format!("Pi process died during {cmd_type}")), None);
+        }
 
-    tokio::select! {
-        _ = state.done_notify.notified() => {
-            if !*alive_rx.borrow_and_update() {
-                warn!(
-                    "pi_command_queue: process terminated while waiting for {} done",
-                    cmd_type
-                );
-                return false;
+        let notified = state.done_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // `prompt_pending` is cleared by agent_start. It may already be idle
+        // again if a very short turn started and ended before this check.
+        if state.is_agent_active() || !state.is_prompt_pending() {
+            return (Ok(()), Some(response_rx));
+        }
+
+        tokio::select! {
+            response = &mut response_rx => {
+                return match response {
+                    Ok(Ok(())) => (Ok(()), None),
+                    Ok(Err(error)) => {
+                        state.mark_prompt_rejected();
+                        (Err(error), None)
+                    }
+                    Err(_) => {
+                        state.mark_prompt_rejected();
+                        (Err(format!("Pi process died during {cmd_type}")), None)
+                    }
+                };
             }
-            debug!("pi_command_queue: done received for {}", cmd_type);
-            true
+            _ = &mut notified => continue,
+            changed = alive_rx.changed() => {
+                if changed.is_err() || !*alive_rx.borrow_and_update() {
+                    state.mark_prompt_rejected();
+                    return (Err(format!("Pi process died during {cmd_type}")), None);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                state.mark_prompt_rejected();
+                return (Err(format!("timed out waiting for {cmd_type} acceptance")), None);
+            }
         }
-        _ = state.terminated_notify.notified() => {
-            warn!("pi_command_queue: process terminated while waiting for {} done", cmd_type);
-            false
+    }
+}
+
+/// After acceptance, wait for the turn to become idle while continuing to
+/// watch a still-pending response for a late SDK rejection.
+async fn wait_for_prompt_idle_or_rejected(
+    state: &PiQueueState,
+    alive_rx: &mut watch::Receiver<bool>,
+    mut response_rx: Option<oneshot::Receiver<Result<(), String>>>,
+    timeout: std::time::Duration,
+) -> PromptWait {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !*alive_rx.borrow() {
+            return PromptWait::Terminated;
         }
-        // Safety timeout — if the SDK never sends done (bug), don't block forever
+
+        let notified = state.done_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !state.has_active_turn_work() {
+            return PromptWait::Idle;
+        }
+
+        if let Some(receiver) = response_rx.as_mut() {
+            tokio::select! {
+                response = receiver => {
+                    response_rx = None;
+                    if let Ok(Err(error)) = response {
+                        state.mark_prompt_rejected();
+                        return PromptWait::Rejected(error);
+                    }
+                }
+                _ = &mut notified => continue,
+                changed = alive_rx.changed() => {
+                    if changed.is_err() || !*alive_rx.borrow_and_update() {
+                        return PromptWait::Terminated;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return PromptWait::TimedOut,
+            }
+        } else {
+            tokio::select! {
+                _ = &mut notified => continue,
+                changed = alive_rx.changed() => {
+                    if changed.is_err() || !*alive_rx.borrow_and_update() {
+                        return PromptWait::Terminated;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return PromptWait::TimedOut,
+            }
+        }
+    }
+}
+
+/// Wait until prompt/tool/steer state is actually idle. The notification is
+/// armed before checking the predicate, closing the check-then-wait race where
+/// agent_end lands between those operations.
+async fn wait_until_idle_or_terminated(
+    state: &PiQueueState,
+    alive_rx: &mut watch::Receiver<bool>,
+    cmd_type: &str,
+    timeout: std::time::Duration,
+) -> IdleWait {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !*alive_rx.borrow() {
+            warn!(
+                "pi_command_queue: process already dead, skipping wait for {}",
+                cmd_type
+            );
+            return IdleWait::Terminated;
+        }
+
+        let notified = state.done_notify.notified();
+        tokio::pin!(notified);
+        // notify_waiters does not retain a permit. Register before checking
+        // the durable idle predicate so an immediate transition is retained.
+        notified.as_mut().enable();
+        if !state.has_active_turn_work() {
+            debug!("pi_command_queue: {} is idle", cmd_type);
+            return IdleWait::Idle;
+        }
+
+        tokio::select! {
+            _ = &mut notified => continue,
+            changed = alive_rx.changed() => {
+                if changed.is_err() || !*alive_rx.borrow_and_update() {
+                    warn!(
+                        "pi_command_queue: process terminated while waiting for {} idle",
+                        cmd_type
+                    );
+                    return IdleWait::Terminated;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => return IdleWait::TimedOut,
+        }
+    }
+}
+
+/// Wait for the response matching one lifecycle request id. The receiver is
+/// installed before stdin is written, so fast responses cannot be lost.
+async fn wait_for_response_or_terminated(
+    response_rx: oneshot::Receiver<Result<(), String>>,
+    alive_rx: &mut watch::Receiver<bool>,
+    cmd_type: &str,
+) -> Result<(), String> {
+    if !*alive_rx.borrow() {
+        return Err(format!("Pi process died during {cmd_type}"));
+    }
+    tokio::select! {
+        response = response_rx => {
+            response.unwrap_or_else(|_| Err(format!("Pi process died during {cmd_type}")))
+        }
+        changed = alive_rx.changed() => {
+            let _ = changed;
+            Err(format!("Pi process died during {cmd_type}"))
+        }
         _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-            warn!("pi_command_queue: 300s timeout waiting for {} done, proceeding", cmd_type);
-            true
+            Err(format!("timed out waiting for {cmd_type} response"))
         }
     }
 }
@@ -848,26 +1211,53 @@ async fn wait_for_done_or_terminated(
 mod tests {
     use super::*;
 
+    async fn wait_for_response_id(state: &PiQueueState) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(id) = state
+                    .response_waiters
+                    .lock()
+                    .ok()
+                    .and_then(|waiters| waiters.keys().next().cloned())
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("response waiter should be registered before write")
+    }
+
     #[tokio::test]
     async fn test_queue_state_done_signal() {
         let state = PiQueueState::new();
+        state.mark_agent_active();
 
         // Signal done and verify it wakes the waiter
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            state_clone.mark_agent_idle();
             state_clone.signal_done();
         });
 
         let mut alive_rx = state.alive.subscribe();
-        let result = wait_for_done_or_terminated(&state, &mut alive_rx, "test").await;
-        assert!(result, "should return true on done signal");
+        let result = wait_until_idle_or_terminated(
+            &state,
+            &mut alive_rx,
+            "test",
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result, IdleWait::Idle, "should become idle on done signal");
         handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_queue_state_terminated_signal() {
         let state = PiQueueState::new();
+        state.mark_agent_active();
 
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
@@ -876,9 +1266,38 @@ mod tests {
         });
 
         let mut alive_rx = state.alive.subscribe();
-        let result = wait_for_done_or_terminated(&state, &mut alive_rx, "test").await;
-        assert!(!result, "should return false on terminated signal");
+        let result = wait_until_idle_or_terminated(
+            &state,
+            &mut alive_rx,
+            "test",
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            result,
+            IdleWait::Terminated,
+            "should stop on terminated signal"
+        );
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_response_registered_before_wait_is_not_lost() {
+        let state = PiQueueState::new();
+        let mut alive_rx = state.alive.subscribe();
+        let response_rx = state.register_response("req-fast");
+
+        // Model an ACP response arriving synchronously during the stdin write,
+        // before the queue task gets a chance to await its receiver.
+        state.signal_response("req-fast", Ok(()));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_response_or_terminated(response_rx, &mut alive_rx, "new_session"),
+        )
+        .await
+        .expect("fast response must be retained");
+        assert_eq!(result, Ok(()));
     }
 
     #[tokio::test]
@@ -913,64 +1332,360 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn test_abort_cancels_pending() {
-        let (tx, mut rx) = mpsc::channel::<QueueMessage>(8);
+    async fn test_priority_abort_interrupts_active_prompt_and_drops_follow_up() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake pi");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("fake pi stdin")));
         let state = PiQueueState::new();
-        let handle = PiQueueHandle {
-            tx,
-            stdin: None,
-            state,
-        };
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
 
-        // Queue two commands
-        let h1 = {
-            let h = handle.clone();
-            tokio::spawn(async move { h.send(json!({"type": "prompt"}), WaitMode::Prompt).await })
-        };
-        let h2 = {
-            let h = handle.clone();
-            tokio::spawn(async move {
-                h.send(json!({"type": "new_session"}), WaitMode::WaitDone)
-                    .await
-            })
-        };
+        let (_, active_reply) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "message": "active" }),
+                WaitMode::Prompt,
+                "active".into(),
+                false,
+            )
+            .await
+            .expect("enqueue active prompt");
+        let active_request_id = wait_for_response_id(&state).await;
+        state.signal_response(&active_request_id, Ok(()));
+        assert_eq!(active_reply.await.expect("active reply"), Ok(()));
 
-        // Give them time to enqueue
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_, follow_up_reply) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "message": "must not run" }),
+                WaitMode::Prompt,
+                "must not run".into(),
+                true,
+            )
+            .await
+            .expect("enqueue follow-up");
 
-        // Now abort
-        let abort_handle = {
-            let h = handle.clone();
-            tokio::spawn(async move { h.abort().await })
+        let abort_task = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.abort().await })
         };
+        let abort_request_id = wait_for_response_id(&state).await;
+        state.signal_response(&abort_request_id, Ok(()));
 
-        // The drain loop would process these, but we're simulating:
-        // Read the first command (prompt)
-        if let Some(QueueMessage::Command(cmd)) = rx.recv().await {
-            // Simulate: it was being processed, now abort arrives
-            let _ = cmd.reply.send(Err("aborted".to_string()));
-        }
-        // Read the second (new_session) — it should have been enqueued
-        if let Some(msg) = rx.recv().await {
-            match msg {
-                QueueMessage::Command(cmd) => {
-                    let _ = cmd.reply.send(Err("aborted".to_string()));
+        assert_eq!(abort_task.await.expect("abort task"), Ok(()));
+        assert_eq!(
+            follow_up_reply.await.expect("follow-up reply"),
+            Err("aborted".to_string())
+        );
+        assert!(!state.is_abort_requested());
+
+        state.signal_terminated();
+        drop(handle);
+        join.await.expect("queue join");
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_abort_clears_tool_state_when_sdk_omits_tool_end() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake pi");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("fake pi stdin")));
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        state.mark_agent_active();
+        state.mark_tool_active("tool-without-final-event");
+        let (_, follow_up_reply) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "message": "must not wait five minutes" }),
+                WaitMode::Prompt,
+                "must not wait five minutes".into(),
+                true,
+            )
+            .await
+            .expect("enqueue blocked follow-up");
+
+        let abort = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.abort().await })
+        };
+        let abort_id = wait_for_response_id(&state).await;
+        state.signal_response(&abort_id, Ok(()));
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), abort)
+                .await
+                .expect("abort cleanup must not wait for a missing tool end")
+                .expect("abort task"),
+            Ok(())
+        );
+        assert_eq!(
+            follow_up_reply.await.expect("follow-up reply"),
+            Err("aborted".to_string())
+        );
+        assert!(!state.has_active_tools());
+        assert!(!state.has_active_turn_work());
+
+        state.signal_terminated();
+        drop(handle);
+        join.await.expect("queue join");
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_prompt_preflight_rejection_releases_queue_and_fails_sender() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake pi");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("fake pi stdin")));
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        let (_, rejected_reply) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "message": "reject me" }),
+                WaitMode::Prompt,
+                "reject me".into(),
+                false,
+            )
+            .await
+            .expect("enqueue rejected prompt");
+        let rejected_request_id = wait_for_response_id(&state).await;
+        state.signal_response(&rejected_request_id, Err("preflight rejected".into()));
+        assert_eq!(
+            rejected_reply.await.expect("rejected reply"),
+            Err("preflight rejected".into())
+        );
+        assert!(
+            !state.has_active_turn_work(),
+            "rejected prompt must release the optimistic turn reservation"
+        );
+
+        let (_, next_reply) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "message": "next" }),
+                WaitMode::Prompt,
+                "next".into(),
+                false,
+            )
+            .await
+            .expect("enqueue next prompt");
+        let next_request_id = wait_for_response_id(&state).await;
+        state.signal_response(&next_request_id, Ok(()));
+        assert_eq!(next_reply.await.expect("next reply"), Ok(()));
+
+        state.signal_terminated();
+        drop(handle);
+        join.await.expect("queue join");
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_overlapping_full_aborts_keep_gate_closed_until_every_cleanup() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake pi");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("fake pi stdin")));
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        let first_abort = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.abort().await })
+        };
+        let second_abort = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.abort().await })
+        };
+        let abort_ids = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let ids = state
+                    .response_waiters
+                    .lock()
+                    .map(|waiters| waiters.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if ids.len() == 2 {
+                    break ids;
                 }
-                QueueMessage::Abort { reply } => {
-                    let _ = reply.send(Ok(()));
-                }
+                tokio::task::yield_now().await;
             }
-        }
-        // Read the abort itself
-        if let Some(QueueMessage::Abort { reply }) = rx.recv().await {
-            let _ = reply.send(Ok(()));
-        }
+        })
+        .await
+        .expect("both abort response waiters should be registered");
 
-        // All handles should complete
-        let _ = h1.await;
-        let _ = h2.await;
-        let _ = abort_handle.await;
+        state.signal_response(&abort_ids[0], Ok(()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.abort_requests.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first abort cleanup should release exactly one owner");
+        assert!(
+            state.is_abort_requested(),
+            "second in-flight abort must keep the queue gate closed"
+        );
+
+        let (_, blocked_reply) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "message": "must stay blocked" }),
+                WaitMode::Prompt,
+                "must stay blocked".into(),
+                false,
+            )
+            .await
+            .expect("enqueue prompt during overlapping aborts");
+        assert_eq!(
+            blocked_reply.await.expect("blocked prompt reply"),
+            Err("aborted".into())
+        );
+
+        state.signal_response(&abort_ids[1], Ok(()));
+        assert_eq!(first_abort.await.expect("first abort task"), Ok(()));
+        assert_eq!(second_abort.await.expect("second abort task"), Ok(()));
+        assert!(!state.is_abort_requested());
+
+        state.signal_terminated();
+        drop(handle);
+        join.await.expect("queue join");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_dropped_abort_marker_releases_permit() {
+        let state = PiQueueState::new();
+        let permit = state.acquire_abort();
+        let (reply, _reply_rx) = oneshot::channel();
+        let (tx, rx) = mpsc::channel(1);
+        assert!(
+            tx.try_send(QueueMessage::Abort { permit, reply }).is_ok(),
+            "buffer abort marker"
+        );
+        assert!(state.is_abort_requested());
+
+        drop(rx);
+        assert!(
+            !state.is_abort_requested(),
+            "dropping a buffered marker must release its abort permit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cancelled_abort_caller_keeps_gate_closed_until_cleanup() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake pi");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("fake pi stdin")));
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        let caller = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.abort().await })
+        };
+        let abort_id = wait_for_response_id(&state).await;
+        assert_eq!(state.abort_requests.load(Ordering::SeqCst), 1);
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(
+            state.abort_requests.load(Ordering::SeqCst),
+            1,
+            "caller cancellation must detach, not cancel, abort cleanup"
+        );
+
+        let (_, blocked_reply) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "message": "must stay blocked" }),
+                WaitMode::Prompt,
+                "must stay blocked".into(),
+                false,
+            )
+            .await
+            .expect("enqueue prompt during detached abort");
+        assert_eq!(
+            blocked_reply.await.expect("blocked prompt reply"),
+            Err("aborted".into())
+        );
+
+        state.signal_response(&abort_id, Ok(()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.is_abort_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached abort must release its permit after cleanup");
+
+        state.signal_terminated();
+        drop(handle);
+        join.await.expect("queue join");
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_termination_releases_abort_permit_without_reset() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake pi");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("fake pi stdin")));
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        let abort = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.abort().await })
+        };
+        let _ = wait_for_response_id(&state).await;
+        assert!(state.is_abort_requested());
+        state.signal_terminated();
+        assert!(abort.await.expect("abort task").is_err());
+        assert!(
+            !state.is_abort_requested(),
+            "the owned permit, not a termination reset, must reopen the gate"
+        );
+
+        drop(handle);
+        join.await.expect("queue join");
+        let _ = child.wait();
     }
 
     /// The real regression guard for native-steer queue serialization: drive
@@ -1029,6 +1744,8 @@ mod tests {
         // the guard). Clearing it must wake the drain loop and release the
         // follow-up — proving the `select!` is wired to `done_notify`.
         state.clear_steer_in_flight();
+        let prompt_request_id = wait_for_response_id(&state).await;
+        state.signal_response(&prompt_request_id, Ok(()));
 
         let released = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
             .await
@@ -1095,6 +1812,8 @@ mod tests {
 
         state.mark_tool_idle("tool-1");
         state.signal_done_if_idle();
+        let prompt_request_id = wait_for_response_id(&state).await;
+        state.signal_response(&prompt_request_id, Ok(()));
 
         let released = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
             .await
@@ -1198,6 +1917,9 @@ mod tests {
             .await
             .expect("enqueue first prompt");
 
+        let first_request_id = wait_for_response_id(&state).await;
+        state.signal_response(&first_request_id, Ok(()));
+
         let first = tokio::time::timeout(std::time::Duration::from_secs(5), first_rx)
             .await
             .expect("first prompt write should be acknowledged")
@@ -1207,8 +1929,8 @@ mod tests {
             "first prompt should be written, got {first:?}"
         );
         assert!(
-            state.is_agent_active(),
-            "prompt writes mark the active turn before agent_start arrives"
+            state.has_active_turn_work(),
+            "an accepted prompt reserves the turn before agent_start arrives"
         );
 
         let (_queued_id, mut queued_rx) = handle

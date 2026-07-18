@@ -1319,7 +1319,7 @@ async performOcrOnImage(imageBase64: string) : Promise<Result<string, string>> {
 },
 /**
  * Abort current Pi operation. Priority command — cancels all pending commands
- * in the queue and sends abort directly. Waits for the SDK's done event.
+ * in the queue and sends abort directly. Waits for its exact SDK response.
  */
 async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -1425,7 +1425,7 @@ async piListExtensionPackages() : Promise<Result<PiExtensionPackage[], string>> 
 /**
  * Start a new Pi session (clears conversation history).
  * Serialized through the queue — waits for any in-flight work to complete,
- * then sends new_session and waits for the SDK's done event before returning.
+ * then sends new_session and waits for its exact SDK response before returning.
  */
 async piNewSession(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -2696,7 +2696,7 @@ startupError: string | null }
 export type PiProviderConfig = {
 /**
  * Transport backend. Omitted keeps the native Pi RPC implementation;
- * `acp` runs a registry-compatible ACP adapter through the bridge.
+ * `acp` runs a registry-compatible adapter through the official Rust SDK.
  */
 backend?: PiBackend | null;
 /**
