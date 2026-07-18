@@ -7,8 +7,8 @@
 //! Thin napi wrapper around [`screenpipe_recorder`]. All orchestration —
 //! ffmpeg pipelines, event-driven paired capture, multi-monitor, UI hook
 //! plumbing, filter watcher — lives in the `screenpipe-recorder` crate
-//! (`sdk/recorder-core/`). The Tauri plugin
-//! (`sdk/tauri/rust/`) depends on the same crate directly, so neither
+//! (`packages/sdk/recorder-core/`). The Tauri plugin
+//! (`packages/sdk/tauri/rust/`) depends on the same crate directly, so neither
 //! consumer has to spawn a Node bridge to drive the recorder.
 //!
 //! The structs in this file exist solely to give the JS side typed

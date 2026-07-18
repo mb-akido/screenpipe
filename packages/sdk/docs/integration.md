@@ -99,7 +99,7 @@ import Screenpipe
 
 let client = try ScreenpipeClient(
   configuration: .localPackage(
-    sdkRoot: URL(fileURLWithPath: "/path/to/screenpipe/sdk"),
+    sdkRoot: URL(fileURLWithPath: "/path/to/screenpipe/packages/sdk"),
     commandTimeout: 30
   )
 )
@@ -165,6 +165,6 @@ The SDK wraps the same primitives used by the main ScreenPipe project:
 - `screenpipe_core::video::{start_ffmpeg_process, write_frame_to_ffmpeg, finish_ffmpeg_process}` for MP4 encoding.
 - `screenpipe_a11y::tree` for focused-window metadata.
 
-The SDK lives in `sdk` and uses local path dependencies for the Screenpipe
+The SDK lives in `packages/sdk` and uses local path dependencies for the Screenpipe
 core crates, so SDK changes can be reviewed with the public monorepo code they
 wrap.

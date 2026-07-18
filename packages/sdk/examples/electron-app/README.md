@@ -17,7 +17,7 @@ Minimal Electron app that embeds the SDK with the packaged
 First, build the SDK prebuild (from repo root):
 
 ```bash
-cd /path/to/screenpipe/sdk
+cd /path/to/screenpipe/packages/sdk
 bun install
 bun run build          # release build — recommended for real perf
 ```

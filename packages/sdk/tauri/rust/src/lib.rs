@@ -5,7 +5,7 @@
 //! Native Tauri v2 plugin for the screenpipe SDK.
 //!
 //! The recorder lives in [`screenpipe_recorder`], a pure-Rust crate
-//! shared with the napi addon (`sdk`). This plugin owns a single
+//! shared with the napi addon (`packages/sdk`). This plugin owns a single
 //! [`Recorder`](screenpipe_recorder::Recorder) instance behind a tokio
 //! mutex and exposes it through Tauri commands. No Node binary, no
 //! stdio bridge, no child process — everything runs in-process inside
@@ -66,7 +66,7 @@ pub const SCREENPIPE_EVENT_CHANNEL: &str = "screenpipe://event";
 
 /// Stable taxonomy of event names the plugin will emit on
 /// [`SCREENPIPE_EVENT_CHANNEL`]. Keep in sync with `SCREENPIPE_EVENTS`
-/// in `sdk/session/index.js` — both sides should describe the same
+/// in `packages/sdk/session/index.js` — both sides should describe the same
 /// universe so renderers can allow-list without redeclaring.
 pub const SCREENPIPE_EVENTS: &[&str] = &[
     "start",

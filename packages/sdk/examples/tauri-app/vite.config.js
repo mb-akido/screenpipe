@@ -15,7 +15,7 @@ import { defineConfig } from "vite";
 export default defineConfig({
   // `bun install` symlinks `file:` deps. Vite's default is to follow
   // symlinks to the real path and resolve from there — which sends
-  // `@tauri-apps/api/*` lookups to the SDK source dir (`sdk/tauri/`)
+  // `@tauri-apps/api/*` lookups to the SDK source dir (`packages/sdk/tauri/`)
   // and out of reach of this example's `node_modules`. Preserving the
   // symlink keeps resolution rooted at `node_modules/@screenpipe/sdk/`
   // so the standard upward node_modules walk finds `@tauri-apps/api`

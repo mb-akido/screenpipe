@@ -13,7 +13,7 @@ npm install
 npm run dev
 ```
 
-The Rust plugin is **native** — `sdk/tauri/rust` depends on
+The Rust plugin is **native** — `packages/sdk/tauri/rust` depends on
 `screenpipe-recorder` directly and drives the recorder in-process inside
 the Tauri tokio runtime. No Node binary, no bridge script, no child
 process at runtime. The frontend uses `@screenpipe/sdk/tauri` and talks

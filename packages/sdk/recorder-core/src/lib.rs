@@ -4,8 +4,8 @@
 
 //! Pure-Rust orchestration for the screenpipe SDK.
 //!
-//! Two consumers today: the napi addon in `sdk` (Node/Electron) and
-//! the Tauri v2 plugin in `sdk/tauri/rust` (Rust, no Node bridge).
+//! Two consumers today: the napi addon in `packages/sdk` (Node/Electron) and
+//! the Tauri v2 plugin in `packages/sdk/tauri/rust` (Rust, no Node bridge).
 //! Both call into this crate directly. Anything that previously had to
 //! traverse `node-json-session.mjs` to drive the recorder happens here
 //! in-process now.

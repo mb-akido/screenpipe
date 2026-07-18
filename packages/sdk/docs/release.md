@@ -25,7 +25,7 @@ Human prerequisites:
 Dry-run locally:
 
 ```bash
-cd sdk
+cd packages/sdk
 bun install --frozen-lockfile
 cargo metadata --manifest-path Cargo.toml --format-version 1 --no-deps
 npm pack --dry-run --ignore-scripts
@@ -52,7 +52,7 @@ package.
 ## SwiftPM
 
 SwiftPM consumes packages from Git URLs and semver tags. Because this package is
-nested under `sdk`, the clean public Swift distribution is a mirror repo
+nested under `packages/sdk`, the clean public Swift distribution is a mirror repo
 whose root is the SDK folder.
 
 Recommended repo:
@@ -71,7 +71,7 @@ git clone git@github.com:screenpipe/sdk.git "$WORKDIR/sdk"
 rsync -a --delete \
   --exclude '.git' \
   --exclude 'node_modules' \
-  /path/to/screenpipe/sdk/ "$WORKDIR/sdk/"
+  /path/to/screenpipe/packages/sdk/ "$WORKDIR/sdk/"
 
 cd "$WORKDIR/sdk"
 swift test
@@ -97,7 +97,7 @@ Do not publish the current Rust SDK crate to crates.io yet.
 
 Current blockers:
 
-- `sdk/Cargo.toml` has `publish = false`.
+- `packages/sdk/Cargo.toml` has `publish = false`.
 - The native SDK depends on local monorepo crates through `path` dependencies.
 - crates.io packages cannot depend only on unpublished local path dependencies.
 - The SDK is enterprise-licensed, so any future Cargo package needs a
@@ -112,7 +112,7 @@ If a Rust package becomes necessary, prefer one of these narrower options:
 Dry-run command for a future Cargo package:
 
 ```bash
-cargo publish --dry-run --manifest-path sdk/tauri/rust/Cargo.toml
+cargo publish --dry-run --manifest-path packages/sdk/tauri/rust/Cargo.toml
 ```
 
 That command is expected to fail until `publish = false` is removed and the

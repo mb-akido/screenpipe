@@ -37,7 +37,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # All orchestration lives here. The Tauri plugin
-# (`sdk/tauri/rust`) depends on the same crate, so the recorder
+# (`packages/sdk/tauri/rust`) depends on the same crate, so the recorder
 # logic isn't duplicated and no Node bridge is needed for native hosts.
 screenpipe-recorder = { path = "recorder-core" }
 

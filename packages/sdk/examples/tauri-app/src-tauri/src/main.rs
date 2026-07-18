@@ -6,7 +6,7 @@
 //!
 //! Pre-v0.3 the plugin spawned a Node helper at runtime via
 //! `bridges/node-json-session.mjs` — that's gone now. The recorder is
-//! pure Rust (see `sdk/recorder-core`), so we just call
+//! pure Rust (see `packages/sdk/recorder-core`), so we just call
 //! `screenpipe_tauri::init` with the plugin config and the host app
 //! doesn't need to ship `node` or know where the SDK source lives.
 
