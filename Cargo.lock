@@ -8268,7 +8268,9 @@ dependencies = [
  "russh",
  "russh-sftp",
  "screenpipe-core",
+ "screenpipe-db",
  "screenpipe-secrets",
+ "screenpipe-sqlite-coordinator",
  "screenpipe-vault",
  "serde",
  "serde_json",
@@ -8595,6 +8597,7 @@ name = "screenpipe-sqlite-coordinator"
 version = "0.4.25"
 dependencies = [
  "libsqlite3-sys",
+ "sqlx",
  "tempfile",
  "tokio",
  "tracing",

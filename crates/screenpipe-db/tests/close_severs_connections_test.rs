@@ -11,13 +11,13 @@
 //! These tests model the incident directly:
 //!  * a "leaked" pool clone must be SEVERED by `DatabaseManager::close()`
 //!    (fail fast, not pin the WAL-index),
-//!  * after `close()` SQLite must have dropped the `-wal`/`-shm` sidecars —
-//!    the file-level proof that zero connections survived teardown,
+//!  * `close()` must not checkpoint or rewrite WAL bytes while quarantining —
+//!    `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` intentionally leaves sidecars present,
 //!  * a fresh `DatabaseManager` on the same file must then init and write,
 //!  * repeated restart cycles (the engine-respawn path) must stay clean.
 
 use screenpipe_config::{DbConfig, DeviceTier};
-use screenpipe_db::DatabaseManager;
+use screenpipe_db::{DatabaseManager, SqliteHardFault};
 
 fn temp_db_path(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!("sp_close_test_{}_{}", tag, std::process::id()));
@@ -26,27 +26,12 @@ fn temp_db_path(tag: &str) -> String {
     dir.join("db.sqlite").to_string_lossy().into_owned()
 }
 
-/// Wait (bounded) for SQLite to unlink the WAL sidecars after the last
-/// connection closes. `close()` resolves when the pools are closed; the OS
-/// unlink is usually immediate after that, but Linux CI can lag under load.
-async fn assert_wal_sidecars_gone(db_path: &str) {
-    let wal_path = format!("{db_path}-wal");
-    let shm_path = format!("{db_path}-shm");
-    for _ in 0..200 {
-        let wal = std::path::Path::new(&wal_path).exists();
-        let shm = std::path::Path::new(&shm_path).exists();
-        if !wal && !shm {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+fn read_optional(path: &str) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("failed to read SQLite sidecar {path}: {error}"),
     }
-    let wal = std::path::Path::new(&wal_path).exists();
-    let shm = std::path::Path::new(&shm_path).exists();
-    panic!(
-        "-wal/-shm still present after close() — a SQLite connection survived teardown \
-         (the exact leak that made the 2026-07-02 wedge unrecoverable in-process); \
-         wal={wal}, shm={shm}"
-    );
 }
 
 #[tokio::test]
@@ -66,6 +51,9 @@ async fn close_severs_leaked_pool_clones_and_allows_reinit() {
         .await
         .expect("leaked clone works before close");
 
+    let database_before_close = std::fs::read(&db_path).expect("read database before close");
+    let wal_path = format!("{db_path}-wal");
+    let wal_before_close = read_optional(&wal_path);
     db.close().await;
 
     // The leaked clone must be severed — fail fast with a closed-pool error
@@ -76,9 +64,17 @@ async fn close_severs_leaked_pool_clones_and_allows_reinit() {
         "leaked pool clone must be unusable after DatabaseManager::close()"
     );
 
-    // File-level proof that ZERO connections survived: SQLite only deletes
-    // -wal/-shm when the LAST connection to the db closes.
-    assert_wal_sidecars_gone(&db_path).await;
+    assert!(leaked.is_closed(), "every pool clone must be marked closed");
+    assert_eq!(
+        std::fs::read(&db_path).expect("read database after close"),
+        database_before_close,
+        "pool close must not checkpoint into the main database"
+    );
+    assert_eq!(
+        read_optional(&wal_path),
+        wal_before_close,
+        "pool close must preserve WAL evidence byte-for-byte"
+    );
 
     // And the same process can re-open the db cleanly — the step that failed
     // with (code: 522) disk I/O error for hours on 2026-07-02.
@@ -113,7 +109,6 @@ async fn repeated_restart_cycles_reopen_cleanly() {
             .await
             .unwrap_or_else(|e| panic!("cycle {cycle}: write failed: {e}"));
         db.close().await;
-        assert_wal_sidecars_gone(&db_path).await;
     }
 
     // All five cycles' writes survived the churn.
@@ -124,4 +119,57 @@ async fn repeated_restart_cycles_reopen_cleanly() {
         .unwrap();
     assert_eq!(count.0, 5);
     db.close().await;
+}
+
+#[tokio::test]
+async fn hard_fault_tombstone_blocks_secret_pool_reopen_after_manager_teardown() {
+    let db_path = temp_db_path("secret_tombstone");
+    let config = DbConfig::for_tier(DeviceTier::Low);
+    screenpipe_secrets::close_all_secret_pools().await;
+
+    let db = DatabaseManager::new(&db_path, config)
+        .await
+        .expect("initial manager");
+    let store = screenpipe_secrets::SecretStore::open(&db_path, None)
+        .await
+        .expect("initial secret store");
+    store
+        .set("before-fault", b"preserved")
+        .await
+        .expect("seed secret");
+
+    db.hard_fault_reporter()
+        .report_fault(SqliteHardFault::Corrupt { code: 11 });
+    db.close().await;
+    screenpipe_secrets::close_all_secret_pools().await;
+    drop(store);
+
+    let trio_paths = [
+        db_path.clone(),
+        format!("{db_path}-wal"),
+        format!("{db_path}-shm"),
+    ];
+    let before_reopen = trio_paths
+        .iter()
+        .map(|path| read_optional(path))
+        .collect::<Vec<_>>();
+
+    let error = match screenpipe_secrets::SecretStore::open(&db_path, None).await {
+        Ok(_) => panic!("a background secret task must not reopen a quarantined database"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("hard fault")
+            || error.to_string().contains("coordinator is closed"),
+        "unexpected reopen error: {error:#}"
+    );
+
+    let after_reopen = trio_paths
+        .iter()
+        .map(|path| read_optional(path))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_reopen, before_reopen,
+        "rejected reopen must not mutate the database, WAL, or SHM"
+    );
 }

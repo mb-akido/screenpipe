@@ -283,13 +283,17 @@ impl DatabaseManager {
         let mut last_error = None;
         for attempt in 1..=max_retries {
             let mut conn = self.pool.acquire().await?;
-            match sqlx::query_as::<_, (i64,)>(
+            let result = sqlx::query_as::<_, (i64,)>(
                 "SELECT COUNT(*) FROM meetings WHERE meeting_end IS NULL",
             )
             .fetch_one(&mut *conn)
-            .await
-            {
+            .await;
+            match result {
                 Ok(row) => return Ok(row.0 > 0),
+                Err(e) if self.hard_fault_reporter.report_error(&e).is_some() => {
+                    let _raw = conn.detach();
+                    return Err(e);
+                }
                 Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
                     warn!(
                         "db: has_active_meeting read connection error (attempt {}/{}), detaching connection: {}",
@@ -317,15 +321,19 @@ impl DatabaseManager {
         let mut last_error = None;
         for attempt in 1..=max_retries {
             let mut conn = self.pool.acquire().await?;
-            match sqlx::query_as::<_, MeetingRecord>(
+            let result = sqlx::query_as::<_, MeetingRecord>(
                 "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
                  detection_source, created_at FROM meetings WHERE id = ?1 AND meeting_end IS NULL",
             )
             .bind(id)
             .fetch_optional(&mut *conn)
-            .await
-            {
+            .await;
+            match result {
                 Ok(meeting) => return Ok(meeting),
+                Err(e) if self.hard_fault_reporter.report_error(&e).is_some() => {
+                    let _raw = conn.detach();
+                    return Err(e);
+                }
                 Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
                     warn!(
                         "db: get_active_meeting_by_id read connection error (attempt {}/{}), detaching connection: {}",
@@ -350,13 +358,17 @@ impl DatabaseManager {
         let mut last_error = None;
         for attempt in 1..=max_retries {
             let mut conn = self.pool.acquire().await?;
-            match sqlx::query_as::<_, (i64,)>(
+            let result = sqlx::query_as::<_, (i64,)>(
                 "SELECT id FROM meetings WHERE meeting_end IS NULL ORDER BY id DESC LIMIT 1",
             )
             .fetch_optional(&mut *conn)
-            .await
-            {
+            .await;
+            match result {
                 Ok(row) => return Ok(row.map(|r| r.0)),
+                Err(e) if self.hard_fault_reporter.report_error(&e).is_some() => {
+                    let _raw = conn.detach();
+                    return Err(e);
+                }
                 Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
                     warn!(
                         "db: get_most_recent_active_meeting_id read connection error (attempt {}/{}), detaching connection: {}",
@@ -381,15 +393,19 @@ impl DatabaseManager {
         let mut last_error = None;
         for attempt in 1..=max_retries {
             let mut conn = self.pool.acquire().await?;
-            match sqlx::query_as::<_, MeetingRecord>(
+            let result = sqlx::query_as::<_, MeetingRecord>(
                 "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
                  detection_source, created_at FROM meetings WHERE meeting_end IS NULL \
                  ORDER BY id DESC LIMIT 1",
             )
             .fetch_optional(&mut *conn)
-            .await
-            {
+            .await;
+            match result {
                 Ok(meeting) => return Ok(meeting),
+                Err(e) if self.hard_fault_reporter.report_error(&e).is_some() => {
+                    let _raw = conn.detach();
+                    return Err(e);
+                }
                 Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
                     warn!(
                         "db: get_most_recent_active_meeting read connection error (attempt {}/{}), detaching connection: {}",
@@ -458,8 +474,13 @@ impl DatabaseManager {
             q = q.bind(limit).bind(offset);
 
             let mut conn = self.pool.acquire().await?;
-            match q.fetch_all(&mut *conn).await {
+            let result = q.fetch_all(&mut *conn).await;
+            match result {
                 Ok(meetings) => return Ok(meetings),
+                Err(e) if self.hard_fault_reporter.report_error(&e).is_some() => {
+                    let _raw = conn.detach();
+                    return Err(e);
+                }
                 Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
                     warn!(
                         "db: list_meetings read connection error (attempt {}/{}), detaching connection: {}",
@@ -484,15 +505,19 @@ impl DatabaseManager {
         let mut last_error = None;
         for attempt in 1..=max_retries {
             let mut conn = self.pool.acquire().await?;
-            match sqlx::query_as::<_, MeetingRecord>(
+            let result = sqlx::query_as::<_, MeetingRecord>(
                 "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
                  detection_source, created_at FROM meetings WHERE id = ?1",
             )
             .bind(id)
             .fetch_one(&mut *conn)
-            .await
-            {
+            .await;
+            match result {
                 Ok(meeting) => return Ok(meeting),
+                Err(e) if self.hard_fault_reporter.report_error(&e).is_some() => {
+                    let _raw = conn.detach();
+                    return Err(e);
+                }
                 Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
                     warn!(
                         "db: get_meeting_by_id read connection error (attempt {}/{}), detaching connection: {}",

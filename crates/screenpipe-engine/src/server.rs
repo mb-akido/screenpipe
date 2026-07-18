@@ -80,7 +80,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -91,6 +91,53 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::DefaultMakeSpan,
 };
+
+/// Shared owner for background tasks that may capture DB, SecretStore, or
+/// AudioManager handles. Registration is fail-closed after shutdown begins:
+/// a racing late spawn is aborted immediately instead of escaping teardown.
+#[derive(Clone, Default)]
+pub struct BackgroundTaskRegistry {
+    inner: Arc<BackgroundTaskRegistryInner>,
+}
+
+#[derive(Default)]
+struct BackgroundTaskRegistryInner {
+    closed: AtomicBool,
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl BackgroundTaskRegistry {
+    pub fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.register(tokio::spawn(future));
+    }
+
+    pub fn register(&self, task: tokio::task::JoinHandle<()>) {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            task.abort();
+            return;
+        }
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if self.inner.closed.load(Ordering::SeqCst) {
+            task.abort();
+        } else {
+            tasks.push(task);
+        }
+    }
+
+    pub async fn abort_all(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        let tasks = {
+            let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *tasks)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+}
 
 /// Bind a TcpListener with SO_REUSEADDR on Windows to avoid TIME_WAIT port conflicts.
 /// On non-Windows platforms, falls back to the standard tokio bind.
@@ -230,6 +277,9 @@ pub struct SCServer {
     audio_disabled: bool,
     use_pii_removal: bool,
     sync_handle: Option<Arc<SyncServiceHandle>>,
+    /// Runtime sync tasks shared with the desktop owner so shutdown can stop
+    /// detached upload/download loops before closing DatabaseManager.
+    pub sync_state: SyncState,
     video_quality: String,
     pipe_manager: Option<crate::pipes_api::SharedPipeManager>,
     pub vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
@@ -279,6 +329,8 @@ pub struct SCServer {
     /// warming the hot frame cache from the DB at startup (the cache is only
     /// read by the timeline streaming endpoint). Set before `start()`.
     pub timeline_disabled: bool,
+    /// Every server-created background task that can retain runtime resources.
+    pub background_tasks: BackgroundTaskRegistry,
     /// Advertise this instance over mDNS. Disabled for loopback-only binds
     /// because LAN clients cannot reach those addresses and Windows may show a
     /// firewall prompt for an otherwise local-only CLI run.
@@ -349,6 +401,7 @@ impl SCServer {
             audio_manager,
             use_pii_removal,
             sync_handle: None,
+            sync_state: sync_api::new_sync_state(),
             video_quality,
             pipe_manager: None,
             vision_metrics: Arc::new(screenpipe_screen::PipelineMetrics::new()),
@@ -368,6 +421,7 @@ impl SCServer {
             high_fps_controller: None,
             vision_manager: Arc::new(ArcSwap::from_pointee(None)),
             timeline_disabled: false,
+            background_tasks: BackgroundTaskRegistry::default(),
             advertise_mdns: should_advertise_mdns(addr),
         }
     }
@@ -485,7 +539,7 @@ impl SCServer {
         if analytics_enabled {
             // Spawn periodic API usage reporter (every 5 minutes)
             let counter_clone = api_request_count.clone();
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(300));
                 loop {
                     interval.tick().await;
@@ -500,7 +554,7 @@ impl SCServer {
 
             // Spawn periodic vision pipeline metrics reporter (every 60 seconds)
             let metrics_for_posthog = self.vision_metrics.clone();
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
@@ -555,7 +609,7 @@ impl SCServer {
             // Spawn periodic audio pipeline metrics reporter (every 60 seconds)
             let audio_metrics_for_posthog = self.audio_metrics.clone();
             let audio_manager_for_posthog = self.audio_manager.clone();
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
@@ -626,7 +680,7 @@ impl SCServer {
         } else {
             let cache = hot_frame_cache.clone();
             let db = self.db.clone();
-            tokio::spawn(async move {
+            self.background_tasks.spawn(async move {
                 cache.warm_from_db(&db, 24).await;
             });
         }
@@ -675,7 +729,7 @@ impl SCServer {
             // Cloud sync service handle (from CLI)
             sync_handle: self.sync_handle.clone(),
             // Runtime sync state (initialized via /sync/init)
-            sync_state: sync_api::new_sync_state(),
+            sync_state: self.sync_state.clone(),
             video_quality: self.video_quality.clone(),
             api_request_count: api_request_count.clone(),
             pipe_manager: self.pipe_manager.clone(),
