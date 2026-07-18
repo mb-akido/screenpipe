@@ -33,7 +33,6 @@ use tracing::{debug, info, warn};
 
 use super::frame_redactor::{redact_frame, FrameRedactionOutcome};
 use super::{ImageRedactionPolicy, ImageRedactor};
-use crate::Redactor;
 
 /// Knobs for the image reconciliation worker.
 ///
@@ -333,16 +332,11 @@ impl ImageWorker {
                 anyhow::anyhow!("read image dimensions for {}: {e}", path.display())
             })?;
 
-            let augmented = crate::a11y_context::augment_text("", Some(tree));
-            let regex = crate::adapters::regex::RegexRedactor::new();
-            let regex_out = regex.redact(&augmented.text).await?;
-            let mut a11y_regions =
-                crate::a11y_context::forced_image_regions(tree, image_width, image_height);
-            a11y_regions.extend(augmented.sensitive_regions(
-                &regex_out.spans,
-                image_width,
-                image_height,
-            ));
+            // Parse once and add only deterministic high-confidence fields.
+            // Generic inputs remain RF-DETR-confirmed. If text redaction ran
+            // first, values it marked `[SECRET]` are also force-masked here.
+            let context = crate::a11y_context::A11yContext::parse(tree).unwrap_or_default();
+            let a11y_regions = context.forced_image_regions(image_width, image_height);
             crate::a11y_context::merge_image_regions(&mut regions, a11y_regions);
         }
         let outcome =
@@ -536,6 +530,39 @@ mod tests {
         assert_eq!(image.get_pixel(2, 2).0, [0, 0, 0], "model region missing");
         assert_eq!(image.get_pixel(55, 55).0, [0, 0, 0], "a11y region missing");
         assert_eq!(image.get_pixel(90, 90).0, [255, 255, 255]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generic_input_stays_model_confirmed() {
+        let pool = setup().await;
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("frame.png");
+        white_test_image(&image_path);
+        let tree = r#"[{"role":"AXTextArea","value":"ordinary prompt","bounds":{"left":0.5,"top":0.5,"width":0.2,"height":0.1},"on_screen":true}]"#;
+        sqlx::query(
+            "INSERT INTO frames (id, timestamp, name, app_name, window_name, accessibility_tree_json) VALUES (1, datetime('now','-1 hour'), ?1, 'Arc', 'Chat', ?2)",
+        )
+        .bind(image_path.to_string_lossy().into_owned())
+        .bind(tree)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let detector = Arc::new(CountingSecretDetector {
+            calls: AtomicUsize::new(0),
+        });
+        let cfg = ImageWorkerConfig {
+            min_age_seconds: 0,
+            resource_governor: None,
+            ..Default::default()
+        };
+        let worker = ImageWorker::new(pool, detector.clone(), cfg);
+        let outcome = worker.process_one().await.unwrap().unwrap();
+
+        assert_eq!(detector.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.regions_redacted, 1);
+        let image = image::open(&image_path).unwrap().to_rgb8();
+        assert_eq!(image.get_pixel(55, 55).0, [255, 255, 255]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

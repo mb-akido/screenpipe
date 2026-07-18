@@ -18,6 +18,8 @@ use serde_json::Value;
 use crate::{ImageRegion, RedactedSpan, SpanLabel};
 
 const MAX_CONTEXT_VALUE_BYTES: usize = 4096;
+const MAX_CONTEXT_BYTES: usize = 16 * 1024;
+const MAX_CONTEXT_FIELDS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NormalizedBounds {
@@ -96,11 +98,84 @@ pub struct InputField {
     hint: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct A11yContext {
+    fields: Vec<InputField>,
+}
+
+impl A11yContext {
+    pub fn parse(blob: &str) -> Result<Self, serde_json::Error> {
+        let value: Value = serde_json::from_str(blob)?;
+        let mut fields = Vec::new();
+        collect_nodes(&value, &mut fields);
+        Ok(Self { fields })
+    }
+
+    /// Add bounded, forced-first input semantics to the existing text-model
+    /// input. Forced fields are prioritized so a page with many ordinary
+    /// controls cannot crowd a password/API-key field out of the budget.
+    pub fn augment_text(&self, base: &str) -> AugmentedText {
+        let mut text = base.to_string();
+        let mut payloads = Vec::new();
+        let mut context_bytes = 0usize;
+
+        let fields = self
+            .fields
+            .iter()
+            .filter(|field| field.force_secret)
+            .chain(self.fields.iter().filter(|field| !field.force_secret));
+        for field in fields {
+            if payloads.len() >= MAX_CONTEXT_FIELDS {
+                break;
+            }
+            if field.value.is_empty() || field.value.len() > MAX_CONTEXT_VALUE_BYTES {
+                continue;
+            }
+
+            let mut prefix = String::from("\n[a11y_input role=");
+            prefix.push_str(&sanitize_metadata(&field.role));
+            if !field.hint.is_empty() {
+                prefix.push_str(" hint=");
+                prefix.push_str(&sanitize_metadata(&field.hint));
+            }
+            prefix.push_str("] ");
+            prefix.push_str(field.context_key);
+            prefix.push('=');
+            let added = prefix.len() + field.value.len();
+            if context_bytes.saturating_add(added) > MAX_CONTEXT_BYTES {
+                continue;
+            }
+
+            text.push_str(&prefix);
+            let start = text.len();
+            text.push_str(&field.value);
+            let end = text.len();
+            context_bytes += added;
+            payloads.push(PayloadRange {
+                range: start..end,
+                value: field.value.clone(),
+                force_secret: field.force_secret,
+            });
+        }
+        AugmentedText { text, payloads }
+    }
+
+    /// Bounds that are sensitive without model confirmation: secure/password
+    /// controls, credential-labelled fields, or values already replaced by
+    /// the text worker with `[SECRET]`.
+    pub fn forced_image_regions(&self, image_width: u32, image_height: u32) -> Vec<ImageRegion> {
+        self.fields
+            .iter()
+            .filter(|field| field.force_secret)
+            .filter_map(|field| field.bounds?.to_image_region(image_width, image_height))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PayloadRange {
     pub range: Range<usize>,
     pub value: String,
-    pub bounds: Option<NormalizedBounds>,
     pub force_secret: bool,
 }
 
@@ -144,85 +219,18 @@ impl AugmentedText {
         }
         pairs
     }
-
-    pub fn sensitive_regions(
-        &self,
-        spans: &[RedactedSpan],
-        image_width: u32,
-        image_height: u32,
-    ) -> Vec<ImageRegion> {
-        self.payloads
-            .iter()
-            .filter(|payload| {
-                payload.force_secret
-                    || spans.iter().any(|span| {
-                        span.label == SpanLabel::Secret
-                            && span.start < payload.range.end
-                            && span.end > payload.range.start
-                    })
-            })
-            .filter_map(|payload| payload.bounds?.to_image_region(image_width, image_height))
-            .collect()
-    }
-}
-
-pub fn parse_input_fields(blob: &str) -> Result<Vec<InputField>, serde_json::Error> {
-    let value: Value = serde_json::from_str(blob)?;
-    let mut fields = Vec::new();
-    collect_nodes(&value, &mut fields);
-    Ok(fields)
 }
 
 pub fn augment_text(base: &str, tree_json: Option<&str>) -> AugmentedText {
-    let mut text = base.to_string();
-    let mut payloads = Vec::new();
     let Some(blob) = tree_json else {
-        return AugmentedText { text, payloads };
+        return AugmentedText {
+            text: base.to_string(),
+            payloads: Vec::new(),
+        };
     };
-    let Ok(fields) = parse_input_fields(blob) else {
-        return AugmentedText { text, payloads };
-    };
-
-    for field in fields {
-        if field.value.is_empty() || field.value.len() > MAX_CONTEXT_VALUE_BYTES {
-            continue;
-        }
-        text.push_str("\n[a11y_input role=");
-        text.push_str(&sanitize_metadata(&field.role));
-        if !field.hint.is_empty() {
-            text.push_str(" hint=");
-            text.push_str(&sanitize_metadata(&field.hint));
-        }
-        text.push_str("] ");
-        text.push_str(field.context_key);
-        text.push('=');
-        let start = text.len();
-        text.push_str(&field.value);
-        let end = text.len();
-        payloads.push(PayloadRange {
-            range: start..end,
-            value: field.value,
-            bounds: field.bounds,
-            force_secret: field.force_secret,
-        });
-    }
-    AugmentedText { text, payloads }
-}
-
-/// Bounds that are sensitive without needing model confirmation: secure /
-/// password controls, credential-labelled fields, or values already replaced
-/// by the text worker with `[SECRET]`.
-pub fn forced_image_regions(
-    tree_json: &str,
-    image_width: u32,
-    image_height: u32,
-) -> Vec<ImageRegion> {
-    parse_input_fields(tree_json)
+    A11yContext::parse(blob)
         .unwrap_or_default()
-        .into_iter()
-        .filter(|field| field.force_secret)
-        .filter_map(|field| field.bounds?.to_image_region(image_width, image_height))
-        .collect()
+        .augment_text(base)
 }
 
 /// Union accessibility regions with model detections. Overlapping Secret
@@ -283,6 +291,7 @@ fn collect_nodes(value: &Value, fields: &mut Vec<InputField>) {
                             == Some(true)
                             || role_is_secure(role)
                             || looks_credential_label(&hint)
+                            || looks_like_secret_value(&value)
                             || value.contains(SpanLabel::Secret.placeholder());
                         let context_key = if force_secret {
                             "password"
@@ -396,6 +405,53 @@ fn looks_credential_label(label: &str) -> bool {
     .any(|needle| label.contains(needle))
 }
 
+/// High-confidence token shapes used by the image-only path. This deliberately
+/// stays small and allocation-free instead of initializing the full text regex
+/// engine (~56 MB RSS). Ambiguous high-entropy strings remain model-confirmed.
+fn looks_like_secret_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    let known_prefix = [
+        "sk-",
+        "sk_",
+        "github_pat_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+        "xapp-",
+        "AIza",
+        "whsec_",
+        "hf_",
+        "npm_",
+        "pypi-",
+        "age-secret-key-",
+        "tskey-",
+        "flwseck",
+        "sg.",
+    ]
+    .iter()
+    .any(|prefix| starts_with_ignore_ascii_case(trimmed, prefix));
+
+    (known_prefix && trimmed.len() >= 20)
+        || ((trimmed.starts_with("AKIA") || trimmed.starts_with("ASIA")) && trimmed.len() == 20)
+        || (starts_with_ignore_ascii_case(trimmed, "bearer ") && trimmed.len() > 23)
+        || (trimmed.starts_with("eyJ") && trimmed.matches('.').count() == 2)
+        || (trimmed.contains("-----BEGIN")
+            && (trimmed.contains("PRIVATE KEY") || trimmed.contains("SECRET KEY")))
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 fn sanitize_metadata(value: &str) -> String {
     value
         .chars()
@@ -435,7 +491,7 @@ mod tests {
           {"role":"Document","text":"editor","is_keyboard_focusable":true,"bounds":{"left":0.1,"top":0.1,"width":0.4,"height":0.4}},
           {"role":"AXButton","text":"ignore me","bounds":{"left":0,"top":0,"width":1,"height":1}}
         ]"#;
-        let fields = parse_input_fields(blob).unwrap();
+        let fields = A11yContext::parse(blob).unwrap().fields;
         assert_eq!(fields.len(), 4);
         assert_eq!(fields[0].bounds.unwrap().left, 0.1);
         assert_eq!(fields[1].bounds.unwrap().width, 0.4);
@@ -447,11 +503,49 @@ mod tests {
     fn credential_hint_forces_secret_but_generic_input_does_not() {
         let blob = r#"[
           {"role":"AXTextField","value":"hunter2","placeholder":"API key"},
+          {"role":"AXTextField","value":"sk-admin-abcdefghijklmnopqrstuvwxyz"},
           {"role":"AXTextArea","value":"ordinary prompt"}
         ]"#;
-        let fields = parse_input_fields(blob).unwrap();
+        let fields = A11yContext::parse(blob).unwrap().fields;
         assert!(fields[0].force_secret);
-        assert!(!fields[1].force_secret);
+        assert!(fields[1].force_secret);
+        assert!(!fields[2].force_secret);
+    }
+
+    #[test]
+    fn lightweight_secret_shapes_are_high_confidence_only() {
+        assert!(looks_like_secret_value(
+            "sk-admin-abcdefghijklmnopqrstuvwxyz"
+        ));
+        assert!(looks_like_secret_value("AKIAIOSFODNN7EXAMPLE"));
+        assert!(looks_like_secret_value(
+            "eyJhbGciOiJIUzI1NiJ9.payload.signature"
+        ));
+        assert!(!looks_like_secret_value("sk-short"));
+        assert!(!looks_like_secret_value("ordinary prompt"));
+    }
+
+    #[test]
+    fn context_budget_is_bounded_and_prioritizes_forced_fields() {
+        let mut nodes = (0..40)
+            .map(|i| {
+                serde_json::json!({
+                    "role": "AXTextArea",
+                    "value": format!("ordinary-{i}-{}", "x".repeat(900))
+                })
+            })
+            .collect::<Vec<_>>();
+        nodes.push(serde_json::json!({
+            "role": "AXTextField",
+            "value": "opaque-credential",
+            "placeholder": "API key"
+        }));
+        let tree = serde_json::to_string(&nodes).unwrap();
+        let augmented = A11yContext::parse(&tree).unwrap().augment_text("base");
+
+        assert!(augmented.text.contains("opaque-credential"));
+        assert!(augmented.payloads.len() <= MAX_CONTEXT_FIELDS);
+        assert!(augmented.text.len() - "base".len() <= MAX_CONTEXT_BYTES);
     }
 
     #[test]
@@ -470,16 +564,13 @@ mod tests {
 
     #[test]
     fn secure_empty_field_still_produces_image_region() {
-        let fields = parse_input_fields(
+        let context = A11yContext::parse(
             r#"[{"role":"AXSecureTextField","is_password":true,"bounds":{"left":0.1,"top":0.2,"width":0.3,"height":0.1}}]"#,
         )
         .unwrap();
-        assert_eq!(fields.len(), 1);
-        let region = fields[0]
-            .bounds
-            .unwrap()
-            .to_image_region(1000, 500)
-            .unwrap();
+        let regions = context.forced_image_regions(1000, 500);
+        assert_eq!(regions.len(), 1);
+        let region = &regions[0];
         assert_eq!(region.bbox, [98, 98, 304, 54]);
     }
 
