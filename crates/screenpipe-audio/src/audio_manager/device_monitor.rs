@@ -90,6 +90,37 @@ fn is_session_type_streaming(
 
 use super::{AudioManager, AudioManagerStatus};
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScreenLockAudioGate {
+    suspended: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ScreenLockAudioAction {
+    None,
+    Suspend,
+    Resume,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ScreenLockAudioGate {
+    fn update(&mut self, should_suspend: bool) -> ScreenLockAudioAction {
+        match (self.suspended, should_suspend) {
+            (false, true) => {
+                self.suspended = true;
+                ScreenLockAudioAction::Suspend
+            }
+            (true, false) => {
+                self.suspended = false;
+                ScreenLockAudioAction::Resume
+            }
+            _ => ScreenLockAudioAction::None,
+        }
+    }
+}
+
 /// Exponential backoff for device recovery.
 ///
 /// Transient errors (e.g., ScreenCaptureKit not yet initialized) use a short
@@ -585,6 +616,15 @@ pub async fn start_device_monitor(
         // the stable path on any gap. Pure decider in `meeting_piggyback.rs`.
         let mut piggyback_state = super::meeting_piggyback::PiggybackState::default();
 
+        // macOS CoreAudio keeps a PreventUserIdleSystemSleep assertion for as
+        // long as an input/output stream remains open. Merely skipping samples
+        // while the display is locked leaves that assertion alive and prevents
+        // the machine from completing idle sleep. Track the lock edge so every
+        // stream is torn down exactly once, then enrolled for normal reconnect
+        // after unlock.
+        #[cfg(target_os = "macos")]
+        let mut screen_lock_audio_gate = ScreenLockAudioGate::default();
+
         // Initialize tracker with current defaults
         let _ = default_tracker.check_input_changed();
         let _ = default_tracker.check_output_changed().await;
@@ -605,6 +645,61 @@ pub async fn start_device_monitor(
 
         loop {
             if audio_manager.status().await == AudioManagerStatus::Running {
+                #[cfg(target_os = "macos")]
+                {
+                    let should_suspend = screenpipe_config::should_pause_audio_for_lock();
+                    match screen_lock_audio_gate.update(should_suspend) {
+                        ScreenLockAudioAction::Suspend => {
+                            let session_devices = audio_manager.session_devices();
+                            for device_name in &session_devices {
+                                if let Ok(device) = parse_audio_device(device_name) {
+                                    let _ = audio_manager.stop_session_device(&device).await;
+                                }
+                            }
+
+                            // Piggyback may have suspended the stable mic/output
+                            // while session streams were active. Lift those
+                            // guards without restarting yet; the screen-lock
+                            // gate below keeps every start path closed.
+                            for device_name in audio_manager.suspended_devices() {
+                                audio_manager.unsuspend_device(&device_name);
+                            }
+                            piggyback_state = super::meeting_piggyback::PiggybackState::default();
+
+                            let current_devices = audio_manager.current_devices();
+                            for device in &current_devices {
+                                if let Err(e) = audio_manager.stop_device_recording(device).await {
+                                    warn!(
+                                        "failed to stop audio device {} for screen lock: {}",
+                                        device, e
+                                    );
+                                }
+                            }
+                            info!(
+                                "screen locked: released {} audio stream(s) so macOS can idle sleep",
+                                current_devices.len() + session_devices.len()
+                            );
+                        }
+                        ScreenLockAudioAction::Resume => {
+                            let enabled_devices = audio_manager.enabled_devices().await;
+                            for device_name in enabled_devices {
+                                disconnected_devices.insert(device_name.clone());
+                                disconnected_device_backoffs.remove(&device_name);
+                            }
+                            info!("screen unlocked: scheduling audio stream recovery");
+                        }
+                        ScreenLockAudioAction::None => {}
+                    }
+
+                    if should_suspend {
+                        tokio::select! {
+                            _ = sleep(Duration::from_secs(1)) => {}
+                            _ = super::piggyback_listeners::sweep_wake_notified() => {}
+                        }
+                        continue;
+                    }
+                }
+
                 // Check if sleep/wake or display reconfiguration requested
                 // audio stream invalidation. Force-cycle all running devices
                 // to recover from silent CoreAudio stream failures.
@@ -2167,6 +2262,17 @@ impl RestartCooldown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_lock_audio_gate_tears_down_and_resumes_once_per_edge() {
+        let mut gate = ScreenLockAudioGate::default();
+
+        assert_eq!(gate.update(false), ScreenLockAudioAction::None);
+        assert_eq!(gate.update(true), ScreenLockAudioAction::Suspend);
+        assert_eq!(gate.update(true), ScreenLockAudioAction::None);
+        assert_eq!(gate.update(false), ScreenLockAudioAction::Resume);
+        assert_eq!(gate.update(false), ScreenLockAudioAction::None);
+    }
 
     lazy_static::lazy_static! {
         /// Default for builders that don't exercise the fail-over-to-any-available

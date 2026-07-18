@@ -779,6 +779,15 @@ impl AudioManager {
             return Ok(());
         }
 
+        #[cfg(target_os = "macos")]
+        if screenpipe_config::should_pause_audio_for_lock() {
+            debug!(
+                "skipping start of audio device while screen is locked: {}",
+                device
+            );
+            return Ok(());
+        }
+
         // Don't restart devices that are paused due to DRM content detection.
         // The monitor watcher will call start_output_devices() when DRM clears.
         if self
@@ -870,6 +879,14 @@ impl AudioManager {
         tap_pids: Option<Vec<i32>>,
     ) -> Result<()> {
         if self.options.read().await.is_disabled {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        if screenpipe_config::should_pause_audio_for_lock() {
+            debug!(
+                "skipping start of meeting-session audio device while screen is locked: {}",
+                device
+            );
             return Ok(());
         }
         // Insert BEFORE starting: the audio-receiver drop-gate bypass must see
