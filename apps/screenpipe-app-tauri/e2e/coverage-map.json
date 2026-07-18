@@ -159,6 +159,16 @@
       "notes": "Home webview, routing, reload, focus, resize, and storage stability."
     },
     {
+      "spec": "db-hard-fault-fail-closed.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["database", "local-api", "notifications", "tauri-command"],
+      "features": ["app-launch", "local-api-auth", "notifications", "database-hard-fault-recovery"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "mixed",
+      "notes": "Opt-in isolated desktop regression damages a real SQLite leaf page after the production DatabaseManager hook is wired, then proves recovery surfacing, engine/capture teardown, and no in-process respawn past the watchdog threshold."
+    },
+    {
       "spec": "audio-fallback.spec.ts",
       "platforms": ["macos"],
       "layers": ["audio-device", "settings", "notifications"],

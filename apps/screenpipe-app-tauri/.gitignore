@@ -17,6 +17,7 @@ e2e/screenshots/
 e2e/results/
 e2e/COVERAGE.runtime.md
 e2e/dist/
+.e2e-evidence/
 
 # next.js
 /.next/
@@ -57,4 +58,3 @@ ffprobe*
 *src-tauri/ollama*
 *src-tauri/bun*
 *src-tauri/ollama*
-

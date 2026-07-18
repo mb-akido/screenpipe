@@ -10939,7 +10939,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-app"
-version = "2.5.120"
+version = "2.5.121"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -11002,6 +11002,7 @@ dependencies = [
  "screenpipe-redact",
  "screenpipe-screen",
  "screenpipe-secrets",
+ "screenpipe-sqlite-coordinator",
  "screenpipe-sync",
  "screenpipe-vault",
  "security-framework",
@@ -11013,6 +11014,7 @@ dependencies = [
  "sha2 0.10.9",
  "specta",
  "specta-typescript",
+ "sqlx",
  "sysinfo",
  "tauri",
  "tauri-build",
@@ -11177,6 +11179,7 @@ dependencies = [
  "russh-sftp",
  "screenpipe-core",
  "screenpipe-secrets",
+ "screenpipe-sqlite-coordinator",
  "screenpipe-vault",
  "serde",
  "serde_json",
@@ -11467,6 +11470,7 @@ name = "screenpipe-sqlite-coordinator"
 version = "0.4.25"
 dependencies = [
  "libsqlite3-sys",
+ "sqlx",
  "tokio",
  "tracing",
 ]
