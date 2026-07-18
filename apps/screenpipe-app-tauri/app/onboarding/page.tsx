@@ -29,6 +29,68 @@ const SLIDE_WINDOW_SIZES: Record<SlideKey, { width: number; height: number }> =
     pipe: { width: 500, height: 500 },
   };
 
+const SLIDE_ORDER: SlideKey[] = [
+  "login",
+  "permissions",
+  "engine",
+  "connect-apps",
+  "pipe",
+];
+
+// endowed progress: the bar first renders on permissions with login already
+// counted done, so it always starts above zero. When the current step reports
+// sub-progress (e.g. one sub per permission grant), its segment splits so the
+// bar advances with every grant instead of stalling for the whole step.
+const EndowedProgress = ({
+  step,
+  total,
+  sub,
+}: {
+  step: number;
+  total: number;
+  sub?: { done: number; total: number } | null;
+}) => (
+  <div className="w-full max-w-sm mx-auto mb-[22px]">
+    <div className="flex justify-between font-mono text-[9px] lowercase tracking-[0.04em] text-muted-foreground mb-[5px]">
+      <span>setup</span>
+      <span>
+        {step} of {total}
+      </span>
+    </div>
+    <div className="flex gap-[3px]">
+      {Array.from({ length: total }, (_, i) =>
+        i + 1 === step && sub && sub.total > 1 ? (
+          <div key={i} className="h-[3px] flex-1 flex gap-[2px]">
+            {Array.from({ length: sub.total }, (_, j) => (
+              <div
+                key={j}
+                className={`h-[3px] flex-1 ${
+                  j < sub.done
+                    ? "bg-foreground"
+                    : j === sub.done
+                      ? "bg-foreground opacity-[0.45]"
+                      : "bg-border"
+                }`}
+              />
+            ))}
+          </div>
+        ) : (
+          <div
+            key={i}
+            className={`h-[3px] flex-1 ${
+              i + 1 < step
+                ? "bg-foreground"
+                : i + 1 === step
+                  ? "bg-foreground opacity-[0.45]"
+                  : "bg-border"
+            }`}
+          />
+        )
+      )}
+    </div>
+  </div>
+);
+
 const setWindowSizeForSlide = async (slide: SlideKey) => {
   try {
     const { width, height } = SLIDE_WINDOW_SIZES[slide];
@@ -43,6 +105,14 @@ export default function OnboardingPage() {
   const [currentSlide, setCurrentSlide] = useState<SlideKey>("login");
   const [isVisible, setIsVisible] = useState(true);
   const [isTransitioning, setIsTransitioning] = useState(false);
+  const [permissionsProgress, setPermissionsProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
+  const handlePermissionsProgress = useCallback(
+    (done: number, total: number) => setPermissionsProgress({ done, total }),
+    []
+  );
   const { onboardingData, isLoading, completeOnboarding } = useOnboarding();
   const completedForHiddenUiRef = React.useRef(false);
   const enterpriseBuild = useEnterpriseBuildStatus();
@@ -121,14 +191,7 @@ export default function OnboardingPage() {
     setIsTransitioning(true);
 
     posthog.capture(`onboarding_${currentSlide}_completed`);
-    const stepOrder: SlideKey[] = [
-      "login",
-      "permissions",
-      "engine",
-      "connect-apps",
-      "pipe",
-    ];
-    const currentIdx = stepOrder.indexOf(currentSlide);
+    const currentIdx = SLIDE_ORDER.indexOf(currentSlide);
     posthog.capture("onboarding_step_reached", {
       step_name: `${currentSlide}_completed`,
       step_index: currentIdx + 1,
@@ -152,7 +215,7 @@ export default function OnboardingPage() {
         completedForHiddenUiRef.current = true;
         posthog.capture("onboarding_hidden_ui_completed_after_permissions");
         try {
-          await completeOnboarding();
+          await completeOnboarding({ method: "hidden_enterprise" });
         } catch (error) {
           // Never fall through to UI-only onboarding on a hidden deployment.
           // Closing lets the persisted permission state be recovered on the
@@ -164,7 +227,7 @@ export default function OnboardingPage() {
       }
     }
 
-    const nextSlide = stepOrder[currentIdx + 1] || "pipe";
+    const nextSlide = SLIDE_ORDER[currentIdx + 1] || "pipe";
     try {
       await commands.setOnboardingStep(nextSlide);
     } catch {
@@ -225,6 +288,13 @@ export default function OnboardingPage() {
             isVisible ? "opacity-100" : "opacity-0"
           }`}
         >
+          {currentSlide !== "login" && (
+            <EndowedProgress
+              step={SLIDE_ORDER.indexOf(currentSlide) + 1}
+              total={SLIDE_ORDER.length}
+              sub={currentSlide === "permissions" ? permissionsProgress : null}
+            />
+          )}
           {currentSlide === "login" && (
             enterpriseBuild.isEnterprise ? (
               authenticationState === "license_key" ? (
@@ -269,7 +339,10 @@ export default function OnboardingPage() {
             )
           )}
           {currentSlide === "permissions" && (
-            <PermissionsStep handleNextSlide={handleNextSlide} />
+            <PermissionsStep
+              handleNextSlide={handleNextSlide}
+              onProgressChange={handlePermissionsProgress}
+            />
           )}
           {currentSlide === "engine" && (
             <EngineStartup handleNextSlide={handleNextSlide} />

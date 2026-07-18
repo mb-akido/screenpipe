@@ -18,6 +18,12 @@
     <string>screenpipe reads your calendar to detect meetings. Your calendar data stays on-device.</string>
     <key>NSCalendarsFullAccessUsageDescription</key>
     <string>screenpipe reads your calendar to detect meetings. Your calendar data stays on-device.</string>
+    <!-- Required for the Automation (Apple Events) consent prompt. Browser URL
+         capture sends Apple Events in-process since #5123 (previously routed
+         through osascript, which carried its own usage description); without
+         this key macOS denies the request silently and never shows a prompt. -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>screenpipe reads the active tab URL from your browser so captured screens are linked to the page you were on. Your browsing data stays on-device.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>

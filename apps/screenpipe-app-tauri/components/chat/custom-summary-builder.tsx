@@ -8,8 +8,12 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
-import { Sparkles, Save, CalendarIcon } from "lucide-react";
-import { type CustomTemplate } from "@/lib/summary-templates";
+import { Sparkles, Save, CalendarIcon, Pin, Trash2 } from "lucide-react";
+import { toast } from "@/components/ui/use-toast";
+import {
+  parseTemplateInstructions,
+  type CustomTemplate,
+} from "@/lib/summary-templates";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { format } from "date-fns";
@@ -39,6 +43,10 @@ interface CustomSummaryBuilderProps {
   onClose: () => void;
   onGenerate: (prompt: string, timeRange: string) => void;
   onSaveTemplate: (template: CustomTemplate) => void;
+  /** When set, the dialog edits this saved template instead of building a new one. */
+  editingTemplate?: CustomTemplate;
+  onUpdateTemplate?: (template: CustomTemplate) => void;
+  onDeleteTemplate?: () => void;
 }
 
 export function CustomSummaryBuilder({
@@ -46,9 +54,20 @@ export function CustomSummaryBuilder({
   onClose,
   onGenerate,
   onSaveTemplate,
+  editingTemplate,
+  onUpdateTemplate,
+  onDeleteTemplate,
 }: CustomSummaryBuilderProps) {
-  const [selectedTime, setSelectedTime] = useState("today");
-  const [instructions, setInstructions] = useState("");
+  const [selectedTime, setSelectedTime] = useState(
+    editingTemplate?.timeRange || "today",
+  );
+  const [instructions, setInstructions] = useState(
+    editingTemplate
+      ? editingTemplate.instructions ??
+          parseTemplateInstructions(editingTemplate.prompt) ??
+          editingTemplate.prompt
+      : "",
+  );
   const [templateTitle, setTemplateTitle] = useState("");
   const [showSave, setShowSave] = useState(false);
   const [dateRange, setDateRange] = useState<DateRange | undefined>();
@@ -81,11 +100,31 @@ export function CustomSummaryBuilder({
       prompt: buildPrompt(),
       timeRange: selectedTime,
       createdAt: new Date().toISOString(),
+      instructions: instructions.trim(),
     };
 
     onSaveTemplate(template);
     setShowSave(false);
     setTemplateTitle("");
+    // The dialog stays open so the user can still hit Generate; the toast is
+    // the only signal the save happened.
+    toast({
+      title: "Template saved",
+      description: `"${template.title}" added to your templates`,
+    });
+  };
+
+  const handleUpdate = () => {
+    if (!editingTemplate || !onUpdateTemplate) return;
+
+    onUpdateTemplate({
+      ...editingTemplate,
+      description: instructions.trim().slice(0, 60) || `Summary for ${selectedTime}`,
+      prompt: buildPrompt(),
+      timeRange: selectedTime,
+      instructions: instructions.trim(),
+    });
+    onClose();
   };
 
   const handleQuickTemplate = (prompt: string) => {
@@ -110,10 +149,20 @@ export function CustomSummaryBuilder({
       <DialogContent className="sm:max-w-[600px] max-h-[80vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <span>✨</span> Custom Summary
+            {editingTemplate ? (
+              <>
+                <Pin className="w-4 h-4" strokeWidth={1.5} /> {editingTemplate.title}
+              </>
+            ) : (
+              <>
+                <span>✨</span> Custom Summary
+              </>
+            )}
           </DialogTitle>
           <DialogDescription>
-            Choose a time period and describe what you want to know
+            {editingTemplate
+              ? "Review or tweak the prompt, then run it — Update Template persists your changes"
+              : "Choose a time period and describe what you want to know"}
           </DialogDescription>
         </DialogHeader>
 
@@ -202,11 +251,33 @@ export function CustomSummaryBuilder({
 
         {/* Bottom bar */}
         <div className="flex items-center justify-between mt-4 pt-3 border-t border-border/30">
-          <div className="text-[11px] text-muted-foreground">
-            Summarizing <span className="font-medium text-foreground">{getTimeLabel().toLowerCase()}</span>
-          </div>
+          {editingTemplate && onDeleteTemplate ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onDeleteTemplate}
+              className="h-8 text-[11px] text-muted-foreground hover:text-foreground"
+            >
+              <Trash2 className="w-3 h-3 mr-1" />
+              Delete
+            </Button>
+          ) : (
+            <div className="text-[11px] text-muted-foreground">
+              Summarizing <span className="font-medium text-foreground">{getTimeLabel().toLowerCase()}</span>
+            </div>
+          )}
           <div className="flex items-center gap-2">
-            {showSave ? (
+            {editingTemplate ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleUpdate}
+                className="h-8 text-[11px]"
+              >
+                <Save className="w-3 h-3 mr-1" />
+                Update Template
+              </Button>
+            ) : showSave ? (
               <div className="flex items-center gap-1.5">
                 <Input
                   value={templateTitle}
@@ -232,7 +303,7 @@ export function CustomSummaryBuilder({
             )}
             <Button size="sm" onClick={handleGenerate} className="h-8 text-[11px] gap-1.5">
               <Sparkles className="w-3 h-3" />
-              Generate
+              {editingTemplate ? "Run" : "Generate"}
             </Button>
           </div>
         </div>

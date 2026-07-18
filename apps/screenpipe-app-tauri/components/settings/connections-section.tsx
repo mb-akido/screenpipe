@@ -49,6 +49,24 @@ import { SkillsCard } from "./skills-card";
 import { PiExtensionsCard } from "./pi-extensions-card";
 import { WhatsAppPanel } from "./whatsapp-panel";
 import posthog from "posthog-js";
+import {
+  areExternalAgentSkillsInstalled,
+  installExternalAgentSkills,
+  removeExternalAgentSkills,
+} from "@/lib/external-agent-skills";
+// Shared MCP matrix (build/install/uninstall per tool) — same module the
+// onboarding connect-all uses, so connect and disconnect can never drift.
+import {
+  buildMcpConfig,
+  buildCodexMcpToml,
+  installCursorMcp,
+  installCodexMcp,
+  uninstallClaudeMcp,
+  uninstallCursorMcp,
+  uninstallCodexMcp,
+} from "@/lib/ai-tools-mcp";
+import { AiToolsCard } from "./ai-tools-card";
+import { CursorLogo } from "./tool-logos";
 
 // ---------------------------------------------------------------------------
 // Utility functions (unchanged)
@@ -388,113 +406,6 @@ async function detectInstalledConnectionIds(): Promise<Set<string>> {
   return detected;
 }
 
-/**
- * MCP install config for screenpipe.
- *
- * Prefers the `bun` binary we ship with the desktop app over `npx`:
- *  - no Node.js dependency (many Claude Desktop users don't have node)
- *  - ~3× faster cold start than npx (avoids first-run download stalling
- *    Claude's MCP startup timeout)
- *  - absolute path → no PATH lookup races
- *
- * Falls back to `npx` for copy-paste configs targeting users without our
- * desktop app installed (Claude Code CLI block, AnythingLLM, MstyStudio).
- *
- * Always pins `@latest` so npx/bunx don't lock onto a stale cached
- * version forever — without `@latest`, the first install caches and
- * never updates.
- */
-async function buildMcpConfig(opts?: { forceNpx?: boolean }): Promise<McpCommand> {
-  const apiKey = await (commands.getLocalApiConfig() as Promise<{ key: string | null }>)
-    .then(r => r.key ?? undefined)
-    .catch(() => undefined);
-
-  const env: Record<string, string> | undefined = apiKey
-    ? { SCREENPIPE_LOCAL_API_KEY: apiKey }
-    : undefined;
-
-  if (opts?.forceNpx) return { command: "npx", args: ["-y", "screenpipe-mcp@latest"], env };
-  try {
-    const res = await commands.bunCheck();
-    if (res.status === "ok" && res.data.available && res.data.path) {
-      return { command: res.data.path, args: ["x", "screenpipe-mcp@latest"], env };
-    }
-  } catch { /* fall through to npx */ }
-  // Unintended fallback: the desktop app should always ship a bundled `bun`, so
-  // reaching here means bun couldn't be resolved. The npx config needs Node,
-  // which many users don't have — don't fail silently. Callers writing an app
-  // config surface this to the user; see handleConnect.
-  console.warn("[mcp] bundled bun not found — falling back to npx (requires Node). MCP setup may not work without Node installed.");
-  return { command: "npx", args: ["-y", "screenpipe-mcp@latest"], env };
-}
-
-async function installCursorMcp(): Promise<void> {
-  const configPath = await getCursorMcpConfigPath();
-  let config: Record<string, unknown> = {};
-  try { config = JSON.parse(await readTextFile(configPath)); } catch { /* fresh */ }
-  if (!config.mcpServers || typeof config.mcpServers !== "object") config.mcpServers = {};
-  (config.mcpServers as Record<string, unknown>).screenpipe = await buildMcpConfig();
-  await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
-}
-
-const CODEX_SCREENPIPE_TABLE = /(?:^|\n)\[mcp_servers\.screenpipe\][\s\S]*?(?=\n\[(?!mcp_servers\.screenpipe(?:\.|\]))[^\]]+\]|\s*$)/;
-
-function tomlString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function tomlKey(value: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(value) ? value : tomlString(value);
-}
-
-function removeCodexMcpConfig(content: string): string {
-  return content
-    .replace(CODEX_SCREENPIPE_TABLE, "")
-    .replace(/^\n+/, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trimEnd();
-}
-
-function buildCodexMcpToml(config: McpCommand): string {
-  const lines = [
-    "[mcp_servers.screenpipe]",
-    `command = ${tomlString(config.command)}`,
-    `args = [${config.args.map(tomlString).join(", ")}]`,
-    "enabled = true",
-  ];
-
-  const envEntries = Object.entries(config.env ?? {});
-  if (envEntries.length > 0) {
-    lines.push("", "[mcp_servers.screenpipe.env]");
-    for (const [key, value] of envEntries) {
-      lines.push(`${tomlKey(key)} = ${tomlString(value)}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-async function installCodexMcp(): Promise<void> {
-  const configPath = await getCodexConfigPath();
-  let existing = "";
-  try { existing = await readTextFile(configPath); } catch { /* fresh */ }
-
-  const config = await buildMcpConfig();
-  const withoutScreenpipe = removeCodexMcpConfig(existing);
-  const next = `${withoutScreenpipe}${withoutScreenpipe ? "\n\n" : ""}${buildCodexMcpToml(config)}\n`;
-
-  await mkdir(await dirname(configPath), { recursive: true });
-  await writeFile(configPath, new TextEncoder().encode(next));
-}
-
-async function uninstallCodexMcp(): Promise<void> {
-  const configPath = await getCodexConfigPath();
-  let existing = "";
-  try { existing = await readTextFile(configPath); } catch { return; }
-  const next = removeCodexMcpConfig(existing);
-  await writeFile(configPath, new TextEncoder().encode(next ? `${next}\n` : ""));
-}
-
 // Grok CLI stores MCP servers as an array under `mcp.servers[]` in
 // ~/.grok/user-settings.json, each entry tagged with `id`/`label`/`enabled`
 // (see superagent-ai/grok-cli src/utils/settings.ts McpServerConfig).
@@ -552,40 +463,6 @@ function ClaudeLogo({ className }: { className?: string }) {
   );
 }
 
-function CursorLogo({ className }: { className?: string }) {
-  return (
-    <svg fill="none" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" className={className}>
-      <g clipPath="url(#cursor_clip0)">
-        <rect width="512" height="512" rx="122" fill="#000"/>
-        <g clipPath="url(#cursor_clip1)">
-          <mask id="cursor_mask" style={{maskType:"luminance"}} maskUnits="userSpaceOnUse" x="85" y="89" width="343" height="334">
-            <path d="M85 89h343v334H85V89z" fill="#fff"/>
-          </mask>
-          <g mask="url(#cursor_mask)">
-            <path d="M255.428 423l148.991-83.5L255.428 256l-148.99 83.5 148.99 83.5z" fill="url(#cursor_grad0)"/>
-            <path d="M404.419 339.5v-167L255.428 89v167l148.991 83.5z" fill="url(#cursor_grad1)"/>
-            <path d="M255.428 89l-148.99 83.5v167l148.99-83.5V89z" fill="url(#cursor_grad2)"/>
-            <path d="M404.419 172.5L255.428 423V256l148.991-83.5z" fill="#E4E4E4"/>
-            <path d="M404.419 172.5L255.428 256l-148.99-83.5h297.981z" fill="#fff"/>
-          </g>
-        </g>
-      </g>
-      <defs>
-        <linearGradient id="cursor_grad0" x1="255.428" y1="256" x2="255.428" y2="423" gradientUnits="userSpaceOnUse">
-          <stop offset=".16" stopColor="#fff" stopOpacity=".39"/><stop offset=".658" stopColor="#fff" stopOpacity=".8"/>
-        </linearGradient>
-        <linearGradient id="cursor_grad1" x1="404.419" y1="173.015" x2="257.482" y2="261.497" gradientUnits="userSpaceOnUse">
-          <stop offset=".182" stopColor="#fff" stopOpacity=".31"/><stop offset=".715" stopColor="#fff" stopOpacity="0"/>
-        </linearGradient>
-        <linearGradient id="cursor_grad2" x1="255.428" y1="89" x2="112.292" y2="342.802" gradientUnits="userSpaceOnUse">
-          <stop stopColor="#fff" stopOpacity=".6"/><stop offset=".667" stopColor="#fff" stopOpacity=".22"/>
-        </linearGradient>
-        <clipPath id="cursor_clip0"><path fill="#fff" d="M0 0h512v512H0z"/></clipPath>
-        <clipPath id="cursor_clip1"><path fill="#fff" transform="translate(85 89)" d="M0 0h343v334H0z"/></clipPath>
-      </defs>
-    </svg>
-  );
-}
 
 
 function GrokLogo({ className }: { className?: string }) {
@@ -1133,26 +1010,6 @@ function PiExtensionsSpotlight({
 // Expanded panels for each connection type
 // ---------------------------------------------------------------------------
 
-async function uninstallClaudeMcp(): Promise<void> {
-  const configPath = await getClaudeConfigPath();
-  if (!configPath) return;
-  let config: Record<string, unknown> = {};
-  try { config = JSON.parse(await readTextFile(configPath)); } catch { return; }
-  const servers = config.mcpServers as Record<string, unknown> | undefined;
-  if (!servers?.screenpipe) return;
-  delete servers.screenpipe;
-  await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
-}
-
-async function uninstallCursorMcp(): Promise<void> {
-  const configPath = await getCursorMcpConfigPath();
-  let config: Record<string, unknown> = {};
-  try { config = JSON.parse(await readTextFile(configPath)); } catch { return; }
-  const servers = config.mcpServers as Record<string, unknown> | undefined;
-  if (!servers?.screenpipe) return;
-  delete servers.screenpipe;
-  await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
-}
 
 function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void; onDisconnected?: () => void }) {
   const [state, setState] = useState<"idle" | "connecting" | "connected">("idle");
@@ -1161,6 +1018,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
   useEffect(() => {
     getInstalledClaudeScreenpipeEntry().then(async (entry) => {
       if (!entry) return;
+      if (!(await areExternalAgentSkillsInstalled("claude"))) return;
       setState("connected");
       onConnected?.();
       // Auto-repair legacy/keyless configs (older builds, hand-authored npx
@@ -1217,6 +1075,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
     try {
       setState("connecting");
       const mcp = await writeClaudeScreenpipeConfig();
+      await installExternalAgentSkills("claude");
       setState("connected");
       onConnected?.();
       // The desktop app ships a bundled `bun`, so an npx fallback here means bun
@@ -1240,6 +1099,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
 
   const handleDisconnect = async () => {
     try { await uninstallClaudeMcp(); } catch (e) { console.warn("claude config remove failed:", e); }
+    try { await removeExternalAgentSkills("claude"); } catch (e) { console.warn("claude skills remove failed:", e); }
     setState("idle");
     onDisconnected?.();
   };
@@ -1265,7 +1125,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Search your screen recordings and audio with natural language.
+        Install the screenpipe MCP plus API and CLI skills for Claude in one click.
       </p>
       <div className="flex flex-wrap gap-2">
         {state === "connected" ? (
@@ -1289,7 +1149,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
       </div>
       {state === "connected" && (
         <p className="text-xs text-muted-foreground">
-          <strong>connected!</strong> restart claude desktop and ask: &quot;what did I do in the last 5 minutes?&quot;
+          <strong>connected!</strong> MCP + both skills installed. Restart Claude and ask: &quot;what did I do in the last 5 minutes?&quot;
         </p>
       )}
     </div>
@@ -1301,7 +1161,14 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
   const [cursorAppInstalled, setCursorAppInstalled] = useState<boolean | null>(null);
 
   useEffect(() => {
-    isCursorMcpInstalled().then(ok => { if (ok) { setState("installed"); onConnected?.(); } }).catch(() => {});
+    Promise.all([isCursorMcpInstalled(), areExternalAgentSkillsInstalled("cursor")])
+      .then(([hasMcp, hasSkills]) => {
+        if (hasMcp && hasSkills) {
+          setState("installed");
+          onConnected?.();
+        }
+      })
+      .catch(() => {});
 
     const os = platform();
     if (os === "windows") {
@@ -1321,6 +1188,7 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
     try {
       setState("installing");
       await installCursorMcp();
+      await installExternalAgentSkills("cursor");
       setState("installed");
       onConnected?.();
     } catch (error) {
@@ -1336,6 +1204,7 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
 
   const handleDisconnect = async () => {
     try { await uninstallCursorMcp(); } catch (e) { console.warn("cursor config remove failed:", e); }
+    try { await removeExternalAgentSkills("cursor"); } catch (e) { console.warn("cursor skills remove failed:", e); }
     setState("idle");
     onDisconnected?.();
   };
@@ -1378,7 +1247,15 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
 
 function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void; onDisconnected?: () => void }) {
   const [state, setState] = useState<"idle" | "installing" | "installed">("idle");
-  useEffect(() => { isCodexMcpInstalled().then(ok => { if (ok) { setState("installed"); onConnected?.(); } }); }, []);
+  useEffect(() => {
+    Promise.all([isCodexMcpInstalled(), areExternalAgentSkillsInstalled("codex")])
+      .then(([hasMcp, hasSkills]) => {
+        if (hasMcp && hasSkills) {
+          setState("installed");
+          onConnected?.();
+        }
+      });
+  }, []);
 
   const manualConfig = useMemo(() => buildCodexMcpToml({
     command: "npx",
@@ -1389,6 +1266,7 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
     try {
       setState("installing");
       await installCodexMcp();
+      await installExternalAgentSkills("codex");
       setState("installed");
       onConnected?.();
     } catch (error) {
@@ -1403,6 +1281,7 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
 
   const handleDisconnect = async () => {
     try { await uninstallCodexMcp(); } catch (e) { console.warn("codex config remove failed:", e); }
+    try { await removeExternalAgentSkills("codex"); } catch (e) { console.warn("codex skills remove failed:", e); }
     setState("idle");
     onDisconnected?.();
   };
@@ -1418,7 +1297,7 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-muted-foreground">Give Codex access to your screen &amp; audio history via MCP.</p>
+      <p className="text-xs text-muted-foreground">Install the screenpipe MCP plus API and CLI skills for Codex in one click.</p>
       <div className="flex flex-wrap gap-2">
         {state === "installed" ? (
           <Button onClick={handleDisconnect} variant="outline" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
@@ -1435,7 +1314,7 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
       </div>
       {state === "installed" && (
         <p className="text-xs text-muted-foreground">
-          <strong>connected!</strong> open a new Codex session and ask: &quot;what did I do in the last 5 minutes?&quot;
+          <strong>connected!</strong> MCP + both skills installed. Open a new Codex session and ask: &quot;what did I do in the last 5 minutes?&quot;
         </p>
       )}
       <details className="text-xs text-muted-foreground">
@@ -3850,11 +3729,18 @@ export function ConnectionsSection({
     detectInstalledConnectionIds()
       .then(setDetectedConnectionIds)
       .catch(() => setDetectedConnectionIds(new Set()));
-    getInstalledMcpVersion()
-      .then(v => setClaudeInstalled(!!v))
+    // Connected = MCP entry AND both built-in skills, matching the panels
+    // (ClaudePanel/CodexPanel) — an MCP-only setup shows as not connected so
+    // one click can repair it.
+    Promise.all([getInstalledMcpVersion(), areExternalAgentSkillsInstalled("claude")])
+      .then(([v, skills]) => setClaudeInstalled(!!v && skills))
       .catch(() => setClaudeInstalled(false));
-    isCursorMcpInstalled().then(setCursorInstalled).catch(() => {});
-    isCodexMcpInstalled().then(setCodexInstalled).catch(() => {});
+    Promise.all([isCursorMcpInstalled(), areExternalAgentSkillsInstalled("cursor")])
+      .then(([mcp, skills]) => setCursorInstalled(mcp && skills))
+      .catch(() => setCursorInstalled(false));
+    Promise.all([isCodexMcpInstalled(), areExternalAgentSkillsInstalled("codex")])
+      .then(([mcp, skills]) => setCodexInstalled(mcp && skills))
+      .catch(() => setCodexInstalled(false));
     isGrokMcpInstalled().then(setGrokInstalled).catch(() => {});
     commands.chatgptOauthStatus().then(res => {
       setChatgptConnected(res.status === "ok" && res.data.logged_in);
@@ -4381,6 +4267,18 @@ export function ConnectionsSection({
         selected={selected === "skills"}
         onClick={() => setSelected(selected === "skills" ? null : "skills")}
       />
+
+      {/* AI tools block — 4th sibling to MCP servers / Pi extensions / Skills.
+          Connect-all when nothing is on, per-tool manage + disconnect-all once
+          connected (Louis's "easy way to uninstall" ask). Default view only. */}
+      {isDefaultView && (
+        <AiToolsCard
+          onChanged={() => {
+            refreshStatus();
+            notifyConnectionsUpdated();
+          }}
+        />
+      )}
 
       {/* Suggested — device-aware high-activation connections, default view only. */}
       {!search.trim() && suggested.length > 0 && (

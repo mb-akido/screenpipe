@@ -896,6 +896,19 @@ async initSync(password: string) : Promise<Result<boolean, string>> {
 }
 },
 /**
+ * Install the two built-in screenpipe skills into a supported external agent.
+ * MCP registration stays in the frontend because that path uses the app's
+ * bundled bun binary and injects the current local API key.
+ */
+async installExternalAgentSkills(target: string) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_external_agent_skills", { target }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Install a catalog skill: download its folder into a staging dir, then swap it
  * into the store atomically so a failed download never leaves a half-written
  * skill behind. Re-installing the same name refreshes it.
@@ -1568,28 +1581,6 @@ async piUpdateConfig(userToken: string | null, providerConfig: PiProviderConfig 
 }
 },
 /**
- * Get current pipe suggestions settings.
- */
-async pipeSuggestionsGetSettings() : Promise<Result<PipeSuggestionsSettings, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("pipe_suggestions_get_settings") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Update pipe suggestions settings and restart the scheduler.
- */
-async pipeSuggestionsUpdateSettings(enabled: boolean, frequencyHours: number) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("pipe_suggestions_update_settings", { enabled, frequencyHours }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Read bundle ID, display name, and icon from a `.app` bundle selected in Finder.
  */
 async readAppBundleMetadata(path: string) : Promise<Result<ExcludedApp, string>> {
@@ -1754,6 +1745,19 @@ async remoteSyncStopScheduler() : Promise<Result<null, string>> {
 async remoteSyncTest(config: RemoteSyncConfig) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remote_sync_test", { config }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove the two built-in screenpipe skills from a supported external agent.
+ * Mirror of `install_external_agent_skills`; MCP entry removal stays in the
+ * frontend, next to the code that wrote it.
+ */
+async removeExternalAgentSkills(target: string) : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_external_agent_skills", { target }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2704,7 +2708,6 @@ preview: string;
  * label in the UI ("queued 4s ago").
  */
 queuedAtMs: number }
-export type PipeSuggestionsSettings = { enabled: boolean; frequencyHours: number }
 /**
  * A skill offered by the curated registry. Installing one downloads its folder
  * (the directory containing `SKILL.md`) from a public GitHub repo into the

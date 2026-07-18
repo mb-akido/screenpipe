@@ -6,16 +6,40 @@
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Monitor, Mic, Keyboard, Lock, Check, RefreshCw } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { commands } from "@/lib/utils/tauri";
 import { requestPermissionWithFlow } from "@/lib/utils/permission-flow";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import posthog from "posthog-js";
+
+// Same permission wheel as onboarding: rows recede in opacity, scale, and
+// depth (blur) by distance from the focused step — plain CSS transitions.
+const WHEEL_DIM = [
+  "opacity-100 scale-100",
+  "opacity-[0.45] scale-[0.88] blur-[0.4px]",
+  "opacity-[0.22] scale-[0.8] blur-[0.8px]",
+] as const;
+
+// The wheel turns on detected grants — pull the user back from System
+// Settings so they see it happen instead of returning to a stale screen.
+async function refocusAppWindow() {
+  try {
+    const appWindow = getCurrentWindow();
+    await appWindow.show();
+    await appWindow.unminimize();
+    await appWindow.setFocus();
+  } catch {
+    // best-effort — not running inside tauri, or the window is gone
+  }
+}
 
 function PermissionRow({
   icon,
   label,
   description,
   status,
+  focused,
+  distance,
   onFix,
   testId,
 }: {
@@ -23,26 +47,43 @@ function PermissionRow({
   label: string;
   description: string;
   status: "granted" | "denied" | "checking";
+  focused: boolean;
+  distance: number;
   onFix: () => void;
   testId: string;
 }) {
   const isGranted = status === "granted";
+  const interactive = focused && status === "denied";
   return (
     <button
       data-testid={testId}
       data-permission-status={status}
-      onClick={isGranted ? undefined : onFix}
-      disabled={isGranted || status === "checking"}
-      className="w-full flex items-center gap-3 px-4 py-3 border border-border/50 transition-all group disabled:cursor-default hover:enabled:bg-foreground hover:enabled:text-background"
+      onClick={interactive ? onFix : undefined}
+      disabled={!interactive}
+      className={`w-full flex items-center gap-3 px-4 py-3 border origin-center transition-all duration-[250ms] ease-out group disabled:cursor-default ${
+        WHEEL_DIM[Math.min(distance, 2)]
+      } ${
+        interactive
+          ? "border-foreground shadow-[0_2px_10px_rgba(0,0,0,0.08)] hover:bg-foreground hover:text-background"
+          : "border-border/50"
+      }`}
     >
       <div
         className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 transition-colors ${
-          isGranted ? "bg-foreground/10" : "bg-muted group-hover:bg-background/10"
+          isGranted
+            ? "bg-foreground/10"
+            : interactive
+              ? "bg-muted group-hover:bg-background/10"
+              : "bg-muted"
         }`}
       >
         <div
           className={`transition-colors ${
-            isGranted ? "text-foreground" : "text-muted-foreground group-hover:text-background/70"
+            isGranted
+              ? "text-foreground"
+              : interactive
+                ? "text-muted-foreground group-hover:text-background/70"
+                : "text-muted-foreground"
           }`}
         >
           {status === "checking" ? (
@@ -57,7 +98,11 @@ function PermissionRow({
 
       <div className="flex flex-col items-start min-w-0">
         <span className="font-mono text-xs font-medium">{label}</span>
-        <span className="font-mono text-[10px] text-muted-foreground group-hover:enabled:text-background/50 leading-tight">
+        <span
+          className={`font-mono text-[10px] text-muted-foreground leading-tight ${
+            interactive ? "group-hover:text-background/50" : ""
+          }`}
+        >
           {description}
         </span>
       </div>
@@ -65,11 +110,11 @@ function PermissionRow({
       <div className="ml-auto shrink-0">
         {isGranted ? (
           <span className="font-mono text-[10px] text-muted-foreground">ok</span>
-        ) : status === "checking" ? null : (
+        ) : interactive ? (
           <span className="font-mono text-[10px] text-muted-foreground group-hover:text-background/70">
             grant →
           </span>
-        )}
+        ) : null}
       </div>
     </button>
   );
@@ -167,17 +212,92 @@ export default function PermissionRecoveryPage() {
     await checkKeychain();
   };
 
-  const screenStatus = permissions?.screenRecording === "granted" || permissions?.screenRecording === "notNeeded"
+  type PermissionStatus = "granted" | "denied" | "checking";
+  const screenStatus: PermissionStatus = permissions?.screenRecording === "granted" || permissions?.screenRecording === "notNeeded"
     ? "granted" : permissions === null ? "checking" : "denied";
-  const micStatus = permissions?.microphone === "granted" || permissions?.microphone === "notNeeded"
+  const micStatus: PermissionStatus = permissions?.microphone === "granted" || permissions?.microphone === "notNeeded"
     ? "granted" : permissions === null ? "checking" : "denied";
-  const accessibilityStatus = permissions?.accessibility === "granted" || permissions?.accessibility === "notNeeded"
+  const accessibilityStatus: PermissionStatus = permissions?.accessibility === "granted" || permissions?.accessibility === "notNeeded"
     ? "granted" : permissions === null ? "checking" : "denied";
 
   const allOk =
     screenStatus === "granted" &&
     micStatus === "granted" &&
     accessibilityStatus === "granted";
+
+  // Wheel rows in fix order (screen last — regaining it restarts the engine).
+  // The keychain row only exists while denied, so it can't hold the wheel up.
+  const rows = [
+    {
+      id: "microphone",
+      icon: <Mic className="w-4 h-4" strokeWidth={1.5} />,
+      label: "microphone",
+      description: "transcribe audio",
+      status: micStatus,
+      onFix: () => handleFix("microphone"),
+      testId: "permission-row-microphone",
+    },
+    ...(isMacOS
+      ? [
+          {
+            id: "accessibility",
+            icon: <Keyboard className="w-4 h-4" strokeWidth={1.5} />,
+            label: "accessibility",
+            description: "read text from apps",
+            status: accessibilityStatus,
+            onFix: () => handleFix("accessibility"),
+            testId: "permission-row-accessibility",
+          },
+        ]
+      : []),
+    {
+      id: "screen",
+      icon: <Monitor className="w-4 h-4" strokeWidth={1.5} />,
+      label: "screen",
+      description: "capture display",
+      status: screenStatus,
+      onFix: () => handleFix("screenRecording"),
+      testId: "permission-row-screen",
+    },
+    ...(isMacOS && keychainStatus === "denied"
+      ? [
+          {
+            id: "keychain",
+            icon: <Lock className="w-4 h-4" strokeWidth={1.5} />,
+            label: "secure storage",
+            description: "encrypt api keys & credentials",
+            status: keychainStatus,
+            onFix: handleFixKeychain,
+            testId: "permission-row-keychain",
+          },
+        ]
+      : []),
+  ];
+
+  // Focus the first revoked permission; still-granted rows stay inert. A
+  // failed or abandoned grant keeps the row in focus — the wheel only turns
+  // when the poller confirms the permission is back.
+  const focusIndex = rows.findIndex((r) => r.status === "denied");
+
+  // Refocus only on a confirmed denied → granted transition, so permissions
+  // that were never revoked don't steal focus on the initial check.
+  const prevStatusesRef = useRef<Record<string, string>>({});
+  useEffect(() => {
+    const current: Record<string, string> = {
+      microphone: micStatus,
+      accessibility: accessibilityStatus,
+      screen: screenStatus,
+      keychain: keychainStatus,
+    };
+    const prev = prevStatusesRef.current;
+    const regained = Object.keys(current).some(
+      (k) => prev[k] === "denied" && current[k] === "granted"
+    );
+    prevStatusesRef.current = current;
+    if (regained && !restartTriggeredRef.current) {
+      void refocusAppWindow();
+    }
+  }, [micStatus, accessibilityStatus, screenStatus, keychainStatus]);
 
   return (
     <div className="flex flex-col w-full h-screen overflow-hidden bg-background">
@@ -199,42 +319,19 @@ export default function PermissionRecoveryPage() {
             </div>
 
             <div className="space-y-2">
-              <PermissionRow
-                icon={<Mic className="w-4 h-4" strokeWidth={1.5} />}
-                label="microphone"
-                description="transcribe audio"
-                status={micStatus}
-                onFix={() => handleFix("microphone")}
-                testId="permission-row-microphone"
-              />
-              {isMacOS && (
+              {rows.map((row, i) => (
                 <PermissionRow
-                  icon={<Keyboard className="w-4 h-4" strokeWidth={1.5} />}
-                  label="accessibility"
-                  description="read text from apps"
-                  status={accessibilityStatus}
-                  onFix={() => handleFix("accessibility")}
-                  testId="permission-row-accessibility"
+                  key={row.id}
+                  icon={row.icon}
+                  label={row.label}
+                  description={row.description}
+                  status={row.status}
+                  focused={focusIndex === i}
+                  distance={focusIndex === -1 ? 0 : Math.abs(i - focusIndex)}
+                  onFix={row.onFix}
+                  testId={row.testId}
                 />
-              )}
-              <PermissionRow
-                icon={<Monitor className="w-4 h-4" strokeWidth={1.5} />}
-                label="screen"
-                description="capture display"
-                status={screenStatus}
-                onFix={() => handleFix("screenRecording")}
-                testId="permission-row-screen"
-              />
-              {isMacOS && keychainStatus === "denied" && (
-                <PermissionRow
-                  icon={<Lock className="w-4 h-4" strokeWidth={1.5} />}
-                  label="secure storage"
-                  description="encrypt api keys & credentials"
-                  status={keychainStatus}
-                  onFix={handleFixKeychain}
-                  testId="permission-row-keychain"
-                />
-              )}
+              ))}
             </div>
 
             <p className="font-mono text-[10px] text-muted-foreground text-center">

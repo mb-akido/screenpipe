@@ -2165,7 +2165,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -5707,7 +5707,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -5725,7 +5725,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -8637,7 +8637,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -8878,7 +8878,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "permission-flow"
 version = "0.1.40"
-source = "git+https://github.com/divanshu-go/permission-flow?rev=f3fb7a5ab2f551ac2392c18749b70c9976f56f4d#f3fb7a5ab2f551ac2392c18749b70c9976f56f4d"
+source = "git+https://github.com/EzraEllette/permission-flow?rev=1a114ff3e9526d815b98201cd2ba35e91f2b4bd3#1a114ff3e9526d815b98201cd2ba35e91f2b4bd3"
 dependencies = [
  "swift-rs",
 ]
@@ -9671,7 +9671,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -9709,7 +9709,7 @@ dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10939,7 +10939,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-app"
-version = "2.5.117"
+version = "2.5.120"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -13786,7 +13786,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-permission-flow"
 version = "0.1.40"
-source = "git+https://github.com/divanshu-go/permission-flow?rev=f3fb7a5ab2f551ac2392c18749b70c9976f56f4d#f3fb7a5ab2f551ac2392c18749b70c9976f56f4d"
+source = "git+https://github.com/EzraEllette/permission-flow?rev=1a114ff3e9526d815b98201cd2ba35e91f2b4bd3#1a114ff3e9526d815b98201cd2ba35e91f2b4bd3"
 dependencies = [
  "permission-flow",
  "serde",
@@ -15928,7 +15928,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -408,6 +408,93 @@ fn get_arc_url_cached(pid: i32, window_name: &str) -> Option<String> {
     url
 }
 
+/// Silent (never-prompting) check that the Automation TCC grant for Arc already
+/// exists, cached process-globally: a confirmed grant is permanent, a missing
+/// grant is re-checked at most every 30s.
+///
+/// The walker must never send an Apple Event that could raise the consent
+/// dialog itself: `executeAndReturnError` blocks the pooled walker thread for
+/// as long as the dialog stays on screen, and the prompt would fire at a
+/// random moment mid-recording. Prompting is owned by the app's explicit
+/// permission-request UI; this fallback only consumes a grant that is already
+/// in place. (The old `osascript` subprocess got prompting "for free" because
+/// osascript is the Apple-Events sender there; in-process, we are.)
+fn arc_automation_granted() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static GRANTED: AtomicBool = AtomicBool::new(false);
+    static LAST_DENIED_CHECK: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+    const RECHECK: Duration = Duration::from_secs(30);
+
+    if GRANTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    {
+        let last = LAST_DENIED_CHECK.lock();
+        if let Some(at) = *last {
+            if at.elapsed() < RECHECK {
+                return false;
+            }
+        }
+    }
+    let granted = ae_arc_permission_silent() == 0;
+    if granted {
+        GRANTED.store(true, Ordering::Relaxed);
+    } else {
+        *LAST_DENIED_CHECK.lock() = Some(Instant::now());
+    }
+    granted
+}
+
+/// `AEDeterminePermissionToAutomateTarget` for Arc with `askUserIfNeeded=false`:
+/// returns the raw OSStatus (0 = granted, -1744 = denied, -1745 = not asked)
+/// without ever showing a dialog.
+fn ae_arc_permission_silent() -> i32 {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct AEDesc {
+        descriptor_type: u32,
+        data_handle: *mut c_void,
+    }
+
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        fn AECreateDesc(
+            type_code: u32,
+            data_ptr: *const u8,
+            data_size: isize,
+            result: *mut AEDesc,
+        ) -> i16;
+        fn AEDeterminePermissionToAutomateTarget(
+            target: *const AEDesc,
+            the_ae_event_class: u32,
+            the_ae_event_id: u32,
+            ask_user_if_needed: u8,
+        ) -> i32;
+        fn AEDisposeDesc(the_ae_desc: *mut AEDesc) -> i16;
+    }
+
+    const ARC_BUNDLE_ID: &str = "company.thebrowser.Browser";
+    // 'bund' = typeApplicationBundleID, '****' = typeWildCard
+    const TYPE_BUND: u32 = u32::from_be_bytes(*b"bund");
+    const TYPE_WILD: u32 = u32::from_be_bytes(*b"****");
+
+    unsafe {
+        let mut desc = AEDesc {
+            descriptor_type: 0,
+            data_handle: std::ptr::null_mut(),
+        };
+        let data = ARC_BUNDLE_ID.as_bytes();
+        if AECreateDesc(TYPE_BUND, data.as_ptr(), data.len() as isize, &mut desc) != 0 {
+            return -1;
+        }
+        let result = AEDeterminePermissionToAutomateTarget(&desc, TYPE_WILD, TYPE_WILD, 0);
+        AEDisposeDesc(&mut desc);
+        result
+    }
+}
+
 thread_local! {
     /// Compiled-once `NSAppleScript` for the Arc URL query. Held per-thread
     /// because the walker runs on pooled tokio blocking threads and an
@@ -425,6 +512,10 @@ thread_local! {
 /// (no subprocess); relies on the same Apple-Events automation TCC grant the old
 /// `osascript` path used.
 fn run_arc_url_applescript() -> Option<String> {
+    if !arc_automation_granted() {
+        debug!("get_arc_url: Automation not granted for Arc, skipping AppleScript fallback");
+        return None;
+    }
     ARC_URL_SCRIPT.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
