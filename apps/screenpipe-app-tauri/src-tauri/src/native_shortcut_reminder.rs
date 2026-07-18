@@ -29,6 +29,7 @@ mod ffi {
         pub fn shortcut_show(json: *const c_char) -> c_int;
         pub fn shortcut_hide() -> c_int;
         pub fn shortcut_set_meeting_active(active: c_int);
+        pub fn shortcut_set_inbox_unread(count: c_int);
         pub fn shortcut_set_health_state(state: *const c_char) -> c_int;
         pub fn shortcut_set_action_callback(cb: Option<extern "C" fn(*const c_char)>);
     }
@@ -68,6 +69,13 @@ mod ffi {
         }
     }
 
+    /// Unread pipe-notification count for the pill's bell dot.
+    pub fn set_inbox_unread(count: i32) {
+        unsafe {
+            shortcut_set_inbox_unread(count);
+        }
+    }
+
     /// Push a recording-health state ("normal" | "failure" | "fixing" |
     /// "recovered") into the panel. Safe while hidden — Swift keeps the value
     /// and renders it on the next show.
@@ -99,6 +107,7 @@ mod ffi {
         false
     }
     pub fn set_meeting_active(_active: bool) {}
+    pub fn set_inbox_unread(_count: i32) {}
     pub fn set_health_state(_state: &str) -> bool {
         false
     }

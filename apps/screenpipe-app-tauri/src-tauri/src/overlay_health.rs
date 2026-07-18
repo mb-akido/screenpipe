@@ -330,8 +330,16 @@ async fn reveal_overlay_if_hidden(app: &tauri::AppHandle) {
     if overlay_visible(app) {
         return;
     }
+    // Only take responsibility for re-hiding after recovery when the user's
+    // preference is actually "hidden". If the pref is on and we merely beat
+    // the startup show (incident 1s into boot), the overlay should stay.
+    let user_wants_hidden = crate::store::SettingsStore::get(app)
+        .ok()
+        .flatten()
+        .map(|s| !s.show_shortcut_overlay)
+        .unwrap_or(false);
     if let Ok(mut inner) = INNER.lock() {
-        inner.auto_revealed = true;
+        inner.auto_revealed = user_wants_hidden;
     }
     info!("overlay health: revealing hidden shortcut overlay for incident");
     // Skip the disable_timeline gate and the wait-for-server handshake — the

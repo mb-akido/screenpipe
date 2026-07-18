@@ -2182,6 +2182,19 @@ async setWindowSize(window: ShowRewindWindow, width: number, height: number) : P
 async showMainWindow() : Promise<void> {
     await TAURI_INVOKE("show_main_window");
 },
+/**
+ * Toggle the standalone notification inbox opened from the shortcut
+ * overlay's bell: a small always-on-top window just below the pill,
+ * rendering the same list as the pipes-store bell. Hides itself on blur.
+ */
+async showNotificationInbox() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("show_notification_inbox") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async showNotificationPanel(payload: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("show_notification_panel", { payload }) };

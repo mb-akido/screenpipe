@@ -2542,9 +2542,14 @@ pub(crate) async fn show_shortcut_reminder_impl(
             let native_payload = serde_json::Value::Object(map).to_string();
             if native_shortcut_reminder::show(Some(&native_payload)) {
                 // A recording incident may already be active (e.g. this show IS
-                // the incident reveal) — sync the panel's health state.
+                // the incident reveal) — sync the panel's health state. Same
+                // for the bell's unread dot, which is otherwise only pushed on
+                // notification-store writes.
                 native_shortcut_reminder::set_health_state(
                     &crate::overlay_health::current_state_payload(),
+                );
+                native_shortcut_reminder::set_inbox_unread(
+                    crate::notifications::store::unread_count() as i32,
                 );
                 return Ok(());
             }
@@ -2816,6 +2821,107 @@ pub async fn overlay_restart_recording(app_handle: tauri::AppHandle) -> Result<(
 #[specta::specta]
 pub async fn overlay_dismiss_incident(app_handle: tauri::AppHandle) -> Result<(), String> {
     crate::overlay_health::dismiss_incident(app_handle).await;
+    Ok(())
+}
+
+/// Toggle the standalone notification inbox opened from the shortcut
+/// overlay's bell: a small always-on-top window just below the pill,
+/// rendering the same list as the pipes-store bell. Hides itself on blur.
+#[tauri::command]
+#[specta::specta]
+pub async fn show_notification_inbox(app_handle: tauri::AppHandle) -> Result<(), String> {
+    use tauri::WebviewWindowBuilder;
+
+    let label = "notification-inbox";
+    let window_width = 340.0_f64;
+    let window_height = 420.0_f64;
+    // Sit just below the shortcut overlay pill (y=12, ~26 logical tall).
+    let y = 46.0_f64;
+
+    // Top-center of the screen the overlay lives on: screen under the mouse
+    // on macOS (matches the pill), primary monitor elsewhere.
+    let x = {
+        #[cfg(target_os = "macos")]
+        {
+            use tauri_nspanel::cocoa::appkit::{NSEvent, NSScreen};
+            use tauri_nspanel::cocoa::base::{id, nil};
+            use tauri_nspanel::cocoa::foundation::{NSArray, NSPoint, NSRect};
+            unsafe {
+                let mouse: NSPoint = NSEvent::mouseLocation(nil);
+                let screens: id = NSScreen::screens(nil);
+                let count: u64 = NSArray::count(screens);
+                let mut x = 0.0_f64;
+                for i in 0..count {
+                    let screen: id = NSArray::objectAtIndex(screens, i);
+                    let frame: NSRect = NSScreen::frame(screen);
+                    if mouse.x >= frame.origin.x
+                        && mouse.x < frame.origin.x + frame.size.width
+                        && mouse.y >= frame.origin.y
+                        && mouse.y < frame.origin.y + frame.size.height
+                    {
+                        x = frame.origin.x + (frame.size.width - window_width) / 2.0;
+                        break;
+                    }
+                }
+                x
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let monitor = app_handle
+                .primary_monitor()
+                .map_err(|e| e.to_string())?
+                .ok_or("No primary monitor found")?;
+            let screen_size = monitor.size();
+            let scale_factor = monitor.scale_factor();
+            ((screen_size.width as f64 / scale_factor) - window_width) / 2.0
+        }
+    };
+
+    if let Some(window) = app_handle.get_webview_window(label) {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            return Ok(());
+        }
+        let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    let window = WebviewWindowBuilder::new(
+        &app_handle,
+        label,
+        tauri::WebviewUrl::App("notification-inbox".into()),
+    )
+    .title("")
+    .inner_size(window_width, window_height)
+    .position(x, y)
+    .visible_on_all_workspaces(true)
+    .always_on_top(true)
+    .decorations(false)
+    .skip_taskbar(true)
+    .transparent(true)
+    .shadow(false)
+    .resizable(false)
+    .focused(true)
+    .build()
+    .map(crate::window::finalize_webview_window)
+    .map_err(|e| {
+        log_webview_build_failure(label, "notification-inbox", &e);
+        format!("Failed to create notification inbox window: {}", e)
+    })?;
+
+    // Click-away dismiss: the inbox is a transient popover, not a window the
+    // user manages. (The overlay pill itself is non-activating, so clicking
+    // the bell again still reaches the toggle branch above.)
+    let window_clone = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Focused(false) = event {
+            let _ = window_clone.hide();
+        }
+    });
+
     Ok(())
 }
 

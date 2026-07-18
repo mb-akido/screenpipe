@@ -7,17 +7,15 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { localFetch } from "@/lib/api";
+import { invoke } from "@tauri-apps/api/core";
 import posthog from "posthog-js";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { getStore, saveAndEncrypt } from "@/lib/hooks/use-settings";
 import { commands } from "@/lib/utils/tauri";
-import { X, Phone, RotateCw, Loader2, CheckCircle2 } from "lucide-react";
+import { X, Bell, RotateCw, Loader2, CheckCircle2 } from "lucide-react";
 import { useOverlayData } from "./use-overlay-data";
 import { AudioEqualizer } from "./audio-equalizer";
 import { ScreenMatrix } from "./screen-matrix";
-import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/meeting-state";
-import { appendAuthToken, ensureApiReady, getApiBaseUrl } from "@/lib/api";
 
 type ReminderSettings = {
   disabledShortcuts?: string[];
@@ -27,89 +25,38 @@ type ReminderSettings = {
   searchShortcut?: string;
 };
 
-function useMeetingState() {
-  const [meetingState, setMeetingState] = useState(() => computeMeetingActive(null, 0));
-  const [loading, setLoading] = useState(false);
+/// Unread-dot state for the overlay's inbox bell — a light poll of the app
+/// server's notification history (same source as the pipes-store bell).
+function useInboxUnread(): boolean {
+  const [unread, setUnread] = useState(false);
 
   useEffect(() => {
-    let ws: WebSocket | null = null;
-    let retry: ReturnType<typeof setTimeout> | null = null;
-    let backoffMs = 1000;
-
-    const connect = () => {
-      void (async () => {
-        try {
-          await ensureApiReady();
-          const wsBase = getApiBaseUrl().replace("http://", "ws://");
-          ws = new WebSocket(appendAuthToken(`${wsBase}/ws/meeting-status`));
-          ws.onopen = () => {
-            backoffMs = 1000;
-          };
-          ws.onmessage = (event) => {
-            try {
-              const parsed = JSON.parse(event.data) as MeetingStatusResponse;
-              setMeetingState(computeMeetingActive(parsed, 0));
-            } catch {
-              // ignore malformed payloads
-            }
-          };
-          ws.onclose = (event) => {
-            if (event.code === 1000) return;
-            retry = setTimeout(connect, backoffMs);
-            backoffMs = Math.min(backoffMs * 2, 10000);
-          };
-          ws.onerror = () => {
-            ws?.close();
-          };
-        } catch {
-          retry = setTimeout(connect, backoffMs);
-          backoffMs = Math.min(backoffMs * 2, 10000);
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const config = await invoke<{ port: number }>("get_app_server_config").catch(
+          () => ({ port: 11435 }),
+        );
+        const res = await fetch(
+          `http://localhost:${config.port || 11435}/notifications`,
+        );
+        if (res.ok && !cancelled) {
+          const entries: { read: boolean }[] = await res.json();
+          setUnread(entries.some((n) => !n.read));
         }
-      })();
-    };
-
-    connect();
-
-    return () => {
-      if (retry) clearTimeout(retry);
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-        ws.close(1000, "unmount");
+      } catch {
+        // app server not ready yet
       }
+    };
+    poll();
+    const timer = setInterval(poll, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
     };
   }, []);
 
-  const toggle = useCallback(async () => {
-    setLoading(true);
-    try {
-      if (meetingState.active) {
-        await localFetch("/meetings/stop", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: meetingState.stoppableMeetingId }),
-        });
-        setMeetingState(computeMeetingActive(null, 0));
-      } else {
-        const res = await localFetch("/meetings/start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ app: "manual" }),
-        });
-        if (res.ok) {
-          setMeetingState(computeMeetingActive({
-            active: true,
-            manualActive: true,
-            meetingApp: "manual",
-            detectionSource: "manual",
-          }, Date.now()));
-        }
-      }
-    } catch (e) {
-      console.error("meeting toggle failed:", e);
-    }
-    setLoading(false);
-  }, [meetingState]);
-
-  return { active: meetingState.active, loading, toggle };
+  return unread;
 }
 
 type RecordingHealthState = "normal" | "failure" | "fixing" | "recovered";
@@ -122,7 +69,7 @@ export default function ShortcutReminderPage() {
   const [chatShortcut, setChatShortcut] = useState<string | null>(null);
   const [searchShortcut, setSearchShortcut] = useState<string | null>(null);
   const overlayData = useOverlayData();
-  const meeting = useMeetingState();
+  const inboxUnread = useInboxUnread();
   const [overlayScale, setOverlayScale] = useState(1);
   const isMacRef = useRef(isMac);
   isMacRef.current = isMac;
@@ -541,22 +488,23 @@ export default function ShortcutReminderPage() {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                meeting.toggle();
+                commands.showNotificationInbox();
+                posthog.capture("shortcut_reminder_inbox_clicked");
               }}
-              disabled={meeting.loading}
+              onMouseDown={(e) => e.stopPropagation()}
               className="relative flex items-center justify-center hover:bg-white/10 transition-colors cursor-pointer"
-              title={meeting.active ? "stop meeting" : "start meeting"}
+              title="notifications"
               style={{ padding: `${padY}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
             >
-              {meeting.active && (
+              {inboxUnread && (
                 <span
-                  className="absolute rounded-full bg-white animate-pulse"
+                  className="absolute rounded-full bg-white"
                   style={{ top: -1, right: -1, width: `${dotPx}px`, height: `${dotPx}px` }}
                 />
               )}
-              <Phone
+              <Bell
                 style={{ width: `${smIconPx}px`, height: `${smIconPx}px` }}
-                className={meeting.active ? "text-white" : "text-white/60 hover:text-white"}
+                className={inboxUnread ? "text-white" : "text-white/60 hover:text-white"}
               />
             </button>
             <button

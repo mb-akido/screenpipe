@@ -22,6 +22,15 @@ public func shortcutSetMeetingActive(_ active: Int32) {
     }
 }
 
+/// Unread pipe-notification count, pushed from the Rust notification store —
+/// drives the bell dot on the collapsed pill.
+@_cdecl("shortcut_set_inbox_unread")
+public func shortcutSetInboxUnread(_ count: Int32) {
+    if #available(macOS 13.0, *) {
+        ShortcutReminderController.shared.setInboxUnread(count > 0)
+    }
+}
+
 /// Recording-health state pushed from the Rust health loop (issue #5127):
 /// "normal" | "failure" | "fixing" | "recovered", optionally "state|detail"
 /// where detail is a boot-phase label shown while fixing. Swift only renders
@@ -48,6 +57,8 @@ final class OverlayMetrics: ObservableObject {
     @Published var screenActive: Bool = false
     @Published var captureFps: Double = 0
     @Published var meetingActive: Bool = false
+    /// Unread pipe notifications exist — bell dot on the collapsed pill.
+    @Published var inboxUnread: Bool = false
     /// "normal" | "failure" | "fixing" | "recovered" — set only via
     /// ShortcutReminderController.setHealthState (pushed from Rust).
     @Published var healthState: String = "normal"
@@ -436,10 +447,10 @@ struct ShortcutReminderView: View {
                 if hovering { isExpanded = true }
             }
 
-            CollapsedPhoneButton(
-                isActive: metrics.meetingActive,
+            CollapsedBellButton(
+                unread: metrics.inboxUnread,
                 scale: scale,
-                action: { onAction("toggle_meeting") }
+                action: { onAction("open_inbox") }
             )
             .padding(.trailing, s(5))
         }
@@ -549,13 +560,14 @@ struct CollapsedAppIconButton: View {
     }
 }
 
-// Phone button shown in the collapsed pill. Same look as the bare icon it
-// replaces, plus a subtle hover halo so the click target is discoverable.
-// Crucially: no .onHover wired to isExpanded — clicking it toggles the
-// meeting without forcing the user through the expanded layout.
+// Bell button shown in the collapsed pill (replaced the phone / meeting
+// toggle, which still lives in the expanded bar). Opens the notification
+// inbox; the dot mirrors the pipes-store bell's unread marker. Crucially:
+// no .onHover wired to isExpanded — clicking it opens the inbox without
+// forcing the user through the expanded layout.
 @available(macOS 13.0, *)
-struct CollapsedPhoneButton: View {
-    let isActive: Bool
+struct CollapsedBellButton: View {
+    let unread: Bool
     let scale: CGFloat
     let action: () -> Void
     @State private var hovered = false
@@ -563,13 +575,13 @@ struct CollapsedPhoneButton: View {
     var body: some View {
         Button(action: action) {
             ZStack {
-                Image(systemName: "phone.fill")
+                Image(systemName: "bell.fill")
                     .font(.system(size: 6 * scale))
                     .foregroundColor(
-                        isActive ? .white :
+                        unread ? .white.opacity(hovered ? 1.0 : 0.85) :
                             (hovered ? .white.opacity(0.6) : .white.opacity(0.2))
                     )
-                if isActive {
+                if unread {
                     Circle().fill(.white)
                         .frame(width: 4 * scale, height: 4 * scale)
                         .offset(x: 5 * scale, y: -5 * scale)
@@ -825,6 +837,14 @@ class ShortcutReminderController: NSObject {
         DispatchQueue.main.async { [self] in
             if self.metrics.meetingActive != active {
                 self.metrics.meetingActive = active
+            }
+        }
+    }
+
+    func setInboxUnread(_ unread: Bool) {
+        DispatchQueue.main.async { [self] in
+            if self.metrics.inboxUnread != unread {
+                self.metrics.inboxUnread = unread
             }
         }
     }

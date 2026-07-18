@@ -526,6 +526,7 @@ int shortcut_show(const char* json) { (void)json; return -2; }
 int shortcut_hide(void) { return -2; }
 int shortcut_is_available(void) { return 0; }
 void shortcut_set_meeting_active(int active) { (void)active; }
+void shortcut_set_inbox_unread(int count) { (void)count; }
 int shortcut_set_health_state(const char* state) { (void)state; return -2; }
 "#,
     )

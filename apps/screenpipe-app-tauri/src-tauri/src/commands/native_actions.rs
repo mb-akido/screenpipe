@@ -504,6 +504,12 @@ fn native_shortcut_action_callback_inner(action_ptr: *const std::os::raw::c_char
                         app_clone.clone(),
                     ));
                 }
+                "open_inbox" => {
+                    let app = app_clone.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = crate::commands::show_notification_inbox(app).await;
+                    });
+                }
                 "toggle_meeting" => {
                     // Directly call the meetings API instead of relying on JS
                     // (the Main window may not be loaded when using the Swift overlay)
