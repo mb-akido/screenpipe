@@ -6,6 +6,10 @@ import { create } from "zustand";
 import { commands, OnboardingStore } from "@/lib/utils/tauri";
 import { useEffect } from "react";
 import posthog from "posthog-js";
+import {
+  PIPES_SIDEBAR_COLLAPSED_KEY,
+  setPipesSidebarCollapsed,
+} from "@/lib/sidebar-pipes";
 
 export type OnboardingCompletionContext = {
   method: "pipes_installed" | "pipe_step_skipped" | "hidden_enterprise";
@@ -53,8 +57,18 @@ export const useOnboarding = create<OnboardingState>((set, get) => ({
   },
 
   completeOnboarding: async (context) => {
+    let previousPipesCollapsed: string | null = null;
     try {
       set({ isLoading: true, error: null });
+      try {
+        previousPipesCollapsed = localStorage.getItem(PIPES_SIDEBAR_COLLAPSED_KEY);
+      } catch {
+        // localStorage may be unavailable in restricted webviews.
+      }
+      // Rust opens Home before this command resolves, so persist and broadcast
+      // the expanded state first. A newly-created Home reads the preference;
+      // an existing Home receives the event.
+      await setPipesSidebarCollapsed(false);
       const result = await commands.completeOnboarding();
       
       if (result.status === "ok") {
@@ -76,6 +90,10 @@ export const useOnboarding = create<OnboardingState>((set, get) => ({
         throw new Error(result.error);
       }
     } catch (error) {
+      const wasCollapsed = previousPipesCollapsed == null
+        ? true
+        : previousPipesCollapsed === "true";
+      await setPipesSidebarCollapsed(wasCollapsed);
       console.error("Error completing onboarding:", error);
       set({ 
         error: error instanceof Error ? error.message : "Failed to complete onboarding",

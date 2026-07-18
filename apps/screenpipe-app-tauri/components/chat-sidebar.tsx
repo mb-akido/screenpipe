@@ -106,6 +106,10 @@ import { normalizeQueueEventPayload } from "@/lib/chat-queue-controls";
 import { Skeleton } from "@/components/ui/skeleton";
 import { localFetch } from "@/lib/api";
 import {
+  PIPES_SIDEBAR_COLLAPSED_EVENT,
+  PIPES_SIDEBAR_COLLAPSED_KEY,
+} from "@/lib/sidebar-pipes";
+import {
   applySidebarRecentsCap,
   buildSidebarRecentsSections,
   listMoveTargetGroups,
@@ -406,8 +410,12 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
   );
 
   const [pipesCollapsed, setPipesCollapsed] = useCollapsedPref(
-    "screenpipe:pipes-collapsed",
+    PIPES_SIDEBAR_COLLAPSED_KEY,
     true
+  );
+  useTauriEvent<{ collapsed: boolean }>(
+    PIPES_SIDEBAR_COLLAPSED_EVENT,
+    (event) => setPipesCollapsed(event.payload.collapsed),
   );
   const [pipeInventory, setPipeInventory] = useState<SidebarPipeInventoryItem[]>([]);
   const [pipeInventoryLoaded, setPipeInventoryLoaded] = useState(false);
