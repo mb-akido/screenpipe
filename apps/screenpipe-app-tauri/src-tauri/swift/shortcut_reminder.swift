@@ -256,9 +256,6 @@ private let kBaseCollapsedW: CGFloat = 62
 private let kBaseCollapsedH: CGFloat = 22
 private let kBaseExpandedW: CGFloat = 200
 private let kBaseExpandedH: CGFloat = 26
-// Panel width while a recording-health state is showing — the hovered failure
-// row ("recording needs help" + restart + dismiss) needs more than 200pt.
-private let kBaseHealthW: CGFloat = 264
 private let kAnimDur: Double = 0.2
 
 @available(macOS 13.0, *)
@@ -310,25 +307,50 @@ struct ShortcutReminderView: View {
 
     private var failureView: some View {
         HStack(spacing: 0) {
-            Circle()
-                .fill(Color.red)
-                .frame(width: s(6), height: s(6))
-                .padding(.leading, s(8))
-                .padding(.trailing, s(4))
+            // The message zone is itself a Button — and clicking it RESTARTS.
+            // Users click the thing that says "recording needs help" expecting
+            // the fix (observed repeatedly in testing); a separate restart
+            // button to the right of the text reads as "nothing happened".
+            // Hover has already expanded the row by the time a click is
+            // possible, so expand-on-click would always be a no-op anyway.
+            // (Plain Button, NOT .onTapGesture: tap recognizers delay/steal
+            // mouse events in this nonactivating panel.)
+            Button(action: {
+                if isExpanded {
+                    metrics.healthState = "fixing"
+                    onAction("restart_recording")
+                } else {
+                    isExpanded = true
+                }
+            }) {
+                HStack(spacing: 0) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: s(6), height: s(6))
+                        .padding(.leading, s(8))
+                        .padding(.trailing, s(4))
 
-            Text("recording needs help")
-                .font(Brand.swiftUIMonoFont(size: 8 * scale, weight: .regular))
-                .foregroundColor(.white.opacity(0.85))
-                .padding(.trailing, isExpanded ? s(8) : s(2))
+                    // Shorter label while expanded so the whole action row
+                    // fits the fixed 200pt panel — the panel frame is never
+                    // resized (setFrame on this nonactivating panel breaks
+                    // its mouse routing; observed as a dead-click pill).
+                    Text(isExpanded ? "needs help" : "recording needs help")
+                        .font(Brand.swiftUIMonoFont(size: 8 * scale, weight: .regular))
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.trailing, isExpanded ? s(8) : s(2))
 
-            if !isExpanded {
-                // Repair affordance: users click the pill directly expecting
-                // the fix — hint that an action lives here.
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 6 * scale, weight: .bold))
-                    .foregroundColor(.white.opacity(0.45))
-                    .padding(.trailing, s(8))
+                    if !isExpanded {
+                        // Repair affordance: hint that an action lives here.
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 6 * scale, weight: .bold))
+                            .foregroundColor(.white.opacity(0.45))
+                            .padding(.trailing, s(8))
+                    }
+                }
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
 
             if isExpanded {
                 Rectangle().fill(.white.opacity(0.15)).frame(width: 0.5).frame(height: s(12))
@@ -374,12 +396,6 @@ struct ShortcutReminderView: View {
         .contentShape(Rectangle())
         .onHover { hovering in
             isExpanded = hovering
-        }
-        // Users click the collapsed pill directly expecting the repair action
-        // (observed in testing) — expand on click, not just hover. Button taps
-        // inside the expanded row still win over this parent gesture.
-        .onTapGesture {
-            if !isExpanded { isExpanded = true }
         }
     }
 
@@ -680,7 +696,6 @@ class ShortcutReminderController: NSObject {
             }
             updateContent()
             positionPanel()
-            resizePanelForHealthState()
             panel?.orderFrontRegardless()
             AnimationTick.shared.setVisible(
                 true,
@@ -850,7 +865,10 @@ class ShortcutReminderController: NSObject {
     }
 
     /// Apply a recording-health state pushed from Rust. Kept even while the
-    /// panel is hidden so a later show renders the active incident.
+    /// panel is hidden so a later show renders the active incident. The panel
+    /// frame is deliberately NOT resized — all health content is sized to fit
+    /// the existing 200pt panel, because setFrame on this nonactivating panel
+    /// breaks its mouse routing (dead-click pill).
     func setHealthState(_ state: String, detail: String = "") {
         DispatchQueue.main.async { [self] in
             if self.metrics.healthDetail != detail {
@@ -861,24 +879,7 @@ class ShortcutReminderController: NSObject {
             // Health states replace the hover-expand UI; don't leave the
             // normal bar stuck expanded when the state clears.
             self.isExpanded = false
-            self.resizePanelForHealthState()
         }
-    }
-
-    /// The failure row needs more width than the normal bar. Resize in place
-    /// (keeping the panel centered on its own midpoint so a user-dragged
-    /// panel stays put) and restore the normal footprint when the state
-    /// clears — a permanently wider panel would grow the invisible
-    /// click-catching margin around the pill (TESTING.md ghost-click rules).
-    private func resizePanelForHealthState() {
-        guard let panel = panel else { return }
-        let wide = metrics.healthState != "normal"
-        let w = (wide ? kBaseHealthW : kBaseExpandedW) * gOverlayScale
-        var frame = panel.frame
-        guard abs(frame.size.width - w) > 0.5 else { return }
-        frame.origin.x = frame.midX - w / 2
-        frame.size.width = w
-        panel.setFrame(frame, display: true)
     }
 
     private func parseShortcuts(_ json: String) {
@@ -949,10 +950,7 @@ class ShortcutReminderController: NSObject {
         for screen in NSScreen.screens {
             if NSMouseInRect(mouseLocation, screen.frame, false) {
                 let visible = screen.visibleFrame
-                // Center using the width the panel will actually have — a
-                // health state widens it (resizePanelForHealthState).
-                let baseW = metrics.healthState != "normal" ? kBaseHealthW : kBaseExpandedW
-                let w = baseW * gOverlayScale
+                let w = kBaseExpandedW * gOverlayScale
                 let h = kBaseExpandedH * gOverlayScale
                 let x = screen.frame.origin.x + (screen.frame.size.width - w) / 2
                 let y = visible.origin.y + visible.size.height - h - 4
@@ -994,6 +992,13 @@ class ShortcutReminderController: NSObject {
     private func sendAction(_ action: String) {
         guard let cb = gShortcutCallback else { return }
         action.withCString { cb($0) }
+    }
+
+    /// Current panel frame in screen coords, or nil while hidden — lets the
+    /// notification inbox anchor itself under the (draggable) pill.
+    func panelFrameIfVisible() -> NSRect? {
+        guard isVisible, let panel = panel else { return nil }
+        return panel.frame
     }
 }
 
@@ -1121,4 +1126,27 @@ public func shortcutIsAvailable() -> Int32 {
         return 1
     }
     return 0
+}
+
+/// Screen frame of the visible pill (bottom-left coords). Returns 0 and fills
+/// the out-params when visible, -1 when hidden.
+@_cdecl("shortcut_get_frame")
+public func shortcutGetFrame(
+    _ x: UnsafeMutablePointer<Double>?,
+    _ y: UnsafeMutablePointer<Double>?,
+    _ w: UnsafeMutablePointer<Double>?,
+    _ h: UnsafeMutablePointer<Double>?
+) -> Int32 {
+    if #available(macOS 13.0, *) {
+        var frame: NSRect?
+        let work = { frame = ShortcutReminderController.shared.panelFrameIfVisible() }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
+        guard let f = frame else { return -1 }
+        x?.pointee = f.origin.x
+        y?.pointee = f.origin.y
+        w?.pointee = f.size.width
+        h?.pointee = f.size.height
+        return 0
+    }
+    return -2
 }

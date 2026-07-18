@@ -150,6 +150,9 @@ interface NotificationInboxPanelProps {
   showManageSettings?: boolean;
   /// Fill the host instead of the popover's capped height.
   fullHeight?: boolean;
+  /// Where this panel is hosted — segments the shared notification_bell_*
+  /// analytics across surfaces (pipe_store | overlay_window | native_overlay).
+  surface?: string;
 }
 
 /// The notification inbox: header + list + footer. Self-contained (fetches
@@ -159,6 +162,7 @@ export function NotificationInboxPanel({
   onRequestClose,
   showManageSettings = true,
   fullHeight = false,
+  surface = "pipe_store",
 }: NotificationInboxPanelProps) {
   const [history, setHistory] = useState<NotificationEntry[]>([]);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -209,7 +213,7 @@ export function NotificationInboxPanel({
   }, []);
 
   const clearAll = async () => {
-    posthog.capture("notification_bell_clear_all", { count: history.length });
+    posthog.capture("notification_bell_clear_all", { count: history.length, surface });
     setHistory([]);
     try {
       await notificationFetch("/notifications", { method: "DELETE" });
@@ -229,6 +233,7 @@ export function NotificationInboxPanel({
     posthog.capture("notification_bell_dismiss", {
       notification_type: entry?.type,
       pipe_name: entry?.pipe_name,
+      surface,
     });
     removeEntry(id);
   };
@@ -239,6 +244,7 @@ export function NotificationInboxPanel({
       pipe_name: entry.pipe_name,
       action: action.action,
       action_type: action.type,
+      surface,
     });
     // Navigating actions need the popover closed so the target surface (chat,
     // a window) isn't hidden behind it.
@@ -267,6 +273,7 @@ export function NotificationInboxPanel({
         action: action.action,
         action_type: action.type,
         error: String(err),
+        surface,
       });
       return;
     }
@@ -497,6 +504,7 @@ export function NotificationInboxPanel({
                           posthog.capture("notification_bell_copy", {
                             notification_type: entry.type,
                             pipe_name: entry.pipe_name,
+                            surface,
                           });
                         }}
                         className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
@@ -530,6 +538,7 @@ export function NotificationInboxPanel({
                             notification_type: entry.type,
                             pipe_name: entry.pipe_name,
                             title: entry.title,
+                            surface,
                           });
                           onRequestClose?.();
                           showChatWithPrefill({
@@ -605,6 +614,7 @@ export function NotificationBell() {
         if (o) {
           posthog.capture("notification_bell_opened", {
             unread_count: unreadCount,
+            surface: "pipe_store",
           });
         } else {
           void pollUnread();

@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import posthog from "posthog-js";
 import { NotificationInboxPanel } from "@/components/notification-bell";
 
 /// Standalone notification inbox opened from the shortcut overlay's bell.
@@ -26,12 +27,27 @@ export default function NotificationInboxPage() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [hide]);
 
+  // Opened analytics: the window stays mounted across hide/show cycles, so
+  // count mount + every return to visibility (matches the popover's
+  // notification_bell_opened, segmented by surface).
+  useEffect(() => {
+    const captureOpen = () =>
+      posthog.capture("notification_bell_opened", { surface: "overlay_window" });
+    captureOpen();
+    const onVisibility = () => {
+      if (!document.hidden) captureOpen();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
   return (
     <div className="h-screen w-screen p-1 bg-transparent">
       <div className="h-full w-full rounded-lg border border-border bg-popover text-popover-foreground shadow-lg overflow-hidden">
         <NotificationInboxPanel
           fullHeight
           showManageSettings={false}
+          surface="overlay_window"
           onRequestClose={hide}
         />
       </div>

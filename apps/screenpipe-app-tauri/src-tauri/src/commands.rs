@@ -2832,6 +2832,46 @@ pub async fn overlay_dismiss_incident(app_handle: tauri::AppHandle) -> Result<()
 pub async fn show_notification_inbox(app_handle: tauri::AppHandle) -> Result<(), String> {
     use tauri::WebviewWindowBuilder;
 
+    // macOS renders the inbox as a native SwiftUI panel (same file/plumbing
+    // as the native toast). The webview window below stays as the
+    // Windows/Linux implementation and the macOS fallback.
+    #[cfg(target_os = "macos")]
+    {
+        native_actions::install_notification_action_callback(&app_handle);
+        if native_notification::is_available() {
+            let entries = crate::notifications::store::read_all();
+            // Anchor under the pill's live frame — it's draggable, so a fixed
+            // top-center would detach the inbox from its trigger.
+            let anchor = native_shortcut_reminder::get_frame()
+                .map(|(x, y, w, h)| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
+            let payload = serde_json::json!({ "entries": entries, "anchor": anchor });
+            let visible = native_notification::toggle_inbox(&payload.to_string());
+            info!("native notification inbox toggled (visible: {})", visible);
+            if visible {
+                if let Some(analytics) =
+                    app_handle.try_state::<std::sync::Arc<crate::analytics::AnalyticsManager>>()
+                {
+                    let analytics = std::sync::Arc::clone(&analytics);
+                    let unread = entries.iter().filter(|e| !e.read).count();
+                    let total = entries.len();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = analytics
+                            .send_event(
+                                "notification_bell_opened",
+                                Some(serde_json::json!({
+                                    "unread_count": unread,
+                                    "total_count": total,
+                                    "surface": "native_overlay",
+                                })),
+                            )
+                            .await;
+                    });
+                }
+            }
+            return Ok(());
+        }
+    }
+
     let label = "notification-inbox";
     let window_width = 340.0_f64;
     let window_height = 420.0_f64;

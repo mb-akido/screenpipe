@@ -275,9 +275,14 @@ export default function ShortcutReminderPage() {
           className="select-none w-full h-full border border-red-500/40 flex flex-col"
           style={{ background: "rgba(0, 0, 0, 0.88)", cursor: "grab" }}
         >
-          <div
-            className="flex items-center justify-center flex-1 min-h-0"
-            style={{ gap: `${gap * 2}px`, padding: `${padY}px ${padX}px` }}
+          {/* The message row itself restarts — users click the thing that
+              says "recording needs help" expecting the fix. */}
+          <button
+            onClick={handleRestartRecording}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="flex items-center justify-center flex-1 min-h-0 hover:bg-white/10 transition-colors cursor-pointer"
+            style={{ gap: `${gap * 2}px`, padding: `${padY}px ${padX}px`, WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+            title="Restart recording"
           >
             <div
               className="rounded-full bg-red-500 animate-pulse shrink-0"
@@ -289,7 +294,7 @@ export default function ShortcutReminderPage() {
             >
               recording needs help
             </span>
-          </div>
+          </button>
           <div className="bg-white/15" style={{ height: "1px" }} />
           <div className="flex items-stretch justify-center flex-1 min-h-0">
             <button
