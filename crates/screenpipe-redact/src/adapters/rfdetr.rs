@@ -20,19 +20,19 @@
 //!
 //! ## Reference benchmark numbers
 //!
-//! `rfdetr_v16` (512×512 input, FP16 ONNX with fp32 I/O wrapper, ~60 MB,
+//! `rfdetr_v17` (512×512 input, FP16 ONNX with fp32 I/O wrapper, ~60 MB,
 //! ~118 ms/frame CPU). Held-out eval, production decode (sigmoid,
 //! conf 0.50), recall@IoU0.5:
 //!
 //!   v13 (prev shipped): recall  6.5 %, 10.2 boxes/frame
-//!   v15:                recall 10.8 %,  2.9 boxes/frame
-//!   v16 (this file):    recall 12.3 %,  3.2 boxes/frame
+//!   v16:                recall 12.3 %,  3.2 boxes/frame
+//!   v17 (this file):    recall 13.0 %,  3.0 boxes/frame
 //!
-//! False-fire hardening: on a 300-page zero-PII eval suite v15 produced
-//! 592 detections at conf 0.50; v16 produces ZERO (any class). Same on
-//! an independent known-truth screenshot run: 0 decoy hits, 0 strays
-//! (v15: 14 + 0.11/shot). Zero date false positives (the v13
-//! complaint).
+//! False-fire hardening: ZERO detections of any class at conf 0.50
+//! across two zero-PII eval suites (300 in-distribution pages + 250
+//! held-out independent layouts; the previous shipped model produced
+//! 592 + 23) and a known-truth screenshot run (0 decoy hits, 0
+//! strays). Zero date false positives (the v13 complaint).
 //!
 //! FP16 re-export recipe: torch half() at ONNX export from the FINAL
 //! training weights (`last.ckpt` — NOT `checkpoint_best_ema.pth`,
@@ -49,7 +49,7 @@ use crate::RedactError;
 use crate::SpanLabel;
 
 const RFDETR_NAME: &str = "rfdetr";
-const RFDETR_VERSION: u32 = 16; // matches the rfdetr_v16 ONNX (fp16, 512px, negative-hardened)
+const RFDETR_VERSION: u32 = 17; // matches the rfdetr_v17 ONNX (fp16, 512px, negative-hardened)
 
 #[cfg(feature = "onnx-cpu")]
 const NUM_CLASSES: usize = 12;
@@ -86,7 +86,7 @@ const CLASS_MIN_SCORE: [f32; NUM_CLASSES] =
 /// Configuration for [`RfdetrRedactor`].
 #[derive(Debug, Clone)]
 pub struct RfdetrConfig {
-    /// Path to `rfdetr_vN.onnx`. We default to `~/.screenpipe/models/rfdetr_v16.onnx`
+    /// Path to `rfdetr_vN.onnx`. We default to `~/.screenpipe/models/rfdetr_v17.onnx`
     /// in [`Self::default_model_path`] but callers may override (e.g.
     /// for an INT8-quantized variant in the future).
     pub model_path: PathBuf,
@@ -117,14 +117,14 @@ impl Default for RfdetrConfig {
 }
 
 impl RfdetrConfig {
-    /// `~/.screenpipe/models/rfdetr_v16.onnx`. Created lazily by
+    /// `~/.screenpipe/models/rfdetr_v17.onnx`. Created lazily by
     /// [`Self::ensure_model_present`] on first run.
     pub fn default_model_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".screenpipe")
             .join("models")
-            .join("rfdetr_v16.onnx")
+            .join("rfdetr_v17.onnx")
     }
 
     /// HuggingFace download URL for the canonical ONNX. Pinned to
@@ -132,16 +132,16 @@ impl RfdetrConfig {
     /// (URL + expected SHA-256 + [`RFDETR_VERSION`] all bumped
     /// together).
     pub const HF_DOWNLOAD_URL: &'static str =
-        "https://huggingface.co/screenpipe/pii-image-redactor/resolve/main/rfdetr_v16.onnx";
+        "https://huggingface.co/screenpipe/pii-image-redactor/resolve/main/rfdetr_v17.onnx";
 
-    /// Expected SHA-256 of the canonical `rfdetr_v16.onnx`. Verified
+    /// Expected SHA-256 of the canonical `rfdetr_v17.onnx`. Verified
     /// after every download. If a future training run produces a new
     /// best, bump [`RFDETR_VERSION`], re-publish to HF, update this
     /// constant. Note: the worker is destructive-only and does NOT
     /// re-redact already-processed frames, so a model-version bump
     /// only takes effect for newly-captured frames going forward.
     pub const EXPECTED_SHA256: &'static str =
-        "154e897c4466b36e5edbe9dec5467f7ea608e2395717e5068ef8dd7e93ef1727";
+        "6ffe181eb2b0b8f12b57d790fc3ca714d1bed241b91f130f3aa01674407329a3";
 
     /// Make sure the ONNX is present on disk. Idempotent — does
     /// nothing if [`Self::model_path`] already exists with the
@@ -170,7 +170,7 @@ impl RfdetrConfig {
         tracing::info!(
             url = Self::HF_DOWNLOAD_URL,
             target = %self.model_path.display(),
-            "downloading rfdetr_v16.onnx (~60 MB) — first-run only"
+            "downloading rfdetr_v17.onnx (~60 MB) — first-run only"
         );
         let resp = reqwest::Client::new()
             .get(Self::HF_DOWNLOAD_URL)
@@ -207,7 +207,7 @@ impl RfdetrConfig {
         tracing::info!(
             target = %self.model_path.display(),
             bytes = bytes.len(),
-            "rfdetr_v16.onnx ready"
+            "rfdetr_v17.onnx ready"
         );
         Ok(())
     }
@@ -554,7 +554,7 @@ mod tests {
         let p = RfdetrConfig::default_model_path();
         let expected_suffix = Path::new(".screenpipe")
             .join("models")
-            .join("rfdetr_v16.onnx");
+            .join("rfdetr_v17.onnx");
         assert!(
             p.ends_with(&expected_suffix),
             "default path {} should end with {}",
@@ -620,7 +620,7 @@ mod tests {
         // (Real download path is exercised by integration tests off
         // the unit-test harness.)
         let d = tempdir().unwrap();
-        let p = d.path().join("models").join("rfdetr_v16.onnx");
+        let p = d.path().join("models").join("rfdetr_v17.onnx");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"not the real model").unwrap();
         let cfg = RfdetrConfig {
