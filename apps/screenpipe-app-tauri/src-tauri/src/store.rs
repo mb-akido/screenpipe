@@ -1570,6 +1570,9 @@ impl SettingsStore {
             data_dir,
             Some(&resolved_engine),
         );
+        config.screenpipe_cloud_audio_requested_and_entitled =
+            self.recording.audio_transcription_engine == "screenpipe-cloud"
+                && self.cloud_transcription_entitled();
         // Resolve the API auth key from the seeded cache. The cache is populated
         // asynchronously by `recording::spawn_screenpipe` via the shared helper
         // (`screenpipe_engine::auth_key::resolve_api_auth_key`) — which is the

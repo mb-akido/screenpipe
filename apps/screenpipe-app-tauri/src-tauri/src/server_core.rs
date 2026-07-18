@@ -30,6 +30,12 @@ use tracing::{error, info, warn};
 /// The HTTP server, pipes, and DB live here.
 pub struct ServerCore {
     pub db: Arc<DatabaseManager>,
+    /// Effective post-preflight config used by the initial capture session.
+    pub recording_config: RecordingConfig,
+    /// Secret store built from DatabaseManager's checked, coordinated pool.
+    /// Tauri commands must use this handle instead of opening db.sqlite by
+    /// path while startup preflight or teardown is in progress.
+    pub secret_store: Option<Arc<screenpipe_secrets::SecretStore>>,
     pub audio_manager: Arc<screenpipe_audio::audio_manager::AudioManager>,
     pub hot_frame_cache: Arc<HotFrameCache>,
     pub vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
@@ -65,12 +71,17 @@ pub struct ServerCore {
     /// post-wedge respawn fail with SQLITE_IOERR 522 (2026-07-02 incident).
     oauth_refresher:
         Option<Arc<screenpipe_connect::oauth_refresh_scheduler::OAuthRefreshScheduler>>,
+    /// ChatGPT uses a separate OAuth flow from screenpipe-connect. Keep its
+    /// refresher under the same DB lifecycle boundary so it cannot reopen the
+    /// shared SecretStore pool during an in-process recovery.
+    chatgpt_refresher: Option<Arc<crate::chatgpt_oauth::ChatGptRefreshScheduler>>,
     external_memory_sync:
         Option<Arc<screenpipe_engine::external_memory_sync::ExternalMemorySyncScheduler>>,
+    runtime_sync_state: screenpipe_engine::SyncState,
     /// Tasks spawned by `start()` that would otherwise outlive the engine:
     /// the HTTP serve task (whose `Server` owns a `db` clone + secret store)
     /// and the HD meeting-event listeners. Aborted in `shutdown()`.
-    owned_tasks: Vec<tokio::task::JoinHandle<()>>,
+    owned_tasks: screenpipe_engine::server::BackgroundTaskRegistry,
 }
 
 /// Bind attempts before giving up on the HTTP port. Together with
@@ -79,7 +90,36 @@ pub struct ServerCore {
 /// without stalling a genuinely conflicted boot for long.
 const BIND_RETRY_ATTEMPTS: u32 = 20;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 const PORT_HOLDER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Stop request-owned work before draining state that a request can lazily
+/// create. In particular, `/sync/*` handlers may publish a runtime containing
+/// DB and SecretStore owners. Draining sync first leaves a check-then-publish
+/// race where an in-flight request can recreate that runtime after shutdown.
+async fn quiesce_request_tasks_before_sync(
+    owned_tasks: &screenpipe_engine::server::BackgroundTaskRegistry,
+    stop_sync: impl std::future::Future<Output = ()>,
+) {
+    owned_tasks.abort_all().await;
+    stop_sync.await;
+}
+
+/// Decide whether a manager-owned SecretStore can be writable. Once encryption
+/// is requested, every missing/denied/unavailable key state fails closed; it
+/// must never silently create plaintext secret rows.
+fn coordinated_secret_store_key(
+    encryption_requested: bool,
+    result: crate::secrets::KeyResult,
+) -> Result<Option<[u8; 32]>, &'static str> {
+    match result {
+        crate::secrets::KeyResult::Found(key) => Ok(Some(key)),
+        crate::secrets::KeyResult::NotFound if !encryption_requested => Ok(None),
+        crate::secrets::KeyResult::NotFound => Err("encryption key was not found"),
+        crate::secrets::KeyResult::AccessDenied => Err("keychain access was denied"),
+        crate::secrets::KeyResult::Unavailable => Err("keychain is unavailable"),
+    }
+}
 
 #[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn parse_lsof_port_holder(stdout: &str) -> Option<String> {
@@ -223,6 +263,7 @@ impl ServerCore {
         // PiExecutor, the Tauri command writer) share one storage cell.
         cloud_token_handle: std::sync::Arc<arc_swap::ArcSwap<Option<String>>>,
     ) -> Result<Self, String> {
+        let mut config = config.clone();
         info!("Starting server core on port {}", config.port);
         crate::health::set_boot_phase("starting", Some("starting server"));
 
@@ -347,6 +388,96 @@ impl ServerCore {
         };
         info!("Database initialized at {}", db_path);
 
+        // SecretStore initialization can execute CREATE TABLE and key
+        // persistence. It must therefore happen only after DatabaseManager's
+        // bounded read-only preflight and writable initialization succeed.
+        // Build it from the manager-owned pool so startup never opens a second
+        // uncoordinated pool before preflight.
+        let secret_store = {
+            let encryption_requested =
+                screenpipe_secrets::is_encryption_requested(&config.data_dir);
+            let key_result = if encryption_requested {
+                crate::secrets::get_key()
+            } else {
+                crate::secrets::KeyResult::NotFound
+            };
+            let secret_key = coordinated_secret_store_key(encryption_requested, key_result);
+            let secret_key = match secret_key {
+                Ok(key) => Some(key),
+                Err(reason) => {
+                    warn!(
+                        "keychain: refusing writable secret store while encryption is unavailable: {reason}"
+                    );
+                    None
+                }
+            };
+            let reporter = db.hard_fault_reporter();
+            let secret_write_lock = reporter.write_semaphore();
+            let secret_error_reporter = reporter.clone();
+            match secret_key {
+                Some(secret_key) => {
+                    match screenpipe_secrets::SecretStore::new_coordinated(
+                        db.coordinated_write_pool(),
+                        secret_key,
+                        secret_write_lock,
+                        move |error| {
+                            secret_error_reporter.report_error(error);
+                        },
+                    )
+                    .await
+                    {
+                        Ok(store) => Some(Arc::new(store)),
+                        Err(error) => {
+                            warn!("failed to initialize secret store: {error}");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+        let resolved_cloud_token = if let Some(store) = secret_store.as_ref() {
+            crate::auth_token::migrate_plaintext_token_with_store(&config.data_dir, store).await
+        } else {
+            cloud_token_handle.load_full().as_ref().clone()
+        };
+        config.refresh_cloud_auth(resolved_cloud_token.clone());
+        cloud_token_handle.store(Arc::new(resolved_cloud_token));
+
+        let effective_api_auth_key = if config.api_auth {
+            match screenpipe_engine::auth_key::resolve_api_auth_key_with_store(
+                &config.data_dir,
+                config.api_auth_key.as_deref(),
+                secret_store.as_deref(),
+            )
+            .await
+            {
+                Ok(key) => {
+                    crate::store::seed_api_auth_key(key.clone());
+                    Some(key)
+                }
+                Err(error) => {
+                    error!("failed to resolve API auth key after database startup: {error}");
+                    config.api_auth_key.clone()
+                }
+            }
+        } else {
+            config.api_auth_key.clone()
+        };
+
+        // SecretStore reads and writes report into the manager's sticky fault
+        // state. Abort before audio, HTTP, pipes, or capture are constructed if
+        // auth/secret initialization was the first code to observe corruption.
+        if let Some(fault) = db.write_queue_health().hard_fault() {
+            db.close().await;
+            let message = format!(
+                "Failed to initialize database secrets: (code: {}) {fault}",
+                fault.code()
+            );
+            crate::health::set_boot_error(&message);
+            return Err(message);
+        }
+
         // --- Audio devices + manager (built but NOT started) ---
         let audio_devices = if config.disable_audio {
             Vec::new()
@@ -469,7 +600,7 @@ impl ServerCore {
         server.power_manager = Some(power_manager.clone());
         server.manual_meeting = Some(manual_meeting.clone());
         server.api_auth = config.api_auth;
-        server.api_auth_key = config.api_auth_key.clone();
+        server.api_auth_key = effective_api_auth_key.clone();
         // Cloud JWT for /v1/chat/completions proxy. config.user_id carries
         // the Clerk JWT (despite the name — see line 96 where the same value
         // is used as the cloud transcription bearer). Pi's bash deliberately
@@ -483,39 +614,20 @@ impl ServerCore {
         // restart — paying users who signed in after the sidecar started got
         // anonymous-tier 403s on every Sonnet/Opus pipe.
         server.cloud_token = cloud_token_handle.clone();
-        // Seed the shared cell from persisted settings, but ONLY when empty
-        // — if `set_cloud_token` has already pushed a fresher value (e.g. the
-        // user signed in between sidecar boots), don't clobber it with the
-        // stale `config.user_id` snapshot.
-        if let Some(ref t) = config.user_id {
-            if !t.is_empty() {
-                let existing = cloud_token_handle.load();
-                if existing.is_none() {
-                    cloud_token_handle.store(std::sync::Arc::new(Some(t.clone())));
-                }
-            }
-        }
         server.owned_browser = owned_browser;
 
         // Handles to the background schedulers created below, kept on Self so
         // `shutdown()` can stop them (they hold DB / secret-pool references).
         let mut oauth_refresher_handle = None;
+        let mut chatgpt_refresher_handle = None;
         let mut external_memory_sync_handle = None;
-        let mut owned_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let owned_tasks = screenpipe_engine::server::BackgroundTaskRegistry::default();
 
-        // Secret store — read-only keychain access on startup.
-        // Never create a key automatically (that triggers a macOS modal).
-        // Users opt in via onboarding or Settings > Privacy.
+        // Finish SecretStore migrations and attach the already-coordinated
+        // store created immediately after DatabaseManager startup above.
         {
-            let secret_key = match crate::secrets::get_key_if_encryption_enabled() {
-                crate::secrets::KeyResult::Found(k) => Some(k),
-                _ => {
-                    info!("keychain: no encryption key found — secrets stored unencrypted until user opts in");
-                    None
-                }
-            };
-            match screenpipe_secrets::SecretStore::new(db.pool.clone(), secret_key).await {
-                Ok(store) => {
+            match secret_store {
+                Some(store) => {
                     let fixed = screenpipe_secrets::fix_secret_file_permissions(&config.data_dir);
                     if fixed > 0 {
                         info!("fixed permissions on {} credential files", fixed);
@@ -545,7 +657,17 @@ impl ServerCore {
                         Err(e) => warn!("oauth: sweep_shadowed_default_slots failed: {}", e),
                     }
 
-                    let store_arc = Arc::new(store);
+                    if let Some(fault) = db.write_queue_health().hard_fault() {
+                        db.close().await;
+                        let message = format!(
+                            "Failed to initialize database secrets: (code: {}) {fault}",
+                            fault.code()
+                        );
+                        crate::health::set_boot_error(&message);
+                        return Err(message);
+                    }
+
+                    let store_arc = store;
 
                     // Background OAuth refresh scheduler. Keeps refresh-token
                     // sliding windows alive on providers like Zoom (15h
@@ -574,9 +696,7 @@ impl ServerCore {
 
                     server.secret_store = Some(store_arc);
                 }
-                Err(e) => {
-                    warn!("failed to initialize secret store: {}", e);
-                }
+                None => {}
             }
         }
 
@@ -590,12 +710,11 @@ impl ServerCore {
         // `set_cloud_token` Tauri command updates both readers in one shot,
         // so a fresh sign-in or sign-out takes effect on the very next pipe
         // run without restarting the engine.
-        let cloud_token_handle = server.cloud_token.clone();
         let pi_executor = Arc::new(
             screenpipe_core::agents::pi::PiExecutor::with_shared_user_token(
-                cloud_token_handle.clone(),
+                server.cloud_token.clone(),
             )
-            .with_api_auth_key(config.api_auth_key.clone()),
+            .with_api_auth_key(effective_api_auth_key.clone()),
         );
         let mut agent_executors: std::collections::HashMap<
             String,
@@ -613,9 +732,8 @@ impl ServerCore {
             pipe_store,
             config.port,
         );
-        pipe_manager.set_scheduler_run_guard(Arc::new(|| {
-            crate::headless::scheduled_pipe_skip_reason()
-        }));
+        pipe_manager
+            .set_scheduler_run_guard(Arc::new(|| crate::headless::scheduled_pipe_skip_reason()));
         let mcp_session_access =
             screenpipe_core::pipes::mcp_access::McpSessionAccessRegistry::new();
         pipe_manager.set_mcp_session_access(mcp_session_access.clone());
@@ -624,7 +742,7 @@ impl ServerCore {
         }
         // Inject local API key so pipe subprocesses can authenticate to localhost
         if config.api_auth {
-            pipe_manager.set_local_api_key(config.api_auth_key.clone());
+            pipe_manager.set_local_api_key(effective_api_auth_key.clone());
         }
         {
             let secret_store_for_check = server.secret_store.clone();
@@ -653,25 +771,29 @@ impl ServerCore {
             let db_for_cb = db.clone();
             let screenpipe_dir_for_cb = config.data_dir.clone();
             let pm_for_cb = shared_pipe_manager.clone();
-            shared_pipe_manager.lock().await.set_on_run_complete(Arc::new(
-                move |pipe_name, execution_id, success, duration_secs, error_type| {
-                    let mut props = serde_json::json!({
-                        "pipe": pipe_name,
-                        "success": success,
-                        "duration_secs": duration_secs,
-                    });
-                    if let Some(et) = error_type {
-                        props["error_type"] = serde_json::Value::String(et.to_string());
-                    }
-                    analytics::capture_event_nonblocking("pipe_scheduled_run", props);
+            let tasks_for_cb = owned_tasks.clone();
+            shared_pipe_manager
+                .lock()
+                .await
+                .set_on_run_complete(Arc::new(
+                    move |pipe_name, execution_id, success, duration_secs, error_type| {
+                        let mut props = serde_json::json!({
+                            "pipe": pipe_name,
+                            "success": success,
+                            "duration_secs": duration_secs,
+                        });
+                        if let Some(et) = error_type {
+                            props["error_type"] = serde_json::Value::String(et.to_string());
+                        }
+                        analytics::capture_event_nonblocking("pipe_scheduled_run", props);
 
-                    // Auto-register pipe artifacts to ~/.screenpipe/outputs/
-                    if success {
-                        let db = db_for_cb.clone();
-                        let dir = screenpipe_dir_for_cb.clone();
-                        let pm = pm_for_cb.clone();
-                        let name = pipe_name.to_string();
-                        tokio::spawn(async move {
+                        // Auto-register pipe artifacts to ~/.screenpipe/outputs/
+                        if success {
+                            let db = db_for_cb.clone();
+                            let dir = screenpipe_dir_for_cb.clone();
+                            let pm = pm_for_cb.clone();
+                            let name = pipe_name.to_string();
+                            tasks_for_cb.spawn(async move {
                             // Hold the lock only to collect declarations, then drop it
                             let items = {
                                 let mgr = pm.lock().await;
@@ -696,9 +818,9 @@ impl ServerCore {
                                 .await;
                             }
                         });
-                    }
-                },
-            ));
+                        }
+                    },
+                ));
         }
         if let Err(e) = shared_pipe_manager.lock().await.start_scheduler().await {
             warn!("failed to start pipe scheduler: {}", e);
@@ -731,7 +853,7 @@ impl ServerCore {
         // ends. Without this the only safety net is the 4-hour hard cap.
         {
             let controller = high_fps_controller.clone();
-            owned_tasks.push(tokio::spawn(async move {
+            owned_tasks.spawn(async move {
                 use futures::StreamExt;
                 let mut sub =
                     screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
@@ -750,7 +872,7 @@ impl ServerCore {
                         controller.handle_meeting_ended(id);
                     }
                 }
-            }));
+            });
         }
 
         // meeting_started → (1) upgrade any prewarm-pending session to a
@@ -759,7 +881,7 @@ impl ServerCore {
         // which adds a "+ HD" action to the meeting notification.
         {
             let controller = high_fps_controller.clone();
-            owned_tasks.push(tokio::spawn(async move {
+            owned_tasks.spawn(async move {
                 use futures::StreamExt;
                 let mut sub =
                     screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
@@ -793,16 +915,17 @@ impl ServerCore {
                         controller.start_meeting_session(id);
                     }
                 }
-            }));
+            });
         }
 
-        let server = server
+        let mut server = server
             .with_pipe_manager(shared_pipe_manager.clone())
             .with_mcp_session_access(mcp_session_access)
             .with_high_fps_controller(high_fps_controller.clone());
+        server.background_tasks = owned_tasks.clone();
 
         // Install pi agent in background
-        tokio::spawn(async move {
+        owned_tasks.spawn(async move {
             use screenpipe_core::agents::AgentExecutor;
             if let Err(e) = pi_executor.ensure_installed().await {
                 warn!("pi agent install failed: {}", e);
@@ -847,6 +970,17 @@ impl ServerCore {
         info!("HTTP server bound to port {}", config.port);
 
         let vision_manager_handle = server.vision_manager.clone();
+        let coordinated_secret_store = server.secret_store.clone();
+        let runtime_sync_state = server.sync_state.clone();
+
+        // Start only after every fallible startup phase and the listener bind
+        // have succeeded. The owner is stopped/joined before SecretStore pool
+        // closure in `shutdown()`.
+        if coordinated_secret_store.is_some() {
+            let chatgpt_refresher = Arc::new(crate::chatgpt_oauth::ChatGptRefreshScheduler::new());
+            chatgpt_refresher.start();
+            chatgpt_refresher_handle = Some(chatgpt_refresher);
+        }
 
         // Start serving in background. The handle is kept on Self and aborted
         // in `shutdown()`: the `Server` moved into this task owns a `db` clone
@@ -854,11 +988,11 @@ impl ServerCore {
         // old SQLite connections (and the shared -shm WAL-index) alive — the
         // core of the 2026-07-02 unrecoverable-522 wedge. Aborting also frees
         // the listener so the next spawn can rebind the port.
-        owned_tasks.push(tokio::spawn(async move {
+        owned_tasks.spawn(async move {
             if let Err(e) = server.start_with_listener(listener).await {
                 error!("Server error: {:?}", e);
             }
-        }));
+        });
 
         info!("Server core started successfully");
         crate::health::set_boot_phase("ready", None);
@@ -900,11 +1034,30 @@ impl ServerCore {
         // authenticates redactor requests. Without this the worker logs
         // "no api key — requests will be un-authenticated" on every
         // restart even when the user is signed in.
-        let tinfoil_api_key = config.user_id.clone().filter(|s| !s.is_empty());
+        let tinfoil_api_key = cloud_token_handle
+            .load_full()
+            .as_ref()
+            .clone()
+            .filter(|s| !s.is_empty());
 
         // One shutdown signal, shared across both worker spawn paths and
         // stored on Self for `shutdown()` to fire on app quit.
         let redact_shutdown = Arc::new(Notify::new());
+
+        // Redaction used to mutate `db.pool` outside the process-wide writer
+        // gate. It was the first component to surface code 522 in the July 17
+        // corruption incident. Keep its inference independent, but serialize
+        // every reconciliation UPDATE with capture/checkpoints and forward the
+        // first hard SQLite error to the same fail-closed quarantine.
+        let redaction_write_control = {
+            let reporter = db.hard_fault_reporter();
+            screenpipe_redact::worker::SqliteWriteControl::new(
+                reporter.write_semaphore(),
+                move |error| {
+                    reporter.report_error(error);
+                },
+            )
+        };
 
         // Opt-in (Settings → Privacy → "redact secrets in agent logs", default
         // off): strip secrets the pi agent persists into its session logs (bash
@@ -928,8 +1081,9 @@ impl ServerCore {
                     poll_interval: std::time::Duration::from_secs(5 * 60),
                     ..Default::default()
                 };
-                let _ = Worker::new(db.pool.clone(), placeholder, cfg)
+                let worker = Worker::new(db.coordinated_write_pool(), placeholder, cfg)
                     .spawn_with_shutdown(redact_shutdown.clone());
+                owned_tasks.register(worker);
             }
         }
 
@@ -1004,18 +1158,22 @@ impl ServerCore {
                     tables: ALL_TARGET_TABLES.to_vec(),
                     ..Default::default()
                 };
-                let _ = Worker::new(db.pool.clone(), pipeline_arc, cfg)
+                let worker = Worker::new(db.coordinated_write_pool(), pipeline_arc, cfg)
+                    .with_sqlite_write_control(redaction_write_control.clone())
                     .spawn_with_shutdown(redact_shutdown.clone());
+                owned_tasks.register(worker);
             } else {
                 // Local mode: spawn the download+load off the boot path
                 // so a slow first-run HF pull doesn't block the app
                 // launch. The worker is created inside the spawned
                 // task once the model is ready.
-                let pool = db.pool.clone();
+                let pool = db.coordinated_write_pool();
                 let shutdown = redact_shutdown.clone();
                 let labels = pii_labels.clone();
                 let pseudonymizer = pseudonymizer.clone();
-                tokio::spawn(async move {
+                let write_control = redaction_write_control.clone();
+                let worker_tasks = owned_tasks.clone();
+                owned_tasks.spawn(async move {
                     let policy = TextRedactionPolicy::from_labels(&labels);
                     // Prefer the local ONNX text redactor (~278 MB INT8,
                     // sub-10 ms p50, gets CoreML on macOS / DirectML on
@@ -1092,7 +1250,10 @@ impl ServerCore {
                         tables: ALL_TARGET_TABLES.to_vec(),
                         ..Default::default()
                     };
-                    let _ = Worker::new(pool, pipeline_arc, cfg).spawn_with_shutdown(shutdown);
+                    let worker = Worker::new(pool, pipeline_arc, cfg)
+                        .with_sqlite_write_control(write_control)
+                        .spawn_with_shutdown(shutdown);
+                    worker_tasks.register(worker);
                 });
             }
         }
@@ -1106,7 +1267,7 @@ impl ServerCore {
             use screenpipe_redact::ImageRedactionPolicy;
             use screenpipe_redact::ImageRedactor;
 
-            let pool = db.pool.clone();
+            let pool = db.coordinated_write_pool();
             if use_tinfoil {
                 let detector = Arc::new(TinfoilImageRedactor::new(TinfoilImageConfig {
                     api_key: tinfoil_api_key.clone(),
@@ -1119,7 +1280,7 @@ impl ServerCore {
                     has_api_key = tinfoil_api_key.is_some(),
                     "starting async image-PII worker (backend=tinfoil)"
                 );
-                let _ = ImageWorker::new(
+                let worker = ImageWorker::new(
                     pool,
                     detector,
                     ImageWorkerConfig {
@@ -1127,7 +1288,9 @@ impl ServerCore {
                         ..Default::default()
                     },
                 )
+                .with_sqlite_write_control(redaction_write_control.clone())
                 .spawn_with_shutdown(redact_shutdown.clone());
+                owned_tasks.register(worker);
             } else {
                 // Local mode: rfdetr ONNX. First-run downloads ~108 MB
                 // from huggingface.co/screenpipe/pii-image-redactor and
@@ -1136,7 +1299,9 @@ impl ServerCore {
                 // loads, so they never drift on a model bump.
                 let shutdown = redact_shutdown.clone();
                 let labels = pii_labels.clone();
-                tokio::spawn(async move {
+                let write_control = redaction_write_control.clone();
+                let worker_tasks = owned_tasks.clone();
+                owned_tasks.spawn(async move {
                     match RfdetrRedactor::load_or_download(RfdetrConfig::default()).await {
                         Ok(detector) => {
                             info!(
@@ -1145,7 +1310,7 @@ impl ServerCore {
                                 "starting async image-PII worker (backend=local)"
                             );
                             let detector_arc = Arc::new(detector) as Arc<dyn ImageRedactor>;
-                            let _ = ImageWorker::new(
+                            let worker = ImageWorker::new(
                                 pool,
                                 detector_arc,
                                 ImageWorkerConfig {
@@ -1153,7 +1318,9 @@ impl ServerCore {
                                     ..Default::default()
                                 },
                             )
+                            .with_sqlite_write_control(write_control)
                             .spawn_with_shutdown(shutdown);
+                            worker_tasks.register(worker);
                         }
                         Err(e) => {
                             warn!(
@@ -1169,6 +1336,8 @@ impl ServerCore {
 
         Ok(Self {
             db,
+            recording_config: config.clone(),
+            secret_store: coordinated_secret_store,
             audio_manager,
             hot_frame_cache,
             vision_metrics,
@@ -1180,10 +1349,12 @@ impl ServerCore {
             data_dir: local_data_dir,
             data_path,
             port: config.port,
-            local_api_key: config.api_auth_key.clone(),
+            local_api_key: effective_api_auth_key,
             redact_shutdown,
             oauth_refresher: oauth_refresher_handle,
+            chatgpt_refresher: chatgpt_refresher_handle,
             external_memory_sync: external_memory_sync_handle,
+            runtime_sync_state,
             owned_tasks,
         })
     }
@@ -1192,6 +1363,18 @@ impl ServerCore {
     pub async fn shutdown(self) {
         info!("Shutting down server core");
         screenpipe_connect::mdns::shutdown();
+
+        // Close the request/task registry first. A sync endpoint can lazily
+        // initialize and publish a runtime, so stopping sync while HTTP work is
+        // still alive allows that request to recreate DB owners after the stop.
+        // `abort_all` awaits cancellation and permanently closes registration;
+        // only then is it safe to drain the final runtime.
+        quiesce_request_tasks_before_sync(
+            &self.owned_tasks,
+            screenpipe_engine::stop_sync_runtime(&self.runtime_sync_state),
+        )
+        .await;
+        info!("Stopped HTTP server, HD meeting-event tasks, and runtime sync");
 
         // Tell redaction workers to exit BEFORE the tokio runtime tears
         // down — otherwise their in-flight sqlx queries panic with
@@ -1219,16 +1402,14 @@ impl ServerCore {
         if let Some(refresher) = &self.oauth_refresher {
             refresher.stop().await;
         }
+        if let Some(refresher) = &self.chatgpt_refresher {
+            refresher.stop().await;
+        }
         if let Some(sync) = &self.external_memory_sync {
-            sync.stop();
+            sync.stop().await;
         }
 
-        // Abort the HTTP serve task (its `Server` owns a db clone + secret
-        // store and the bound listener) and the HD meeting-event listeners.
-        for task in &self.owned_tasks {
-            task.abort();
-        }
-        info!("Stopped background schedulers + HTTP server task");
+        info!("Stopped background schedulers");
 
         // Shut down audio manager (releases ggml Metal resources)
         info!("Shutting down audio manager...");
@@ -1256,6 +1437,38 @@ mod tests {
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[tokio::test]
+    async fn request_tasks_are_cancelled_before_runtime_sync_is_drained() {
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let tasks = screenpipe_engine::server::BackgroundTaskRegistry::default();
+        let request_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&request_dropped));
+        tasks.spawn(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+
+        let sync_drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sync_drained_for_stop = Arc::clone(&sync_drained);
+        quiesce_request_tasks_before_sync(&tasks, async move {
+            assert!(
+                request_dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "request future must be dropped before sync teardown begins"
+            );
+            sync_drained_for_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(sync_drained.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1319,5 +1532,25 @@ mod tests {
             Some("screenpipe.exe")
         );
         assert_eq!(parse_tasklist_process_name(""), None);
+    }
+
+    #[test]
+    fn secret_store_key_policy_never_downgrades_requested_encryption() {
+        let key = [7_u8; 32];
+        assert!(matches!(
+            coordinated_secret_store_key(true, crate::secrets::KeyResult::Found(key)),
+            Ok(Some(found)) if found == key
+        ));
+        assert!(matches!(
+            coordinated_secret_store_key(false, crate::secrets::KeyResult::NotFound),
+            Ok(None)
+        ));
+        assert!(coordinated_secret_store_key(true, crate::secrets::KeyResult::NotFound).is_err());
+        assert!(
+            coordinated_secret_store_key(true, crate::secrets::KeyResult::AccessDenied).is_err()
+        );
+        assert!(
+            coordinated_secret_store_key(true, crate::secrets::KeyResult::Unavailable).is_err()
+        );
     }
 }

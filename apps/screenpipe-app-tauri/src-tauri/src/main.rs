@@ -124,6 +124,25 @@ pub use recording::stop_screenpipe;
 pub use server::spawn_server;
 // Removed: pub use store::get_profiles_store; // Profile functionality has been removed
 
+#[cfg(feature = "e2e")]
+fn handle_e2e_invoke(invoke: tauri::ipc::Invoke<tauri::Wry>) -> bool {
+    let is_hard_fault_command = matches!(
+        invoke.message.command(),
+        "e2e_inject_db_hard_fault" | "e2e_db_hard_fault_state"
+    );
+    if is_hard_fault_command {
+        let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+            e2e_seed::e2e_inject_db_hard_fault,
+            e2e_seed::e2e_db_hard_fault_state
+        ];
+        handler(invoke)
+    } else {
+        let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool =
+            tauri_helper::tauri_collect_commands!();
+        handler(invoke)
+    }
+}
+
 pub use enterprise_install_metadata::get_enterprise_install_metadata;
 pub use enterprise_policy::set_enterprise_policy;
 pub use enterprise_policy::set_sync_streams;
@@ -134,8 +153,8 @@ use sentry;
 use tauri::AppHandle;
 #[cfg(target_os = "macos")]
 mod dock_menu;
-mod health;
 mod headless;
+mod health;
 mod log_files;
 mod media_commands;
 mod native_notification;
@@ -195,6 +214,9 @@ fn get_env(name: &str) -> String {
 #[tauri::command]
 #[specta::specta]
 fn get_e2e_seed_flags() -> Vec<String> {
+    if !cfg!(feature = "e2e") {
+        return Vec::new();
+    }
     std::env::var("SCREENPIPE_E2E_SEED")
         .ok()
         .filter(|s| !s.is_empty())
@@ -205,6 +227,25 @@ fn get_e2e_seed_flags() -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn preflight_database_during_setup(path: std::path::PathBuf) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("screenpipe-db-preflight".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("failed to build DB preflight runtime: {error}"))?;
+            runtime
+                .block_on(screenpipe_db::DatabaseManager::preflight_database_path(
+                    &path,
+                ))
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| format!("failed to start DB preflight thread: {error}"))?
+        .join()
+        .map_err(|_| "DB preflight thread panicked".to_string())?
 }
 
 /// Returns true when SCREENPIPE_SKIP_ONBOARDING is set to a truthy value
@@ -676,19 +717,6 @@ async fn main() {
         }
     }
 
-    // #3943: migrate the cloud auth token out of the plaintext store.bin /
-    // auth.json (and the .last-good snapshot) into the encrypted secret store,
-    // seed the in-process cache, and scrub the plaintext copies. Runs here in
-    // `async main` — BEFORE the store plugin loads store.bin and before the
-    // engine spawn / `to_recording_settings` read the token. Must NOT run
-    // inside `.setup()`: a `block_on` there nests runtimes under
-    // #[tokio::main] and panics ("Cannot start a runtime from within a
-    // runtime"), killing the app at launch.
-    let initial_cloud_token = crate::auth_token::migrate_plaintext_token(
-        &screenpipe_core::paths::default_screenpipe_data_dir(),
-    )
-    .await;
-
     let recording_state = RecordingState {
         server_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         server: Arc::new(tokio::sync::Mutex::new(None)),
@@ -698,7 +726,7 @@ async fn main() {
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
         wants_recording: Arc::new(AtomicBool::new(false)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
-        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token))),
+        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         db_wedge_breaker: recording::new_db_wedge_breaker(),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
@@ -714,6 +742,18 @@ async fn main() {
             tauri::WindowEvent::Focused(true) => {
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
+                    // An isolated no-capture E2E run deliberately has an empty
+                    // audio-device cache. Treating that as a newly-granted mic
+                    // races the initial server boot with a full stop/restart.
+                    // Besides making tests flaky, that recovery path can reach
+                    // orphan cleanup before the test port is resolved. Never
+                    // run permission recovery when capture is explicitly off.
+                    if get_e2e_seed_flags()
+                        .iter()
+                        .any(|flag| flag == "no-recording" || flag == "no-audio")
+                    {
+                        return;
+                    }
                     let permission_granted =
                         permissions::check_microphone_permission().permitted();
                     let audio_devices_empty = health::get_audio_device_status().is_empty();
@@ -874,13 +914,24 @@ async fn main() {
 
     let sync_scheduler = screenpipe_connect::sync_scheduler::SyncScheduler::new();
 
-    let app = app.manage(recording_state)
+    let app = app
+        .manage(recording_state)
         .manage(pi_state)
         .manage(suggestions_state)
         .manage(pipe_suggestions_state)
-        .manage(sync_scheduler)
-        .invoke_handler(tauri_helper::tauri_collect_commands!())
-        .setup(move |app| {
+        .manage(sync_scheduler);
+
+    // Destructive fault-injection commands are compiled and registered only
+    // in E2E builds. Route those two names explicitly while preserving the
+    // generated production handler for every normal command. This keeps the
+    // commands out of production binaries without requiring plugin ACLs in the
+    // isolated WebDriver app.
+    #[cfg(feature = "e2e")]
+    let app = app.invoke_handler(handle_e2e_invoke);
+    #[cfg(not(feature = "e2e"))]
+    let app = app.invoke_handler(tauri_helper::tauri_collect_commands!());
+
+    let app = app.setup(move |app| {
             //deep link register_all
             #[cfg(any(windows, target_os = "linux"))]
             {
@@ -1139,6 +1190,12 @@ async fn main() {
 
             app.manage(store.clone());
 
+            // Install DB-recovery subscribers before the server thread can run
+            // startup preflight. DbRecoveryEvent is intentionally non-replaying;
+            // registering later can lose an immediate corrupt-on-launch event
+            // and leave the tray in Error with no recovery guidance.
+            crate::db_recovery_notifications::start(app_handle.clone());
+
             // Set Chinese HuggingFace mirror early — before any model downloads
             if store.recording.use_chinese_mirror {
                 std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
@@ -1148,6 +1205,15 @@ async fn main() {
             // Resolve data directory from user setting (custom dir or ~/.screenpipe)
             let (data_dir, data_dir_fell_back) = config::resolve_data_dir(&store.data_dir);
             info!("Recording data directory: {}", data_dir.display());
+
+            #[cfg(feature = "e2e")]
+            crate::e2e_seed::seed_startup_db_hard_fault()
+                .map_err(std::io::Error::other)?;
+
+            if let Err(error) = preflight_database_during_setup(data_dir.join("db.sqlite")) {
+                crate::health::set_boot_error(&error);
+                crate::db_relaunch::surface_startup_preflight_failure(&error);
+            }
 
             // Pin SCREENPIPE_DATA_DIR to the *resolved* dir so every consumer of
             // `default_screenpipe_data_dir()` agrees with the engine on where the
@@ -1163,6 +1229,12 @@ async fn main() {
             // also propagates the correct dir to child processes (the CLI
             // sidecar inherits this env).
             std::env::set_var("SCREENPIPE_DATA_DIR", &data_dir);
+            let startup_cloud_token =
+                crate::auth_token::seed_plaintext_token_for_startup(&data_dir);
+            app_handle
+                .state::<RecordingState>()
+                .cloud_token
+                .store(Arc::new(startup_cloud_token));
 
             // Enterprise builds can identify org/device health in Sentry and
             // PostHog without sending the raw license key. No-op on consumer
@@ -1510,6 +1582,10 @@ async fn main() {
             'start_server: {
                 let store_clone = store.clone();
                 let data_dir_clone = data_dir.clone();
+                if crate::db_relaunch::db_recovery_required() {
+                    crate::health::set_recording_status(crate::health::RecordingStatus::Error);
+                    break 'start_server;
+                }
                 if !store_clone.app_entitled_or_dev() {
                     info!("Skipping server auto-start: active screenpipe plan required");
                     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
@@ -1577,27 +1653,11 @@ async fn main() {
                             .expect("Failed to create server runtime");
 
                         server_runtime.block_on(async move {
-                            // Resolve + seed the shared api_auth_key cache before building
-                            // the config. `to_recording_config` is sync and reads the
-                            // cache; without this step the server would start with
-                            // `api_auth_key = None` on the app-auto-start path and every
-                            // request would 403. Mirrors the path in `spawn_screenpipe`.
-                            if store_clone.recording.api_auth {
-                                let settings_key_opt = if store_clone.recording.api_key.is_empty() {
-                                    None
-                                } else {
-                                    Some(store_clone.recording.api_key.clone())
-                                };
-                                match screenpipe_engine::auth_key::resolve_api_auth_key(
-                                    &data_dir_clone,
-                                    settings_key_opt.as_deref(),
-                                )
-                                .await
-                                {
-                                    Ok(key) => crate::store::seed_api_auth_key(key),
-                                    Err(e) => tracing::error!("failed to resolve api auth key: {}", e),
-                                }
-                            }
+                            // ServerCore resolves/persists API auth only after
+                            // DatabaseManager's bounded startup preflight. The
+                            // config carries an explicit settings key if one is
+                            // present; otherwise ServerCore fills it from the
+                            // coordinated SecretStore after DB initialization.
                             let config = store_clone.to_recording_config(data_dir_clone.clone());
 
                             // Check if server already running
@@ -1689,6 +1749,15 @@ async fn main() {
                                 Ok(s) => s,
                                 Err(e) => {
                                     error!("Failed to start server core: {}", e);
+                                    crate::db_relaunch::note_respawn_failure(
+                                        &app_for_db_wedge,
+                                        &e,
+                                    )
+                                    .await;
+                                    crate::recording::quarantine_capture_intent_after_start_failure(
+                                        crate::db_relaunch::db_recovery_required(),
+                                        wants_recording.as_ref(),
+                                    );
                                     is_starting_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                                     return;
                                 }
@@ -1702,9 +1771,32 @@ async fn main() {
                                 crate::recording::make_db_wedge_recovery_hook(
                                     app_for_db_wedge.clone(),
                                     db_wedge_breaker.clone(),
+                                    db_health.clone(),
+                                ),
+                            );
+                            server.db.set_hard_failure_hook(
+                                crate::recording::make_db_hard_failure_hook(
+                                    app_for_db_wedge.clone(),
                                     db_health,
                                 ),
                             );
+
+                            // Startup may have already latched a DB hard fault
+                            // before this hook was wired. The late hook replay
+                            // sets the process quarantine synchronously; never
+                            // start capture for that quarantined server.
+                            if crate::db_relaunch::db_recovery_required() {
+                                crate::recording::quarantine_capture_intent_after_start_failure(
+                                    true,
+                                    wants_recording.as_ref(),
+                                );
+                                server.shutdown().await;
+                                is_starting_clone.store(
+                                    false,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                return;
+                            }
 
                             // E2E: seed deterministic searchable frames so the
                             // search-UI repro tests run against real data with
@@ -1717,33 +1809,94 @@ async fn main() {
                             // value from app launch. Hold the slot across
                             // check/start/assign so a racing stop_capture wins.
                             let mut capture_guard = capture_arc.lock().await;
-                            let capture = if wants_recording
+                            let (mut capture, capture_error) = if wants_recording
                                 .load(std::sync::atomic::Ordering::SeqCst)
                             {
                                 match capture_session::CaptureSession::start(
-                                    &server, &config, true,
+                                    &server,
+                                    &server.recording_config,
+                                    true,
                                 )
                                 .await
                                 {
-                                    Ok(c) => Some(c),
+                                    Ok(c) => (Some(c), None),
                                     Err(e) => {
                                         error!("Failed to start capture: {}", e);
-                                        None
+                                        (None, Some(e))
                                     }
                                 }
                             } else {
-                                None
+                                (None, None)
                             };
 
-                            {
-                                let mut guard = server_arc.lock().await;
-                                *guard = Some(server);
+                            if crate::db_relaunch::db_recovery_required() {
+                                crate::recording::discard_quarantined_startup(
+                                    server,
+                                    capture.take(),
+                                    wants_recording.as_ref(),
+                                )
+                                .await;
+                                drop(capture_guard);
+                                is_starting_clone.store(
+                                    false,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                drop(lifecycle_guard);
+                                return;
                             }
-                            if let Some(capture) = capture {
-                                *capture_guard = Some(capture);
+
+                            let mut server_guard = server_arc.lock().await;
+                            if crate::db_relaunch::db_recovery_required() {
+                                drop(server_guard);
+                                crate::recording::discard_quarantined_startup(
+                                    server,
+                                    capture.take(),
+                                    wants_recording.as_ref(),
+                                )
+                                .await;
+                                drop(capture_guard);
+                                is_starting_clone.store(
+                                    false,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                drop(lifecycle_guard);
+                                return;
+                            }
+
+                            *server_guard = Some(server);
+                            *capture_guard = capture.take();
+                            if let Some((capture, server)) =
+                                crate::recording::reclaim_quarantined_publication(
+                                    crate::db_relaunch::db_recovery_required(),
+                                    &mut capture_guard,
+                                    &mut server_guard,
+                                )
+                            {
+                                drop(server_guard);
+                                drop(capture_guard);
+                                crate::recording::discard_quarantined_startup(
+                                    server,
+                                    capture,
+                                    wants_recording.as_ref(),
+                                )
+                                .await;
+                                is_starting_clone.store(
+                                    false,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                drop(lifecycle_guard);
+                                return;
+                            }
+
+                            let capture_started = capture_guard.is_some();
+                            drop(server_guard);
+                            if capture_started {
                                 info!("Server + capture started successfully on dedicated runtime");
                             } else {
                                 info!("Server started without capture");
+                            }
+                            if let Some(error) = capture_error {
+                                warn!("Server remains available after capture startup failed: {error}");
                             }
                             drop(capture_guard);
                             is_starting_clone
@@ -1863,13 +2016,6 @@ async fn main() {
             crate::monitor_events::start(app_handle.clone());
             crate::meeting_live_notes::start(app_handle.clone());
             crate::meeting_stall_notifications::start(app_handle.clone());
-            crate::db_recovery_notifications::start(app_handle.clone());
-
-            // Background ChatGPT OAuth token refresh — keeps access tokens
-            // fresh so the lazy path in get_valid_token() rarely needs to
-            // refresh at request time. Separate from OAuthRefreshScheduler
-            // which only handles screenpipe-connect integrations.
-            crate::chatgpt_oauth::start_background_refresh();
 
             #[cfg(target_os = "macos")]
             crate::window::reset_to_regular_and_refresh_tray(&app_handle);
@@ -2124,8 +2270,7 @@ async fn main() {
                 tauri::RunEvent::Reopen { .. } => {
                     // Defer off the event stack so run handler stays panic-free.
                     // Open the settings/app window (not the timeline overlay).
-                    if crate::enterprise_policy::is_app_ui_hidden()
-                        || crate::headless::is_dormant()
+                    if crate::enterprise_policy::is_app_ui_hidden() || crate::headless::is_dormant()
                     {
                         return;
                     }
@@ -2156,7 +2301,10 @@ mod autostart_arg_tests {
     #[test]
     fn ignores_unrelated_args() {
         assert!(!args_contain_autostart(["screenpipe"]));
-        assert!(!args_contain_autostart(["screenpipe", "--check-arc-automation"]));
+        assert!(!args_contain_autostart([
+            "screenpipe",
+            "--check-arc-automation"
+        ]));
         assert!(!args_contain_autostart(["screenpipe", "--autostarted"]));
     }
 }
