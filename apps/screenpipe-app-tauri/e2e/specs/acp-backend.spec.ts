@@ -237,13 +237,14 @@ async function startAcp(
   sessionId: string,
   scenario: "normal" | "malformed" | "mcp" | "tree" | "terminal",
   env: Record<string, string> = {},
+  userToken: string | null = null,
 ): Promise<void> {
   const projectDir = path.join(os.tmpdir(), `screenpipe-acp-e2e-${sessionId}`);
   rmSync(projectDir, { recursive: true, force: true });
   const info = await invokeOrThrow<{ running: boolean; sessionId?: string }>("pi_start", {
     sessionId,
     projectDir,
-    userToken: null,
+    userToken,
     providerConfig: acpProviderConfig(scenario, env),
   });
   expect(info.running).toBe(true);
@@ -723,8 +724,10 @@ describe("ACP backend", function () {
     await stopAndAssertGone(mcpSession);
   });
 
-  it("runs ACP terminal callbacks and drains final stdout and stderr", async () => {
-    await startAcp(terminalSession, "terminal");
+  it("scrubs cloud tokens while running ACP terminal callbacks", async () => {
+    await startAcp(terminalSession, "terminal", {
+      SCREENPIPE_API_KEY: "forbidden-adapter-sentinel",
+    }, "forbidden-user-token-sentinel");
     await beginPrompt(terminalSession, "exercise terminal callbacks");
     const prompt = await waitForPromptDone();
     expect(prompt.error).toBeUndefined();

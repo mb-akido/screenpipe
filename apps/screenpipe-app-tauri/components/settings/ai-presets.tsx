@@ -204,7 +204,7 @@ const ACP_ADAPTERS = [
   {
     id: "opencode",
     name: "OpenCode",
-    description: "Use the OpenCode agent installed on this computer.",
+    description: "Use your installed OpenCode agent. First-time login currently requires `opencode auth login` in a terminal.",
   },
   {
     id: "cursor",
@@ -1443,7 +1443,7 @@ const AISection = ({
           )}
 
           <div className="space-y-2 border-t pt-4">
-            <Label htmlFor="acpEnv">Environment access</Label>
+            <Label htmlFor="acpEnv">Additional environment variables</Label>
             <Textarea
               id="acpEnv"
               value={Object.keys(settingsPreset.acpAgent?.env || {}).join("\n")}
@@ -1453,7 +1453,9 @@ const AISection = ({
               spellCheck={false}
             />
             <p className="text-xs text-muted-foreground">
-              Only variable names are saved. Secret values are inherited at launch and are never stored in this preset.
+              Only variable names are saved. Their values are inherited at launch and never stored
+              in this preset. ACP adapters run locally with your account permissions, so use agents
+              you trust.
             </p>
           </div>
         </div>

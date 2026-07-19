@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const RUNTIME_ARG: &str = "--screenpipe-acp-runtime";
 const PROCESS_GUARD_ARG: &str = "--screenpipe-acp-process-guard";
+pub(crate) const CLOUD_API_KEY_ENV: &str = "SCREENPIPE_API_KEY";
 #[cfg(windows)]
 const WRAPPED_COMMAND_ENV: &str = "SCREENPIPE_INTERNAL_ACP_WRAPPED_COMMAND";
 #[cfg(windows)]
@@ -137,7 +138,7 @@ impl RuntimeConfig {
             parse_json_env::<Vec<String>>("SCREENPIPE_ACP_ARGS_JSON")?.unwrap_or_default();
         let mut env = parse_json_env::<HashMap<String, String>>("SCREENPIPE_ACP_ENV_JSON")?
             .unwrap_or_default();
-        env.retain(|name, _| !is_process_guard_env(name));
+        env.retain(|name, _| !is_process_guard_env(name) && !is_forbidden_acp_env(name));
         let configured_command = env_nonempty("SCREENPIPE_ACP_COMMAND");
         let (command, args) = if let Some(command) = configured_command {
             (command, configured_args)
@@ -181,6 +182,13 @@ fn is_process_guard_env(name: &str) -> bool {
         let _ = name;
         false
     }
+}
+
+pub(crate) fn is_forbidden_acp_env(name: &str) -> bool {
+    // This is the signed-in user's Screenpipe cloud JWT, not the local API
+    // key. ACP adapters and client-created terminals never need it. Compare
+    // case-insensitively because Windows environment keys are case-insensitive.
+    name.eq_ignore_ascii_case(CLOUD_API_KEY_ENV)
 }
 
 fn parse_json_env<T: serde::de::DeserializeOwned>(name: &str) -> Result<Option<T>, String> {
@@ -1125,9 +1133,10 @@ fn spawn_terminal(state: &RuntimeState, request: CreateTerminalRequest) -> Resul
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .env_remove(CLOUD_API_KEY_ENV);
     for variable in request.env {
-        if !is_process_guard_env(&variable.name) {
+        if !is_process_guard_env(&variable.name) && !is_forbidden_acp_env(&variable.name) {
             command.env(variable.name, variable.value);
         }
     }
@@ -1268,6 +1277,32 @@ fn configured_env_nonempty(config: &RuntimeConfig, name: &str) -> Option<String>
         .or_else(|| env_nonempty(name))
 }
 
+fn auth_method_has_required_env(
+    agent_id: &str,
+    method_id: &str,
+    is_configured: impl Fn(&str) -> bool,
+) -> bool {
+    match (agent_id, method_id) {
+        ("codex-acp", "api-key") => {
+            is_configured("CODEX_API_KEY") || is_configured("OPENAI_API_KEY")
+        }
+        ("gemini" | "gemini-acp", "gemini-api-key") => is_configured("GEMINI_API_KEY"),
+        ("gemini" | "gemini-acp", "vertex-ai") => {
+            is_configured("GOOGLE_API_KEY")
+                || (is_configured("GOOGLE_CLOUD_PROJECT") && is_configured("GOOGLE_CLOUD_LOCATION"))
+        }
+        ("gemini" | "gemini-acp", "gateway") => is_configured("GOOGLE_GEMINI_BASE_URL"),
+        _ => true,
+    }
+}
+
+fn external_auth_command(agent_id: &str) -> Option<&'static str> {
+    // OpenCode 1.1.x advertises an ACP auth method but returns
+    // "Authentication not implemented" when the client calls it. Its CLI
+    // login persists credentials that the ACP server can reuse afterward.
+    (agent_id == "opencode").then_some("opencode auth login")
+}
+
 fn available_auth_methods<'a>(
     init: &'a InitializeResponse,
     config: &RuntimeConfig,
@@ -1275,19 +1310,9 @@ fn available_auth_methods<'a>(
     init.auth_methods
         .iter()
         .filter(|method| {
-            if !matches!(config.agent_id.as_str(), "gemini" | "gemini-acp") {
-                return true;
-            }
-            match method.id().to_string().as_str() {
-                "gemini-api-key" => configured_env_nonempty(config, "GEMINI_API_KEY").is_some(),
-                "vertex-ai" => {
-                    configured_env_nonempty(config, "GOOGLE_API_KEY").is_some()
-                        || (configured_env_nonempty(config, "GOOGLE_CLOUD_PROJECT").is_some()
-                            && configured_env_nonempty(config, "GOOGLE_CLOUD_LOCATION").is_some())
-                }
-                "gateway" => configured_env_nonempty(config, "GOOGLE_GEMINI_BASE_URL").is_some(),
-                _ => true,
-            }
+            auth_method_has_required_env(&config.agent_id, &method.id().to_string(), |name| {
+                configured_env_nonempty(config, name).is_some()
+            })
         })
         .collect()
 }
@@ -1298,6 +1323,11 @@ async fn authenticate(
     init: &InitializeResponse,
     config: &RuntimeConfig,
 ) -> Result<(), String> {
+    if let Some(command) = external_auth_command(&config.agent_id) {
+        return Err(format!(
+            "OpenCode cannot complete login through ACP yet. Run `{command}` in a terminal, then retry this chat."
+        ));
+    }
     let methods = available_auth_methods(init, config);
     if methods.is_empty() {
         return Err("ACP agent requires authentication but offered no auth methods".into());
@@ -1881,6 +1911,7 @@ pub async fn run_from_env() -> Result<(), String> {
     command
         .current_dir(&config.project_dir)
         .envs(&config.env)
+        .env_remove(CLOUD_API_KEY_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2019,6 +2050,14 @@ mod tests {
     }
 
     #[test]
+    fn cloud_token_is_forbidden_from_acp_processes() {
+        assert!(is_forbidden_acp_env("SCREENPIPE_API_KEY"));
+        assert!(is_forbidden_acp_env("screenpipe_api_key"));
+        assert!(!is_forbidden_acp_env("SCREENPIPE_LOCAL_API_KEY"));
+        assert!(!is_forbidden_acp_env("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
     fn gemini_auth_uses_configured_adapter_environment() {
         use agent_client_protocol::schema::v1::{AuthMethod, AuthMethodAgent};
 
@@ -2037,6 +2076,34 @@ mod tests {
             .map(|method| method.id().to_string())
             .collect::<Vec<_>>();
         assert_eq!(methods, vec!["gemini-api-key"]);
+    }
+
+    #[test]
+    fn codex_key_auth_requires_an_available_key() {
+        assert!(!auth_method_has_required_env(
+            "codex-acp",
+            "api-key",
+            |_| false,
+        ));
+        assert!(auth_method_has_required_env(
+            "codex-acp",
+            "api-key",
+            |name| name == "OPENAI_API_KEY",
+        ));
+        assert!(auth_method_has_required_env(
+            "codex-acp",
+            "chat-gpt",
+            |_| false,
+        ));
+    }
+
+    #[test]
+    fn opencode_auth_uses_its_supported_cli_login() {
+        assert_eq!(
+            external_auth_command("opencode"),
+            Some("opencode auth login")
+        );
+        assert_eq!(external_auth_command("codex-acp"), None);
     }
 
     #[tokio::test]

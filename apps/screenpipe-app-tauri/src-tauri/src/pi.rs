@@ -2099,6 +2099,7 @@ pub async fn pi_start_inner(
         let resolved_env = acp
             .env
             .iter()
+            .filter(|(name, _)| !crate::acp_runtime::is_forbidden_acp_env(name))
             .filter_map(|(name, value)| {
                 let resolved = if value.is_empty() {
                     std::env::var(name).ok()?
@@ -2276,8 +2277,10 @@ pub async fn pi_start_inner(
         cmd.env(k, v);
     });
 
-    if let Some(ref token) = user_token {
-        cmd.env("SCREENPIPE_API_KEY", token);
+    if !use_acp {
+        if let Some(ref token) = user_token {
+            cmd.env("SCREENPIPE_API_KEY", token);
+        }
     }
 
     // Pass local API config so the Pi agent can authenticate to the runtime local API.
@@ -2353,6 +2356,13 @@ pub async fn pi_start_inner(
     if let Some(key) = crate::store::resolved_api_auth_key() {
         cmd.env("SCREENPIPE_LOCAL_API_KEY", &key);
         cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
+    }
+
+    // ACP adapters authenticate through their own configured provider env or
+    // login state. Never expose the signed-in user's Screenpipe cloud JWT to a
+    // third-party adapter (or to the hidden runtime it can ask to run tools).
+    if use_acp {
+        cmd.env_remove(crate::acp_runtime::CLOUD_API_KEY_ENV);
     }
 
     // Spawn process

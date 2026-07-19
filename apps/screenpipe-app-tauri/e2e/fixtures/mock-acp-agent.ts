@@ -25,6 +25,10 @@ const sessionId = "mock-acp-session";
 const permissionRequestId = "mock-permission-1";
 const processMarkerPrefix = process.env.SCREENPIPE_MOCK_PROCESS_MARKER_PREFIX;
 const processMarkerToken = process.env.SCREENPIPE_MOCK_PROCESS_MARKER_TOKEN;
+const forbiddenCloudToken = process.env.SCREENPIPE_API_KEY;
+if (scenario === "terminal" && forbiddenCloudToken) {
+  throw new Error("ACP adapter inherited forbidden SCREENPIPE_API_KEY");
+}
 const descendant = (() => {
   if (scenario !== "tree") return undefined;
   if (!processMarkerPrefix || !processMarkerToken) {
@@ -115,9 +119,10 @@ async function verifyTerminalLifecycle(cwd: string): Promise<void> {
     command: process.execPath,
     args: [
       "-e",
-      "process.stdout.write('terminal-head-'); process.stderr.write('terminal-tail')",
+      "if (process.env.SCREENPIPE_API_KEY) process.exit(41); process.stdout.write('terminal-head-'); process.stderr.write('terminal-tail')",
     ],
     cwd,
+    env: [{ name: "SCREENPIPE_API_KEY", value: "forbidden-terminal-sentinel" }],
     outputByteLimit: 4096,
   });
   const terminalId = created.terminalId;
