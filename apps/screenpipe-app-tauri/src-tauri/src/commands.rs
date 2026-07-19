@@ -1026,6 +1026,38 @@ pub struct E2eAgentStreamResult {
     pub emit_ms: u64,
 }
 
+/// E2E helper: run the real Pi/ACP startup path while keeping its expected
+/// failure inside Rust. WebDriver implementations can surface a rejected Tauri
+/// invocation as the browser command result even when page JavaScript catches
+/// the promise, which makes negative-path process cleanup tests nondeterministic.
+#[tauri::command]
+#[specta::specta]
+pub async fn e2e_capture_pi_start_error(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, crate::pi::PiState>,
+    session_id: String,
+    project_dir: String,
+    provider_config: Option<crate::pi::PiProviderConfig>,
+) -> Result<String, String> {
+    if !cfg!(feature = "e2e") {
+        return Err("e2e_capture_pi_start_error is only available in e2e builds".to_string());
+    }
+
+    match crate::pi::pi_start_inner(
+        app_handle,
+        &state,
+        &session_id,
+        project_dir,
+        None,
+        provider_config,
+    )
+    .await
+    {
+        Ok(_) => Ok(String::new()),
+        Err(error) => Ok(error),
+    }
+}
+
 const E2E_AGENT_STREAM_BATCH_DELTAS: u32 = 10;
 const E2E_AGENT_STREAM_BATCH_DELAY_MS: u64 = 40;
 

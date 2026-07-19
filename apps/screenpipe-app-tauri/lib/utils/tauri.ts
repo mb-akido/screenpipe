@@ -356,6 +356,20 @@ async doPermissionsCheck(initialCheck: boolean) : Promise<OSPermissionsCheck> {
     return await TAURI_INVOKE("do_permissions_check", { initialCheck });
 },
 /**
+ * E2E helper: run the real Pi/ACP startup path while keeping its expected
+ * failure inside Rust. WebDriver implementations can surface a rejected Tauri
+ * invocation as the browser command result even when page JavaScript catches
+ * the promise, which makes negative-path process cleanup tests nondeterministic.
+ */
+async e2eCapturePiStartError(sessionId: string, projectDir: string, providerConfig: PiProviderConfig | null) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("e2e_capture_pi_start_error", { sessionId, projectDir, providerConfig }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * E2E helper: emit a deterministic chat stream from the Rust side.
  *
  * This keeps chat performance tests close to production's Pi stdout path:

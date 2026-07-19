@@ -9,7 +9,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { openHomeWindow, waitForAppReady, t } from "../helpers/test-utils.js";
-import { invoke, invokeOrThrow } from "../helpers/tauri.js";
+import { invokeOrThrow } from "../helpers/tauri.js";
 
 type AgentEnvelope = {
   source?: string;
@@ -747,18 +747,14 @@ describe("ACP backend", function () {
   });
 
   it("fails startup promptly and reaps the runtime when the adapter exits", async () => {
-    let startupError = "";
-    try {
-      const result = await invoke("pi_start", {
-        sessionId: exitSession,
-        projectDir: path.join(os.tmpdir(), `screenpipe-acp-e2e-${exitSession}`),
-        userToken: null,
-        providerConfig: acpProviderConfig("exit"),
-      });
-      if (!result.ok) startupError = result.error ?? "";
-    } catch (error) {
-      startupError = error instanceof Error ? error.message : String(error);
-    }
+    // Capture the expected Rust error before it crosses the WebDriver IPC
+    // boundary. WebView2 otherwise adopts the rejected Tauri invocation as the
+    // execute/async result even when page JavaScript catches the promise.
+    const startupError = await invokeOrThrow<string>("e2e_capture_pi_start_error", {
+      sessionId: exitSession,
+      projectDir: path.join(os.tmpdir(), `screenpipe-acp-e2e-${exitSession}`),
+      providerConfig: acpProviderConfig("exit"),
+    });
     expect(startupError).toContain("custom exited (17)");
 
     await browser.waitUntil(
