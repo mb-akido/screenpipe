@@ -45,17 +45,31 @@ type ProcessMarker = {
 type AcpScenario = "normal" | "malformed" | "exit" | "auth" | "mcp" | "tree" | "terminal";
 
 const fixturePath = fileURLToPath(new URL("../fixtures/mock-acp-agent.ts", import.meta.url));
-const normalSession = "77777777-accc-accc-accc-777777777777";
-const malformedSession = "88888888-accc-accc-accc-888888888888";
-const exitSession = "99999999-accc-accc-accc-999999999999";
-const authSession = "aaaaaaaa-accc-accc-accc-aaaaaaaaaaaa";
-const authCancelSession = "bbbbbbbb-accc-accc-accc-bbbbbbbbbbbb";
-const uiParkingSession = "cccccccc-accc-accc-accc-cccccccccccc";
-const treeSession = "dddddddd-accc-accc-accc-dddddddddddd";
-const mcpSession = "eeeeeeee-accc-accc-accc-eeeeeeeeeeee";
-const terminalSession = "ffffffff-accc-accc-accc-ffffffffffff";
-const treeMarkerPrefix = path.join(os.tmpdir(), `screenpipe-acp-process-${treeSession}`);
-const treeMarkerToken = randomUUID();
+let normalSession = "";
+let malformedSession = "";
+let exitSession = "";
+let authSession = "";
+let authCancelSession = "";
+let uiParkingSession = "";
+let treeSession = "";
+let mcpSession = "";
+let terminalSession = "";
+let treeMarkerPrefix = "";
+let treeMarkerToken = "";
+
+function resetRunIdentifiers(): void {
+  normalSession = randomUUID();
+  malformedSession = randomUUID();
+  exitSession = randomUUID();
+  authSession = randomUUID();
+  authCancelSession = randomUUID();
+  uiParkingSession = randomUUID();
+  treeSession = randomUUID();
+  mcpSession = randomUUID();
+  terminalSession = randomUUID();
+  treeMarkerPrefix = path.join(os.tmpdir(), `screenpipe-acp-process-${treeSession}`);
+  treeMarkerToken = randomUUID();
+}
 
 function acpProviderConfig(
   scenario: AcpScenario,
@@ -112,6 +126,35 @@ async function capturedEvents(sessionId: string): Promise<AgentEnvelope[]> {
       : [];
     return events.filter((event: AgentEnvelope) => event?.sessionId === id);
   }, sessionId)) as AgentEnvelope[];
+}
+
+async function resetCapturedState(): Promise<void> {
+  await browser.execute(() => {
+    (window as any).__e2eAcpAgentEvents = [];
+    (window as any).__e2eAgentActionTrace = [];
+    delete (window as any).__e2eAcpPromptState;
+    delete (window as any).__e2eAcpStartState;
+    delete (window as any).__e2eAcpNewSessionState;
+  });
+}
+
+async function waitForEventCounts(
+  sessionId: string,
+  expected: Record<string, number>,
+  timeoutMsg: string,
+): Promise<void> {
+  await browser.waitUntil(async () => {
+    const counts = new Map<string, number>();
+    for (const envelope of await capturedEvents(sessionId)) {
+      const type = envelope.event?.type;
+      if (typeof type === "string") counts.set(type, (counts.get(type) ?? 0) + 1);
+    }
+    return Object.entries(expected).every(([type, count]) => (counts.get(type) ?? 0) >= count);
+  }, {
+    timeout: t(10_000),
+    interval: 100,
+    timeoutMsg,
+  });
 }
 
 async function foregroundChat(sessionId: string): Promise<void> {
@@ -463,8 +506,14 @@ describe("ACP backend", function () {
   this.timeout(t(120_000));
 
   before(async () => {
+    resetRunIdentifiers();
     await waitForAppReady();
     await installAgentEventCapture();
+  });
+
+  beforeEach(async () => {
+    await installAgentEventCapture();
+    await resetCapturedState();
   });
 
   after(async () => {
@@ -567,6 +616,11 @@ describe("ACP backend", function () {
 
     const settled = await waitForPromptDone();
     expect(settled.error).toBeUndefined();
+    await waitForEventCounts(
+      normalSession,
+      { tool_execution_end: 1, message_end: 1, agent_end: 1 },
+      "first ACP turn did not finish emitting events",
+    );
 
     const events = (await capturedEvents(normalSession)).map((envelope) => envelope.event ?? {});
     const eventTypes = events.map((event) => event.type);
@@ -614,6 +668,11 @@ describe("ACP backend", function () {
     expect(new Set(permissionEvents.map((envelope) => envelope.event?.id)).size).toBe(2);
     await answerAgentAction("permission", "Allow once");
     expect((await waitForPromptDone()).error).toBeUndefined();
+    await waitForEventCounts(
+      normalSession,
+      { tool_execution_end: 2, message_end: 2, agent_end: 2 },
+      "second ACP turn did not finish emitting events",
+    );
 
     const agentStartCount = (await capturedEvents(normalSession)).filter(
       (envelope) => envelope.event?.type === "agent_start",
