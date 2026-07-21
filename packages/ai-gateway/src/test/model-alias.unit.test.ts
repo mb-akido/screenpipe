@@ -39,11 +39,23 @@ describe('resolveModelAlias', () => {
 	});
 
 	it('returns the original model when no alias is registered', () => {
-		expect(resolveModelAlias('claude-haiku-4-5')).toBe('claude-haiku-4-5');
 		expect(resolveModelAlias('gpt-5.6-luna')).toBe('gpt-5.6-luna');
+		expect(resolveModelAlias('claude-sonnet-5')).toBe('claude-sonnet-5');
 		// Internal audio analysis remains separate because the text fallback cannot
 		// accept direct audio input.
 		expect(resolveModelAlias('gemma4-e4b')).toBe('gemma4-e4b');
+	});
+
+	it('routes retired Haiku and Sonnet families to the current hosted fallback', () => {
+		for (const model of [
+			'claude-haiku-4-5',
+			'claude-haiku-4-5-20251001',
+			'claude-3-5-haiku-20241022',
+			'claude-sonnet-4-6',
+			'claude-3-7-sonnet-20250219',
+		]) {
+			expect(resolveModelAlias(model)).toBe(RETIRED_HOSTED_MODEL_FALLBACK);
+		}
 	});
 
 	it('routes retired OpenRouter IDs to the current fallback', () => {

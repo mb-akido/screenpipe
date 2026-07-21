@@ -16,14 +16,14 @@ import { captureException } from '@sentry/cloudflare';
 // (otherwise served-model cost rows fall into the unknown-model estimate).
 export const AUTO_WATERFALL = [
   'gpt-5.6-luna',
-  'claude-haiku-4-5',
+  'claude-sonnet-5',
   'gpt-5.4-mini',
 ];
 
 // Vision-capable models for requests containing images
 export const AUTO_WATERFALL_VISION = [
   'gpt-5.6-luna',
-  'claude-haiku-4-5',
+  'claude-sonnet-5',
   'gpt-5.4-mini',
 ];
 
@@ -31,7 +31,7 @@ export const AUTO_WATERFALL_VISION = [
 // support tools; the second entry crosses providers for outage resilience.
 export const AUTO_WATERFALL_BACKGROUND = [
   'gpt-5.6-luna',
-  'claude-haiku-4-5',
+  'claude-sonnet-5',
   'gpt-5.4-mini',
 ];
 
@@ -41,7 +41,7 @@ export const AUTO_WATERFALL_BACKGROUND = [
 // in sync with the conservative reservation in free-chat-limit.ts.
 export const FREE_PREVIEW_WATERFALL = [
   'gpt-5.6-luna',
-  'claude-haiku-4-5',
+  'gpt-5.4-mini',
 ];
 export const FREE_PREVIEW_MAX_UPSTREAM_ATTEMPTS = 2;
 
@@ -57,9 +57,9 @@ function isGeminiModel(model: string): boolean {
 // Per-model fallback chains — when a current user-selected model fails with a
 // transient/upstream error, try a comparable model from another provider.
 export const MODEL_FALLBACKS: Record<string, string[]> = {
-  'gpt-5.6-luna': ['claude-haiku-4-5', 'gpt-5.4-mini'],
-  'claude-haiku-4-5': ['gpt-5.4-mini'],
-  'gpt-5.4-mini': ['claude-haiku-4-5'],
+  'gpt-5.6-luna': ['claude-sonnet-5', 'gpt-5.4-mini'],
+  'claude-sonnet-5': ['gpt-5.4-mini'],
+  'gpt-5.4-mini': ['claude-sonnet-5'],
 };
 
 // HTTP statuses we consider upstream/transient — eligible for cascade.
@@ -260,7 +260,7 @@ async function tryModel(
     // Provider geo-blocks (OpenAI 403 by region) — expected per-region
     // condition; tell the user what will work, keep Sentry quiet.
     if (isGeoBlocked(status, msg)) {
-      error.userMessage = `${model} isn't available in your country or region (the provider rejected the request). Pick Auto or Claude Haiku instead.`;
+      error.userMessage = `${model} isn't available in your country or region (the provider rejected the request). Pick Auto instead.`;
       console.warn(`${ctx}: ${model} geo-blocked by provider (403)`);
       logModelOutcome(env, { model, outcome: 'error' }).catch(() => {});
       throw error;
@@ -472,7 +472,7 @@ export async function handleChatCompletions(
     isFrontierModel(body.model)
   ) {
     if (String((env as any)?.PIPE_FRONTIER_POLICY ?? 'downgrade').toLowerCase() === 'reject') {
-      return errorResponse(body, 403, `"${body.model}" (a frontier model) isn't available for scheduled pipes / background tasks. Use "auto", GPT-5.6 Luna, GPT-5.4 mini, or Claude Haiku.`);
+      return errorResponse(body, 403, `"${body.model}" (a frontier model) isn't available for scheduled pipes / background tasks. Use "auto", GPT-5.6 Luna, or GPT-5.4 mini.`);
     }
     const fallback = String((env as any)?.PIPE_FRONTIER_FALLBACK ?? 'auto');
     body = { ...body, model: fallback };

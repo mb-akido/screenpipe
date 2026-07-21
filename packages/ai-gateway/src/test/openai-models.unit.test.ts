@@ -92,8 +92,9 @@ describe('OpenAI API model catalog', () => {
 			TINFOIL_API_KEY: 'tinfoil-test',
 		});
 		for (const id of ids) {
-			expect(id).not.toMatch(/gemini|gemma|gpt-oss|glm-|kimi-|qwen|llama-4/i);
+			expect(id).not.toMatch(/gemini|gemma|gpt-oss|glm-|kimi-|qwen|llama-4|haiku|sonnet-4/i);
 		}
+		expect(ids).toContain('claude-sonnet-5');
 	});
 
 	it('does not expose provider-secret gates in /v1/models responses', async () => {
@@ -114,7 +115,7 @@ describe('tier locking in /v1/models', () => {
 
 	it('marks marquee models locked for non-Business but still lists them', async () => {
 		const models = await listedFor('logged_in');
-		const sonnet = models.find(m => m.id === 'claude-sonnet-4-5');
+		const sonnet = models.find(m => m.id === 'claude-sonnet-5');
 		const opus = models.find(m => m.id === 'claude-opus-4-8');
 		// present (not hidden) and flagged so the app can grey + upsell
 		expect(sonnet?.locked).toBe(true);
@@ -124,7 +125,7 @@ describe('tier locking in /v1/models', () => {
 	it('leaves allowed models unlocked for non-Business', async () => {
 		const models = await listedFor('logged_in');
 		expect(models.find(m => m.id === 'auto')?.locked).toBeFalsy();
-		expect(models.find(m => m.id === 'claude-haiku-4-5')?.locked).toBeFalsy();
+		expect(models.find(m => m.id === 'gpt-5.6-luna')?.locked).toBeFalsy();
 	});
 
 	it('never locks anything for Business (subscribed)', async () => {

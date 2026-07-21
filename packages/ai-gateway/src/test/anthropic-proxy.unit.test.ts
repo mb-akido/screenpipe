@@ -144,7 +144,7 @@ describe('proxyToAnthropic', () => {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				model: 'claude-haiku-4-5-20251001',
+				model: 'claude-sonnet-5',
 				max_tokens: 100,
 				messages: [{
 					role: 'user',
@@ -158,6 +158,32 @@ describe('proxyToAnthropic', () => {
 		// The sanitization should have fixed the nested text
 		expect(capturedBody.messages[0].content[0].text).toBe('nested bug');
 		expect(typeof capturedBody.messages[0].content[0].text).toBe('string');
+	});
+
+	it('upgrades retired Haiku and strips sampling parameters for Sonnet 5', async () => {
+		let capturedBody: any = null;
+		globalThis.fetch = async (_url: any, init: any) => {
+			capturedBody = JSON.parse(init.body);
+			return new Response(JSON.stringify({ type: 'message', content: [] }), { status: 200 });
+		};
+
+		await proxyToAnthropic(new Request('http://localhost/v1/messages', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				model: 'claude-haiku-4-5@20251001',
+				max_tokens: 100,
+				temperature: 0.2,
+				top_p: 0.9,
+				top_k: 40,
+				messages: [{ role: 'user', content: 'test' }],
+			}),
+		}), 'sk-ant-test-key');
+
+		expect(capturedBody.model).toBe('claude-sonnet-5');
+		expect(capturedBody.temperature).toBeUndefined();
+		expect(capturedBody.top_p).toBeUndefined();
+		expect(capturedBody.top_k).toBeUndefined();
 	});
 
 	it('should pass through Anthropic error format on non-200', async () => {
@@ -403,6 +429,7 @@ describe('listAnthropicModels', () => {
 
 			return new Response(JSON.stringify({
 				data: [
+					{ id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5', created_at: '2026-07-21T00:00:00Z', type: 'model' },
 					{ id: 'claude-opus-4-6', display_name: 'Claude Opus 4.6', created_at: '2026-02-05T00:00:00Z', type: 'model' },
 					{ id: 'claude-sonnet-4-5-20250929', display_name: 'Claude Sonnet 4.5', created_at: '2025-09-29T00:00:00Z', type: 'model' },
 					{ id: 'claude-haiku-4-5-20251001', display_name: 'Claude Haiku 4.5', created_at: '2025-10-01T00:00:00Z', type: 'model' },
@@ -412,10 +439,11 @@ describe('listAnthropicModels', () => {
 
 		const models = await listAnthropicModels('sk-test');
 
-		expect(models.length).toBe(3);
-		expect(models[0].id).toBe('claude-opus-4-6');
+		expect(models.length).toBe(2);
+		expect(models[0].id).toBe('claude-sonnet-5');
 		expect(models[0].owned_by).toBe('anthropic');
 		expect(models[0].object).toBe('model');
+		expect(models.some(m => /haiku|sonnet-4/.test(m.id))).toBe(false);
 	});
 
 	it('should return fallback models on API error', async () => {
@@ -425,8 +453,8 @@ describe('listAnthropicModels', () => {
 
 		// Should return fallback list
 		expect(models.length).toBeGreaterThan(0);
-		expect(models.some(m => m.id.includes('opus-4-6'))).toBe(true);
-		expect(models.some(m => m.id.includes('haiku'))).toBe(true);
+		expect(models.some(m => m.id === 'claude-sonnet-5')).toBe(true);
+		expect(models.some(m => m.id.includes('haiku'))).toBe(false);
 	});
 
 	it('should return fallback models on network error', async () => {
@@ -452,10 +480,10 @@ describe('createProvider routing', () => {
 		expect(provider).toBeInstanceOf(AnthropicProvider);
 	});
 
-	it('should route claude-haiku to AnthropicProvider', () => {
-		const env = { ANTHROPIC_API_KEY: 'sk-ant-test' } as any;
+	it('should route retired claude-haiku IDs to the Luna OpenAI fallback', () => {
+		const env = { OPENAI_API_KEY: 'sk-openai-test' } as any;
 		const provider = createProvider('claude-haiku-4-5-20251001', env);
-		expect(provider).toBeInstanceOf(AnthropicProvider);
+		expect(provider).toBeInstanceOf(OpenAIProvider);
 	});
 
 	it('should throw if ANTHROPIC_API_KEY missing for claude', () => {
@@ -639,8 +667,8 @@ describe('AnthropicProvider.formatMessages', () => {
 // isModelAllowed — tier-based model access
 // ============================================================================
 describe('isModelAllowed with Anthropic model IDs', () => {
-	it('should allow haiku for anonymous users', () => {
-		expect(isModelAllowed('claude-haiku-4-5-20251001', 'anonymous')).toBe(true);
+	it('should deny retired haiku IDs before top-level alias normalization', () => {
+		expect(isModelAllowed('claude-haiku-4-5-20251001', 'anonymous')).toBe(false);
 	});
 
 	it('should deny opus for anonymous users', () => {
@@ -682,10 +710,10 @@ describe('Model ID format consistency', () => {
 		expect(isModelAllowed(model, 'subscribed')).toBe(true);
 	});
 
-	it('Haiku still works with date suffix (dash format)', () => {
+	it('retired Haiku is no longer directly allowed', () => {
 		const model = 'claude-haiku-4-5-20251001';
 		expect(model).not.toContain('@');
-		expect(isModelAllowed(model, 'anonymous')).toBe(true);
+		expect(isModelAllowed(model, 'anonymous')).toBe(false);
 	});
 });
 
@@ -699,7 +727,7 @@ describe('Backwards compatibility with @YYYYMMDD model IDs', () => {
 		globalThis.fetch = originalFetch;
 	});
 
-	it('proxyToAnthropic should normalize @ to - in model ID', async () => {
+	it('proxyToAnthropic should upgrade retired @-format Haiku to Sonnet 5', async () => {
 		let capturedBody: any = null;
 
 		globalThis.fetch = async (_url: any, init: any) => {
@@ -719,8 +747,7 @@ describe('Backwards compatibility with @YYYYMMDD model IDs', () => {
 
 		await proxyToAnthropic(request, 'sk-ant-test-key');
 
-		// The @ should be converted to - before sending to Anthropic API
-		expect(capturedBody.model).toBe('claude-haiku-4-5-20251001');
+		expect(capturedBody.model).toBe('claude-sonnet-5');
 	});
 
 	it('proxyToAnthropic should not modify model IDs without @', async () => {

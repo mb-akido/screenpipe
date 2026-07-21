@@ -71,7 +71,7 @@ describe('isFreeModel — weight-0 models classified as free', () => {
 	});
 
 	it('treats priced models as NOT free', () => {
-		for (const m of ['gpt-5.5', 'gpt-5.6-luna', 'claude-opus-4-7', 'claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-fable-5']) {
+		for (const m of ['gpt-5.5', 'gpt-5.6-luna', 'claude-opus-4-7', 'claude-sonnet-5', 'claude-fable-5']) {
 			expect(isFreeModel(m)).toBe(false);
 		}
 	});

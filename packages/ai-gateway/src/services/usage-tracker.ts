@@ -142,12 +142,11 @@ const MODEL_WEIGHTS: Record<string, number> = {
   // getModelWeight ensures this override beats the generic 'claude-opus' entry.
   // Fable 5 is Opus-tier ($10/$50 per MTok, ~2x Opus 4.8). Weight it like premium Opus
   // so it eats daily quota proportionally. Explicit key: 'claude-fable-5' matches no
-  // 'claude-opus/sonnet/haiku' prefix, so without this it would default to weight 1.
+  // 'claude-opus/sonnet' prefix, so without this it would default to weight 1.
   'claude-fable-5': 10,
   'claude-opus-4-7': 5,
   'claude-opus': 15,
   'claude-sonnet': 3,
-  'claude-haiku': 1,
   // (gpt-5.5 / gpt-5.4 / gpt-5.4-mini were duplicated here once — duplicate
   // object keys silently override the earlier entries. Keep each model
   // defined exactly once, in the OpenAI block above.)
@@ -186,7 +185,6 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     freeRpm: 60,
     allowedModels: [
       'auto',
-      'claude-haiku-4-5',
       'gpt-5.6-luna',
     ],
   },
@@ -194,7 +192,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
   // "Basic" tier — Free and Basic both resolve here (recording is gated by
   // app_entitled elsewhere). This is the Free/Basic -> Business upgrade gate:
   // marquee models (Sonnet, Opus, premium GPT-5.x, Fable, *-pro) are
-  // Business-only, while everyone keeps Auto, Luna, and Haiku. Auto carries
+  // Business-only, while everyone keeps Auto and Luna. Auto carries
   // query_weight 0 so it does not consume daily query units; the cash cap and
   // free-preview turn limit still bound hosted spend.
   logged_in: {
@@ -203,7 +201,6 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     freeRpm: 120,
     allowedModels: [
       'auto',
-      'claude-haiku-4-5',
       'gpt-5.6-luna',
     ],
   },

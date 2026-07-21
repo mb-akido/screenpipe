@@ -111,22 +111,22 @@ describe('chat handler — client payload classification (SCREENPIPE-AI-PROXY-1A
 });
 
 describe('chat handler — current hosted fallback chains', () => {
-	it('crosses providers when Luna or Haiku fails', () => {
-		expect(MODEL_FALLBACKS['gpt-5.6-luna']).toEqual(['claude-haiku-4-5', 'gpt-5.4-mini']);
-		expect(MODEL_FALLBACKS['claude-haiku-4-5']).toEqual(['gpt-5.4-mini']);
+	it('crosses providers through Sonnet 5 when Luna fails', () => {
+		expect(MODEL_FALLBACKS['gpt-5.6-luna']).toEqual(['claude-sonnet-5', 'gpt-5.4-mini']);
+		expect(MODEL_FALLBACKS['claude-sonnet-5']).toEqual(['gpt-5.4-mini']);
 	});
 
 	it('contains no removed Google, Open MaaS, Gemma, or GPT-OSS model', () => {
 		const models = [...Object.keys(MODEL_FALLBACKS), ...Object.values(MODEL_FALLBACKS).flat()];
 		for (const model of models) {
-			expect(model).not.toMatch(/gemini|gemma|gpt-oss|glm-|kimi-|qwen|llama-4/i);
+			expect(model).not.toMatch(/gemini|gemma|gpt-oss|glm-|kimi-|qwen|llama-4|haiku|sonnet-4/i);
 		}
 	});
 });
 
 describe('chat handler — authenticated-free preview lane', () => {
 	it('uses only the dedicated low-cost current chain', () => {
-		expect(FREE_PREVIEW_WATERFALL).toEqual(['gpt-5.6-luna', 'claude-haiku-4-5']);
+		expect(FREE_PREVIEW_WATERFALL).toEqual(['gpt-5.6-luna', 'gpt-5.4-mini']);
 		expect(FREE_PREVIEW_WATERFALL.some((model) => /opus|pro|gemini|gemma|glm|kimi|qwen/i.test(model))).toBe(false);
 	});
 

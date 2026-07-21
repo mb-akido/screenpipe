@@ -15,6 +15,13 @@ import { Env } from '../types';
 export const RETIRED_HOSTED_MODEL_FALLBACK = 'gpt-5.6-luna';
 
 const RETIRED_HOSTED_MODEL_IDS = new Set([
+	// Retired Anthropic shortcuts used by older presets and integrations.
+	'claude-haiku',
+	'claude-3-haiku',
+	'claude-3-5-haiku',
+	'claude-sonnet-4',
+	'claude-3-5-sonnet',
+	'claude-3-7-sonnet',
 	// Google Vertex Open MaaS names previously exposed by screenpipe.
 	'glm-4.7',
 	'glm-5',
@@ -55,6 +62,12 @@ export function resolveModelAlias(model: string): string {
 const RETIRED_HOSTED_MODEL_PREFIXES = [
 	'deepseek/',
 	'deepseek-',
+	'claude-3-haiku-',
+	'claude-3-5-haiku-',
+	'claude-3-5-sonnet-',
+	'claude-3-7-sonnet-',
+	'claude-haiku-',
+	'claude-sonnet-4-',
 	'codestral-',
 	'gemini-',
 	'gemma-',
