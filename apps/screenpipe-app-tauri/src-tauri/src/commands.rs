@@ -1701,7 +1701,7 @@ pub async fn open_google_calendar_auth_window(
 
     builder = builder.on_navigation(move |url| {
         if is_login_callback_scheme(url.scheme()) {
-            info!("google calendar auth window intercepted deep link: {}", url);
+            info!("google calendar auth window intercepted callback deep link");
             let _ = app_for_nav.emit("deep-link-received", url.to_string());
             if let Some(w) = app_for_nav.get_webview_window("google-calendar-auth") {
                 let _ = w.close();
