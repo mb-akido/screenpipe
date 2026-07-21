@@ -25,10 +25,10 @@ export const FREE_CHAT_IN_FLIGHT_LEASE_SECONDS = 10 * 60;
 // preview waterfall at the maximum text/tool/output limits above. Reserving
 // before inference makes concurrent requests unable to race a post-hoc spend
 // check. Keep this in sync with FREE_PREVIEW_WATERFALL in handlers/chat.ts.
-export const FREE_CHAT_COST_RESERVATION_MICRO_USD = 75_000;
+export const FREE_CHAT_COST_RESERVATION_MICRO_USD = 150_000;
 // Deliberately independent from the turn/call constants: increasing those
 // later cannot silently raise the daily cash ceiling.
-export const FREE_CHAT_DAILY_BUDGET_MICRO_USD = 1_200_000;
+export const FREE_CHAT_DAILY_BUDGET_MICRO_USD = 2_400_000;
 
 const FREE_CHAT_USAGE_TIER_PREFIX = 'free_chat_turn_v2';
 const FREE_CHAT_BUDGET_TIER_PREFIX = 'free_chat_budget_v2';

@@ -8,6 +8,7 @@ import {
 	FREE_CHAT_COST_RESERVATION_MICRO_USD,
 	FREE_CHAT_DAILY_BUDGET_MICRO_USD,
 	FREE_CHAT_IN_FLIGHT_LEASE_SECONDS,
+	FREE_CHAT_MESSAGE_LIMIT,
 	FREE_CHAT_MAX_IMAGE_BYTES,
 	FREE_CHAT_MAX_IMAGES,
 	FREE_CHAT_MAX_MESSAGES,
@@ -697,6 +698,11 @@ describe('reserveFreeChatTurn', () => {
 });
 
 describe('free chat capacity reservations', () => {
+	it('keeps enough daily budget for both advertised messages at the request cap', () => {
+		expect(FREE_CHAT_DAILY_BUDGET_MICRO_USD / FREE_CHAT_COST_RESERVATION_MICRO_USD)
+			.toBeGreaterThanOrEqual(FREE_CHAT_MESSAGE_LIMIT * FREE_CHAT_MAX_PROVIDER_CALLS_PER_MESSAGE);
+	});
+
 	it('does not burn a turn or budget when an overlapping request is rejected', async () => {
 		const db = new FakeD1();
 		const env = envWith(db);

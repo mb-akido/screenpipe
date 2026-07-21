@@ -75,10 +75,25 @@ describe('OpenAI API model catalog', () => {
 		expect(ids).not.toContain('gpt-5.4-mini');
 	});
 
-	it('keeps OpenAI models subscribed-only in the tier allowlist', () => {
+	it('keeps premium OpenAI models gated while Luna remains an included fallback', () => {
 		expect(isModelAllowed('gpt-5.4-mini', 'anonymous')).toBe(false);
 		expect(isModelAllowed('gpt-5.4-mini', 'logged_in')).toBe(false);
 		expect(isModelAllowed('gpt-5.4-mini', 'subscribed')).toBe(true);
+		expect(isModelAllowed('gpt-5.6-luna', 'anonymous')).toBe(true);
+		expect(isModelAllowed('gpt-5.6-luna', 'logged_in')).toBe(true);
+	});
+
+	it('does not advertise removed hosted model families', async () => {
+		const ids = await listedModelIds({
+			ANTHROPIC_API_KEY: 'sk-ant-test',
+			VERTEX_SERVICE_ACCOUNT_JSON: '{}',
+			VERTEX_PROJECT_ID: 'test-project',
+			GEMINI_API_KEY: 'gemini-test',
+			TINFOIL_API_KEY: 'tinfoil-test',
+		});
+		for (const id of ids) {
+			expect(id).not.toMatch(/gemini|gemma|gpt-oss|glm-|kimi-|qwen|llama-4/i);
+		}
 	});
 
 	it('does not expose provider-secret gates in /v1/models responses', async () => {

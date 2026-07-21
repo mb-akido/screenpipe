@@ -17,6 +17,7 @@ import { sanitizeMessages, sanitizeToolUseId } from '../providers/vertex';
 import { createProvider } from '../providers';
 import { isModelAllowed } from '../services/usage-tracker';
 import { AnthropicProvider } from '../providers/anthropic';
+import { OpenAIProvider } from '../providers/openai';
 
 // ============================================================================
 // proxyToAnthropic — request forwarding
@@ -462,16 +463,13 @@ describe('createProvider routing', () => {
 		expect(() => createProvider('claude-opus-4-6', env)).toThrow('Anthropic API key not configured');
 	});
 
-	it('should route gemini models to GeminiProvider (not AnthropicProvider)', () => {
+	it('should route removed Gemini IDs to the current OpenAI fallback', () => {
 		const env = {
-			ANTHROPIC_API_KEY: 'sk-ant-test',
-			VERTEX_SERVICE_ACCOUNT_JSON: '{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBg...\\n-----END PRIVATE KEY-----\\n","client_email":"test@test.iam.gserviceaccount.com","token_uri":"https://oauth2.googleapis.com/token"}',
-			VERTEX_PROJECT_ID: 'test-project',
+			OPENAI_API_KEY: 'sk-openai-test',
 		} as any;
 
 		const provider = createProvider('gemini-3-flash', env);
-		// Should NOT be AnthropicProvider
-		expect(provider).not.toBeInstanceOf(AnthropicProvider);
+		expect(provider).toBeInstanceOf(OpenAIProvider);
 	});
 });
 
@@ -667,8 +665,8 @@ describe('isModelAllowed with Anthropic model IDs', () => {
 		expect(isModelAllowed('some-random-model', 'subscribed')).toBe(true);
 	});
 
-	it('should allow gemini flash for anonymous', () => {
-		expect(isModelAllowed('gemini-3.1-flash-lite', 'anonymous')).toBe(true);
+	it('should reject removed Gemini IDs before top-level alias normalization', () => {
+		expect(isModelAllowed('gemini-3.1-flash-lite', 'anonymous')).toBe(false);
 	});
 });
 

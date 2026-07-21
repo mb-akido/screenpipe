@@ -55,7 +55,7 @@ export function registerPiLogListener({
       patchActiveMessage(
         setMessages,
         piMessageIdRef.current,
-        "This model doesn't support images — try a vision-capable model (e.g. llama-4-scout on Groq, gpt-4o on OpenAI).",
+        "This model doesn't support images — try a vision-capable model such as GPT-5.6 Luna or Claude Haiku.",
       );
     } else if (line.includes("not found") || line.includes("ECONNREFUSED") || line.includes("connection refused")) {
       let hint = line;
