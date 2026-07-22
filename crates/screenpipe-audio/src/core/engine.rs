@@ -28,7 +28,7 @@ impl std::str::FromStr for AudioTranscriptionEngine {
             "deepgram" | "screenpipe-cloud" => Ok(Self::Deepgram),
             "whisper-tiny" => Ok(Self::WhisperTiny),
             "whisper-tiny-quantized" => Ok(Self::WhisperTinyQuantized),
-            "whisper-large" => Ok(Self::WhisperLargeV3),
+            "whisper-large" | "whisper-large-v3" => Ok(Self::WhisperLargeV3),
             "whisper-large-quantized" => Ok(Self::WhisperLargeV3Quantized),
             "whisper-large-v3-turbo" => Ok(Self::WhisperLargeV3Turbo),
             "whisper-large-v3-turbo-quantized" => Ok(Self::WhisperLargeV3TurboQuantized),
@@ -105,6 +105,16 @@ mod tests {
     fn from_str_whisper_large() {
         assert_eq!(
             "whisper-large".parse::<AudioTranscriptionEngine>().unwrap(),
+            AudioTranscriptionEngine::WhisperLargeV3
+        );
+    }
+
+    #[test]
+    fn from_str_whisper_large_v3() {
+        assert_eq!(
+            "whisper-large-v3"
+                .parse::<AudioTranscriptionEngine>()
+                .unwrap(),
             AudioTranscriptionEngine::WhisperLargeV3
         );
     }

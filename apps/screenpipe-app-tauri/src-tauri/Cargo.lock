@@ -5725,7 +5725,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.59.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -10939,7 +10939,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-app"
-version = "2.5.129"
+version = "2.5.130"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",

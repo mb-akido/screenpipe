@@ -37,7 +37,7 @@ step 1 — find the meeting that just ended:
 
 the most recent row is the one that just ended. capture its `id`, `meeting_start`, `meeting_end`, `title`, `note`, `meeting_app`, and `attendees`.
 
-step 2 — search screenpipe for what happened during this meeting and summarize it: key topics, decisions, action items. scope your searches to the meeting's `meeting_start`/`meeting_end` window. prefer `content_type=audio` for transcripts.
+step 2 — search screenpipe for what happened during this meeting and summarize it: key topics, decisions, action items. scope your searches to the meeting's `meeting_start`/`meeting_end` window. prefer `content_type=audio` for transcripts. when available, first use `GET /meetings/<MEETING_ID>/transcript` as the primary transcript source; use each row's `transcript`, `speakerName`, `capturedAt`, and `source` fields, sorted by `capturedAt`. The `/search?content_type=audio` fallback uses `content.transcription` (not `content.text`), and missing `content.text` must not be treated as an empty transcript.
 
 step 2b — also query the screen for what was *shown*: `content_type=ocr` over the same window (this returns the frame's on-screen text — accessibility tree + OCR merged, not just OCR) — shared slides, docs, code, demos, and the on-screen name tags video-call apps render for participants. fold anything useful into the summary, and use on-screen names to fill in attendees who never spoke.
 

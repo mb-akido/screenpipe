@@ -1274,7 +1274,8 @@ function CodexPanel({ onConnected, onDisconnected }: { onConnected?: () => void;
           setState("installed");
           onConnected?.();
         }
-      });
+      })
+      .catch(() => {});
   }, []);
 
   const manualConfig = useMemo(() => buildCodexMcpToml({

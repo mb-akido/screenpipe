@@ -197,6 +197,7 @@ const TRANSCRIPTION_ENGINE_LABELS: Record<string, string> = {
   deepgram: "Deepgram",
   "whisper-large-v3-turbo": "Whisper Turbo",
   "whisper-large-v3-turbo-quantized": "Whisper Turbo (fast)",
+  "whisper-large-v3": "Whisper Large v3 (best quality)",
   "whisper-tiny": "Whisper Tiny",
   "whisper-tiny-quantized": "Whisper Tiny (fast)",
   "openai-compatible": "OpenAI Compatible",
@@ -2767,6 +2768,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                       <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">offline</SelectLabel>
                       <SelectItem value="whisper-large-v3-turbo">Whisper Turbo</SelectItem>
                       <SelectItem value="whisper-large-v3-turbo-quantized">Whisper Turbo (fast)</SelectItem>
+                      <SelectItem value="whisper-large-v3">Whisper Large v3 (best quality)</SelectItem>
                       <SelectItem value="whisper-tiny">Whisper Tiny</SelectItem>
                       <SelectItem value="whisper-tiny-quantized">Whisper Tiny (fast)</SelectItem>
                       {!isMacOS && <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>}

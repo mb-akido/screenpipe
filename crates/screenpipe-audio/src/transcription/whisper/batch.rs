@@ -6,6 +6,7 @@ use super::detect_language;
 use crate::transcription::VocabularyEntry;
 use anyhow::Result;
 use screenpipe_core::Language;
+use std::sync::OnceLock;
 use tracing::debug;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperState};
 
@@ -26,6 +27,21 @@ const INITIAL_PROMPT_CHAR_BUDGET: usize = 800;
 // the guard covers the calling thread's share of the compute. The guard lives
 // in screenpipe-core (`BackgroundWorkDip`) and is shared with the vision
 // pipeline's OCR/frame-diff/encode dips.
+
+/// Whisper CPU thread count — scales with available cores, capped at 8
+/// (whisper.cpp shows diminishing/negative returns beyond ~8 threads: more
+/// threads increases synchronization overhead in the mel/encode/decode
+/// pipeline without proportional speedup). Floor of 2 to preserve prior
+/// minimum on low-core machines.
+fn whisper_thread_count() -> i32 {
+    static THREADS: OnceLock<i32> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(2, 8) as i32
+    })
+}
 
 /// Build the Whisper initial_prompt from vocabulary, capped to `budget` chars by
 /// adding *whole* comma-joined entries. Never byte-slices a joined string: a cut
@@ -97,7 +113,7 @@ fn transcribe_sync(
         audio.resize(16000, 0.0);
     }
 
-    params.set_n_threads(2);
+    params.set_n_threads(whisper_thread_count());
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);

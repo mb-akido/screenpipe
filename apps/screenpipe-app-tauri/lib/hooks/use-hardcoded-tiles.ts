@@ -145,7 +145,7 @@ export async function isCodexMcpInstalled(): Promise<boolean> {
     const content = await readTextFile(path);
     return hasEnabledCodexMcp(content);
   } catch (e) {
-    console.error("[isCodexMcpInstalled] failed:", e);
+    console.debug("[isCodexMcpInstalled] failed:", e);
     return false;
   }
 }
