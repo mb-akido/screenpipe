@@ -376,6 +376,7 @@ export function AccountSection() {
 
           <PlanExpirationNotice
             expiresAt={planExpiresAt}
+            plan={subscriptionPlan}
             onClick={() => openExternalUrl(BILLING_URL)}
             variant="account"
           />

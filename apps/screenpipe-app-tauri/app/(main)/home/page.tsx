@@ -1121,6 +1121,7 @@ function HomeContent() {
 
               <PlanExpirationNotice
                 expiresAt={(settings.user as AppUser | null)?.plan_expires_at}
+                plan={(settings.user as AppUser | null)?.subscription_plan}
                 onClick={() => openSettings("account")}
               />
 
