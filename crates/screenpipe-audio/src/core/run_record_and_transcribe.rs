@@ -158,6 +158,35 @@ fn should_reconnect_after_silent_input(
     zero_fill_reconnect_enabled_for_platform()
 }
 
+/// Tracks mic-only callback liveness for the software-AEC recorder.
+///
+/// Speaker callbacks and the AEC processing timer must not mask a dead mic stream.
+struct AecMicReceiveWatchdog {
+    stream_started_at: Instant,
+    last_chunk_at: Instant,
+}
+
+impl AecMicReceiveWatchdog {
+    fn new(now: Instant) -> Self {
+        Self {
+            stream_started_at: now,
+            last_chunk_at: now,
+        }
+    }
+
+    fn note_chunk(&mut self, now: Instant) {
+        self.last_chunk_at = now;
+    }
+
+    fn timed_out(&self, now: Instant) -> bool {
+        let startup_timeout =
+            Duration::from_secs(STREAM_STARTUP_GRACE_SECS + AUDIO_RECEIVE_TIMEOUT_SECS);
+        now.saturating_duration_since(self.stream_started_at) >= startup_timeout
+            && now.saturating_duration_since(self.last_chunk_at)
+                >= Duration::from_secs(AUDIO_RECEIVE_TIMEOUT_SECS)
+    }
+}
+
 fn meeting_frame_from_recorder_output(
     samples: Vec<f32>,
     audio_stream: &AudioStream,
@@ -220,6 +249,8 @@ pub async fn run_record_and_transcribe(
         let mut collected_audio = Vec::new();
         let mut segment_start_time = now_epoch_secs();
         let mut last_diagnostics_time = Instant::now();
+        let mut mic_receive_watchdog = AecMicReceiveWatchdog::new(Instant::now());
+        let mut terminal_stream_death: Option<StreamDeath> = None;
         let mut _last_non_zero_at: Option<Instant> = None;
         let mut _sck_watchdog = crate::core::sck_output_watchdog::SckOutputWatchdog::default();
 
@@ -274,6 +305,9 @@ pub async fn run_record_and_transcribe(
                         match mic_res {
                             Ok(chunk) => {
                                 metrics.update_audio_levels(&device_name, &chunk);
+                                if !chunk.is_empty() {
+                                    mic_receive_watchdog.note_chunk(Instant::now());
+                                }
                                 if !chunk.is_empty() && chunk.iter().any(|&x| x.abs() >= SILENT_BUFFER_PEAK_THRESHOLD) {
                                     _last_non_zero_at = Some(Instant::now());
                                     update_device_capture_time(&device_name);
@@ -294,6 +328,9 @@ pub async fn run_record_and_transcribe(
                                 mic_sample_counter += chunk_len as u64;
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
+                                // The producer is alive and delivered data even
+                                // though this subscriber could not keep up.
+                                mic_receive_watchdog.note_chunk(Instant::now());
                                 metrics.record_chunks_lagged(n);
                                 debug!("AEC: Mic channel lagged by {} messages", n);
                             }
@@ -330,6 +367,28 @@ pub async fn run_record_and_transcribe(
                     }
                     // Timeout to prevent hanging when silent
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+
+                // A deliberate stop/invalidation may land while select is
+                // waiting. Let the existing flush/teardown path handle it
+                // instead of misclassifying shutdown as a watchdog failure.
+                if !is_running.load(Ordering::Relaxed)
+                    || audio_stream.is_disconnected.load(Ordering::Relaxed)
+                {
+                    break;
+                }
+
+                if mic_receive_watchdog.timed_out(Instant::now()) {
+                    metrics.record_stream_timeout();
+                    audio_stream.is_disconnected.store(true, Ordering::Relaxed);
+                    warn!(
+                        "AEC: no microphone data received from {} for {}s — stream dead, triggering reconnect",
+                        device_name, AUDIO_RECEIVE_TIMEOUT_SECS
+                    );
+                    terminal_stream_death = Some(StreamDeath::ReceiveTimeout {
+                        secs: AUDIO_RECEIVE_TIMEOUT_SECS,
+                    });
+                    break;
                 }
 
                 // Pull processed frames from AEC processor
@@ -371,6 +430,10 @@ pub async fn run_record_and_transcribe(
                 }
             }
 
+            if terminal_stream_death.is_some() {
+                break;
+            }
+
             flush_audio(
                 &mut collected_audio,
                 overlap_samples,
@@ -401,7 +464,10 @@ pub async fn run_record_and_transcribe(
             warn!("AEC: Final mic flush failed for {}: {}", device_name, e);
         }
 
-        if audio_stream.is_disconnected.load(Ordering::Relaxed) {
+        if let Some(stream_death) = terminal_stream_death {
+            info!("AEC: Stopped recording for {} (stream dead)", device_name);
+            Err(anyhow!(stream_death))
+        } else if audio_stream.is_disconnected.load(Ordering::Relaxed) {
             info!("AEC: Stopped recording for {} (disconnected)", device_name);
             Err(anyhow::anyhow!("device {} disconnected", device_name))
         } else {
@@ -904,6 +970,26 @@ mod tests {
             found,
             "ReceiveTimeout must remain downcastable after context wrapping"
         );
+    }
+
+    #[test]
+    fn aec_mic_receive_watchdog_matches_startup_and_steady_state_timeouts() {
+        let start = Instant::now();
+        let mut watchdog = AecMicReceiveWatchdog::new(start);
+        let one_millisecond = Duration::from_millis(1);
+        let receive_timeout = Duration::from_secs(AUDIO_RECEIVE_TIMEOUT_SECS);
+        let startup_timeout =
+            Duration::from_secs(STREAM_STARTUP_GRACE_SECS + AUDIO_RECEIVE_TIMEOUT_SECS);
+
+        assert!(!watchdog.timed_out(start + startup_timeout - one_millisecond));
+        assert!(watchdog.timed_out(start + startup_timeout));
+
+        // A real mic callback resets the steady-state timeout. Speaker activity
+        // is intentionally absent from this state, so it cannot mask a dead mic.
+        let mic_chunk_at = start + Duration::from_secs(60);
+        watchdog.note_chunk(mic_chunk_at);
+        assert!(!watchdog.timed_out(mic_chunk_at + receive_timeout - one_millisecond));
+        assert!(watchdog.timed_out(mic_chunk_at + receive_timeout));
     }
 
     #[test]
