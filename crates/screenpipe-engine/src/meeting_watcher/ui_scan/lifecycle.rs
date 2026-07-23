@@ -307,7 +307,8 @@ pub(crate) async fn apply_state_action(
             // Fresh meeting -> reset the flap counter for outcome telemetry.
             *flap_count = 0;
             // Calendar enrichment: find overlapping calendar event
-            let (cal_title, cal_attendees) = find_overlapping_calendar_event(calendar_events);
+            let (cal_title, cal_attendees, cal_event_id) =
+                find_overlapping_calendar_event(calendar_events);
             let attendees_str = cal_attendees.as_ref().map(|a| a.join(", "));
 
             // Try to merge with recently-ended meeting. The DB query
@@ -354,6 +355,15 @@ pub(crate) async fn apply_state_action(
                                 );
                             }
                         }
+                        if let Some(event_id) = cal_event_id.as_deref() {
+                            if let Err(e) = db.set_meeting_ms365_event_id(recent.id, event_id).await
+                            {
+                                warn!(
+                                    "meeting v2: failed to set ms365_event_id on reopened meeting {}: {}",
+                                    recent.id, e
+                                );
+                            }
+                        }
                         (recent.id, "auto_reopen")
                     }
                     Err(e) => {
@@ -364,6 +374,7 @@ pub(crate) async fn apply_state_action(
                                 &app,
                                 cal_title.as_deref(),
                                 attendees_str.as_deref(),
+                                cal_event_id.as_deref(),
                             )
                             .await,
                             "auto_start",
@@ -371,8 +382,14 @@ pub(crate) async fn apply_state_action(
                     }
                 },
                 Ok(None) => (
-                    insert_new_meeting(db, &app, cal_title.as_deref(), attendees_str.as_deref())
-                        .await,
+                    insert_new_meeting(
+                        db,
+                        &app,
+                        cal_title.as_deref(),
+                        attendees_str.as_deref(),
+                        cal_event_id.as_deref(),
+                    )
+                    .await,
                     "auto_start",
                 ),
                 Err(e) => {
@@ -383,6 +400,7 @@ pub(crate) async fn apply_state_action(
                             &app,
                             cal_title.as_deref(),
                             attendees_str.as_deref(),
+                            cal_event_id.as_deref(),
                         )
                         .await,
                         "auto_start",

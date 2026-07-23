@@ -13,12 +13,14 @@ pub(crate) enum AutoStartOutcome {
     Failed,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_or_adopt_auto_meeting(
     db: &DatabaseManager,
     manual_meeting: &tokio::sync::RwLock<Option<i64>>,
     platform: &str,
     title: Option<&str>,
     attendees: Option<&str>,
+    ms365_event_id: Option<&str>,
     last_explicit_stop_id: Option<i64>,
 ) -> AutoStartOutcome {
     if let Some(id) = *manual_meeting.read().await {
@@ -66,6 +68,14 @@ pub(crate) async fn start_or_adopt_auto_meeting(
                         );
                     }
                 }
+                if let Some(event_id) = ms365_event_id {
+                    if let Err(e) = db.set_meeting_ms365_event_id(recent.id, event_id).await {
+                        warn!(
+                            "audio-process meeting detector: failed to set ms365_event_id on reopened meeting {}: {}",
+                            recent.id, e
+                        );
+                    }
+                }
                 if let Ok(meeting) = db.get_meeting_by_id(recent.id).await {
                     capture_detection_decision(&meeting, "audio_process_reopen", None);
                 }
@@ -76,16 +86,19 @@ pub(crate) async fn start_or_adopt_auto_meeting(
                     "audio-process meeting detector: failed to reopen meeting {}: {}",
                     recent.id, e
                 );
-                insert_new_audio_process_meeting(db, platform, title, attendees).await
+                insert_new_audio_process_meeting(db, platform, title, attendees, ms365_event_id)
+                    .await
             }
         },
-        Ok(None) => insert_new_audio_process_meeting(db, platform, title, attendees).await,
+        Ok(None) => {
+            insert_new_audio_process_meeting(db, platform, title, attendees, ms365_event_id).await
+        }
         Err(e) => {
             warn!(
                 "audio-process meeting detector: failed to find recent meeting: {}",
                 e
             );
-            insert_new_audio_process_meeting(db, platform, title, attendees).await
+            insert_new_audio_process_meeting(db, platform, title, attendees, ms365_event_id).await
         }
     }
 }
@@ -95,6 +108,7 @@ pub(crate) async fn insert_new_audio_process_meeting(
     platform: &str,
     title: Option<&str>,
     attendees: Option<&str>,
+    ms365_event_id: Option<&str>,
 ) -> AutoStartOutcome {
     match db
         .insert_meeting(platform, "audio_process", title, attendees)
@@ -105,6 +119,14 @@ pub(crate) async fn insert_new_audio_process_meeting(
                 "audio-process meeting detector: meeting started (id={}, app={})",
                 id, platform
             );
+            if let Some(event_id) = ms365_event_id {
+                if let Err(e) = db.set_meeting_ms365_event_id(id, event_id).await {
+                    warn!(
+                        "audio-process meeting detector: failed to set ms365_event_id on meeting {}: {}",
+                        id, e
+                    );
+                }
+            }
             if let Err(e) = screenpipe_events::send_event(
                 "meeting_started",
                 serde_json::json!({
@@ -230,7 +252,8 @@ pub(crate) async fn apply_state_action(
             pid,
             bundle_id,
         } => {
-            let (cal_title, cal_attendees) = find_overlapping_calendar_event(calendar_events);
+            let (cal_title, cal_attendees, cal_event_id) =
+                find_overlapping_calendar_event(calendar_events);
             let attendees_str = cal_attendees.as_ref().map(|a| a.join(", "));
             let outcome = start_or_adopt_auto_meeting(
                 db,
@@ -238,6 +261,7 @@ pub(crate) async fn apply_state_action(
                 &platform,
                 cal_title.as_deref(),
                 attendees_str.as_deref(),
+                cal_event_id.as_deref(),
                 last_explicit_stop_id,
             )
             .await;

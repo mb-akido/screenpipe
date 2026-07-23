@@ -4,6 +4,33 @@
 
 use super::*;
 
+/// One row as fetched from Microsoft Graph's `/me/calendarView`, ready to
+/// upsert into `ms365_calendar_events`. Field names mirror the DB columns
+/// directly (see `20260720000000_create_ms365_calendar_events.sql`) rather
+/// than the Graph API's own casing, since the ms365_calendar publisher does
+/// the DTO→row mapping before calling `upsert_ms365_calendar_event`.
+#[derive(Debug, Clone)]
+pub struct Ms365CalendarEventRow {
+    pub id: String,
+    pub subject: Option<String>,
+    pub start_utc: String,
+    pub end_utc: String,
+    pub is_all_day: bool,
+    /// Serialized JSON array of `{"name":..,"email":..}` — stored as TEXT,
+    /// not normalized into a join table, since it's read back as a whole
+    /// unit (never queried by individual attendee).
+    pub attendees_json: String,
+    pub organizer_name: Option<String>,
+    pub organizer_email: Option<String>,
+    pub location: Option<String>,
+    pub online_meeting_url: Option<String>,
+    pub is_cancelled: bool,
+    /// Meeting description/agenda, plain text (converted from Graph's HTML
+    /// `body.content` by the publisher — never HTML by the time it reaches
+    /// this struct). `None` when Graph returned an empty body.
+    pub description: Option<String>,
+}
+
 impl DatabaseManager {
     // ── Meeting persistence ──────────────────────────────────────────
     //
@@ -486,7 +513,7 @@ impl DatabaseManager {
             let mut conn = self.pool.acquire().await?;
             match sqlx::query_as::<_, MeetingRecord>(
                 "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
-                 detection_source, created_at FROM meetings WHERE id = ?1",
+                 ms365_event_id, detection_source, created_at FROM meetings WHERE id = ?1",
             )
             .bind(id)
             .fetch_one(&mut *conn)
@@ -1452,5 +1479,182 @@ impl DatabaseManager {
         .fetch_optional(&self.pool)
         .await?;
         Ok(meeting)
+    }
+
+    // ── MS365 calendar persistence ───────────────────────────────────
+    //
+    // See `20260720000000_create_ms365_calendar_events.sql` for why this
+    // table exists (durable rolling-window cache, decoupled from the
+    // in-memory "calendar_events" bus's moment-of-detection timing race).
+
+    /// Insert or refresh one calendar event row. Called once per event, per
+    /// poll cycle, by the ms365_calendar publisher — `last_synced_at` is
+    /// stamped fresh on every call so [`Self::prune_stale_ms365_calendar_events`]
+    /// can later tell which rows this poll still saw vs. which fell out of
+    /// Graph's response entirely (deleted, or rescheduled outside the window).
+    pub async fn upsert_ms365_calendar_event(
+        &self,
+        event: &Ms365CalendarEventRow,
+        synced_at: &str,
+    ) -> Result<(), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            "INSERT INTO ms365_calendar_events \
+                (id, subject, start_utc, end_utc, is_all_day, attendees_json, \
+                 organizer_name, organizer_email, location, online_meeting_url, \
+                 is_cancelled, description, last_synced_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(id) DO UPDATE SET \
+                subject = excluded.subject, \
+                start_utc = excluded.start_utc, \
+                end_utc = excluded.end_utc, \
+                is_all_day = excluded.is_all_day, \
+                attendees_json = excluded.attendees_json, \
+                organizer_name = excluded.organizer_name, \
+                organizer_email = excluded.organizer_email, \
+                location = excluded.location, \
+                online_meeting_url = excluded.online_meeting_url, \
+                is_cancelled = excluded.is_cancelled, \
+                description = excluded.description, \
+                last_synced_at = excluded.last_synced_at",
+        )
+        .bind(&event.id)
+        .bind(&event.subject)
+        .bind(&event.start_utc)
+        .bind(&event.end_utc)
+        .bind(event.is_all_day)
+        .bind(&event.attendees_json)
+        .bind(&event.organizer_name)
+        .bind(&event.organizer_email)
+        .bind(&event.location)
+        .bind(&event.online_meeting_url)
+        .bind(event.is_cancelled)
+        .bind(&event.description)
+        .bind(synced_at)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete rows whose `start_utc` falls inside the just-polled window but
+    /// whose `last_synced_at` predates this poll — i.e. Graph's response for
+    /// this window no longer contains them (hard delete, or the event moved
+    /// outside the window on reschedule). Scoped to `start_utc BETWEEN
+    /// window_start_utc AND window_end_utc` so a wider historical range never
+    /// gets swept by a narrower poll window. Returns the number of rows removed.
+    pub async fn prune_stale_ms365_calendar_events(
+        &self,
+        window_start_utc: &str,
+        window_end_utc: &str,
+        poll_started_at: &str,
+    ) -> Result<u64, SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let result = sqlx::query(
+            "DELETE FROM ms365_calendar_events \
+             WHERE start_utc BETWEEN ?1 AND ?2 \
+               AND last_synced_at < ?3",
+        )
+        .bind(window_start_utc)
+        .bind(window_end_utc)
+        .bind(poll_started_at)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Set the soft-reference `meetings.ms365_event_id` link. Called from two
+    /// places: (1) `find_overlapping_calendar_event`'s detection-time match
+    /// (fast, best-effort), and (2) the calendar-meeting-labeler pipe's
+    /// backfill against the persisted table (slow, authoritative — can
+    /// overwrite a wrong or missing detection-time match later). No FK
+    /// constraint to `ms365_calendar_events.id`: that table's rows are
+    /// pruned on a rolling window and must never cascade into orphaning a
+    /// meeting recording that already happened.
+    pub async fn set_meeting_ms365_event_id(
+        &self,
+        meeting_id: i64,
+        ms365_event_id: &str,
+    ) -> Result<(), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query("UPDATE meetings SET ms365_event_id = ?1 WHERE id = ?2")
+            .bind(ms365_event_id)
+            .bind(meeting_id)
+            .execute(&mut **tx.conn())
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read events overlapping `[hours_back, hours_ahead]` around now, for
+    /// the `GET /ms365-calendar/events` route (a thin read of this table —
+    /// never a live Graph call) and for the calendar-meeting-labeler pipe's
+    /// backfill pass.
+    pub async fn get_ms365_calendar_events_in_window(
+        &self,
+        hours_back: i64,
+        hours_ahead: i64,
+    ) -> Result<Vec<Ms365CalendarEventRow>, SqlxError> {
+        let now = chrono::Utc::now();
+        let window_start = (now - chrono::Duration::hours(hours_back)).to_rfc3339();
+        let window_end = (now + chrono::Duration::hours(hours_ahead)).to_rfc3339();
+        let rows: Vec<(
+            String,
+            Option<String>,
+            String,
+            String,
+            bool,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, subject, start_utc, end_utc, is_all_day, attendees_json, \
+                    organizer_name, organizer_email, location, online_meeting_url, is_cancelled, \
+                    description \
+             FROM ms365_calendar_events \
+             WHERE start_utc <= ?2 AND end_utc >= ?1 \
+             ORDER BY start_utc",
+        )
+        .bind(&window_start)
+        .bind(&window_end)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    subject,
+                    start_utc,
+                    end_utc,
+                    is_all_day,
+                    attendees_json,
+                    organizer_name,
+                    organizer_email,
+                    location,
+                    online_meeting_url,
+                    is_cancelled,
+                    description,
+                )| Ms365CalendarEventRow {
+                    id,
+                    subject,
+                    start_utc,
+                    end_utc,
+                    is_all_day,
+                    attendees_json,
+                    organizer_name,
+                    organizer_email,
+                    location,
+                    online_meeting_url,
+                    is_cancelled,
+                    description,
+                },
+            )
+            .collect())
     }
 }

@@ -1614,17 +1614,23 @@ impl SettingsStore {
         {
             config.port = p;
         }
-        match self.local_plan_policy() {
-            LocalPlanPolicy::VerifiedFree => {
-                config.max_non_template_pipes = Some(2);
-                config.enforce_free_plan_retention = true;
+        // Debug builds (`bun tauri dev`, e2e, signed dev builds) are never
+        // gated — same carve-out as `app_entitled_or_dev()` /
+        // `restricts_paid_local_features()` above. Release builds must not
+        // be bypassable via a runtime env var.
+        if !cfg!(debug_assertions) {
+            match self.local_plan_policy() {
+                LocalPlanPolicy::VerifiedFree => {
+                    config.max_non_template_pipes = Some(2);
+                    config.enforce_free_plan_retention = true;
+                }
+                LocalPlanPolicy::Unknown => {
+                    // Unknown must never inherit paid/unlimited behavior, but it is
+                    // not safe evidence for destructive free-plan retention.
+                    config.max_non_template_pipes = Some(2);
+                }
+                LocalPlanPolicy::VerifiedPaid => {}
             }
-            LocalPlanPolicy::Unknown => {
-                // Unknown must never inherit paid/unlimited behavior, but it is
-                // not safe evidence for destructive free-plan retention.
-                config.max_non_template_pipes = Some(2);
-            }
-            LocalPlanPolicy::VerifiedPaid => {}
         }
         config
     }
@@ -1739,6 +1745,13 @@ impl SettingsStore {
     }
 
     pub(crate) fn restricts_paid_local_features(&self) -> bool {
+        // Debug builds (`bun tauri dev`, e2e, signed dev builds) are never
+        // gated — same carve-out as `app_entitled_or_dev()` above. Release
+        // builds must not be bypassable via a runtime env var.
+        if cfg!(debug_assertions) {
+            return false;
+        }
+
         self.local_plan_policy() != LocalPlanPolicy::VerifiedPaid
     }
 
@@ -2102,6 +2115,48 @@ impl IcsCalendarSettingsStore {
     pub fn save(&self, app: &AppHandle) -> Result<(), String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
         store.set("ics_calendars", json!(self));
+        store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
+        Ok(())
+    }
+}
+
+// ─── MS365 Calendar Settings ─────────────────────────────────────────────────
+//
+// Distinct from the OAuth-based Microsoft 365/Outlook/Teams connections
+// (see connections_api.rs / oauth.rs) — those route token exchange through
+// screenpipe's own backend proxy and its own Azure app registration. This
+// setting instead points at a separately-authenticated MSAL public-client
+// checkout (e.g. a personal automation repo) whose token-bridge script the
+// `ms365_calendar` background publisher shells out to. See
+// `apps/screenpipe-app-tauri/src-tauri/src/ms365_calendar.rs` for the
+// consumer of this setting.
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct Ms365CalendarSettingsStore {
+    pub enabled: bool,
+    /// Absolute path to the repo checkout containing the MSAL token-bridge
+    /// script at `src/integrations/ms365/print-token.ts` and its `.env` with
+    /// `MS_Application_ID`/`MS_Tenant_ID`.
+    pub repo_path: String,
+}
+
+impl Ms365CalendarSettingsStore {
+    pub fn get(app: &AppHandle) -> Result<Option<Self>, String> {
+        let store = get_store(app, None).map_err(|e| e.to_string())?;
+        if store.is_empty() {
+            return Ok(None);
+        }
+        let settings = serde_json::from_value(store.get("ms365_calendar").unwrap_or(Value::Null));
+        match settings {
+            Ok(settings) => Ok(settings),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn save(&self, app: &AppHandle) -> Result<(), String> {
+        let store = get_store(app, None).map_err(|e| e.to_string())?;
+        store.set("ms365_calendar", json!(self));
         store.save().map_err(|e| e.to_string())?;
         reencrypt_store_file(app);
         Ok(())

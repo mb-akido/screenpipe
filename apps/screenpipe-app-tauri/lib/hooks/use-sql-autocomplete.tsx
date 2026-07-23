@@ -14,6 +14,35 @@ export interface AutocompleteItem {
   memory_count?: number;
 }
 
+/** Distinguish "server not listening yet" (raw network failure — TypeError,
+ * fetch rejects before getting a Response) from a real HTTP error response
+ * (4xx/5xx — the server IS up, this request is legitimately bad). Only the
+ * former is worth retrying: on cold start the frontend can render and fire
+ * its mount-time fetch before the Rust backend finishes binding its port
+ * (up to ~15-20s on a fresh dev build / first permission grant), so the
+ * very first fetch attempt commonly loses this race harmlessly. */
+async function fetchWithServerReadyRetry(
+  fn: () => Promise<Response>,
+  { retries = 4, delayMs = 750 }: { retries?: number; delayMs?: number } = {}
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      // fetch() only throws for network-level failures (DNS, connection
+      // refused, CORS) — an HTTP error status resolves normally with
+      // response.ok === false, so it never reaches this catch. Safe to
+      // retry every throw here.
+      lastErr = err;
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 const TAG_AUTOCOMPLETE_LIMIT = 100;
 
@@ -92,13 +121,15 @@ export function useSqlAutocomplete(type: "app" | "window" | "url") {
             LIMIT 100
           `;
         }
-        const response = await localFetch("/raw_sql", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ query }),
-        });
+        const response = await fetchWithServerReadyRetry(() =>
+          localFetch("/raw_sql", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ query }),
+          })
+        );
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -145,8 +176,8 @@ export function useTagAutocomplete() {
         setItems(TAG_CACHE.data);
         return;
       }
-      const response = await localFetch(
-        `/tags/autocomplete?limit=${TAG_AUTOCOMPLETE_LIMIT}`
+      const response = await fetchWithServerReadyRetry(() =>
+        localFetch(`/tags/autocomplete?limit=${TAG_AUTOCOMPLETE_LIMIT}`)
       );
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
@@ -260,11 +291,13 @@ export function useAppWindowTree() {
         ORDER BY a.app_total DESC, w.count DESC
         LIMIT 1000
       `;
-      const response = await localFetch("/raw_sql", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
-      });
+      const response = await fetchWithServerReadyRetry(() =>
+        localFetch("/raw_sql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query }),
+        })
+      );
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }

@@ -13,6 +13,14 @@ use tracing::{error, info, warn};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CalendarEventSignal {
+    /// Source event id (e.g. Microsoft Graph event id, Google Calendar event
+    /// id). Empty for publishers that don't carry a stable id — `#[serde(default)]`
+    /// so older/other-source payloads without this field still deserialize.
+    /// Used to persist a `meetings.ms365_event_id`-style soft link back to the
+    /// calendar event a detected meeting matched, so the recording can be
+    /// re-joined to its calendar entry later (see `set_meeting_ms365_event_id`).
+    #[serde(default)]
+    pub id: String,
     pub title: String,
     pub start: String,
     pub end: String,
@@ -36,10 +44,14 @@ pub(crate) struct DetectorStopSignal {
 }
 
 /// Check if any non-all-day calendar event overlaps with the current time.
-/// Returns (title, attendees) of the first matching event, or (None, None).
+/// Returns (title, attendees, event id) of the first matching event, or
+/// (None, None, None). The event id lets the caller persist a soft link from
+/// the meeting it's about to create/enrich back to the calendar event that
+/// matched (see `set_meeting_ms365_event_id`) — `None` when the matched
+/// event's `id` is empty (publishers that don't carry a stable id).
 pub(crate) fn find_overlapping_calendar_event(
     events: &[CalendarEventSignal],
-) -> (Option<String>, Option<Vec<String>>) {
+) -> (Option<String>, Option<Vec<String>>, Option<String>) {
     let now = Utc::now();
     for cal_event in events {
         if let (Ok(start), Ok(end)) = (
@@ -56,11 +68,16 @@ pub(crate) fn find_overlapping_calendar_event(
                     } else {
                         Some(cal_event.attendees.clone())
                     },
+                    if cal_event.id.is_empty() {
+                        None
+                    } else {
+                        Some(cal_event.id.clone())
+                    },
                 );
             }
         }
     }
-    (None, None)
+    (None, None, None)
 }
 
 /// True if a non-all-day calendar event is happening at `now`. Used as a
@@ -89,12 +106,17 @@ pub(crate) fn has_active_calendar_event(
 }
 
 /// Insert a new meeting into the database with optional calendar enrichment.
-/// Returns the meeting ID, or -1 on failure.
+/// Returns the meeting ID, or -1 on failure. `ms365_event_id` (from
+/// `find_overlapping_calendar_event`'s match) is a fast, best-effort link —
+/// the calendar-meeting-labeler pipe's later backfill against the persisted
+/// `ms365_calendar_events` table is the authoritative pass that can correct
+/// or fill in this link if it's missing or wrong here.
 pub(crate) async fn insert_new_meeting(
     db: &DatabaseManager,
     app: &str,
     title: Option<&str>,
     attendees: Option<&str>,
+    ms365_event_id: Option<&str>,
 ) -> i64 {
     match db.insert_meeting(app, "ui_scan", title, attendees).await {
         Ok(id) => {
@@ -102,6 +124,14 @@ pub(crate) async fn insert_new_meeting(
                 "meeting v2: meeting started (id={}, app={}, title={:?})",
                 id, app, title
             );
+            if let Some(event_id) = ms365_event_id {
+                if let Err(e) = db.set_meeting_ms365_event_id(id, event_id).await {
+                    warn!(
+                        "meeting v2: failed to set ms365_event_id on meeting {}: {}",
+                        id, e
+                    );
+                }
+            }
             // Emit event so triggered pipes can react
             if let Err(e) = screenpipe_events::send_event(
                 "meeting_started",

@@ -61,6 +61,7 @@ export const CONNECTION_CATEGORY_BY_ID: Record<string, string> = {
   "apple-calendar-card": "Calendar",
   "outlook-calendar": "Calendar",
   "ics-calendar": "Calendar",
+  "ms365-calendar": "Calendar",
   calendly: "Calendar",
   calcom: "Calendar",
 
@@ -170,6 +171,7 @@ export const CONNECTION_HARDCODED_DESCRIPTIONS: Record<string, string> = {
   "google-sheets": "Read, create, and edit Google Sheets (via composio.dev managed auth)",
   "outlook-email": "Read and send your Outlook email",
   "ics-calendar": "Subscribe to any ICS calendar feed",
+  "ms365-calendar": "Real meeting attendees from Microsoft Graph via a separate personal MSAL sign-in",
   "remote-agent": "Run a 24/7 agent (OpenClaw, Hermes, Claude, Codex) on your VPS, wired to screenpipe",
   "whatsapp": "Search your WhatsApp conversations",
   "anythingllm": "Give AnythingLLM access to your screen",

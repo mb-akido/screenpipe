@@ -8,6 +8,12 @@ use super::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CalendarEventSignal {
+    /// Source event id (e.g. Microsoft Graph event id). `#[serde(default)]`
+    /// so payloads from publishers without a stable id still deserialize.
+    /// See the sibling definition in `meeting_watcher/shared/calendar.rs` for
+    /// why this exists — kept in sync with that copy.
+    #[serde(default)]
+    pub id: String,
     pub title: String,
     pub start: String,
     pub end: String,
@@ -32,7 +38,7 @@ pub(crate) struct DetectorStopSignal {
 
 pub(crate) fn find_overlapping_calendar_event(
     events: &[CalendarEventSignal],
-) -> (Option<String>, Option<Vec<String>>) {
+) -> (Option<String>, Option<Vec<String>>, Option<String>) {
     let now = Utc::now();
     for cal_event in events {
         if let (Ok(start), Ok(end)) = (
@@ -49,11 +55,16 @@ pub(crate) fn find_overlapping_calendar_event(
                     } else {
                         Some(cal_event.attendees.clone())
                     },
+                    if cal_event.id.is_empty() {
+                        None
+                    } else {
+                        Some(cal_event.id.clone())
+                    },
                 );
             }
         }
     }
-    (None, None)
+    (None, None, None)
 }
 
 /// Apply an explicit `detector_stop_tracking` signal: when it targets the live

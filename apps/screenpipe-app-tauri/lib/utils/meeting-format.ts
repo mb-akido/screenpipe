@@ -10,6 +10,8 @@ export interface MeetingRecord {
   title: string | null;
   attendees: string | null;
   note: string | null;
+  /** Soft-reference to an ms365_calendar_events row, when matched. */
+  ms365_event_id?: string | null;
   detection_source: string;
   created_at: string;
 }

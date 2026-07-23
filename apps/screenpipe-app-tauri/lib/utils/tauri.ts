@@ -1105,6 +1105,35 @@ async lockSync() : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async ms365CalendarGetSettings() : Promise<Result<Ms365CalendarSettingsStore, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("ms365_calendar_get_settings") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ms365CalendarSaveSettings(settings: Ms365CalendarSettingsStore) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("ms365_calendar_save_settings", { settings }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Runs the token bridge + one Graph call, synchronously, for the Settings
+ * UI's "Test connection" button. Returns a human-readable success message
+ * or the failure reason as `Err`.
+ */
+async ms365CalendarTest(repoPath: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("ms365_calendar_test", { repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Cancel any in-flight OAuth flow(s) for the given integration.
  * Dropping the stored sender makes the awaiting `oauth_connect` call fail fast
@@ -2645,6 +2674,13 @@ export type KeychainStatus = { state: string }
 export type LogFile = { name: string; path: string; modified_at: number }
 export type MeetingExportSummary = { job_id: string; output_path: string; frame_count: number; audio_chunk_count: number; duration_secs: number; file_size_bytes: number }
 export type MonitorDevice = { id: number; stableId: string; name: string; isDefault: boolean; width: number; height: number }
+export type Ms365CalendarSettingsStore = { enabled: boolean;
+/**
+ * Absolute path to the repo checkout containing the MSAL token-bridge
+ * script at `src/integrations/ms365/print-token.ts` and its `.env` with
+ * `MS_Application_ID`/`MS_Tenant_ID`.
+ */
+repo_path: string }
 export type NotificationActionEvent = { actionType: string | null; rawJson: string; payload: JsonValue }
 export type OAuthInstanceInfo = { instance: string | null; display_name: string | null }
 export type OAuthStatus = { connected: boolean; display_name: string | null;

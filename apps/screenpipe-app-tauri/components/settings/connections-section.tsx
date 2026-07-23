@@ -41,6 +41,7 @@ import { GoogleCalendarCard } from "./google-calendar-card";
 import { ComposioCard, COMPOSIO_TOOLKITS, type ComposioStatusMap } from "./composio-card";
 import { GoogleDocsCard } from "./google-docs-card";
 import { IcsCalendarCard } from "./ics-calendar-card";
+import { Ms365CalendarCard } from "./ms365-calendar-card";
 import { RemoteAgentCard } from "./remote-agent-card";
 import { BrowserUrlCard } from "./browser-url-card";
 import { UserBrowserCard } from "./user-browser-card";
@@ -517,6 +518,7 @@ const INTEGRATION_ICONS: Record<string, React.ReactNode> = {
     "google-drive": <img src="/images/google-drive.svg" alt="Google Drive" className="w-5 h-5" />,
     "google-sheets": <img src="/images/google-sheets.svg" alt="Google Sheets" className="w-5 h-5" />,
     "ics-calendar": <CalendarIcon className="h-5 w-5 text-muted-foreground" />,
+    "ms365-calendar": <CalendarIcon className="h-5 w-5 text-muted-foreground" />,
     "remote-agent": <img src="/openclaw-icon.svg" alt="Remote agent" className="w-5 h-5" />,
     bee: <img src="/images/bee.png" alt="Bee" className="w-5 h-5 rounded" />,
     email: <Send className="h-5 w-5 text-muted-foreground" />,
@@ -747,6 +749,7 @@ export const TRY_IN_CHAT_PROMPTS: Record<string, string> = {
   chatgpt: "What topics did I discuss with AI recently?",
   "apple-calendar": "What meetings do I have this week?",
   "ics-calendar": "What events are coming up this week?",
+  "ms365-calendar": "What events are coming up this week?",
   granola: "Show notes from my recent meetings",
   zoom: "Summarize my recent Zoom calls",
   gmail: "Summarize my recent emails",
@@ -3914,6 +3917,7 @@ export function ConnectionsSection({
       { id: "google-drive", name: "Google Drive", icon: "google-drive", connected: composioConnected.googledrive },
       { id: "google-sheets", name: "Google Sheets", icon: "google-sheets", connected: composioConnected.googlesheets },
       { id: "ics-calendar", name: "ICS Calendar", icon: "ics-calendar", connected: false },
+      { id: "ms365-calendar", name: "Microsoft 365 Calendar (personal)", icon: "ms365-calendar", connected: false },
       { id: "remote-agent", name: "Remote agent", icon: "remote-agent", connected: false },
       { id: "whatsapp", name: "WhatsApp", icon: "whatsapp", connected: false, detected: detectedConnectionIds.has("whatsapp") },
       { id: "anythingllm", name: "AnythingLLM", icon: "anythingllm", connected: false, detected: detectedConnectionIds.has("anythingllm") },
@@ -4172,6 +4176,7 @@ export function ConnectionsSection({
         </div>
       );
       case "ics-calendar": return <IcsCalendarCard />;
+      case "ms365-calendar": return <Ms365CalendarCard />;
       case "remote-agent": return <RemoteAgentCard />;
       case "whatsapp": return <WhatsAppPanel />;
       case "anythingllm": return <AnythingLLMPanel />;

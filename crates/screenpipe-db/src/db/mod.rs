@@ -367,6 +367,7 @@ mod elements;
 mod frames;
 mod maintenance;
 mod meetings;
+pub use meetings::Ms365CalendarEventRow;
 mod memories;
 mod outputs;
 mod search;

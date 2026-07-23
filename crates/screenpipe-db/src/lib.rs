@@ -18,7 +18,7 @@ pub use cancellable_query::{
 };
 pub use db::{
     find_matching_a11y_positions, parse_all_text_positions, DatabaseManager, DeleteTimeRangeResult,
-    ImmediateTx, NewMeetingTranscriptSegment, MEETING_END_REASON_AUTO_END,
+    ImmediateTx, Ms365CalendarEventRow, NewMeetingTranscriptSegment, MEETING_END_REASON_AUTO_END,
     MEETING_END_REASON_EXPLICIT_STOP, MEETING_END_REASON_SHUTDOWN,
 };
 pub use text_normalizer::{expand_search_query, sanitize_fts5_query};

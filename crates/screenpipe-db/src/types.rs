@@ -366,6 +366,16 @@ pub struct MeetingRecord {
     pub title: Option<String>,
     pub attendees: Option<String>,
     pub note: Option<String>,
+    /// Soft-reference to `ms365_calendar_events.id` — see
+    /// `20260720000001_add_ms365_event_id_to_meetings.sql`. `#[sqlx(default)]`
+    /// so the many existing `SELECT ...` queries that construct this struct
+    /// without listing this column don't break (they simply get `None`
+    /// here); only `get_meeting_by_id`'s query was updated to select it,
+    /// since that's the read path the calendar-meeting-labeler pipe uses to
+    /// verify its PUT actually set the link.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub ms365_event_id: Option<String>,
     pub detection_source: String,
     pub created_at: String,
 }

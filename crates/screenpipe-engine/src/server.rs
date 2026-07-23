@@ -46,8 +46,9 @@ use crate::{
         meetings::{
             bulk_delete_meetings_handler, delete_meeting_handler, export_handler,
             get_meeting_handler, get_meeting_transcript_handler, list_meetings_handler,
-            meeting_status_handler, merge_meetings_handler, split_meeting_handler,
-            start_meeting_handler, stop_meeting_handler, update_meeting_handler,
+            meeting_status_handler, merge_meetings_handler, ms365_calendar_events_handler,
+            split_meeting_handler, start_meeting_handler, stop_meeting_handler,
+            update_meeting_handler,
         },
         memories::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
@@ -794,6 +795,7 @@ impl SCServer {
             .post("/speakers/reassign", reassign_speaker_handler)
             .post("/speakers/undo-reassign", undo_speaker_reassign_handler)
             .get("/meetings", list_meetings_handler)
+            .get("/ms365-calendar/events", ms365_calendar_events_handler)
             .get("/meetings/status", meeting_status_handler)
             .post("/meetings/merge", merge_meetings_handler)
             // General export: meeting_id XOR start/end → MP4 (frames + synced audio).

@@ -66,6 +66,7 @@ mod livetext_ffi;
 mod meeting_export;
 mod meeting_live_notes;
 mod meeting_stall_notifications;
+mod ms365_calendar;
 mod oauth;
 mod overlay_health;
 mod owned_browser;
@@ -270,6 +271,7 @@ macro_rules! define_specta_builder {
             .typ::<calendar::CalendarStatus>()
             .typ::<calendar::CalendarEventItem>()
             .typ::<store::IcsCalendarEntry>()
+            .typ::<store::Ms365CalendarSettingsStore>()
             .typ::<suggestions::CachedSuggestions>()
             .typ::<suggestions::Suggestion>()
             .typ::<hardware::HardwareCapability>()
@@ -1981,6 +1983,18 @@ async fn main() {
             let gcal_app_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 google_calendar::start_google_calendar_publisher(gcal_app_handle).await;
+            });
+
+            // Start MS365 calendar publisher (persists events to
+            // ms365_calendar_events every 15 min, also pushes into the
+            // calendar_events bus). Unlike the other 3 always-on publishers
+            // above, this one no-ops on every poll until the user configures
+            // it in Settings — its token bridge depends on a specific,
+            // separately-authenticated repo checkout that won't exist on
+            // most installs.
+            let ms365_app_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                ms365_calendar::start_ms365_calendar_publisher(ms365_app_handle).await;
             });
 
             // Enterprise telemetry sync (no-op stub on consumer builds).

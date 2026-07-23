@@ -30,6 +30,15 @@ pub struct UpdateMeetingRequest {
     pub attendees: Option<String>,
     pub note: Option<String>,
     pub meeting_app: Option<String>,
+    /// Soft-reference link to `ms365_calendar_events.id` — see
+    /// `20260720000001_add_ms365_event_id_to_meetings.sql`. Written by the
+    /// calendar-meeting-labeler pipe's backfill pass (authoritative,
+    /// overwrites a missing/wrong detection-time match); not part of
+    /// `DatabaseManager::update_meeting`'s fixed positional args, so this is
+    /// applied as a separate `set_meeting_ms365_event_id` call below rather
+    /// than widening that shared fn's signature.
+    #[serde(default)]
+    pub ms365_event_id: Option<String>,
 }
 
 #[derive(OaSchema, Deserialize, Debug)]
@@ -372,6 +381,19 @@ pub(crate) async fn update_meeting_handler(
                 JsonResponse(json!({"error": e.to_string()})),
             )
         })?;
+
+    if let Some(event_id) = body.ms365_event_id.as_deref() {
+        state
+            .db
+            .set_meeting_ms365_event_id(id, event_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?;
+    }
 
     let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {
         (
@@ -966,6 +988,93 @@ pub(crate) async fn export_handler(
         duration_secs: summary.duration_secs,
         file_size_bytes: summary.file_size_bytes,
     }))
+}
+
+#[derive(OaSchema, Deserialize, Debug)]
+pub struct Ms365CalendarEventsQuery {
+    #[serde(default = "default_ms365_hours_back")]
+    pub hours_back: i64,
+    #[serde(default = "default_ms365_hours_ahead")]
+    pub hours_ahead: i64,
+}
+
+fn default_ms365_hours_back() -> i64 {
+    1
+}
+
+fn default_ms365_hours_ahead() -> i64 {
+    24
+}
+
+#[derive(OaSchema, Serialize, Deserialize, Debug)]
+pub struct Ms365CalendarAttendeeDto {
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(OaSchema, Serialize, Debug)]
+pub struct Ms365CalendarEventDto {
+    pub id: String,
+    pub subject: Option<String>,
+    pub start: String,
+    pub end: String,
+    pub is_all_day: bool,
+    pub attendees: Vec<Ms365CalendarAttendeeDto>,
+    pub organizer_name: Option<String>,
+    pub organizer_email: Option<String>,
+    pub location: Option<String>,
+    pub online_meeting_url: Option<String>,
+    pub is_cancelled: bool,
+    pub description: Option<String>,
+}
+
+/// GET /ms365-calendar/events — read the persisted MS365 calendar table
+/// (never a live Graph call; the `ms365_calendar` background publisher owns
+/// writing to this table on its own poll cycle). Consumed by the
+/// calendar-meeting-labeler pipe's backfill pass to set `meetings.attendees`
+/// and `meetings.ms365_event_id` on already-detected meetings — see
+/// `apps/screenpipe-app-tauri/src-tauri/src/ms365_calendar.rs`'s module doc
+/// for why a persisted table exists at all instead of the in-memory-only
+/// `calendar_events` bus every other calendar publisher uses.
+#[oasgen]
+pub(crate) async fn ms365_calendar_events_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<Ms365CalendarEventsQuery>,
+) -> Result<JsonResponse<Vec<Ms365CalendarEventDto>>, (StatusCode, JsonResponse<Value>)> {
+    let rows = state
+        .db
+        .get_ms365_calendar_events_in_window(query.hours_back, query.hours_ahead)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            let attendees: Vec<Ms365CalendarAttendeeDto> =
+                serde_json::from_str(&row.attendees_json).unwrap_or_default();
+            Ms365CalendarEventDto {
+                id: row.id,
+                subject: row.subject,
+                start: row.start_utc,
+                end: row.end_utc,
+                is_all_day: row.is_all_day,
+                attendees,
+                organizer_name: row.organizer_name,
+                organizer_email: row.organizer_email,
+                location: row.location,
+                online_meeting_url: row.online_meeting_url,
+                is_cancelled: row.is_cancelled,
+                description: row.description,
+            }
+        })
+        .collect();
+
+    Ok(JsonResponse(events))
 }
 
 #[cfg(test)]

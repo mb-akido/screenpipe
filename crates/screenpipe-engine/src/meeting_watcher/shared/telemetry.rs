@@ -308,6 +308,7 @@ mod tests {
             title: Some("private title must not be emitted".to_string()),
             attendees: Some("private attendee must not be emitted".to_string()),
             note: Some("private note must not be emitted".to_string()),
+            ms365_event_id: None,
             detection_source: detection_source.to_string(),
             created_at: "2026-05-13T20:00:00.000Z".to_string(),
         }

@@ -526,6 +526,7 @@ fn test_calendar_event_keep_alive() {
     let now = Utc::now();
     let rfc = |t: DateTime<Utc>| t.to_rfc3339();
     let ev = |start, end, all_day| CalendarEventSignal {
+        id: String::new(),
         title: "Standup".to_string(),
         start: rfc(start),
         end: rfc(end),

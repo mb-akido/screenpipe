@@ -1119,8 +1119,16 @@ async fn active_meeting_blocks_audio_process_insert() {
         .await
         .unwrap();
     let manual_meeting = tokio::sync::RwLock::new(None);
-    let outcome =
-        start_or_adopt_auto_meeting(&db, &manual_meeting, "Google Meet", None, None, None).await;
+    let outcome = start_or_adopt_auto_meeting(
+        &db,
+        &manual_meeting,
+        "Google Meet",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
     assert_eq!(outcome, AutoStartOutcome::BlockedByActive(active_id));
 
     let open_count: (i64,) =
